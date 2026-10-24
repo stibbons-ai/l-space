@@ -2,3 +2,9 @@
 # MemPalace per-project files (issue #185)
 mempalace.yaml
 entities.json
+
+# JetBrains IDE
+.idea/
+
+# Agent build-loop feature folders (briefs, progress, checkpoints)
+.work/
