@@ -1,4 +1,4 @@
-# Shelfcast — Rust ecosystem findings (2026-10-24)
+# L-Space — Rust ecosystem findings (2026-10-24)
 
 ## 1. Rust UPnP / Sonos crates
 | crate | version | last release | notes |

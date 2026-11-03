@@ -1,19 +1,19 @@
-# Shelfcast
+# L-Space
 
-Self-hosted playback of Audiobookshelf podcasts and audiobooks, on Sonos or on the phone: pick something, send it to a speaker, and walk away.
+Self-hosted playback of Audiobookshelf podcasts and audiobooks, on Sonos or on the phone: pick something, send it to a speaker, and walk away. The Bridge ships as **Clacks** and the App as **Ook**; these are product names only, so docs and issues keep using Bridge and App.
 
 ## Language
 
 **Bridge**:
-The always-on Shelfcast server in the household. It is the App's only backend and the only part of Shelfcast that talks to Sonos.
+The always-on L-Space server in the household, shipped as Clacks. It is the App's only backend and the only part of L-Space that talks to Sonos.
 _Avoid_: backend, server, hub
 
 **App**:
-The Shelfcast client on the phone. It is a remote for the Bridge and can also play Items itself (Local playback).
+The L-Space client on the phone, shipped as Ook. It is a remote for the Bridge and can also play Items itself (Local playback).
 _Avoid_: client
 
 **Library Server**:
-An Audiobookshelf server whose Items Shelfcast plays. One Bridge can serve several.
+An Audiobookshelf server whose Items L-Space plays. One Bridge can serve several.
 _Avoid_: instance, ABS server, backend
 
 **Library**:

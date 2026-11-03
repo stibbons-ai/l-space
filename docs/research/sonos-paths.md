@@ -1,8 +1,8 @@
-# Shelfcast — Sonos playback paths (research 2026-10-24)
+# L-Space — Sonos playback paths (research 2026-10-24)
 
 ## Q1. Local UPnP on current S2 firmware
 - **Still works, and Sonos has made it an official user toggle.** Since a July 2025 update the Sonos app has Account > Privacy & Security > Connection Security with three toggles: Authentication (default OFF), **UPnP (default ON)**, and Guest access. Sonos calls UPnP an "unsupported protocol". Turning it off also breaks the Sonos macOS/Windows app. https://support.sonos.com/en-us/article/adjust-connection-security-settings ; announcement thread: https://en.community.sonos.com/product-updates/a-new-player-update-is-live-6930092/index3.html
-- Sonos security advisory SSA-2025-0002 (2025-08-25) tells S2 users to **disable UPnP** as a mitigation. That is a real risk: a user who has followed the advice will break Shelfcast. https://www.sonos.com/en-in/security-advisory-2025-0002
+- Sonos security advisory SSA-2025-0002 (2025-08-25) tells S2 users to **disable UPnP** as a mitigation. That is a real risk: a user who has followed the advice will break L-Space. https://www.sonos.com/en-in/security-advisory-2025-0002
 - No formal deprecation date for UPnP was found. A "Legacy" split of older S2 players began 2025-12-16, but they still get maintenance updates. https://support.sonos.com/en-ca/article/release-notes-sonos-system-updates , https://support.sonos.com/en-gb/article/legacy-product-update
 - **Home Assistant** (SoCo-based) docs list "UPnP must be enabled" as a prerequisite. It uses UPnP events and falls back to polling. https://www.home-assistant.io/integrations/sonos . **SoCo** `play_uri` uses AVTransport SetAVTransportURI: https://github.com/SoCo/SoCo/blob/master/soco/core.py
 - AVTransport actions on S2 models are documented, including SetAVTransportURI, AddURIToQueue, Seek (REL_TIME) and GetPositionInfo: https://github.com/svrooij/sonos-api-docs/blob/main/docs/services/av-transport.md

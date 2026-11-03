@@ -1,4 +1,4 @@
-# Shelfcast — audiobook playback on Sonos (research, 2026-10-24)
+# L-Space — audiobook playback on Sonos (research, 2026-10-24)
 
 ## 1. Formats, MIME, long files, seeking
 - Sonos supports AAC-LC/HE-AAC/HEv2 in .m4a/.mp4/.aac (audio/mp4, audio/aac), FLAC (audio/flac), MP3 (audio/mpeg etc.), Ogg Vorbis (application/ogg), WMA, over HTTP/HTTPS. Fragmented MP4 supported. https://docs.sonos.com/docs/supported-audio-formats

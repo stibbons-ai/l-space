@@ -1,4 +1,4 @@
-# Shelfcast — Project Kick-off Brief
+# L-Space (formerly Shelfcast) — Project Kick-off Brief
 
 > Podcast playback that hands off from your phone to Sonos, powered by Audiobookshelf.
 
@@ -24,7 +24,7 @@ Primary scope: personal / household use. Public release (Sonos partner program, 
 | Sonos mechanism | **Cloud Queue + Control API** (not AirPlay) | Players keep playing and fetching tracks from the cloud queue after the app leaves the network. |
 | Progress sync | Sonos `POST /timePlayed` reports → ABS `PATCH /api/me/progress/:libraryItemId/:episodeId` | Players report `positionMillis`; periodic reports configurable via `reports.periodicIntervalMillis`. |
 | Platforms | iOS first, Android later | |
-| Name | **Shelfcast** | Fits the ABS ecosystem naming (ShelfPlayer, ShelfDroid). No existing product found by web search. "Roomcast" rejected (TeleAdapt, Yealink). |
+| Name | **L-Space** (renamed from Shelfcast on 2026-11-03); Bridge = **Clacks**, App = **Ook** | Discworld names to match the `stibbons-ai` org: L-Space connects every library, the clacks relay messages, and the Librarian (Ook) navigates L-Space. The original name Shelfcast followed ABS ecosystem naming (ShelfPlayer, ShelfDroid); "Roomcast" was rejected (TeleAdapt, Yealink). |
 | Repo naming | `shelfcast` (umbrella); `shelfcast-ios`, `shelfcast-android`, `shelfcast-bridge` | |
 
 ## 3. Architecture
@@ -76,7 +76,7 @@ Overcast's search quality comes mainly from its own popularity-based ranking, no
 **Scope & product**
 1. v1 = podcasts only, or audiobooks too (ABS supports both; chapters, long files)?
 2. Is the phone app also a local player (play on phone + hand off), or a pure Sonos remote?
-3. Queue model: single episode, "Up Next" from ABS, or a Shelfcast-managed queue?
+3. Queue model: single episode, "Up Next" from ABS, or an L-Space-managed queue?
 4. Is improved search in v1 scope, or later?
 
 **Sonos integration**

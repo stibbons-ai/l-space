@@ -1,10 +1,10 @@
-# shelfcast
+# l-space
 
 ## Agent skills
 
 ### Issue tracker
 
-Issues are tracked in GitHub Issues on dVelopment/shelfcast (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
+Issues are tracked in GitHub Issues on stibbons-ai/l-space (via the `gh` CLI). See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

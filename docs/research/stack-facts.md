@@ -1,4 +1,4 @@
-# Shelfcast stack facts (checked 2026-10-24)
+# L-Space stack facts (checked 2026-10-24)
 
 ## 1. Sonos local (LAN) Control API
 - Officially, Sonos says: "The Control API on the LAN is not available for wide release. Use the Control API on the cloud." Source: https://docs.sonos.com/docs/connected-home-architecture (updated 2026-04-16). The documented base URL is the cloud gateway `api.ws.sonos.com/control/api`, which uses OAuth and a developer-portal client key: https://docs.sonos.com/docs/discover, https://docs.sonos.com/docs/control, https://docs.sonos.com/reference/about-control-api

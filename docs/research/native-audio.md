@@ -1,4 +1,4 @@
-# Shelfcast: native audio on iOS (Dioxus vs Tauri 2 vs SwiftUI)
+# L-Space: native audio on iOS (Dioxus vs Tauri 2 vs SwiftUI)
 Researched 2026-10-24.
 
 ## 1. HTML `<audio>` in WKWebView (native host app)

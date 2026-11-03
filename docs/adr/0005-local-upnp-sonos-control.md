@@ -1,6 +1,6 @@
 # The Bridge controls Sonos over local UPnP
 
-The Bridge drives Groups through Sonos's local UPnP interface: it finds players with SSDP, uses AVTransport actions to play, seek and pause, and watches playback through GENA events. Groups play media URLs served by the Bridge (ADR 0010). We chose this over the official cloud Control API because it needs no Sonos developer account, OAuth, trusted TLS hostname or internet connection. That matters because every household that builds Shelfcast has to repeat that setup. Sonos calls UPnP "unsupported" and its 2025 security advisory recommends turning it off. Shelfcast therefore requires the UPnP setting in the Sonos app (Account → Privacy & Security → Connection Security, on by default) to stay enabled.
+The Bridge drives Groups through Sonos's local UPnP interface: it finds players with SSDP, uses AVTransport actions to play, seek and pause, and watches playback through GENA events. Groups play media URLs served by the Bridge (ADR 0010). We chose this over the official cloud Control API because it needs no Sonos developer account, OAuth, trusted TLS hostname or internet connection. That matters because every household that builds L-Space has to repeat that setup. Sonos calls UPnP "unsupported" and its 2025 security advisory recommends turning it off. L-Space therefore requires the UPnP setting in the Sonos app (Account → Privacy & Security → Connection Security, on by default) to stay enabled.
 
 ## Considered Options
 
