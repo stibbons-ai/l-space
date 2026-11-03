@@ -76,30 +76,28 @@ fn two_entries_for_the_same_library_server() {
 
 #[test]
 fn url_with_a_query_is_named_without_its_value() {
-    for url in [
-        "https://abs.lan/?token=s3cret",
-        "https://abs.lan/?user=a@b.c&token=s3cret",
-    ] {
-        let error = refused_without_leaking(
-            &format!("{LISTEN}[[library_servers]]\nurl = \"{url}\"\n"),
-            "s3cret",
-        );
-        assert!(error.contains("library_servers[0].url"), "{error}");
-        assert!(error.contains("https://abs.lan/?REDACTED"), "{error}");
-    }
+    let error = refused_without_leaking(
+        &format!("{LISTEN}[[library_servers]]\nurl = \"https://abs.lan/?token=s3cret\"\n"),
+        "s3cret",
+    );
+    assert!(error.contains("library_servers[0].url"), "{error}");
+    assert!(error.contains("https://abs.lan/?REDACTED"), "{error}");
 }
 
 #[test]
-fn unparseable_url_with_a_password_is_named_without_it() {
+fn url_with_an_at_sign_is_named_by_entry_only() {
     for url in [
         "https://alice:hunter2@abs lan",
         "https://alice:hunter2@abs.lan:99999",
+        "https://abs.lan/?user=a@b.c&token=hunter2",
+        // The url crate would read host `alice`, port 123 and path `/hunter2@abs.lan`.
+        "https://alice:123/hunter2@abs.lan",
     ] {
         let error = refused_without_leaking(
             &format!("{LISTEN}[[library_servers]]\nurl = \"{url}\"\n"),
             "hunter2",
         );
-        assert!(error.contains("library_servers[0].url"), "{error}");
+        assert!(error.contains("library_servers[0].url:"), "{error}");
     }
 }
 

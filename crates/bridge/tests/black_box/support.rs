@@ -205,6 +205,8 @@ fn spawn(config: &Path, rust_log: &str) -> (Child, Receiver<Value>) {
         .arg(config)
         .env("RUST_LOG", rust_log)
         .env_remove("BRIDGE_CONFIG")
+        // Dioxus reads static files from here; a developer's setting must not change the logs.
+        .env_remove("DIOXUS_PUBLIC_PATH")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

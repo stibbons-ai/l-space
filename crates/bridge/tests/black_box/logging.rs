@@ -12,6 +12,25 @@ fn logged_by(bridge: &TestBridge, target: &str) -> Vec<String> {
 }
 
 #[test]
+fn default_level_is_info_without_dioxus_index_html_noise() {
+    let bridge = TestBridge::start("");
+
+    // Control for the tests below: at the default level Dioxus's info event shows.
+    assert_eq!(
+        logged_by(&bridge, "dioxus_server::server"),
+        ["INFO"],
+        "{:#?}",
+        bridge.startup_output()
+    );
+    assert_eq!(
+        logged_by(&bridge, "dioxus_server::config"),
+        Vec::<String>::new(),
+        "{:#?}",
+        bridge.startup_output()
+    );
+}
+
+#[test]
 fn rust_log_directives_may_be_padded_with_spaces() {
     let bridge = TestBridge::start_logging("", " warn , bridge=info ");
 
