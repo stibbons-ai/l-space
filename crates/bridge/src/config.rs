@@ -131,23 +131,27 @@ impl std::str::FromStr for Config {
 }
 
 /// The TOML error without its source snippet, positioned by 1-based line and column. A missing
-/// field has no position (the parser reports it at the start of the file), so none is given.
+/// top-level field has no position (the parser reports it as the empty span at the start of
+/// the file), so none is given; a field missing inside a table points at the table's header.
 ///
 /// The message itself can quote a value too (`invalid type: string "s3cret", expected a
 /// sequence`), so everything from its first to its last double quote becomes `REDACTED`.
 /// Non-string values and key names stay.
 fn parse_error(text: &str, error: &toml::de::Error) -> ConfigError {
     let missing_field = error.message().starts_with("missing field");
-    let position = error.span().filter(|_| !missing_field).map(|span| {
-        let before = text.get(..span.start).unwrap_or(text);
-        let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
-        let column = before[line_start..]
-            .chars()
-            .filter(|&c| c != '\r' && c != '\u{feff}')
-            .count()
-            + 1;
-        (before.matches('\n').count() + 1, column)
-    });
+    let position = error
+        .span()
+        .filter(|span| !(missing_field && *span == (0..0)))
+        .map(|span| {
+            let before = text.get(..span.start).unwrap_or(text);
+            let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+            let column = before[line_start..]
+                .chars()
+                .filter(|&c| c != '\r' && c != '\u{feff}')
+                .count()
+                + 1;
+            (before.matches('\n').count() + 1, column)
+        });
     let message = error.message();
     let message = match (message.find('"'), message.rfind('"')) {
         (Some(open), Some(close)) if open < close => {
@@ -161,12 +165,16 @@ fn parse_error(text: &str, error: &toml::de::Error) -> ConfigError {
 /// What of a rejected URL is safe to show in a log: scheme, host, port and path, plus
 /// `?REDACTED` / `#REDACTED` where it has a query or fragment. Nothing at all when it contains
 /// an `@` (a password may hide anywhere around it, see [`LibraryServerUrl`]), when the url crate
-/// cannot parse it, or when it has no host, because then any part of it may be a secret.
+/// cannot parse it, when it is not written as `scheme://` (`ftp:/s3cret` would show a host the
+/// operator never wrote), or when it has no host, because then any part of it may be a secret.
 fn shown(input: &str) -> Option<String> {
     if input.contains('@') {
         return None;
     }
     let url = Url::parse(input).ok()?;
+    if !written_with_scheme(input, &url) {
+        return None;
+    }
     let host = url.host_str()?;
     let port = url
         .port()
@@ -180,6 +188,17 @@ fn shown(input: &str) -> Option<String> {
         shown.push_str("#REDACTED");
     }
     Some(shown)
+}
+
+/// Whether `input` literally starts with `url`'s scheme and `://`. Otherwise what the url crate
+/// took for a scheme, host or path may be something else the operator wrote, so it is not
+/// repeated.
+fn written_with_scheme(input: &str, url: &Url) -> bool {
+    let prefix = format!("{}://", url.scheme());
+    input
+        .trim_start()
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(&prefix))
 }
 
 /// A Library Server's normalized base URL, which identifies it (ADR 0006: Audiobookshelf has no
@@ -213,7 +232,7 @@ pub enum UrlError {
     MissingScheme,
     #[error("unsupported scheme {0:?}, expected http or https")]
     UnsupportedScheme(String),
-    #[error("must not contain `@` (a user name or password)")]
+    #[error("must not contain `@` (it may hide a user name or password)")]
     Userinfo,
     #[error("must not contain a query")]
     Query,
@@ -232,14 +251,7 @@ impl LibraryServerUrl {
             error => UrlError::Malformed(error),
         })?;
         if !matches!(url.scheme(), "http" | "https") {
-            // Without `://`, what the url crate took for a scheme may be something else, so it
-            // is not repeated.
-            let prefix = format!("{}://", url.scheme());
-            let written_as_scheme = input
-                .trim_start()
-                .get(..prefix.len())
-                .is_some_and(|start| start.eq_ignore_ascii_case(&prefix));
-            return Err(if written_as_scheme {
+            return Err(if written_with_scheme(input, &url) {
                 UrlError::UnsupportedScheme(url.scheme().to_owned())
             } else {
                 UrlError::MissingScheme
@@ -453,6 +465,8 @@ mod tests {
             ("ftp://abs.lan/books", Some("ftp://abs.lan/books")),
             ("https://abs lan", None),
             ("abs.lan/s3cret", None),
+            ("ftp:/s3cret", None),
+            ("http:abs.lan/?x", None),
             ("https://abs.lan/?user=a@b.c&token=s3cret", None),
             ("https://abs.lan/#tok@s3cret", None),
             ("http:alice:s3cret@abs.lan/?r=https://x", None),
@@ -500,6 +514,16 @@ mod tests {
         let message = "".parse::<Config>().unwrap_err().to_string();
         assert!(message.contains("listen"), "{message}");
         assert!(!message.contains("line"), "{message}");
+    }
+
+    #[test]
+    fn positions_a_field_missing_inside_a_table_at_its_header() {
+        let text = "listen = \"127.0.0.1:0\"\n\
+                    [[library_servers]]\nurl = \"https://a.lan\"\n\
+                    [[library_servers]]\nname = \"Home\"\n";
+        let message = text.parse::<Config>().unwrap_err().to_string();
+        assert!(message.contains("missing field `url`"), "{message}");
+        assert!(message.contains("line 4, column 1"), "{message}");
     }
 
     #[test]
