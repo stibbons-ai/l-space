@@ -2,7 +2,7 @@
 //!
 //! The contract is shared Rust types plus Dioxus server functions, so neither side generates
 //! code from the other. With the `server` feature (the Bridge) a server function runs its body
-//! and [`server::router`] serves it over HTTP; without it (the App) calling the same function
+//! and `server::router` serves it over HTTP; without it (the App) calling the same function
 //! sends the HTTP request to the Bridge.
 //!
 //! Errors the App shows to a person are [`ApiError`] codes, which the App translates. The
@@ -30,12 +30,17 @@ pub struct LibraryServer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ApiError {
-    /// The App could not reach the Bridge, or could not understand its answer.
+    /// The App could not reach the Bridge, or could not understand its answer. Produced only
+    /// on the App's side, by the client half of a server function; the Bridge never sends it.
     #[error("bridge_unreachable")]
     BridgeUnreachable,
     /// The Bridge failed in a way the user cannot fix.
     #[error("internal")]
     Internal,
+    /// A code this build of the App does not know yet, from a newer Bridge.
+    #[serde(other)]
+    #[error("unknown")]
+    Unknown,
 }
 
 impl From<ServerFnError> for ApiError {
@@ -53,7 +58,7 @@ impl AsStatusCode for ApiError {
     fn as_status_code(&self) -> StatusCode {
         match self {
             Self::BridgeUnreachable => StatusCode::BAD_GATEWAY,
-            Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Internal | Self::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -89,5 +94,32 @@ pub mod server {
             .register_server_functions()
             .layer(Extension(bridge))
             .with_state(FullstackState::headless())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::ApiError;
+
+    #[test]
+    fn error_codes_travel_as_a_code_field() {
+        assert_eq!(
+            serde_json::to_value(ApiError::Internal).unwrap(),
+            json!({"code": "internal"})
+        );
+        assert_eq!(
+            serde_json::from_value::<ApiError>(json!({"code": "internal"})).unwrap(),
+            ApiError::Internal
+        );
+    }
+
+    #[test]
+    fn a_code_from_a_newer_bridge_decodes_as_unknown() {
+        assert_eq!(
+            serde_json::from_value::<ApiError>(json!({"code": "api_key_rejected"})).unwrap(),
+            ApiError::Unknown
+        );
     }
 }

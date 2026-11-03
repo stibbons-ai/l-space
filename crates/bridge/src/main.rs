@@ -24,11 +24,11 @@ struct Args {
 
 /// The App API's view of this Bridge.
 #[derive(Debug)]
-struct Bridge {
+struct AppApiState {
     library_servers: Vec<api::LibraryServer>,
 }
 
-impl Bridge {
+impl AppApiState {
     fn new(library_servers: Vec<LibraryServerConfig>) -> Self {
         let library_servers = library_servers
             .into_iter()
@@ -41,7 +41,7 @@ impl Bridge {
     }
 }
 
-impl api::server::Bridge for Bridge {
+impl api::server::Bridge for AppApiState {
     fn library_servers(&self) -> Vec<api::LibraryServer> {
         self.library_servers.clone()
     }
@@ -74,7 +74,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let router = api::server::router(Arc::new(Bridge::new(config.library_servers)));
+    let router = api::server::router(Arc::new(AppApiState::new(config.library_servers)));
 
     tracing::info!(%addr, "listening");
     if let Err(error) = axum::serve(listener, router).await {

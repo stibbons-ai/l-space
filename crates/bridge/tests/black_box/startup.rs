@@ -1,14 +1,17 @@
-//! An invalid configuration stops the Bridge before it serves: a non-zero exit and one error
-//! event naming what is wrong.
+//! A Bridge that cannot start properly stops before it serves: a non-zero exit and one error
+//! event saying what is wrong, without repeating any secret from the configuration.
 
-use crate::support::{Exited, LISTEN, config_file, is_listening, run_until_exit};
+use std::net::TcpListener;
 
-/// Asserts the Bridge refused to start, and returns its single error event's `error` field.
-fn refused(exited: &Exited) -> String {
+use crate::support::{Exited, LISTEN, RUST_LOG, config_file, is_listening, run_until_exit};
+
+/// Asserts the Bridge refused to start with one error event `message`, and returns that
+/// event's `error` field.
+fn refused(exited: &Exited, message: &str) -> String {
     assert!(!exited.status.success(), "exit status {:?}", exited.status);
     assert!(
         !exited.events.iter().any(is_listening),
-        "Bridge served despite invalid configuration: {:#?}",
+        "Bridge served anyway: {:#?}",
         exited.events
     );
     let errors: Vec<_> = exited.errors().collect();
@@ -18,13 +21,29 @@ fn refused(exited: &Exited) -> String {
         "expected one error event: {:#?}",
         exited.events
     );
-    assert_eq!(errors[0]["message"], "invalid configuration");
+    assert_eq!(errors[0]["message"], message);
     errors[0]["error"].as_str().expect("error field").to_owned()
 }
 
-fn refused_with(config: &str) -> String {
+fn run_with(config: &str) -> Exited {
     let (_dir, path) = config_file(config);
-    refused(&run_until_exit(&path))
+    run_until_exit(&path, RUST_LOG)
+}
+
+fn refused_with(config: &str) -> String {
+    refused(&run_with(config), "invalid configuration")
+}
+
+/// Asserts the Bridge refused `config` and never wrote `secret` anywhere.
+fn refused_without_leaking(config: &str, secret: &str) -> String {
+    let exited = run_with(config);
+    let error = refused(&exited, "invalid configuration");
+    assert!(
+        !exited.output_contains(secret),
+        "{secret:?} leaked: {:#?}",
+        exited.events
+    );
+    error
 }
 
 #[test]
@@ -56,17 +75,42 @@ fn two_entries_for_the_same_library_server() {
 }
 
 #[test]
-fn url_with_a_query() {
-    let error = refused_with(&format!(
-        "{LISTEN}[[library_servers]]\nurl = \"https://abs.lan/?token=abc\"\n"
-    ));
-    assert!(error.contains("https://abs.lan/?token=abc"), "{error}");
+fn url_with_a_query_is_named_without_its_value() {
+    let error = refused_without_leaking(
+        &format!("{LISTEN}[[library_servers]]\nurl = \"https://abs.lan/?token=s3cret\"\n"),
+        "s3cret",
+    );
+    assert!(error.contains("library_servers[0].url"), "{error}");
+    assert!(error.contains("https://abs.lan/?token="), "{error}");
 }
 
 #[test]
-fn invalid_toml() {
-    let error = refused_with(&format!("{LISTEN}[[library_servers]\n"));
-    assert!(error.contains("TOML"), "{error}");
+fn unparseable_url_with_a_password_is_named_without_it() {
+    for url in [
+        "https://alice:hunter2@abs lan",
+        "https://alice:hunter2@abs.lan:99999",
+    ] {
+        let error = refused_without_leaking(
+            &format!("{LISTEN}[[library_servers]]\nurl = \"{url}\"\n"),
+            "hunter2",
+        );
+        assert!(error.contains("library_servers[0].url"), "{error}");
+    }
+}
+
+#[test]
+fn invalid_toml_is_positioned_without_quoting_the_line() {
+    let error = refused_without_leaking(
+        &format!("{LISTEN}[[library_servers]]\nurl = \"https://alice:hunter2@abs.lan\n"),
+        "hunter2",
+    );
+    assert!(error.contains("TOML at line 3"), "{error}");
+}
+
+#[test]
+fn unknown_setting_is_named_without_its_value() {
+    let error = refused_without_leaking(&format!("{LISTEN}token = \"s3cret\"\n"), "s3cret");
+    assert!(error.contains("token"), "{error}");
 }
 
 #[test]
@@ -76,17 +120,36 @@ fn missing_listen_address() {
 }
 
 #[test]
-fn unknown_setting() {
-    let error = refused_with(&format!("{LISTEN}library_server = []\n"));
-    assert!(error.contains("library_server"), "{error}");
-}
-
-#[test]
 fn missing_file() {
     let dir = tempfile::tempdir().expect("create temp dir");
     let missing = dir.path().join("does-not-exist.toml");
-    let exited = run_until_exit(&missing);
-    refused(&exited);
+    let exited = run_until_exit(&missing, RUST_LOG);
+    refused(&exited, "invalid configuration");
     let event = exited.errors().next().unwrap();
     assert_eq!(event["config"], missing.display().to_string());
+}
+
+#[test]
+fn rust_log_for_other_targets_keeps_the_startup_error() {
+    let (_dir, path) = config_file(&format!(
+        "{LISTEN}[[library_servers]]\nurl = \"ftp://abs.lan\"\n"
+    ));
+    let exited = run_until_exit(&path, "hyper=debug");
+    let error = refused(&exited, "invalid configuration");
+    assert!(error.contains("ftp://abs.lan"), "{error}");
+}
+
+#[test]
+fn listen_address_in_use() {
+    let taken = TcpListener::bind("127.0.0.1:0").expect("bind a port");
+    let addr = taken.local_addr().expect("local addr");
+    let exited = run_with(&format!("listen = \"{addr}\"\n"));
+    refused(&exited, "cannot listen");
+}
+
+#[test]
+fn wrongly_typed_value_is_named_without_its_value() {
+    let error =
+        refused_without_leaking(&format!("{LISTEN}library_servers = \"s3cret\"\n"), "s3cret");
+    assert!(error.contains("TOML at line 2"), "{error}");
 }
