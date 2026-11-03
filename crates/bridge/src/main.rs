@@ -3,6 +3,8 @@
 mod config;
 mod telemetry;
 
+use std::io;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -10,7 +12,7 @@ use std::sync::Arc;
 use clap::Parser;
 use tokio::net::TcpListener;
 
-use crate::config::Config;
+use crate::config::{Config, LibraryServerConfig};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "The L-Space Bridge (Clacks)")]
@@ -26,10 +28,30 @@ struct Bridge {
     library_servers: Vec<api::LibraryServer>,
 }
 
+impl Bridge {
+    fn new(library_servers: Vec<LibraryServerConfig>) -> Self {
+        let library_servers = library_servers
+            .into_iter()
+            .map(|server| api::LibraryServer {
+                base_url: server.url.into_string(),
+                name: server.name,
+            })
+            .collect();
+        Self { library_servers }
+    }
+}
+
 impl api::server::Bridge for Bridge {
     fn library_servers(&self) -> Vec<api::LibraryServer> {
         self.library_servers.clone()
     }
+}
+
+/// Binds the App API's address, resolving port 0 to the port actually bound.
+async fn listen(addr: SocketAddr) -> io::Result<(TcpListener, SocketAddr)> {
+    let listener = TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
+    Ok((listener, addr))
 }
 
 #[tokio::main]
@@ -45,30 +67,14 @@ async fn main() -> ExitCode {
         }
     };
 
-    let bound = async {
-        let listener = TcpListener::bind(config.listen).await?;
-        let addr = listener.local_addr()?;
-        std::io::Result::Ok((listener, addr))
-    };
-    let (listener, addr) = match bound.await {
+    let (listener, addr) = match listen(config.listen).await {
         Ok(bound) => bound,
         Err(error) => {
             tracing::error!(listen = %config.listen, %error, "cannot listen");
             return ExitCode::FAILURE;
         }
     };
-
-    let bridge = Bridge {
-        library_servers: config
-            .library_servers
-            .into_iter()
-            .map(|server| api::LibraryServer {
-                base_url: server.url.as_str().to_owned(),
-                name: server.name,
-            })
-            .collect(),
-    };
-    let router = api::server::router(Arc::new(bridge));
+    let router = api::server::router(Arc::new(Bridge::new(config.library_servers)));
 
     tracing::info!(%addr, "listening");
     if let Err(error) = axum::serve(listener, router).await {

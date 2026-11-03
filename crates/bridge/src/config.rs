@@ -8,7 +8,6 @@
 //! name = "Home"              # optional
 //! ```
 
-use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
@@ -27,7 +26,7 @@ pub struct Config {
 }
 
 /// One configured Library Server.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LibraryServerConfig {
     pub url: LibraryServerUrl,
     pub name: Option<String>,
@@ -52,9 +51,9 @@ struct RawLibraryServer {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read the file: {0}")]
-    Read(#[source] io::Error),
+    Read(io::Error),
     #[error("not valid configuration TOML: {0}")]
-    Parse(#[source] toml::de::Error),
+    Parse(toml::de::Error),
     #[error("library_servers[{index}].url {url:?}: {reason}")]
     InvalidUrl {
         index: usize,
@@ -84,8 +83,8 @@ impl std::str::FromStr for Config {
 
     fn from_str(text: &str) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(text).map_err(ConfigError::Parse)?;
-        let mut first_index_of = HashMap::new();
-        let mut library_servers = Vec::with_capacity(raw.library_servers.len());
+        let mut library_servers: Vec<LibraryServerConfig> =
+            Vec::with_capacity(raw.library_servers.len());
         for (index, server) in raw.library_servers.into_iter().enumerate() {
             let url =
                 LibraryServerUrl::parse(&server.url).map_err(|reason| ConfigError::InvalidUrl {
@@ -93,7 +92,7 @@ impl std::str::FromStr for Config {
                     url: redact_password(&server.url),
                     reason,
                 })?;
-            if let Some(&first) = first_index_of.get(&url) {
+            if let Some(first) = library_servers.iter().position(|known| known.url == url) {
                 return Err(ConfigError::Duplicate {
                     index,
                     url: server.url,
@@ -101,7 +100,6 @@ impl std::str::FromStr for Config {
                     normalized: url,
                 });
             }
-            first_index_of.insert(url.clone(), index);
             library_servers.push(LibraryServerConfig {
                 url,
                 name: server.name,
@@ -136,11 +134,11 @@ fn redact_password(input: &str) -> String {
 ///   `https://abs.example.com/` becomes `https://abs.example.com`;
 /// - a query, a fragment, or a user name or password is rejected rather than dropped, because
 ///   it means the operator pasted something other than a base URL.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct LibraryServerUrl(String);
 
 /// Why a string is not a Library Server base URL.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum UrlError {
     #[error("not a valid URL: {0}")]
     Malformed(#[from] url::ParseError),
@@ -170,17 +168,14 @@ impl LibraryServerUrl {
         if url.fragment().is_some() {
             return Err(UrlError::Fragment);
         }
-        let host = url.host_str().ok_or(url::ParseError::EmptyHost)?;
-        let port = url
-            .port()
-            .map(|port| format!(":{port}"))
-            .unwrap_or_default();
-        let path = url.path().trim_end_matches('/');
-        Ok(Self(format!("{}://{host}{port}{path}", url.scheme())))
+        // What is left serializes as `scheme://host[:port]/path`.
+        let mut normalized = String::from(url);
+        normalized.truncate(normalized.trim_end_matches('/').len());
+        Ok(Self(normalized))
     }
 
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn into_string(self) -> String {
+        self.0
     }
 }
 
@@ -323,7 +318,7 @@ mod tests {
             matches!(
                 &error,
                 ConfigError::Duplicate { index: 2, first: 0, normalized, .. }
-                    if normalized.as_str() == "https://abs.lan"
+                    if normalized.to_string() == "https://abs.lan"
             ),
             "{error:?}"
         );

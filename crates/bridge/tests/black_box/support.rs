@@ -33,10 +33,13 @@ use tempfile::TempDir;
 /// Generous: the Bridge is up within milliseconds, but CI machines can be slow.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The `listen` line for a free loopback port, so tests can run in parallel.
+pub const LISTEN: &str = "listen = \"127.0.0.1:0\"\n";
+
 /// A running Bridge, killed on drop.
 pub struct TestBridge {
     child: Child,
-    base_url: String,
+    api: AppApi,
     _dir: TempDir,
 }
 
@@ -44,19 +47,24 @@ impl TestBridge {
     /// Starts a Bridge on a free loopback port with `config` (TOML, without `listen`) and waits
     /// until it serves. Panics if it exits or does not get ready in time.
     pub fn start(config: &str) -> Self {
-        let dir = TempDir::new().expect("create temp dir");
-        let path = dir.path().join("bridge.toml");
-        std::fs::write(&path, format!("listen = \"127.0.0.1:0\"\n{config}")).expect("write config");
+        let (dir, path) = config_file(&format!("{LISTEN}{config}"));
         let (mut child, events) = spawn(&path);
 
         let deadline = Instant::now() + TIMEOUT;
         loop {
             match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(event) if event["message"] == "listening" => {
-                    let addr = event["addr"].as_str().expect("listening event has an addr");
+                Ok(event) if is_listening(&event) => {
+                    let Some(addr) = event["addr"].as_str() else {
+                        let _ = child.kill();
+                        panic!("listening event has no addr: {event}");
+                    };
+                    let api = AppApi {
+                        http: reqwest::Client::new(),
+                        base_url: format!("http://{addr}"),
+                    };
                     return Self {
                         child,
-                        base_url: format!("http://{addr}"),
+                        api,
                         _dir: dir,
                     };
                 }
@@ -73,12 +81,14 @@ impl TestBridge {
     }
 
     /// A client for this Bridge's App API.
-    pub fn api(&self) -> AppApi {
-        AppApi {
-            http: reqwest::Client::new(),
-            base_url: self.base_url.clone(),
-        }
+    pub fn api(&self) -> &AppApi {
+        &self.api
     }
+}
+
+/// Whether `event` is the Bridge announcing it serves the App API.
+pub fn is_listening(event: &Value) -> bool {
+    event["message"] == "listening"
 }
 
 impl Drop for TestBridge {

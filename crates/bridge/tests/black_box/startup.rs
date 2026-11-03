@@ -1,16 +1,13 @@
 //! An invalid configuration stops the Bridge before it serves: a non-zero exit and one error
 //! event naming what is wrong.
 
-use crate::support::{Exited, config_file, run_until_exit};
+use crate::support::{Exited, LISTEN, config_file, is_listening, run_until_exit};
 
 /// Asserts the Bridge refused to start, and returns its single error event's `error` field.
 fn refused(exited: &Exited) -> String {
     assert!(!exited.status.success(), "exit status {:?}", exited.status);
     assert!(
-        !exited
-            .events
-            .iter()
-            .any(|event| event["message"] == "listening"),
+        !exited.events.iter().any(is_listening),
         "Bridge served despite invalid configuration: {:#?}",
         exited.events
     );
@@ -29,8 +26,6 @@ fn refused_with(config: &str) -> String {
     let (_dir, path) = config_file(config);
     refused(&run_until_exit(&path))
 }
-
-const LISTEN: &str = "listen = \"127.0.0.1:0\"\n";
 
 #[test]
 fn malformed_library_server_url() {
@@ -88,7 +83,7 @@ fn unknown_setting() {
 
 #[test]
 fn missing_file() {
-    let (dir, _) = config_file("");
+    let dir = tempfile::tempdir().expect("create temp dir");
     let missing = dir.path().join("does-not-exist.toml");
     let exited = run_until_exit(&missing);
     refused(&exited);

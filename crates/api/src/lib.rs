@@ -29,7 +29,6 @@ pub struct LibraryServer {
 /// `{"code":"internal"}`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "code", rename_all = "snake_case")]
-#[non_exhaustive]
 pub enum ApiError {
     /// The App could not reach the Bridge, or could not understand its answer.
     #[error("bridge_unreachable")]
