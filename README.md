@@ -32,6 +32,6 @@ name = "Home"                     # optional
 
 Each Library Server is identified by its normalized base URL: lowercase scheme and host, no default port, no trailing slash. Only `http` and `https` are accepted; a query, fragment, user name or password is rejected, as are two entries that normalize to the same URL.
 
-A configuration that can't be read or parsed, or a bad Library Server URL, stops the Bridge with exit code 1 and one `invalid configuration` error event. For a bad URL the event names the entry and its value, with any password, query value or fragment shown as `REDACTED`; for a TOML error it gives the line and column. If the `listen` address can't be bound, the Bridge exits with code 1 after one `cannot listen` error event.
+A configuration that can't be read or parsed, or a bad Library Server URL, stops the Bridge with exit code 1 and one `invalid configuration` error event. For a bad URL the event names the entry and shows only the URL's scheme, host, port and path (a query or fragment as `REDACTED`, never a user name or password), or nothing of it when it can't be parsed; for a TOML error it gives the line and column where known, never the source line. If the `listen` address can't be bound, the Bridge exits with code 1 after one `cannot listen` error event.
 
 Logs are JSON on stdout, one event per line. `RUST_LOG` adds to the default level `info`: `RUST_LOG=hyper=debug` raises one target and leaves the rest at `info`, and `RUST_LOG=warn` lowers the default.

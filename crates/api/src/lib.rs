@@ -37,7 +37,8 @@ pub enum ApiError {
     /// The Bridge failed in a way the user cannot fix.
     #[error("internal")]
     Internal,
-    /// A code this build of the App does not know yet, from a newer Bridge.
+    /// A code this build of the App does not know yet, from a newer Bridge. Produced only on
+    /// the App's side, when decoding; the Bridge never sends it.
     #[serde(other)]
     #[error("unknown")]
     Unknown,
@@ -99,6 +100,7 @@ pub mod server {
 
 #[cfg(test)]
 mod tests {
+    use dioxus::fullstack::{AsStatusCode, StatusCode};
     use serde_json::json;
 
     use super::ApiError;
@@ -120,6 +122,18 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ApiError>(json!({"code": "api_key_rejected"})).unwrap(),
             ApiError::Unknown
+        );
+    }
+
+    #[test]
+    fn unknown_encodes_as_a_server_error() {
+        assert_eq!(
+            serde_json::to_value(ApiError::Unknown).unwrap(),
+            json!({"code": "unknown"})
+        );
+        assert_eq!(
+            ApiError::Unknown.as_status_code(),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 }

@@ -47,12 +47,12 @@ fn refused_without_leaking(config: &str, secret: &str) -> String {
 }
 
 #[test]
-fn malformed_library_server_url() {
+fn malformed_library_server_url_is_named_by_entry_only() {
     let error = refused_with(&format!(
         "{LISTEN}[[library_servers]]\nurl = \"https://abs lan\"\n"
     ));
     assert!(error.contains("library_servers[0].url"), "{error}");
-    assert!(error.contains("https://abs lan"), "{error}");
+    assert!(!error.contains("abs lan"), "{error}");
 }
 
 #[test]
@@ -76,12 +76,17 @@ fn two_entries_for_the_same_library_server() {
 
 #[test]
 fn url_with_a_query_is_named_without_its_value() {
-    let error = refused_without_leaking(
-        &format!("{LISTEN}[[library_servers]]\nurl = \"https://abs.lan/?token=s3cret\"\n"),
-        "s3cret",
-    );
-    assert!(error.contains("library_servers[0].url"), "{error}");
-    assert!(error.contains("https://abs.lan/?token="), "{error}");
+    for url in [
+        "https://abs.lan/?token=s3cret",
+        "https://abs.lan/?user=a@b.c&token=s3cret",
+    ] {
+        let error = refused_without_leaking(
+            &format!("{LISTEN}[[library_servers]]\nurl = \"{url}\"\n"),
+            "s3cret",
+        );
+        assert!(error.contains("library_servers[0].url"), "{error}");
+        assert!(error.contains("https://abs.lan/?REDACTED"), "{error}");
+    }
 }
 
 #[test]

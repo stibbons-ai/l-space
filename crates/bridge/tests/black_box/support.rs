@@ -1,8 +1,8 @@
 //! The black-box Bridge harness.
 //!
 //! A test starts the real `bridge` binary as a subprocess and acts on it through the App API,
-//! the way the App would; it also observes the exit status and log events, as an operator
-//! would. It never reaches into the Bridge's modules or state.
+//! speaking its HTTP wire format; it also observes the exit status and log events, as an
+//! operator would. It never reaches into the Bridge's modules or state.
 //!
 //! ```ignore
 //! let bridge = TestBridge::start(r#"
@@ -46,6 +46,7 @@ pub const RUST_LOG: &str = "info";
 pub struct TestBridge {
     child: Child,
     api: AppApi,
+    startup: Vec<Value>,
     _dir: TempDir,
 }
 
@@ -53,10 +54,17 @@ impl TestBridge {
     /// Starts a Bridge on a free loopback port with `config` (TOML, without `listen`) and waits
     /// until it serves. Panics if it exits or does not get ready in time.
     pub fn start(config: &str) -> Self {
+        Self::start_logging(config, RUST_LOG)
+    }
+
+    /// [`TestBridge::start`] with the given `RUST_LOG`, which must let the `bridge` target's
+    /// `listening` event through.
+    pub fn start_logging(config: &str, rust_log: &str) -> Self {
         let (dir, path) = config_file(&format!("{LISTEN}{config}"));
-        let (mut child, output) = spawn(&path, RUST_LOG);
+        let (mut child, output) = spawn(&path, rust_log);
 
         let deadline = Instant::now() + TIMEOUT;
+        let mut startup = Vec::new();
         loop {
             match output.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
                 Ok(event) if is_listening(&event) => {
@@ -68,19 +76,24 @@ impl TestBridge {
                         http: reqwest::Client::new(),
                         base_url: format!("http://{addr}"),
                     };
+                    startup.push(event);
                     return Self {
                         child,
                         api,
+                        startup,
                         _dir: dir,
                     };
                 }
-                Ok(_) => {}
+                Ok(event) => startup.push(event),
                 Err(RecvTimeoutError::Disconnected) => {
-                    panic!("Bridge exited before serving: {:?}", child.wait());
+                    panic!(
+                        "Bridge exited before serving: {:?}; output: {startup:#?}",
+                        child.wait()
+                    );
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     stop(&mut child);
-                    panic!("Bridge not ready within {TIMEOUT:?}");
+                    panic!("Bridge not ready within {TIMEOUT:?}; output: {startup:#?}");
                 }
             }
         }
@@ -89,6 +102,11 @@ impl TestBridge {
     /// A client for this Bridge's App API.
     pub fn api(&self) -> &AppApi {
         &self.api
+    }
+
+    /// Everything the Bridge wrote up to and including its `listening` event.
+    pub fn startup_output(&self) -> &[Value] {
+        &self.startup
     }
 }
 

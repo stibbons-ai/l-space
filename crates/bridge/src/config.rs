@@ -47,35 +47,47 @@ struct RawLibraryServer {
     name: Option<String>,
 }
 
-/// Why the configuration was rejected. URL errors name the offending entry and its value; no
-/// error repeats a secret (a password, a query or fragment value, a TOML source line).
+/// Why the configuration was rejected. URL errors name the offending entry, and its value only
+/// as far as it is safe to show; no error repeats a secret (a password, a query or fragment, a
+/// TOML source line, a value quoted by the TOML parser).
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("cannot read the file: {0}")]
     Read(io::Error),
-    /// Only the parser's message and position: its usual rendering quotes the source line,
-    /// which may hold a secret.
-    #[error("not valid configuration TOML at line {line}, column {column}: {message}")]
+    /// The parser's message, with any double-quoted value replaced by `REDACTED`, and its
+    /// position if it has one; never the source line it usually quotes.
+    #[error("not valid configuration TOML{}: {message}", at(.position))]
     Parse {
         message: String,
-        line: usize,
-        column: usize,
+        /// 1-based line and column.
+        position: Option<(usize, usize)>,
     },
-    #[error("library_servers[{index}].url {url:?}: {reason}")]
+    #[error("library_servers[{index}].url{}: {reason}", quoted(.url))]
     InvalidUrl {
         index: usize,
-        url: String,
+        /// What [`shown`] allows of the value.
+        url: Option<String>,
         reason: UrlError,
     },
     #[error(
-        "library_servers[{index}].url {url:?} is the same Library Server as library_servers[{first}]: both normalize to {normalized}"
+        "library_servers[{index}].url is the same Library Server as library_servers[{first}]: both normalize to {normalized}"
     )]
     Duplicate {
         index: usize,
-        url: String,
         first: usize,
         normalized: LibraryServerUrl,
     },
+}
+
+fn at(position: &Option<(usize, usize)>) -> String {
+    position.map_or_else(String::new, |(line, column)| {
+        format!(" at line {line}, column {column}")
+    })
+}
+
+fn quoted(url: &Option<String>) -> String {
+    url.as_ref()
+        .map_or_else(String::new, |url| format!(" {url:?}"))
 }
 
 impl Config {
@@ -96,13 +108,12 @@ impl std::str::FromStr for Config {
             let url =
                 LibraryServerUrl::parse(&server.url).map_err(|reason| ConfigError::InvalidUrl {
                     index,
-                    url: redact(&server.url),
+                    url: shown(&server.url),
                     reason,
                 })?;
             if let Some(first) = library_servers.iter().position(|known| known.url == url) {
                 return Err(ConfigError::Duplicate {
                     index,
-                    url: redact(&server.url),
                     first,
                     normalized: url,
                 });
@@ -119,15 +130,20 @@ impl std::str::FromStr for Config {
     }
 }
 
-/// The TOML error without its source snippet, positioned by 1-based line and column.
+/// The TOML error without its source snippet, positioned by 1-based line and column when the
+/// parser knows where. A missing top-level field comes with the empty span `0..0`, which is no
+/// position.
 ///
 /// The message itself can quote a value too (`invalid type: string "s3cret", expected a
-/// sequence`), so anything between its first and last double quote becomes `REDACTED`. Field
-/// names are quoted with backticks and stay.
+/// sequence`), so anything between its first and last double quote becomes `REDACTED`.
+/// Non-string values and key names stay.
 fn parse_error(text: &str, error: &toml::de::Error) -> ConfigError {
-    let offset = error.span().map_or(0, |span| span.start).min(text.len());
-    let before = text.get(..offset).unwrap_or(text);
-    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    let position = error.span().filter(|span| *span != (0..0)).map(|span| {
+        let before = text.get(..span.start).unwrap_or(text);
+        let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+        let column = before[line_start..].chars().filter(|&c| c != '\r').count() + 1;
+        (before.matches('\n').count() + 1, column)
+    });
     let message = error.message();
     let message = match (message.find('"'), message.rfind('"')) {
         (Some(open), Some(close)) if open < close => {
@@ -135,51 +151,28 @@ fn parse_error(text: &str, error: &toml::de::Error) -> ConfigError {
         }
         _ => message.to_owned(),
     };
-    ConfigError::Parse {
-        message,
-        line: before.matches('\n').count() + 1,
-        column: before[line_start..].chars().count() + 1,
-    }
+    ConfigError::Parse { message, position }
 }
 
-/// A URL as the operator wrote it, minus anything that may be a secret: the user name and
-/// password, query values and the fragment become `REDACTED`.
-///
-/// Plain string handling, so it also works on input the url crate cannot parse. Everything
-/// up to the last `@` counts as userinfo, so a password containing `/`, `?` or `#` is still
-/// hidden.
-fn redact(input: &str) -> String {
-    let (scheme, rest) = input
-        .find("://")
-        .map_or(("", input), |i| input.split_at(i + 3));
-    let (userinfo, rest) = match rest.rfind('@') {
-        Some(at) => ("REDACTED@", &rest[at + 1..]),
-        None => ("", rest),
-    };
-    let (rest, fragment) = match rest.split_once('#') {
-        Some((rest, "")) => (rest, "#"),
-        Some((rest, _)) => (rest, "#REDACTED"),
-        None => (rest, ""),
-    };
-    let (base, query) = rest
-        .split_once('?')
-        .map_or((rest, None), |(b, q)| (b, Some(q)));
-    let mut redacted = format!("{scheme}{userinfo}{base}");
-    if let Some(query) = query {
-        redacted.push('?');
-        for (i, pair) in query.split('&').enumerate() {
-            if i > 0 {
-                redacted.push('&');
-            }
-            match pair.split_once('=') {
-                Some((key, _)) => redacted.push_str(&format!("{key}=REDACTED")),
-                None if pair.is_empty() => {}
-                None => redacted.push_str("REDACTED"),
-            }
-        }
+/// What of a rejected URL is safe to show in a log: scheme, host, port and path, plus
+/// `?REDACTED` / `#REDACTED` where it has a query or fragment. Never the user name or
+/// password. Nothing at all when the url crate cannot parse it or finds no host, because then
+/// any part of it may be a secret.
+fn shown(input: &str) -> Option<String> {
+    let url = Url::parse(input).ok()?;
+    let host = url.host_str()?;
+    let port = url
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    let mut shown = format!("{}://{host}{port}{}", url.scheme(), url.path());
+    if url.query().is_some() {
+        shown.push_str("?REDACTED");
     }
-    redacted.push_str(fragment);
-    redacted
+    if url.fragment().is_some() {
+        shown.push_str("#REDACTED");
+    }
+    Some(shown)
 }
 
 /// A Library Server's normalized base URL, which identifies it (ADR 0006: Audiobookshelf has no
@@ -206,6 +199,8 @@ pub struct LibraryServerUrl(String);
 pub enum UrlError {
     #[error("not a valid URL: {0}")]
     Malformed(#[from] url::ParseError),
+    #[error("missing http:// or https://")]
+    MissingScheme,
     #[error("unsupported scheme {0:?}, expected http or https")]
     UnsupportedScheme(String),
     #[error("must not contain a user name or password")]
@@ -221,7 +216,18 @@ impl LibraryServerUrl {
         // The url crate already lowercases the scheme and host and forgets a default port.
         let url = Url::parse(input)?;
         if !matches!(url.scheme(), "http" | "https") {
-            return Err(UrlError::UnsupportedScheme(url.scheme().to_owned()));
+            // Without `://`, what the url crate took for a scheme may be a user name
+            // (`alice:s3cret@abs.lan`), so it is not repeated.
+            let prefix = format!("{}://", url.scheme());
+            let written_as_scheme = input
+                .trim_start()
+                .get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(&prefix));
+            return Err(if written_as_scheme {
+                UrlError::UnsupportedScheme(url.scheme().to_owned())
+            } else {
+                UrlError::MissingScheme
+            });
         }
         if !url.username().is_empty() || url.password().is_some() {
             return Err(UrlError::Userinfo);
@@ -310,10 +316,17 @@ mod tests {
             LibraryServerUrl::parse("ftp://abs.lan"),
             Err(UrlError::UnsupportedScheme("ftp".into()))
         );
-        assert_eq!(
-            LibraryServerUrl::parse("abs.lan:13378"),
-            Err(UrlError::UnsupportedScheme("abs.lan".into()))
-        );
+        for input in [
+            "abs.lan:13378",
+            "alice:s3cret@abs.lan",
+            "alice:s3cret@ftp://x",
+        ] {
+            assert_eq!(
+                LibraryServerUrl::parse(input),
+                Err(UrlError::MissingScheme),
+                "{input:?}"
+            );
+        }
     }
 
     #[test]
@@ -417,23 +430,35 @@ mod tests {
     }
 
     #[test]
-    fn redacts_userinfo_query_values_and_fragments_even_when_unparseable() {
+    fn shows_only_scheme_host_port_and_path_of_a_rejected_url() {
         for (input, expected) in [
-            ("https://alice:hunter2@abs lan", "https://REDACTED@abs lan"),
             (
-                "https://alice:hun@ter/2@abs.lan:99999",
-                "https://REDACTED@abs.lan:99999",
+                "https://abs.lan/?user=a@b.c&token=s3cret",
+                Some("https://abs.lan/?REDACTED"),
             ),
-            ("alice:hunter2@abs.lan", "REDACTED@abs.lan"),
             (
-                "https://abs.lan/?token=s3cret&x",
-                "https://abs.lan/?token=REDACTED&REDACTED",
+                "https://abs.lan/?password=p@ssw0rd",
+                Some("https://abs.lan/?REDACTED"),
             ),
-            ("https://abs.lan/a#s3cret", "https://abs.lan/a#REDACTED"),
-            ("https://abs.lan?#", "https://abs.lan?#"),
-            ("ftp://abs.lan/books", "ftp://abs.lan/books"),
+            (
+                "https://abs.lan/#tok@s3cret",
+                Some("https://abs.lan/#REDACTED"),
+            ),
+            (
+                "http:alice:s3cret@abs.lan/?r=https://x",
+                Some("http://abs.lan/?REDACTED"),
+            ),
+            (
+                "https:/alice:s3cret@abs.lan/a#https://x",
+                Some("https://abs.lan/a#REDACTED"),
+            ),
+            ("https://abs.lan/a@b", Some("https://abs.lan/a@b")),
+            ("ftp://abs.lan/books", Some("ftp://abs.lan/books")),
+            ("https://alice:s3cret@abs lan", None),
+            ("https://alice:s3cret@abs.lan:99999", None),
+            ("alice:s3cret@abs.lan", None),
         ] {
-            assert_eq!(redact(input), expected, "{input:?}");
+            assert_eq!(shown(input).as_deref(), expected, "{input:?}");
         }
     }
 
@@ -445,5 +470,31 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("line 2, column 3"), "{message}");
         assert!(!message.contains("s3cret"), "{message}");
+    }
+
+    #[test]
+    fn counts_toml_columns_in_characters_without_carriage_returns() {
+        for (text, position) in [
+            (
+                "listen = \"127.0.0.1:0\"\r\ntoken = 1\r\n",
+                "line 2, column 1",
+            ),
+            // An unterminated string is reported at the `\r` that ends its line.
+            ("listen = \"127.0.0.1:0\r\n", "line 1, column 22"),
+            (
+                "listen = \"127.0.0.1:0\"\nname = \"äöü\" x\n",
+                "line 2, column 14",
+            ),
+        ] {
+            let message = text.parse::<Config>().unwrap_err().to_string();
+            assert!(message.contains(position), "{text:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn gives_no_position_when_the_parser_has_none() {
+        let message = "".parse::<Config>().unwrap_err().to_string();
+        assert!(message.contains("listen"), "{message}");
+        assert!(!message.contains("line"), "{message}");
     }
 }

@@ -3,5 +3,6 @@
 //! modules here so they share one binary.
 
 mod library_servers;
+mod logging;
 mod startup;
 mod support;
