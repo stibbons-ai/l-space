@@ -1,0 +1,21 @@
+[package]
+name = "api"
+description = "The App API: the contract between the App and the Bridge, as shared types and server functions"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# The Bridge's side: server function bodies and the axum router that serves them.
+# Without it, each server function is an HTTP client call to the Bridge (the App's side).
+server = ["dioxus/server"]
+
+[dependencies]
+dioxus.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

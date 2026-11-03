@@ -8,3 +8,6 @@ entities.json
 
 # Agent build-loop feature folders (briefs, progress, checkpoints)
 .work/
+
+# Cargo build output
+/target/

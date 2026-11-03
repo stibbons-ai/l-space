@@ -1,0 +1,23 @@
+[tools]
+rust = { version = "1.99.1", profile = "minimal", components = ["clippy", "rustfmt"] }
+
+[tasks.build]
+description = "Build every crate and target"
+run = "cargo build --workspace --all-targets --locked"
+
+[tasks.test]
+description = "Run every test, including the black-box Bridge tests"
+run = "cargo test --workspace --all-targets --locked"
+
+[tasks.lint]
+description = "Clippy with warnings denied, and rustfmt in check mode"
+run = [
+  "cargo clippy --workspace --all-targets --locked -- -D warnings",
+  # The workspace build enables `api/server` (the Bridge needs it); this checks the App's side.
+  "cargo clippy --package api --all-targets --locked -- -D warnings",
+  "cargo fmt --all --check",
+]
+
+[tasks.check]
+description = "Everything CI-worthy: build, lint, test"
+depends = ["build", "lint", "test"]
