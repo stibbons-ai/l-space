@@ -1,0 +1,21 @@
+[package]
+name = "abs"
+description = "The Audiobookshelf client: the Bridge's only way to talk to a Library Server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Library Servers may be https.
+reqwest = { workspace = true, features = ["rustls-tls"] }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

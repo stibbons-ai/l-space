@@ -8,10 +8,14 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+abs.workspace = true
 api = { workspace = true, features = ["server"] }
 axum.workspace = true
 clap.workspace = true
+getrandom.workspace = true
 serde.workspace = true
+store.workspace = true
+store-sqlite.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -23,6 +27,8 @@ url.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+testcontainers.workspace = true
+tokio = { workspace = true, features = ["io-util", "time"] }
 
 [lints]
 workspace = true
