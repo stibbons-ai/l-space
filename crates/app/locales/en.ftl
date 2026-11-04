@@ -28,7 +28,10 @@ language-english = English
 language-german = Deutsch
 
 error-bridge-url-invalid = That is not a Clacks address. Enter it with http:// or https://, for example http://192.168.1.10:8080.
-error-storage = Ook could not save on this device. You may have to log in again after restarting it.
+error-storage-load = Ook couldn't read what it saved on this device, so it started afresh. The unreadable file was kept next to it as app.json.bad.
+error-storage-save = Ook could not save on this device. You may have to log in again after restarting it.
+error-logout-not-saved = You are logged out, but Ook couldn't save that on this device: after a restart you may be logged in again. Log out again then.
+error-not-a-bridge = Something answers at this address, but it isn't Clacks. Check the address.
 error-bridge-unreachable = Clacks can't be reached. Check its address, and that this phone is on your home network or VPN.
 error-internal = Something went wrong on Clacks. Please try again later.
 error-api-key-rejected = Audiobookshelf rejected this API key: it is wrong, or it was revoked or has expired. Ask your Audiobookshelf admin for a new one.

@@ -19,19 +19,21 @@ Crates live in `crates/`: `api` (the App API contract), `bridge` (the Bridge bin
 
 ## Build and run the App
 
-The App (shipped as Ook; its screens call the Bridge Clacks) is a [Dioxus](https://dioxuslabs.com) 0.8 mobile app (ADR 0007), built with Dioxus's CLI `dx`, which `crates/app/mise.toml` pins to the workspace's `dioxus` version (0.8.0-alpha.3). It also points `DEVELOPER_DIR` at `/Applications/Xcode.app`, so iOS builds use Xcode without `xcode-select -s`. Run `dx` from `crates/app` through mise, which also shadows Homebrew's unrelated `dx` (Deno):
+The App (shipped as Ook; its screens call the Bridge Clacks) is a [Dioxus](https://dioxuslabs.com) 0.8 mobile app (ADR 0007), built with Dioxus's CLI `dx`, which `crates/app/mise.toml` pins to the workspace's `dioxus` version (0.8.0-alpha.3). It also points `DEVELOPER_DIR` at `/Applications/Xcode.app/Contents/Developer`, so iOS builds use Xcode without `xcode-select -s`. Run `dx` from `crates/app` through mise, which also shadows Homebrew's unrelated `dx` (Deno):
 
 ```sh
 cd crates/app
 mise trust && mise install                  # once: Rust's iOS targets and dx
 mise exec -- dx serve --ios                 # iOS Simulator: builds, installs and launches on the booted simulator
 mise exec -- dx serve --ios --release --device "<iPhone name>" \
-  --codesign --apple-team-id "Apple Development: <Name> (<TEAMID>)"   # a phone; device setup as in spikes/ios-audio/README.md
+  --codesign --apple-team-id "Apple Development: <Name> (<TEAMID>)"   # a phone
 ```
 
-The bundle identifier is `ai.stibbons.ook`. On first launch the App asks for the Bridge's address, for example `http://192.168.1.10:8080` (the Simulator reaches a Bridge on the same Mac at `http://127.0.0.1:8080`); the Bridge answers with its Library Servers, and the App remembers the address. Then a person picks a Library Server and enters their Audiobookshelf API key (see [Log in](#log-in)). The App keeps the address, the session and the language choice in `Application Support/ai.stibbons.ook/app.json` inside its sandbox, readable by its owner only; the API key is not kept. The session lasts across launches until logout, or until the Bridge reports the key revoked or the session ended; if the Bridge can't be reached at launch the App stays logged in. Logout also forgets the session when the Bridge can't be reached.
+For a phone, set it up as in `spikes/ios-audio/README.md` ("One-time device setup"), but create the provisioning profile for the App's bundle identifier `ai.stibbons.ook`, not the spike's.
 
-Every string comes from Fluent (`crates/app/locales/en.ftl`, `de.ftl`, embedded in the binary). The App shows German on a German device and English otherwise, unless Settings picks a language.
+The bundle identifier is `ai.stibbons.ook`. On first launch the App asks for the Bridge's address, for example `http://192.168.1.10:8080` (the Simulator reaches a Bridge on the same Mac at `http://127.0.0.1:8080`); the Bridge answers with its Library Servers, and the App remembers the address. Then a person picks a Library Server and enters their Audiobookshelf API key (see [Log in](#log-in)). The App keeps the address, the session and the language choice in `Application Support/ai.stibbons.ook/app.json` inside its sandbox, readable by its owner only; the API key is not kept. A file the App can't read is moved aside to `app.json.bad`, and the App starts afresh and says so. The session lasts across launches until logout, or until the Bridge answers `api_key_rejected` or `session_invalid` at launch; then the App forgets it and shows Login with the reason. That includes a session whose Library Server the operator removed from the configuration: re-adding it later needs a new login. Any other failure at launch (the Bridge or the Library Server unreachable, a call taking longer than 10 seconds, an address that isn't a Bridge) keeps the session. Logout also forgets the session when the Bridge can't be reached; if the App can't save that, it says so.
+
+Every string inside the App comes from Fluent (`crates/app/locales/en.ftl`, `de.ftl`, embedded in the binary). The Info.plist strings (display name, local network usage text) are the exception and stay English, since dx doesn't generate `InfoPlist.strings`. The App shows German on a German device and English otherwise, unless Settings picks a language.
 
 ## Run the Bridge
 

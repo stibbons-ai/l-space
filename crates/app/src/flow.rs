@@ -9,6 +9,7 @@
 //! one [`App`] at a time.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use api::{ApiError, ApiKey, LibraryServer, Session, SessionToken};
 use dioxus::fullstack::http::header::{AUTHORIZATION, HeaderValue};
@@ -61,8 +62,12 @@ pub enum Notice {
     Api(ApiError),
     /// What was entered is not a Bridge address.
     BridgeUrlInvalid,
-    /// The device storage could not be read or written.
-    Storage,
+    /// What the App saved on the device could not be read; it started afresh.
+    StorageLoad,
+    /// The device storage could not be written.
+    StorageSave,
+    /// Logged out, but the device storage still holds the session.
+    LogoutNotSaved,
 }
 
 impl Notice {
@@ -70,10 +75,15 @@ impl Notice {
         match self {
             Self::Api(error) => error.into(),
             Self::BridgeUrlInvalid => Text::ErrorBridgeUrlInvalid,
-            Self::Storage => Text::ErrorStorage,
+            Self::StorageLoad => Text::ErrorStorageLoad,
+            Self::StorageSave => Text::ErrorStorageSave,
+            Self::LogoutNotSaved => Text::ErrorLogoutNotSaved,
         }
     }
 }
+
+/// How long a call to the Bridge may take before the App treats the Bridge as unreachable.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The App: what it remembers on the device and the screen it shows.
 #[derive(Debug, Clone)]
@@ -84,19 +94,24 @@ pub struct App {
     screen: Screen,
     /// Why the stored state could not be loaded, for the first screen.
     load_notice: Option<Notice>,
+    call_timeout: Duration,
 }
 
 impl App {
     /// The App as it launches: what `store` remembers, on [`Screen::Starting`] until
     /// [`App::start`]. `device_locale` is the device's language (a BCP 47 tag such as `de-DE`).
     pub fn open(store: Arc<dyn DeviceStore>, device_locale: Option<&str>) -> Self {
-        let (stored, load_notice) = match store.load() {
+        let (mut stored, load_notice) = match store.load() {
             Ok(stored) => (stored, None),
             Err(error) => {
                 tracing::warn!(%error, "cannot load the App's stored state; starting afresh");
-                (Stored::default(), Some(Notice::Storage))
+                (Stored::default(), Some(Notice::StorageLoad))
             }
         };
+        // A session belongs to its Bridge; without one it can't be used.
+        if stored.bridge_url.is_none() {
+            stored.session = None;
+        }
         if let Some(url) = &stored.bridge_url {
             point_at(url);
         }
@@ -107,13 +122,20 @@ impl App {
             device_language: Language::for_locale(device_locale),
             screen: Screen::Starting,
             load_notice,
+            call_timeout: CALL_TIMEOUT,
         }
+    }
+
+    /// This App with calls to the Bridge bounded by `timeout` instead of [`CALL_TIMEOUT`].
+    pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
+        self.call_timeout = timeout;
+        self
     }
 
     /// Picks the first screen: the Bridge address if there is none, Login if there is no
     /// session, else Settings once the Bridge confirmed the session. A session the Bridge
-    /// ended (revoked key, ended session) is forgotten; one the Bridge could not check (the
-    /// Bridge or Library Server is unreachable) stays.
+    /// ended (`api_key_rejected`, `session_invalid`) is forgotten; on any other failure (the
+    /// Bridge or Library Server unreachable, for example) it stays.
     pub async fn start(&mut self) {
         let mut notice = self.load_notice.take();
         if self.stored.bridge_url.is_none() {
@@ -124,7 +146,7 @@ impl App {
             self.show_login(notice).await;
             return;
         }
-        match api::current_user().await {
+        match self.call(api::current_user()).await {
             Ok(user) => {
                 if let Some(session) = &mut self.stored.session
                     && session.user != user
@@ -161,7 +183,7 @@ impl App {
         };
         let previous = get_server_url();
         point_at(&url);
-        match api::library_servers().await {
+        match self.call(api::library_servers()).await {
             Ok(library_servers) => {
                 self.stored.bridge_url = Some(url);
                 self.screen = Screen::Login {
@@ -198,7 +220,12 @@ impl App {
         if !matches!(self.screen, Screen::Login { .. }) {
             return;
         }
-        match api::login(library_server.to_owned(), api_key).await {
+        // Pasted keys often bring a space or line break along.
+        let api_key = ApiKey::new(api_key.expose().trim());
+        match self
+            .call(api::login(library_server.to_owned(), api_key))
+            .await
+        {
             Ok(Session { token, user }) => {
                 authorize(Some(&token));
                 let listed = match &self.screen {
@@ -233,11 +260,15 @@ impl App {
         if self.stored.session.is_none() {
             return;
         }
-        if let Err(error) = api::logout().await {
+        if let Err(error) = self.call(api::logout()).await {
             tracing::info!(%error, "the Bridge did not end the session; forgetting it anyway");
         }
-        let notice = self.forget_session();
-        self.show_login(notice).await;
+        let not_saved = self.forget_session().is_some();
+        self.show_login(None).await;
+        if not_saved {
+            // The token is still on the device: the next launch may be logged in again.
+            self.set_notice(Notice::LogoutNotSaved);
+        }
     }
 
     /// Switches the language now and remembers the choice.
@@ -276,12 +307,12 @@ impl App {
         i18n::text(self.language(), text)
     }
 
-    /// Shows Login with the Bridge's Library Servers, and `notice` (or why they could not be
-    /// listed).
+    /// Shows Login with the Bridge's Library Servers and `notice`, or why they could not be
+    /// listed, which then replaces `notice`.
     async fn show_login(&mut self, notice: Option<Notice>) {
-        let (library_servers, notice) = match api::library_servers().await {
+        let (library_servers, notice) = match self.call(api::library_servers()).await {
             Ok(library_servers) => (library_servers, notice),
-            Err(error) => (Vec::new(), notice.or(Some(Notice::Api(error)))),
+            Err(error) => (Vec::new(), Some(Notice::Api(error))),
         };
         self.screen = Screen::Login {
             library_servers,
@@ -300,7 +331,17 @@ impl App {
     fn save(&self) -> Option<Notice> {
         let error = self.store.save(&self.stored).err()?;
         tracing::warn!(%error, "cannot save the App's state on the device");
-        Some(Notice::Storage)
+        Some(Notice::StorageSave)
+    }
+
+    /// `call` to the Bridge, or `bridge_unreachable` if it takes longer than the call timeout.
+    async fn call<T>(
+        &self,
+        call: impl Future<Output = Result<T, ApiError>>,
+    ) -> Result<T, ApiError> {
+        tokio::time::timeout(self.call_timeout, call)
+            .await
+            .unwrap_or(Err(ApiError::BridgeUnreachable))
     }
 
     fn set_notice(&mut self, new: Notice) {

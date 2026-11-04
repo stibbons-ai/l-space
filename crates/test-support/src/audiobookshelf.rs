@@ -57,13 +57,20 @@ impl std::fmt::Debug for IssuedKey {
     }
 }
 
-/// A running Audiobookshelf, removed on drop.
-#[derive(Debug)]
+/// A running Audiobookshelf, removed on drop. `Debug` leaves out its root token.
 pub struct Audiobookshelf {
     container: Option<Container<GenericImage>>,
     base_url: String,
     root_token: String,
     http: reqwest::Client,
+}
+
+impl std::fmt::Debug for Audiobookshelf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Audiobookshelf")
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Audiobookshelf {

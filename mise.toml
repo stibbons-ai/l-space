@@ -2,9 +2,10 @@
 # The iOS targets build the App (`crates/app`, which also pins `dx`).
 rust = { version = "1.99.1", profile = "minimal", components = ["clippy", "rustfmt"], targets = "aarch64-apple-ios,aarch64-apple-ios-sim" }
 
-# The App (`app`) always builds on its own. Built with the Bridge, `api` gets its `server`
-# feature, and the App's server function calls would run in-process instead of reaching the
-# Bridge over HTTP; the `bridge` binary would also differ from the one the tests expect.
+# The App (`app`) always builds on its own. Cargo unifies features across the packages it
+# builds together: with the Bridge, `api` gets its `server` feature and the App's server
+# function calls would run in-process instead of reaching the Bridge over HTTP; and the App's
+# `dioxus` features (mobile, ...) would land in the `bridge` binary the App's tests start.
 
 [tasks.build]
 description = "Build every crate and target"

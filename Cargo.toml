@@ -20,6 +20,7 @@ clap = { version = "4.6.7", features = ["derive", "env"] }
 dioxus = { version = "=0.8.0-alpha.3", default-features = false }
 dirs = "7.0.0"
 fluent-bundle = "0.16.0"
+fluent-syntax = "0.12.0"
 getrandom = "0.4.3"
 reqwest = { version = "0.12.28", default-features = false, features = ["json"] }
 rusqlite = { version = "0.41.1", features = ["bundled"] }

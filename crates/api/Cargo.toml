@@ -17,6 +17,7 @@ abs = { workspace = true, optional = true }
 dioxus = { workspace = true, features = ["fullstack"] }
 serde.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

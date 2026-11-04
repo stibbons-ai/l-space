@@ -191,6 +191,11 @@ pub fn library_server_toml(url: &str) -> String {
     format!("[[library_servers]]\nurl = \"{url}\"\n")
 }
 
+/// The configuration entry for a Library Server at `url` named `name`.
+pub fn named_library_server_toml(url: &str, name: &str) -> String {
+    format!("{}name = \"{name}\"\n", library_server_toml(url))
+}
+
 /// The App API as the App calls it, over HTTP. Paths and payloads follow the `api` crate's
 /// server functions; responses decode into its types.
 #[derive(Debug)]

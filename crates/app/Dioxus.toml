@@ -6,10 +6,11 @@ identifier = "ai.stibbons.ook"
 publisher = "stibbons-ai"
 
 [ios.plist]
-# The Bridge may be a plain-HTTP address on the LAN.
+# English only: dx doesn't generate InfoPlist.strings.
 NSLocalNetworkUsageDescription = "Ook connects to Clacks on your network."
 CFBundleDisplayName = "Ook"
 
+# The Bridge may be a plain-HTTP address on the LAN.
 [ios.plist.NSAppTransportSecurity]
 NSAllowsArbitraryLoads = true
 

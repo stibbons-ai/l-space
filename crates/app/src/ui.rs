@@ -1,5 +1,5 @@
 //! Rendering: one component per [`Screen`]. Every action goes through [`App`]; every string
-//! comes from [`crate::i18n`].
+//! the App shows comes from [`crate::i18n`] (Info.plist strings are the exception).
 
 use std::sync::Arc;
 

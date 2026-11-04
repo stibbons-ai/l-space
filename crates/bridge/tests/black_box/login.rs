@@ -8,14 +8,16 @@ use reqwest::StatusCode;
 use serde_json::json;
 
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
-use test_support::bridge::{TestBridge, library_server_toml, output_contains};
+use test_support::bridge::{
+    TestBridge, library_server_toml, named_library_server_toml, output_contains,
+};
 use test_support::closed_port;
 
 use crate::forwarder::Forwarder;
 
 /// The configuration naming `abs` as the one Library Server.
 fn abs_config(abs: &Audiobookshelf) -> String {
-    format!("{}name = \"Home\"\n", library_server_toml(abs.base_url()))
+    named_library_server_toml(abs.base_url(), "Home")
 }
 
 /// A Bridge with the shared Audiobookshelf as its one Library Server.

@@ -101,10 +101,15 @@ pub struct CurrentUser {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ApiError {
-    /// The App could not reach the Bridge, or could not understand its answer. Produced only
-    /// on the App's side, by the client half of a server function; the Bridge never sends it.
+    /// The App could not reach the Bridge. Produced only on the App's side, by the client half
+    /// of a server function; the Bridge never sends it.
     #[error("bridge_unreachable")]
     BridgeUnreachable,
+    /// Something answered at the Bridge's address, but not as a Bridge: an HTTP error without
+    /// an App API error code, or a body the App cannot decode. Produced only on the App's
+    /// side; the Bridge never sends it.
+    #[error("not_a_bridge")]
+    NotABridge,
     /// The Bridge failed in a way the user cannot fix.
     #[error("internal")]
     Internal,
@@ -135,12 +140,17 @@ pub enum ApiError {
     Unknown,
 }
 
+/// How the client half of a server function reports a call that got no App API answer.
 impl From<ServerFnError> for ApiError {
     fn from(error: ServerFnError) -> Self {
+        // Without a session token or API key: requests carry those in headers and bodies,
+        // which these errors don't include.
+        tracing::debug!(%error, "server function call failed");
         match error {
-            ServerFnError::Request(_)
-            | ServerFnError::StreamError(_)
-            | ServerFnError::Deserialization(_) => Self::BridgeUnreachable,
+            ServerFnError::Request(_) | ServerFnError::StreamError(_) => Self::BridgeUnreachable,
+            ServerFnError::ServerError { .. } | ServerFnError::Deserialization(_) => {
+                Self::NotABridge
+            }
             _ => Self::Internal,
         }
     }
@@ -151,7 +161,9 @@ impl AsStatusCode for ApiError {
         match self {
             Self::ApiKeyRejected | Self::SessionInvalid => StatusCode::UNAUTHORIZED,
             Self::LibraryServerNotConfigured => StatusCode::NOT_FOUND,
-            Self::BridgeUnreachable | Self::LibraryServerUnreachable => StatusCode::BAD_GATEWAY,
+            Self::BridgeUnreachable | Self::NotABridge | Self::LibraryServerUnreachable => {
+                StatusCode::BAD_GATEWAY
+            }
             Self::Internal | Self::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

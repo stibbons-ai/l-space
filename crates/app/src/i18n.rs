@@ -1,5 +1,7 @@
-//! Every string the App shows a person, in English and German, from Fluent resources embedded
-//! in the binary.
+//! Every string the App shows a person inside the App, in English and German, from Fluent
+//! resources embedded in the binary. The exception are the Info.plist strings (the display
+//! name and the local network usage text): they stay English, since dx doesn't generate
+//! `InfoPlist.strings`.
 //!
 //! The language follows the device unless the person picked one in Settings
 //! ([`LanguageChoice`]); a device language other than German falls back to English.
@@ -135,7 +137,10 @@ texts! {
     LanguageEnglish => "language-english",
     LanguageGerman => "language-german",
     ErrorBridgeUrlInvalid => "error-bridge-url-invalid",
-    ErrorStorage => "error-storage",
+    ErrorStorageLoad => "error-storage-load",
+    ErrorStorageSave => "error-storage-save",
+    ErrorLogoutNotSaved => "error-logout-not-saved",
+    ErrorNotABridge => "error-not-a-bridge",
     ErrorBridgeUnreachable => "error-bridge-unreachable",
     ErrorInternal => "error-internal",
     ErrorApiKeyRejected => "error-api-key-rejected",
@@ -150,6 +155,7 @@ impl From<&api::ApiError> for Text {
         use api::ApiError;
         match error {
             ApiError::BridgeUnreachable => Self::ErrorBridgeUnreachable,
+            ApiError::NotABridge => Self::ErrorNotABridge,
             ApiError::Internal => Self::ErrorInternal,
             ApiError::ApiKeyRejected => Self::ErrorApiKeyRejected,
             ApiError::LibraryServerNotConfigured => Self::ErrorLibraryServerNotConfigured,
@@ -205,6 +211,10 @@ fn format(language: Language, text: Text) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use api::ApiError;
+
     use super::{Language, Text, format};
 
     #[test]
@@ -219,27 +229,51 @@ mod tests {
     }
 
     #[test]
-    fn every_api_error_code_has_a_message() {
-        use api::ApiError;
-        // `Text::from(&ApiError)` matches exhaustively, so a new code fails to compile until
-        // it has a message; this checks each code's message differs from the others.
-        let errors = [
-            ApiError::BridgeUnreachable,
-            ApiError::Internal,
-            ApiError::ApiKeyRejected,
-            ApiError::LibraryServerNotConfigured,
-            ApiError::LibraryServerUnreachable,
-            ApiError::SessionInvalid,
-            ApiError::Unknown,
-        ];
+    fn no_language_has_messages_the_app_does_not_use() {
+        let used: BTreeSet<_> = Text::ALL.iter().map(|text| text.id()).collect();
         for language in Language::ALL {
-            let mut messages: Vec<_> = errors
+            let resource = fluent_syntax::parser::parse(language.source())
+                .unwrap_or_else(|(_, errors)| panic!("{language:?}: {errors:?}"));
+            let defined: BTreeSet<_> = resource
+                .body
                 .iter()
-                .map(|error| super::text(language, error.into()))
+                .filter_map(|entry| match entry {
+                    fluent_syntax::ast::Entry::Message(message) => Some(message.id.name),
+                    _ => None,
+                })
                 .collect();
-            messages.sort();
-            messages.dedup();
-            assert_eq!(messages.len(), errors.len(), "{language:?}: {messages:#?}");
+            assert_eq!(defined, used, "{language:?}");
+        }
+    }
+
+    /// Every `error-<code>` message, with the [`ApiError`] its code decodes to. `Text::from`
+    /// matches every [`ApiError`] exhaustively, so a new code doesn't compile without a message.
+    fn api_error_messages() -> Vec<(Text, ApiError)> {
+        Text::ALL
+            .iter()
+            .filter_map(|&text| {
+                let code = text.id().strip_prefix("error-")?.replace('-', "_");
+                let error: ApiError =
+                    serde_json::from_value(serde_json::json!({ "code": code })).ok()?;
+                (error != ApiError::Unknown || code == "unknown").then_some((text, error))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_api_error_code_shows_its_own_message() {
+        let messages = api_error_messages();
+        for (text, error) in &messages {
+            assert_eq!(Text::from(error), *text, "{error:?}");
+        }
+        // One message per code (ApiError has 8), each different in every language.
+        assert_eq!(messages.len(), 8, "{messages:?}");
+        for language in Language::ALL {
+            let distinct: BTreeSet<_> = messages
+                .iter()
+                .map(|(text, _)| super::text(language, *text))
+                .collect();
+            assert_eq!(distinct.len(), messages.len(), "{language:?}");
         }
     }
 
