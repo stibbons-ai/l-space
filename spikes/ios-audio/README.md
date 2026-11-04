@@ -1,7 +1,8 @@
 # iOS audio spike (issue #2, ADR 0007 gate)
 
 Throwaway Dioxus app that plays an HTTP stream through native `AVPlayer` via `objc2`, not HTML audio.
-Not a workspace member. Delete it once ADR 0007 records the outcome.
+Not a workspace member. Results are in ADR 0007. Kept as the reference for the App's iOS `LocalPlayer`;
+delete it once that exists.
 
 ## What it does
 
@@ -20,7 +21,8 @@ Not a workspace member. Delete it once ADR 0007 records the outcome.
 Dioxus 0.7.10, the workspace pin, does not work here: its tao 0.34 has no UIScene support, and apps built
 with the iOS 27 SDK abort at launch with "UIScene life cycle is required for apps built with this SDK".
 Dioxus 0.8.0-alpha.3 ships tao 0.37, which does; `Dioxus.toml` declares the static scene manifest the
-launch-time validator needs.
+launch-time validator needs. `build.rs` adds `/usr/lib/swift` to the runpath: the iOS 27 SDK's CoreMedia
+links `@rpath/libswiftCoreMedia.dylib`, and without it dyld aborts at launch on a device.
 
 ## One-time device setup (human)
 

@@ -14,6 +14,27 @@ This decision holds only if a spike on a physical iPhone shows all of the follow
 4. a phone call interrupts playback and it resumes afterwards;
 5. switching to an AirPlay output from Control Center keeps playing.
 
+## Gate result (2026-11-04): Dioxus holds, on Dioxus 0.8
+
+The spike in `spikes/ios-audio` (issue #2) ran a release `dx` build on an iPhone 17 Pro with iOS 27, built with Xcode 27. It played an HTTP MP3 stream through AVPlayer driven from Rust via `objc2`. The evidence is the spike's in-app log.
+
+| # | Check | Result |
+|---|-------|--------|
+| 1 | `dx` build installs | Pass, but only on Dioxus 0.8 (see below) |
+| 2 | 10+ minutes locked | Pass: 11 minutes of 60-second heartbeats while playing, with no stalls |
+| 3 | Lock-screen pause and resume reach Rust | Pass: `MPRemoteCommandCenter` pause and play handlers ran in Rust |
+| 4 | A call interrupts and playback resumes | Pass: interruption began, then ended with `shouldResume`, and playback resumed |
+| 5 | AirPlay from Control Center | Pass: the route changed to AirPlay and playback continued |
+
+AirPods also worked. Taking them out paused playback, as iOS does when headphones disconnect, and the next play used the speaker.
+
+Findings that bind the App:
+
+- **Dioxus 0.8, not 0.7.** With the iOS 27 SDK, apps that don't adopt the UIScene life cycle abort at launch. Dioxus 0.7.10 uses tao 0.34, which has no scene support. Dioxus 0.8 (0.8.0-alpha.3 at the time of the spike) uses tao 0.37, which does. The App needs Dioxus 0.8 and `dx` 0.8, so the workspace's `dioxus` pin moves with it.
+- **A static scene manifest.** The iOS 27 launch check reads only `Info.plist`, so `Dioxus.toml` must declare `UIApplicationSceneManifest` with `TaoSceneDelegate` as the scene delegate.
+- **The Swift runtime path.** In the iOS 27 SDK, CoreMedia links `@rpath/libswiftCoreMedia.dylib`, and `dx` doesn't add `/usr/lib/swift` to the runpath the way Xcode does. A `build.rs` passes `-Wl,-rpath,/usr/lib/swift`.
+- **Signing.** `dx` signs with any Apple Development profile matching the bundle ID. Xcode's wildcard team profile works.
+
 ## Considered Options
 
 - **SwiftUI**: the best iOS feel, but API types would come from code generation (OpenAPI or protobuf) and Android would be a separate app.
