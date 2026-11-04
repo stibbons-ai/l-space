@@ -1,12 +1,12 @@
 -- API keys are now stored encrypted. Keys stored by an earlier Bridge are in plain text and
 -- are dropped rather than encrypted in place, with the sessions opened with them: their
--- users log in again. Plain text left in the file is handled outside this migration:
--- `SqliteStore::open` sets `PRAGMA secure_delete = ON`, so the rows dropped here are zeroed,
--- and after migrating from schema version 1 it runs `VACUUM`, which drops the free pages where
--- keys the earlier Bridge deleted may linger. Two gaps remain: while this migration runs, the
--- rollback journal holds copies of the dropped pages (unlinked after commit, not zeroed; a
--- crash leaves it as a hot journal), and a crash between this migration's commit and the
--- `VACUUM` skips the `VACUUM`.
+-- users log in again. Plain text left in the file is handled outside this migration: before
+-- migrating from schema version 1, `SqliteStore::open` runs `VACUUM`, which drops the free
+-- pages where keys the earlier Bridge deleted may linger (if it fails, nothing is migrated and
+-- the next start retries), and it sets `PRAGMA secure_delete = ON`, so the pages this
+-- migration frees are zeroed. One gap remains: while this migration runs, the rollback
+-- journal holds copies of the dropped pages; it is unlinked after commit, not zeroed, and a
+-- crash leaves it as a hot journal until the next open rolls it back.
 
 DROP TABLE sessions;
 DROP TABLE api_keys;

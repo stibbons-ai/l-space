@@ -231,7 +231,8 @@ fn no_encryption_key() {
         let error = refused_key(&key, &[]);
         assert!(
             error.starts_with(
-                "neither BRIDGE_ENCRYPTION_KEY_FILE nor BRIDGE_ENCRYPTION_KEY is set; "
+                "neither BRIDGE_ENCRYPTION_KEY_FILE nor BRIDGE_ENCRYPTION_KEY is set (or both \
+                 are empty); "
             ),
             "{key:?}: {error}"
         );

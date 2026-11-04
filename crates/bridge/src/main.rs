@@ -28,7 +28,7 @@ struct Args {
 }
 
 /// `error` followed by each error that caused it, joined by `: `, for a log line.
-fn error_chain(error: &dyn std::error::Error) -> String {
+pub(crate) fn error_chain(error: &dyn std::error::Error) -> String {
     let mut chain = error.to_string();
     let mut source = error.source();
     while let Some(cause) = source {

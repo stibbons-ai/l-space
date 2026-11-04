@@ -175,7 +175,7 @@ impl Sealing {
 pub enum SealError {
     #[error("cannot seal the API key: no randomness for its nonce")]
     NoRandomness(#[source] getrandom::Error),
-    /// The cipher refused the key (only a key far too long to be one makes it).
+    /// The API key is too long to encrypt (about 256 GiB or more).
     #[error("cannot seal the API key: encryption failed")]
     Encrypt,
 }

@@ -26,6 +26,15 @@ const OTHER_KEY_WARNING: &str = "stored API keys were encrypted with another enc
 const BOTH_SET_WARNING: &str = "both BRIDGE_ENCRYPTION_KEY_FILE and BRIDGE_ENCRYPTION_KEY are set; using \
      BRIDGE_ENCRYPTION_KEY_FILE";
 
+/// A key file of exactly 1024 bytes, the most allowed, is accepted.
+#[test]
+fn a_key_file_at_the_size_limit_is_accepted() {
+    let padded = format!("{KEY}{}", "\n".repeat(1024 - KEY.len()));
+    assert_eq!(padded.len(), 1024);
+    // Starting at all proves it: `start_with_key` panics unless the Bridge serves.
+    TestBridge::start_with_key("", KeyEnv::file(&padded));
+}
+
 #[tokio::test]
 async fn a_key_file_and_the_same_key_in_the_environment_open_the_same_sessions() {
     let abs = Audiobookshelf::shared();

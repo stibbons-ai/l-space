@@ -74,7 +74,7 @@ fn decode(encoded: &[u8]) -> Result<EncryptionKey, Problem> {
 /// Why there is no usable key.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
-    #[error("neither {FILE_VAR} nor {VALUE_VAR} is set; {HINT}")]
+    #[error("neither {FILE_VAR} nor {VALUE_VAR} is set (or both are empty); {HINT}")]
     Missing,
     #[error("{FILE_VAR}: cannot read the file it names: {0}; {HINT}")]
     Unreadable(std::io::Error),

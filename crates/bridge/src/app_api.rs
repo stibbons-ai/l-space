@@ -74,7 +74,7 @@ impl<S: Store> AppApi<S> {
                     operation = "open a session",
                     library_server = owner.library_server,
                     user_id = owner.user_id,
-                    %error,
+                    error = crate::error_chain(&error),
                     "storage failed"
                 );
                 ApiError::Internal
@@ -166,7 +166,7 @@ impl<S: Store> AppApi<S> {
                     library_server,
                     user_id,
                     reason,
-                    %error,
+                    error = crate::error_chain(&error),
                     "storage failed"
                 );
                 ApiError::Internal
@@ -224,7 +224,11 @@ fn abs_error(library_server: &str, error: abs::Error) -> ApiError {
 /// Logs a storage failure during `operation` and hides it from the App.
 fn storage_error(operation: &'static str) -> impl FnOnce(store::Error) -> ApiError {
     move |error| {
-        tracing::error!(operation, %error, "storage failed");
+        tracing::error!(
+            operation,
+            error = crate::error_chain(&error),
+            "storage failed"
+        );
         ApiError::Internal
     }
 }

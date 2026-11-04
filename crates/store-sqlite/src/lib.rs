@@ -56,14 +56,20 @@ impl SqliteStore {
         connection
             .pragma_update(None, "secure_delete", true)
             .map_err(step("enable secure delete"))?;
-        let applied = migrate(&mut connection).map_err(step("migrate the schema"))?;
-        if (1..FIRST_ENCRYPTED_SCHEMA).contains(&applied) {
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(step("read the schema version"))?;
+        if (1..FIRST_ENCRYPTED_SCHEMA).contains(&version) {
             // The earlier Bridge stored keys in plain text and never set `secure_delete`, so
-            // keys it deleted may linger in free pages; rebuilding the file drops them.
+            // keys it deleted may linger in free pages. Rebuilding the file before migrating
+            // drops them, and a failure leaves the schema unmigrated, so the next start
+            // retries; the migration's own deletes then run under `secure_delete`. The rebuild
+            // stays in memory rather than in a temporary file.
             connection
-                .execute_batch("VACUUM")
+                .execute_batch("PRAGMA temp_store = MEMORY; VACUUM; PRAGMA temp_store = DEFAULT;")
                 .map_err(step("drop plain-text keys from free pages"))?;
         }
+        migrate(&mut connection).map_err(step("migrate the schema"))?;
         let sealing = Sealing::new(key);
         forget_keys_sealed_under_another_key(&connection, &sealing)
             .map_err(step("forget keys sealed under another encryption key"))?;
@@ -136,11 +142,10 @@ fn create_private(_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-/// The schema version from which API keys are stored encrypted.
-const FIRST_ENCRYPTED_SCHEMA: usize = 2;
+/// The schema version (`user_version`) from which API keys are stored encrypted.
+const FIRST_ENCRYPTED_SCHEMA: i64 = 2;
 
-/// Migrates the schema to the newest, returning the version the database had.
-fn migrate(connection: &mut Connection) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+fn migrate(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let known = MIGRATIONS.len();
     let transaction = connection.transaction()?;
     let applied: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -151,14 +156,14 @@ fn migrate(connection: &mut Connection) -> Result<usize, Box<dyn std::error::Err
             format!("the database has schema version {applied}, newer than this Bridge's {known}")
         })?;
     if applied == known {
-        return Ok(applied);
+        return Ok(());
     }
     for migration in &MIGRATIONS[applied..] {
         transaction.execute_batch(migration)?;
     }
     transaction.pragma_update(None, "user_version", known as i64)?;
     transaction.commit()?;
-    Ok(applied)
+    Ok(())
 }
 
 /// Removes keys sealed under another encryption key than `sealing`'s that no session uses
@@ -168,12 +173,19 @@ fn forget_keys_sealed_under_another_key(
     connection: &Connection,
     sealing: &Sealing,
 ) -> rusqlite::Result<()> {
-    connection.execute(
+    let removed = connection.execute(
         "DELETE FROM api_keys
          WHERE key_id <> ?1
            AND NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.api_key_id = api_keys.id)",
         params![sealing.key_id()],
     )?;
+    if removed > 0 {
+        tracing::info!(
+            removed,
+            "removed stored API keys that were encrypted with another encryption key and that \
+             no session used"
+        );
+    }
     let keys: i64 = connection.query_row(
         "SELECT count(*) FROM api_keys WHERE key_id <> ?1",
         params![sealing.key_id()],
