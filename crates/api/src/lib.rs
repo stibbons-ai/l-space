@@ -106,8 +106,9 @@ pub enum ApiError {
     #[error("bridge_unreachable")]
     BridgeUnreachable,
     /// Something answered at the Bridge's address, but not as a Bridge: an HTTP error without
-    /// an App API error code, or a body the App cannot decode. Produced only on the App's
-    /// side; the Bridge never sends it.
+    /// an App API error code (other than 502, 503 and 504, which count as
+    /// [`ApiError::BridgeUnreachable`]), or a body the App cannot decode. Produced only on the
+    /// App's side; the Bridge never sends it.
     #[error("not_a_bridge")]
     NotABridge,
     /// The Bridge failed in a way the user cannot fix.
@@ -143,11 +144,15 @@ pub enum ApiError {
 /// How the client half of a server function reports a call that got no App API answer.
 impl From<ServerFnError> for ApiError {
     fn from(error: ServerFnError) -> Self {
-        // Without a session token or API key: requests carry those in headers and bodies,
-        // which these errors don't include.
+        // These errors carry the response's body, not the request, so no session token or API
+        // key shows in the log.
         tracing::debug!(%error, "server function call failed");
         match error {
             ServerFnError::Request(_) | ServerFnError::StreamError(_) => Self::BridgeUnreachable,
+            // A reverse proxy in front of the Bridge that can't reach it answers like this.
+            ServerFnError::ServerError {
+                code: 502..=504, ..
+            } => Self::BridgeUnreachable,
             ServerFnError::ServerError { .. } | ServerFnError::Deserialization(_) => {
                 Self::NotABridge
             }

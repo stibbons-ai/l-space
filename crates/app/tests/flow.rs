@@ -11,12 +11,12 @@ use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use api::{ApiError, ApiKey, LibraryServer, Session};
 use app::flow::{App, Notice, Screen};
 use app::i18n::{self, Language, LanguageChoice, Text};
-use app::storage::{DeviceStore, FileStore, Stored};
+use app::storage::{DeviceStore, FileStore, LoadError, Stored};
 use tempfile::TempDir;
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
 use test_support::bridge::{TestBridge, library_server_toml, named_library_server_toml};
@@ -38,8 +38,9 @@ fn run(test: impl AsyncFnOnce()) {
     RUNTIME.block_on(test());
 }
 
-/// Short, so tests against a Bridge that never answers stay fast.
-const TEST_CALL_TIMEOUT: Duration = Duration::from_millis(500);
+/// Short, so tests against something that never answers stay fast. Only those tests use it:
+/// real calls through the Bridge to Audiobookshelf get the App's default.
+const SHORT_CALL_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// The App's device storage, kept across launches. Saves fail while `fail_saves` is set.
 #[derive(Debug, Clone)]
@@ -70,14 +71,35 @@ impl Device {
         self.dir.path().join("app.json")
     }
 
+    /// The files in the device's App directory.
+    fn files(&self) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(self.dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Launches the App on this device, as a fresh process would, and waits for its first
     /// screen.
     async fn launch(&self) -> App {
+        self.launch_with(None).await
+    }
+
+    /// [`Device::launch`] with Bridge calls bounded by [`SHORT_CALL_TIMEOUT`].
+    async fn launch_impatient(&self) -> App {
+        self.launch_with(Some(SHORT_CALL_TIMEOUT)).await
+    }
+
+    async fn launch_with(&self, call_timeout: Option<Duration>) -> App {
         // A fresh process has no server URL and no `Authorization` header yet.
         dioxus::fullstack::set_server_url("");
         dioxus::fullstack::clear_request_headers();
-        let mut app = App::open(Arc::new(self.clone()), Some(self.locale))
-            .with_call_timeout(TEST_CALL_TIMEOUT);
+        let mut app = App::open(Arc::new(self.clone()), Some(self.locale));
+        if let Some(timeout) = call_timeout {
+            app = app.with_call_timeout(timeout);
+        }
         app.start().await;
         app
     }
@@ -92,7 +114,7 @@ impl Device {
 }
 
 impl DeviceStore for Device {
-    fn load(&self) -> io::Result<Stored> {
+    fn load(&self) -> Result<Stored, LoadError> {
         self.file().load()
     }
 
@@ -178,20 +200,35 @@ fn silent_server() -> SocketAddr {
     addr
 }
 
-/// A loopback web server that answers every request with a plain `404 Not Found`.
-fn not_found_server() -> SocketAddr {
+/// A loopback web server that answers every request with `status` (e.g. `404 Not Found`) and
+/// a `content_type` body.
+fn web_server(status: &'static str, content_type: &'static str, body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
             let mut request = [0; 4096];
             let _ = stream.read(&mut request);
-            let _ = stream.write_all(
-                b"HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\ncontent-length: 9\r\nconnection: close\r\n\r\nNot Found",
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
             );
+            let _ = stream.write_all(response.as_bytes());
         }
     });
-    addr
+    format!("http://{addr}")
+}
+
+/// A router's or captive portal's web page.
+fn html_page_server() -> String {
+    web_server("200 OK", "text/html", "<html><body>Welcome</body></html>")
+}
+
+/// Fails the test instead of hanging when `action` outlives `limit`.
+async fn within<T>(limit: Duration, action: impl Future<Output = T>) -> T {
+    tokio::time::timeout(limit, action)
+        .await
+        .unwrap_or_else(|_| panic!("still waiting after {limit:?}: the call timeout didn't apply"))
 }
 
 #[test]
@@ -244,11 +281,12 @@ fn the_bridge_url_is_entered_once_and_remembered() {
 #[test]
 fn an_address_that_is_not_a_bridge_is_named_as_such_and_not_remembered() {
     let abs = Audiobookshelf::shared();
-    let not_found = format!("http://{}", not_found_server());
+    let not_found = web_server("404 Not Found", "text/plain", "Not Found");
+    let html = html_page_server();
     let device = Device::new();
     run(async || {
         let mut app = device.launch().await;
-        for address in [abs.base_url(), not_found.as_str()] {
+        for address in [abs.base_url(), &not_found, &html] {
             app.submit_bridge_url(address).await;
             assert_eq!(
                 app.screen(),
@@ -260,6 +298,14 @@ fn an_address_that_is_not_a_bridge_is_named_as_such_and_not_remembered() {
             assert_eq!(notice_texts(&mut app), both(Text::ErrorNotABridge));
             assert_eq!(device.launch().await.bridge_url(), None, "{address}");
         }
+
+        // A proxy whose Bridge is down.
+        let proxy = web_server("503 Service Unavailable", "text/html", "<h1>503</h1>");
+        app.submit_bridge_url(&proxy).await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::BridgeUnreachable))
+        );
     });
 }
 
@@ -450,19 +496,14 @@ fn a_bridge_that_never_answers_counts_as_unreachable() {
     let (bridge, abs, _) = bridge_with_abs();
     let silent = format!("http://{}", silent_server());
     let device = Device::new();
+    let limit = SHORT_CALL_TIMEOUT * 10;
     run(async || {
         let user = abs.new_user().await;
         let before = session(&logged_in(&device, &bridge, &abs, &user).await);
         // The Bridge's address now leads to something that accepts and never answers.
         device.edit(|json| json["bridge_url"] = silent.clone().into());
 
-        let started = Instant::now();
-        let mut app = device.launch().await;
-        assert!(
-            started.elapsed() < TEST_CALL_TIMEOUT * 4,
-            "{:?}",
-            started.elapsed()
-        );
+        let mut app = within(limit, device.launch_impatient()).await;
         assert_eq!(
             app.screen(),
             &Screen::Settings {
@@ -471,18 +512,77 @@ fn a_bridge_that_never_answers_counts_as_unreachable() {
         );
         assert_eq!(app.session().map(|stored| &stored.user), Some(&before.user));
 
-        app.log_out().await;
+        within(limit, app.log_out()).await;
         assert_eq!(app.session(), None);
         assert_eq!(device.launch().await.session(), None);
 
         let fresh = Device::new();
-        let mut app = fresh.launch().await;
-        app.submit_bridge_url(&silent).await;
+        let mut app = fresh.launch_impatient().await;
+        within(limit, app.submit_bridge_url(&silent)).await;
         assert_eq!(
             app.screen().notice(),
             Some(&Notice::Api(ApiError::BridgeUnreachable))
         );
         assert_eq!(fresh.launch().await.bridge_url(), None);
+    });
+}
+
+#[test]
+fn a_slow_library_server_is_named_and_not_mistaken_for_an_unreachable_bridge() {
+    // The Bridge gives up on a Library Server after 10 seconds; the App waits longer.
+    let silent = format!("http://{}", silent_server());
+    let bridge = TestBridge::start(&named_library_server_toml(&silent, "Slow"));
+    let device = Device::new();
+    run(async || {
+        let mut app = device.launch().await;
+        app.submit_bridge_url(bridge.url()).await;
+        app.log_in(&silent, ApiKey::new("any-key")).await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::LibraryServerUnreachable))
+        );
+    });
+}
+
+#[test]
+fn a_captive_portal_at_the_stored_address_keeps_the_session() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let html = html_page_server();
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let before = session(&logged_in(&device, &bridge, &abs, &user).await);
+        device.edit(|json| json["bridge_url"] = html.clone().into());
+
+        let app = device.launch().await;
+        assert_eq!(
+            app.screen(),
+            &Screen::Settings {
+                notice: Some(Notice::Api(ApiError::BridgeUnreachable))
+            }
+        );
+        assert_eq!(app.session().map(|stored| &stored.user), Some(&before.user));
+    });
+}
+
+#[test]
+fn the_account_is_refreshed_at_launch() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async move || {
+        let user = abs.new_user().await;
+        logged_in(&device, &bridge, &abs, &user).await;
+        let renamed = format!("{}-renamed", user.username);
+        abs.rename_user(&user.id, &renamed).await;
+
+        let app = device.launch().await;
+        assert_eq!(app.screen(), &Screen::Settings { notice: None });
+        assert_eq!(app.session().unwrap().user.username, renamed);
+
+        // Remembered: shown even when the Bridge can't confirm it.
+        drop(bridge);
+        let app = device.launch_impatient().await;
+        assert_eq!(app.session().unwrap().user.username, renamed);
     });
 }
 
@@ -508,14 +608,29 @@ fn logout_forgets_the_session_even_when_the_bridge_is_unreachable() {
 }
 
 #[test]
-fn failed_saves_are_reported() {
+fn failed_saves_are_reported_until_a_save_succeeds() {
     let (bridge, abs, _) = bridge_with_abs();
     let device = Device::new();
     run(async move || {
         let user = abs.new_user().await;
+
+        // Entering the address.
+        device.fail_saves.store(true, Ordering::SeqCst);
         let mut app = device.launch().await;
         app.submit_bridge_url(bridge.url()).await;
+        assert!(matches!(
+            app.screen(),
+            Screen::Login {
+                notice: Some(Notice::StorageSave),
+                ..
+            }
+        ));
+        device.fail_saves.store(false, Ordering::SeqCst);
+        assert_eq!(device.launch().await.bridge_url(), None);
 
+        // Logging in.
+        let mut app = device.launch().await;
+        app.submit_bridge_url(bridge.url()).await;
         device.fail_saves.store(true, Ordering::SeqCst);
         app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
             .await;
@@ -525,23 +640,59 @@ fn failed_saves_are_reported() {
                 notice: Some(Notice::StorageSave)
             }
         );
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorStorageSave));
+        assert_eq!(app.text(Text::ErrorStorageSave), notice_text(&app));
 
+        // Picking a language: fails, then works and clears the notice.
         app.set_language(LanguageChoice::German);
         assert_eq!(app.screen().notice(), Some(&Notice::StorageSave));
         assert_eq!(app.language(), Language::German);
-
-        // Logged in on the device after all, so logout has a stored session to forget.
         device.fail_saves.store(false, Ordering::SeqCst);
-        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.set_language(LanguageChoice::English);
+        assert_eq!(app.screen().notice(), None);
+
+        // Logging out with the Bridge gone and the device failing.
         drop(bridge);
         device.fail_saves.store(true, Ordering::SeqCst);
         app.log_out().await;
         assert_eq!(app.session(), None);
         assert_eq!(app.screen().notice(), Some(&Notice::LogoutNotSaved));
-        // Switching languages to read the notice saves too.
+        assert_eq!(
+            notice_text(&app),
+            i18n::text(Language::English, Text::ErrorLogoutNotSaved)
+        );
+        // Saving the logged-out state later clears it.
         device.fail_saves.store(false, Ordering::SeqCst);
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorLogoutNotSaved));
+        app.set_language(LanguageChoice::German);
+        assert_eq!(app.screen().notice(), None);
+        assert_eq!(device.launch_impatient().await.session(), None);
+    });
+}
+
+#[test]
+fn a_revocation_at_launch_that_cannot_be_saved_is_found_again() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        logged_in(&device, &bridge, &abs, &user).await;
+        abs.delete_api_key(&user.api_key).await;
+
+        device.fail_saves.store(true, Ordering::SeqCst);
+        let app = device.launch().await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::ApiKeyRejected))
+        );
+        assert_eq!(app.session(), None);
+
+        // Still on the device, so the next launch checks it again; the Bridge ended it.
+        device.fail_saves.store(false, Ordering::SeqCst);
+        let app = device.launch().await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::SessionInvalid))
+        );
+        assert_eq!(device.launch().await.screen().notice(), None);
     });
 }
 
@@ -549,6 +700,8 @@ fn failed_saves_are_reported() {
 fn an_unreadable_device_file_is_set_aside_and_reported() {
     let device = Device::new();
     run(async || {
+        // An earlier unreadable file stays.
+        std::fs::write(device.dir.path().join("app.json.bad"), b"earlier").unwrap();
         std::fs::write(device.path(), b"{ not json").unwrap();
 
         let mut app = device.launch().await;
@@ -559,10 +712,59 @@ fn an_unreadable_device_file_is_set_aside_and_reported() {
             }
         );
         assert_eq!(notice_texts(&mut app), both(Text::ErrorStorageLoad));
+        let dir = device.dir.path();
+        assert_eq!(std::fs::read(dir.join("app.json.bad")).unwrap(), b"earlier");
         assert_eq!(
-            std::fs::read(device.file().set_aside_path()).unwrap(),
+            std::fs::read(dir.join("app.json.bad.2")).unwrap(),
             b"{ not json"
         );
+
+        // A file the App may not even read is set aside too.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::remove_file(device.path()).unwrap();
+            std::fs::write(device.path(), b"{}").unwrap();
+            std::fs::set_permissions(device.path(), std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+            let app = device.launch().await;
+            assert_eq!(app.screen().notice(), Some(&Notice::StorageLoad));
+            assert!(dir.join("app.json.bad.3").exists());
+        }
+
+        assert!(!device.path().exists());
+        assert_eq!(
+            device.launch().await.screen(),
+            &Screen::BridgeUrl { notice: None }
+        );
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unreadable_device_file_that_cannot_be_set_aside_is_left_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let (bridge, _abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        std::fs::write(device.path(), b"{ not json").unwrap();
+        let dir = device.dir.path();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let mut app = device.launch().await;
+        assert_eq!(
+            app.screen(),
+            &Screen::BridgeUrl {
+                notice: Some(Notice::StorageStuck)
+            }
+        );
+        assert_eq!(notice_texts(&mut app), both(Text::ErrorStorageStuck));
+        // Usable for this launch, without touching the file.
+        app.submit_bridge_url(bridge.url()).await;
+        assert!(matches!(app.screen(), Screen::Login { notice: None, .. }));
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(std::fs::read(device.path()).unwrap(), b"{ not json");
+        assert_eq!(device.files(), ["app.json"]);
     });
 }
 

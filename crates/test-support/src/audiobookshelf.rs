@@ -153,6 +153,16 @@ impl Audiobookshelf {
         .await;
     }
 
+    /// Renames user `user_id`, as an admin editing them would.
+    pub async fn rename_user(&self, user_id: &str, username: &str) {
+        self.admin(
+            reqwest::Method::PATCH,
+            &format!("/api/users/{user_id}"),
+            Some(json!({"username": username})),
+        )
+        .await;
+    }
+
     /// Makes `api_key` act for user `user_id` instead, as an admin editing it would.
     pub async fn move_api_key(&self, api_key: &IssuedKey, user_id: &str) {
         self.admin(

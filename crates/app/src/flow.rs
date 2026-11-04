@@ -16,7 +16,7 @@ use dioxus::fullstack::http::header::{AUTHORIZATION, HeaderValue};
 use dioxus::fullstack::{HeaderMap, get_server_url, set_request_headers, set_server_url};
 
 use crate::i18n::{self, Language, LanguageChoice, Text};
-use crate::storage::{DeviceStore, Stored, StoredSession};
+use crate::storage::{DeviceStore, LoadError, Stored, StoredSession};
 
 /// What the App shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,8 +62,12 @@ pub enum Notice {
     Api(ApiError),
     /// What was entered is not a Bridge address.
     BridgeUrlInvalid,
-    /// What the App saved on the device could not be read; it started afresh.
+    /// What the App saved on the device could not be read; it was moved aside and the App
+    /// started afresh.
     StorageLoad,
+    /// What the App saved on the device could not be read nor moved aside; the App leaves it
+    /// untouched and saves nothing during this launch.
+    StorageStuck,
     /// The device storage could not be written.
     StorageSave,
     /// Logged out, but the device storage still holds the session.
@@ -76,6 +80,7 @@ impl Notice {
             Self::Api(error) => error.into(),
             Self::BridgeUrlInvalid => Text::ErrorBridgeUrlInvalid,
             Self::StorageLoad => Text::ErrorStorageLoad,
+            Self::StorageStuck => Text::ErrorStorageStuck,
             Self::StorageSave => Text::ErrorStorageSave,
             Self::LogoutNotSaved => Text::ErrorLogoutNotSaved,
         }
@@ -83,7 +88,10 @@ impl Notice {
 }
 
 /// How long a call to the Bridge may take before the App treats the Bridge as unreachable.
-pub const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longer than the Bridge's own 10-second limit for a Library Server request (`abs::TIMEOUT`),
+/// so a slow Library Server shows as `library_server_unreachable` rather than as the Bridge
+/// being unreachable, and a login answered late isn't dropped.
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The App: what it remembers on the device and the screen it shows.
 #[derive(Debug, Clone)]
@@ -94,6 +102,8 @@ pub struct App {
     screen: Screen,
     /// Why the stored state could not be loaded, for the first screen.
     load_notice: Option<Notice>,
+    /// Set when what was saved couldn't be read nor moved aside: saving would destroy it.
+    read_only: bool,
     call_timeout: Duration,
 }
 
@@ -101,11 +111,15 @@ impl App {
     /// The App as it launches: what `store` remembers, on [`Screen::Starting`] until
     /// [`App::start`]. `device_locale` is the device's language (a BCP 47 tag such as `de-DE`).
     pub fn open(store: Arc<dyn DeviceStore>, device_locale: Option<&str>) -> Self {
-        let (mut stored, load_notice) = match store.load() {
-            Ok(stored) => (stored, None),
-            Err(error) => {
-                tracing::warn!(%error, "cannot load the App's stored state; starting afresh");
-                (Stored::default(), Some(Notice::StorageLoad))
+        let (mut stored, load_notice, read_only) = match store.load() {
+            Ok(stored) => (stored, None, false),
+            Err(error @ LoadError::SetAside { .. }) => {
+                tracing::warn!(%error, "starting afresh");
+                (Stored::default(), Some(Notice::StorageLoad), false)
+            }
+            Err(error @ LoadError::Stuck { .. }) => {
+                tracing::warn!(%error, "starting afresh; saving nothing during this launch");
+                (Stored::default(), Some(Notice::StorageStuck), true)
             }
         };
         // A session belongs to its Bridge; without one it can't be used.
@@ -122,6 +136,7 @@ impl App {
             device_language: Language::for_locale(device_locale),
             screen: Screen::Starting,
             load_notice,
+            read_only,
             call_timeout: CALL_TIMEOUT,
         }
     }
@@ -183,7 +198,8 @@ impl App {
         };
         let previous = get_server_url();
         point_at(&url);
-        match self.call(api::library_servers()).await {
+        // Unlike other calls, the person can fix an address that isn't a Bridge right here.
+        match self.probe(api::library_servers()).await {
             Ok(library_servers) => {
                 self.stored.bridge_url = Some(url);
                 self.screen = Screen::Login {
@@ -260,8 +276,14 @@ impl App {
         if self.stored.session.is_none() {
             return;
         }
-        if let Err(error) = self.call(api::logout()).await {
-            tracing::info!(%error, "the Bridge did not end the session; forgetting it anyway");
+        match self.call(api::logout()).await {
+            Ok(()) => {}
+            Err(error @ (ApiError::BridgeUnreachable | ApiError::SessionInvalid)) => {
+                tracing::info!(%error, "the Bridge did not end the session; forgetting it anyway");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the Bridge did not end the session; forgetting it anyway");
+            }
         }
         let not_saved = self.forget_session().is_some();
         self.show_login(None).await;
@@ -274,8 +296,16 @@ impl App {
     /// Switches the language now and remembers the choice.
     pub fn set_language(&mut self, choice: LanguageChoice) {
         self.stored.language = choice;
-        if let Some(notice) = self.save() {
-            self.set_notice(notice);
+        match self.save() {
+            Some(notice) => self.set_notice(notice),
+            // Everything is saved now, so an earlier failure no longer matters.
+            None => {
+                if let Some(notice) = self.screen.notice_mut()
+                    && matches!(notice, Some(Notice::StorageSave | Notice::LogoutNotSaved))
+                {
+                    *notice = None;
+                }
+            }
         }
     }
 
@@ -329,19 +359,40 @@ impl App {
 
     /// Saves what the App remembers. Returns a notice if that failed.
     fn save(&self) -> Option<Notice> {
+        if self.read_only {
+            // The person was told at launch (`Notice::StorageStuck`).
+            tracing::debug!("not saving: the unreadable saved state stays untouched");
+            return None;
+        }
         let error = self.store.save(&self.stored).err()?;
         tracing::warn!(%error, "cannot save the App's state on the device");
         Some(Notice::StorageSave)
     }
 
     /// `call` to the Bridge, or `bridge_unreachable` if it takes longer than the call timeout.
+    /// An address that answers but not as a Bridge counts as unreachable too: once the
+    /// address is stored, that's a captive portal or a proxy in the way, not a typo.
     async fn call<T>(
+        &self,
+        call: impl Future<Output = Result<T, ApiError>>,
+    ) -> Result<T, ApiError> {
+        match self.probe(call).await {
+            Err(ApiError::NotABridge) => Err(ApiError::BridgeUnreachable),
+            result => result,
+        }
+    }
+
+    /// `call` to the Bridge, or `bridge_unreachable` if it takes longer than the call timeout.
+    async fn probe<T>(
         &self,
         call: impl Future<Output = Result<T, ApiError>>,
     ) -> Result<T, ApiError> {
         tokio::time::timeout(self.call_timeout, call)
             .await
-            .unwrap_or(Err(ApiError::BridgeUnreachable))
+            .unwrap_or_else(|_| {
+                tracing::debug!(timeout = ?self.call_timeout, "the Bridge did not answer in time");
+                Err(ApiError::BridgeUnreachable)
+            })
     }
 
     fn set_notice(&mut self, new: Notice) {

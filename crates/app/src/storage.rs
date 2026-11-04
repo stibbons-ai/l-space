@@ -42,10 +42,24 @@ pub struct StoredSession {
 /// Where the App keeps [`Stored`] on the device.
 pub trait DeviceStore: fmt::Debug + Send + Sync {
     /// What was saved last, or [`Stored::default`] if nothing was ever saved.
-    fn load(&self) -> io::Result<Stored>;
+    fn load(&self) -> Result<Stored, LoadError>;
 
     /// Replaces what is saved with `stored`.
     fn save(&self, stored: &Stored) -> io::Result<()>;
+}
+
+/// Why [`DeviceStore::load`] has nothing to give.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    /// What was saved couldn't be read, and was moved aside: saving again is safe.
+    #[error("cannot read the saved state ({error}); kept it as {}", kept_as.display())]
+    SetAside { error: io::Error, kept_as: PathBuf },
+    /// What was saved couldn't be read, nor moved aside: saving again would destroy it.
+    #[error("cannot read the saved state ({error}), nor set it aside ({set_aside})")]
+    Stuck {
+        error: io::Error,
+        set_aside: io::Error,
+    },
 }
 
 /// [`Stored`] as one JSON file, readable by its owner only.
@@ -66,27 +80,24 @@ impl FileStore {
             dirs::data_dir()?.join("ai.stibbons.ook").join("app.json"),
         ))
     }
-
-    /// Where [`DeviceStore::load`] moves a file it can't make sense of, so the next save
-    /// doesn't destroy it.
-    pub fn set_aside_path(&self) -> PathBuf {
-        self.path.with_extension("json.bad")
-    }
 }
 
 impl DeviceStore for FileStore {
-    /// A file that isn't valid JSON for [`Stored`] is moved to [`FileStore::set_aside_path`]
-    /// and reported as [`io::ErrorKind::InvalidData`].
-    fn load(&self) -> io::Result<Stored> {
-        let bytes = match std::fs::read(&self.path) {
-            Ok(bytes) => bytes,
+    /// A file that can't be read, or isn't valid JSON for [`Stored`], is moved aside to the
+    /// first free `app.json.bad`, `app.json.bad.2`, … next to it.
+    fn load(&self) -> Result<Stored, LoadError> {
+        let error = match std::fs::read(&self.path) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(stored) => return Ok(stored),
+                Err(error) => io::Error::new(io::ErrorKind::InvalidData, error),
+            },
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Stored::default()),
-            Err(error) => return Err(error),
+            Err(error) => error,
         };
-        serde_json::from_slice(&bytes).or_else(|error| {
-            std::fs::rename(&self.path, self.set_aside_path())?;
-            Err(io::Error::new(io::ErrorKind::InvalidData, error))
-        })
+        match self.set_aside() {
+            Ok(kept_as) => Err(LoadError::SetAside { error, kept_as }),
+            Err(set_aside) => Err(LoadError::Stuck { error, set_aside }),
+        }
     }
 
     fn save(&self, stored: &Stored) -> io::Result<()> {
@@ -99,6 +110,28 @@ impl DeviceStore for FileStore {
         let partial = self.path.with_extension("json.partial");
         write_private(&partial, &json)?;
         std::fs::rename(&partial, &self.path)
+    }
+}
+
+impl FileStore {
+    /// Moves the file to the first `.bad` name not taken, never replacing an earlier one.
+    fn set_aside(&self) -> io::Result<PathBuf> {
+        for n in 1.. {
+            let candidate = match n {
+                1 => self.path.with_extension("json.bad"),
+                n => self.path.with_extension(format!("json.bad.{n}")),
+            };
+            // A hard link fails instead of replacing an existing file.
+            match std::fs::hard_link(&self.path, &candidate) {
+                Ok(()) => {
+                    std::fs::remove_file(&self.path)?;
+                    return Ok(candidate);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("an unbounded range")
     }
 }
 
