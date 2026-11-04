@@ -293,11 +293,13 @@ impl App {
                 tracing::warn!(%error, "the Bridge did not end the session; forgetting it anyway");
             }
         }
-        let not_saved = self.forget_session().is_some();
+        let not_saved = self.forget_session();
         self.show_login(None).await;
-        if not_saved {
+        match not_saved {
             // The token is still on the device: the next launch may be logged in again.
-            self.set_notice(Notice::LogoutNotSaved);
+            Some(Notice::StorageSave) => self.set_notice(Notice::LogoutNotSaved),
+            Some(notice) => self.set_notice(notice),
+            None => {}
         }
     }
 

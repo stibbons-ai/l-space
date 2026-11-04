@@ -772,9 +772,10 @@ fn an_unreadable_device_file_is_set_aside_and_reported() {
 #[test]
 fn an_unreadable_device_file_that_cannot_be_set_aside_is_left_alone() {
     use std::os::unix::fs::PermissionsExt;
-    let (bridge, _abs, _) = bridge_with_abs();
+    let (bridge, abs, _) = bridge_with_abs();
     let device = Device::new();
     run(async || {
+        let user = abs.new_user().await;
         std::fs::write(device.path(), b"{ not json").unwrap();
         let dir = device.dir.path();
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -805,6 +806,19 @@ fn an_unreadable_device_file_that_cannot_be_set_aside_is_left_alone() {
                 ..
             }
         ));
+        // Logging in and out: nothing of this launch was written, so logging out doesn't
+        // claim the device still holds a session.
+        app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
+            .await;
+        assert_eq!(
+            app.screen(),
+            &Screen::Settings {
+                notice: Some(Notice::StorageStuck)
+            }
+        );
+        app.log_out().await;
+        assert_eq!(app.screen().notice(), Some(&Notice::StorageStuck));
+        assert_eq!(notice_texts(&mut app), both(Text::ErrorStorageStuck));
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(std::fs::read(device.path()).unwrap(), b"{ not json");
         assert_eq!(device.files(), ["app.json"]);
