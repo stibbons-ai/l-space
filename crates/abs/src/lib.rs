@@ -49,7 +49,7 @@ pub enum Error {
     /// The Library Server does not accept the API key (HTTP 401): unknown, deleted,
     /// deactivated or expired, or its user is deactivated. Also a key that cannot be sent as
     /// a header value, which is rejected without a request.
-    #[error("the Library Server rejected the API key")]
+    #[error("the API key was rejected")]
     Rejected,
     /// No usable answer: the Library Server could not be reached in time, or answered with
     /// something other than success or a rejection (a 403, which may come from a proxy in

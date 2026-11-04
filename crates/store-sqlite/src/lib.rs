@@ -108,7 +108,7 @@ impl SqliteStore {
 
 /// Opening the database failed at `step`.
 #[derive(Debug, thiserror::Error)]
-#[error("{step}: {source}")]
+#[error("{step}")]
 struct OpenError {
     step: &'static str,
     #[source]
@@ -180,7 +180,8 @@ impl Store for SqliteStore {
         let (fingerprint, sealed) = (fingerprint(api_key), (self.sealing.seal)(api_key));
         self.transaction(move |tx| {
             // A key already stored for the user keeps its row, and logging in re-seals this
-            // row, so a changed sealing (a new encryption key) takes effect at the next login.
+            // row, so a changed sealing (a new encryption key) takes effect for this key at its
+            // next login.
             let api_key_id: i64 = tx
                 .prepare_cached(
                     "INSERT INTO api_keys (library_server, user_id, key_fingerprint, sealed_key)
@@ -420,10 +421,14 @@ mod tests {
             .pragma_update(None, "user_version", newer)
             .unwrap();
 
-        let error = SqliteStore::open(&database.path).unwrap_err().to_string();
+        let error = SqliteStore::open(&database.path).unwrap_err();
+        assert_eq!(error.to_string(), "migrate the schema");
+        let cause = std::error::Error::source(&error)
+            .expect("a cause")
+            .to_string();
         assert!(
-            error.contains(&format!("schema version {newer}")),
-            "{error}"
+            cause.contains(&format!("schema version {newer}")),
+            "{cause}"
         );
     }
 

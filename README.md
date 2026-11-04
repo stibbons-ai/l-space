@@ -50,4 +50,4 @@ An App user logs in by picking a configured Library Server and entering an Audio
 
 While the operator has removed its Library Server from the configuration, a session is unusable (`session_invalid`); re-adding the Library Server makes it usable again, and Audiobookshelf still checks the key on every call.
 
-A user may log in with several keys, for example one per device; each session depends only on its own key. While Audiobookshelf can't be reached (or answers anything but success or 401, such as a 403 from a proxy in front of it), calls fail with `library_server_unreachable` and sessions stay.
+A user may log in with several keys, for example one per device; each session depends only on its own key. While Audiobookshelf can't be reached (or answers anything but a usable success or 401, such as a 403 from a proxy in front of it), calls fail with `library_server_unreachable` and sessions stay.

@@ -87,7 +87,8 @@ pub trait Store: Send + Sync + 'static {
 
     /// Forgets `api_key` for `user` on `user`'s Library Server, ending every session opened
     /// with it. The user's other keys, and the same key stored for another Library Server or
-    /// user, stay. Returns whether the key was stored.
+    /// user, stay. Returns whether it was still stored; false if there was nothing to revoke
+    /// (a concurrent revoke came first, for example).
     fn revoke_api_key(
         &self,
         user: &LibraryUser,

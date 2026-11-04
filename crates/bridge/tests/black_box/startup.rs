@@ -41,10 +41,10 @@ fn refused_with(config: &str) -> String {
 fn refused_without_leaking(config: &str, secret: &str) -> String {
     let exited = run_with(config);
     let error = refused(&exited, "invalid configuration");
+    // On failure, the output isn't printed: it would repeat the secret.
     assert!(
         !exited.output_contains(secret),
-        "{secret:?} leaked: {:#?}",
-        exited.events
+        "a configuration secret leaked"
     );
     error
 }
@@ -143,7 +143,10 @@ fn missing_database() {
 #[test]
 fn database_that_cannot_be_opened() {
     let exited = run_with(&format!("{LISTEN}database = \"missing-dir/bridge.db\"\n"));
-    refused(&exited, "cannot open the database");
+    let error = refused(&exited, "cannot open the database");
+    // The step that failed, then its cause.
+    assert!(error.starts_with("create the database file: "), "{error}");
+    assert!(error.len() > "create the database file: ".len(), "{error}");
     let event = exited.errors().next().unwrap();
     assert_eq!(event["database"], "missing-dir/bridge.db");
 }

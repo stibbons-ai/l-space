@@ -25,6 +25,18 @@ struct Args {
     config: PathBuf,
 }
 
+/// `error` followed by each error that caused it, joined by `: `, for a log line.
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut chain = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        chain.push_str(": ");
+        chain.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    chain
+}
+
 /// Binds the App API's address, resolving port 0 to the port actually bound.
 async fn listen(addr: SocketAddr) -> io::Result<(TcpListener, SocketAddr)> {
     let listener = TcpListener::bind(addr).await?;
@@ -48,6 +60,7 @@ async fn main() -> ExitCode {
     let store = match SqliteStore::open(&config.database) {
         Ok(store) => store,
         Err(error) => {
+            let error = error_chain(&error);
             tracing::error!(database = %config.database.display(), %error, "cannot open the database");
             return ExitCode::FAILURE;
         }

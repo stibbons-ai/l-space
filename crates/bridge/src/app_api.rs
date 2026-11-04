@@ -69,7 +69,16 @@ impl<S: Store> AppApi<S> {
         self.store
             .open_session(&SessionId::of_token(token.expose()), &owner, &api_key)
             .await
-            .map_err(storage_error("open a session"))?;
+            .map_err(|error| {
+                tracing::error!(
+                    operation = "open a session",
+                    library_server = owner.library_server,
+                    user_id = owner.user_id,
+                    %error,
+                    "storage failed"
+                );
+                ApiError::Internal
+            })?;
         Ok(Session {
             token,
             user: CurrentUser {
@@ -106,7 +115,13 @@ impl<S: Store> AppApi<S> {
         // The operator may have removed the Library Server since the login.
         let library_server = self
             .configured_base_url(&session.user.library_server)
-            .ok_or(ApiError::SessionInvalid)?;
+            .ok_or_else(|| {
+                tracing::info!(
+                    library_server = session.user.library_server,
+                    "session call for a Library Server that is not configured"
+                );
+                ApiError::SessionInvalid
+            })?;
         match self.abs.me(library_server, &session.api_key).await {
             Ok(user) if user.id == session.user.user_id => Ok(CurrentUser {
                 library_server: library_server.to_owned(),
