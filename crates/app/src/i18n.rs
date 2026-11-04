@@ -19,7 +19,7 @@ pub enum Language {
 }
 
 impl Language {
-    pub const ALL: [Language; 2] = [Language::English, Language::German];
+    const ALL: [Language; 2] = [Language::English, Language::German];
 
     /// The language for a device locale such as `de-DE` or `de_AT`: German for any German
     /// locale, otherwise English.
@@ -67,10 +67,10 @@ impl LanguageChoice {
         LanguageChoice::German,
     ];
 
-    /// The language to show, given the device's locale.
-    pub fn resolve(self, device_locale: Option<&str>) -> Language {
+    /// The language to show on a device set to `device`.
+    pub fn resolve(self, device: Language) -> Language {
         match self {
-            Self::System => Language::for_locale(device_locale),
+            Self::System => device,
             Self::English => Language::English,
             Self::German => Language::German,
         }
@@ -110,6 +110,7 @@ macro_rules! texts {
 }
 
 texts! {
+    AppName => "app-name",
     Starting => "starting",
     Busy => "busy",
     BridgeUrlTitle => "bridge-url-title",

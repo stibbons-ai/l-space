@@ -1,3 +1,11 @@
+use app::i18n::{self, Language, Text};
+use dioxus::mobile::{Config, WindowBuilder};
+
 fn main() {
-    dioxus::LaunchBuilder::mobile().launch(app::ui::root);
+    // The window's title until the root component sets it from the person's language choice.
+    let language = Language::for_locale(sys_locale::get_locale().as_deref());
+    let window = WindowBuilder::new().with_title(i18n::text(language, Text::AppName));
+    dioxus::LaunchBuilder::mobile()
+        .with_cfg(Config::new().with_window(window))
+        .launch(app::ui::root);
 }

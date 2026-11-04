@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use api::{ApiError, ApiKey, LibraryServer, Session, SessionToken};
 use dioxus::fullstack::http::header::{AUTHORIZATION, HeaderValue};
-use dioxus::fullstack::{HeaderMap, set_request_headers, set_server_url};
+use dioxus::fullstack::{HeaderMap, get_server_url, set_request_headers, set_server_url};
 
 use crate::i18n::{self, Language, LanguageChoice, Text};
 use crate::storage::{DeviceStore, Stored, StoredSession};
@@ -31,6 +31,27 @@ pub enum Screen {
     },
     /// Logged in: the Library Server, the account, the language, and logout.
     Settings { notice: Option<Notice> },
+}
+
+impl Screen {
+    /// What the screen tells the person about the last action, if anything.
+    pub fn notice(&self) -> Option<&Notice> {
+        match self {
+            Self::Starting => None,
+            Self::BridgeUrl { notice } | Self::Login { notice, .. } | Self::Settings { notice } => {
+                notice.as_ref()
+            }
+        }
+    }
+
+    fn notice_mut(&mut self) -> Option<&mut Option<Notice>> {
+        match self {
+            Self::Starting => None,
+            Self::BridgeUrl { notice } | Self::Login { notice, .. } | Self::Settings { notice } => {
+                Some(notice)
+            }
+        }
+    }
 }
 
 /// Something the person should know about the last action.
@@ -59,7 +80,7 @@ impl Notice {
 pub struct App {
     store: Arc<dyn DeviceStore>,
     stored: Stored,
-    device_locale: Option<String>,
+    device_language: Language,
     screen: Screen,
     /// Why the stored state could not be loaded, for the first screen.
     load_notice: Option<Notice>,
@@ -68,7 +89,7 @@ pub struct App {
 impl App {
     /// The App as it launches: what `store` remembers, on [`Screen::Starting`] until
     /// [`App::start`]. `device_locale` is the device's language (a BCP 47 tag such as `de-DE`).
-    pub fn open(store: Arc<dyn DeviceStore>, device_locale: Option<String>) -> Self {
+    pub fn open(store: Arc<dyn DeviceStore>, device_locale: Option<&str>) -> Self {
         let (stored, load_notice) = match store.load() {
             Ok(stored) => (stored, None),
             Err(error) => {
@@ -83,7 +104,7 @@ impl App {
         Self {
             store,
             stored,
-            device_locale,
+            device_language: Language::for_locale(device_locale),
             screen: Screen::Starting,
             load_notice,
         }
@@ -94,7 +115,7 @@ impl App {
     /// ended (revoked key, ended session) is forgotten; one the Bridge could not check (the
     /// Bridge or Library Server is unreachable) stays.
     pub async fn start(&mut self) {
-        let notice = self.load_notice.take();
+        let mut notice = self.load_notice.take();
         if self.stored.bridge_url.is_none() {
             self.screen = Screen::BridgeUrl { notice };
             return;
@@ -105,7 +126,6 @@ impl App {
         }
         match api::current_user().await {
             Ok(user) => {
-                let mut notice = notice;
                 if let Some(session) = &mut self.stored.session
                     && session.user != user
                 {
@@ -139,6 +159,7 @@ impl App {
             };
             return;
         };
+        let previous = get_server_url();
         point_at(&url);
         match api::library_servers().await {
             Ok(library_servers) => {
@@ -149,9 +170,7 @@ impl App {
                 };
             }
             Err(error) => {
-                if let Some(previous) = &self.stored.bridge_url {
-                    point_at(previous);
-                }
+                set_server_url(previous);
                 self.screen = Screen::BridgeUrl {
                     notice: Some(Notice::Api(error)),
                 };
@@ -176,19 +195,21 @@ impl App {
     /// Logs in to the Library Server with base URL `library_server`. The key is sent to the
     /// Bridge and not kept.
     pub async fn log_in(&mut self, library_server: &str, api_key: ApiKey) {
-        let Screen::Login {
-            library_servers, ..
-        } = &self.screen
-        else {
+        if !matches!(self.screen, Screen::Login { .. }) {
             return;
-        };
-        let listed = library_servers
-            .iter()
-            .find(|listed| listed.base_url == library_server)
-            .cloned();
+        }
         match api::login(library_server.to_owned(), api_key).await {
             Ok(Session { token, user }) => {
                 authorize(Some(&token));
+                let listed = match &self.screen {
+                    Screen::Login {
+                        library_servers, ..
+                    } => library_servers
+                        .iter()
+                        .find(|listed| listed.base_url == library_server)
+                        .cloned(),
+                    _ => None,
+                };
                 let library_server = listed.unwrap_or_else(|| LibraryServer {
                     base_url: user.library_server.clone(),
                     name: None,
@@ -215,8 +236,8 @@ impl App {
         if let Err(error) = api::logout().await {
             tracing::info!(%error, "the Bridge did not end the session; forgetting it anyway");
         }
-        let saved = self.forget_session();
-        self.show_login(saved).await;
+        let notice = self.forget_session();
+        self.show_login(notice).await;
     }
 
     /// Switches the language now and remembers the choice.
@@ -247,7 +268,7 @@ impl App {
 
     /// The language the App shows now.
     pub fn language(&self) -> Language {
-        self.stored.language.resolve(self.device_locale.as_deref())
+        self.stored.language.resolve(self.device_language)
     }
 
     /// `text` in [`App::language`].
@@ -283,11 +304,8 @@ impl App {
     }
 
     fn set_notice(&mut self, new: Notice) {
-        match &mut self.screen {
-            Screen::Starting => {}
-            Screen::BridgeUrl { notice }
-            | Screen::Login { notice, .. }
-            | Screen::Settings { notice } => *notice = Some(new),
+        if let Some(notice) = self.screen.notice_mut() {
+            *notice = Some(new);
         }
     }
 }

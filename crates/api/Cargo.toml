@@ -14,7 +14,7 @@ server = ["dioxus/server", "dep:abs"]
 
 [dependencies]
 abs = { workspace = true, optional = true }
-dioxus.workspace = true
+dioxus = { workspace = true, features = ["fullstack"] }
 serde.workspace = true
 thiserror.workspace = true
 

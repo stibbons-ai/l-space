@@ -5,7 +5,6 @@
 //! The App's server function client is process-wide, so tests take turns ([`run`]). The
 //! Bridge binary must be built first (`cargo build -p bridge`; `mise run test` does).
 
-use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use api::{ApiError, ApiKey, LibraryServer, Session};
@@ -36,7 +35,7 @@ fn run(test: impl AsyncFnOnce()) {
 /// The App's device storage, kept across launches.
 struct Device {
     dir: TempDir,
-    locale: Option<&'static str>,
+    locale: &'static str,
 }
 
 impl Device {
@@ -47,18 +46,14 @@ impl Device {
     fn with_locale(locale: &'static str) -> Self {
         Self {
             dir: TempDir::new().expect("temp dir"),
-            locale: Some(locale),
+            locale,
         }
-    }
-
-    fn store_path(&self) -> &Path {
-        self.dir.path()
     }
 
     /// Launches the App on this device and waits for its first screen.
     async fn launch(&self) -> App {
-        let store = FileStore::new(self.store_path().join("app.json"));
-        let mut app = App::open(Arc::new(store), self.locale.map(str::to_owned));
+        let store = FileStore::new(self.dir.path().join("app.json"));
+        let mut app = App::open(Arc::new(store), Some(self.locale));
         app.start().await;
         app
     }
@@ -90,15 +85,6 @@ async fn logged_in(
         .await;
     assert_eq!(app.screen(), &Screen::Settings { notice: None });
     app
-}
-
-fn notice(app: &App) -> Option<&Notice> {
-    match app.screen() {
-        Screen::Starting => None,
-        Screen::BridgeUrl { notice }
-        | Screen::Login { notice, .. }
-        | Screen::Settings { notice } => notice.as_ref(),
-    }
 }
 
 /// The session the App holds, to check it with the Bridge.
@@ -195,7 +181,10 @@ fn a_rejected_key_or_unreachable_library_server_shows_a_translated_message() {
         app.submit_bridge_url(bridge.url()).await;
 
         app.log_in(abs.base_url(), ApiKey::new("not-a-key")).await;
-        assert_eq!(notice(&app), Some(&Notice::Api(ApiError::ApiKeyRejected)));
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::ApiKeyRejected))
+        );
         assert_eq!(app.session(), None);
         let message = app.text(Text::ErrorApiKeyRejected);
         assert_eq!(
@@ -210,7 +199,7 @@ fn a_rejected_key_or_unreachable_library_server_shows_a_translated_message() {
         app.log_in(&unreachable, ApiKey::new(&user.api_key.key))
             .await;
         assert_eq!(
-            notice(&app),
+            app.screen().notice(),
             Some(&Notice::Api(ApiError::LibraryServerUnreachable))
         );
         assert_eq!(app.session(), None);

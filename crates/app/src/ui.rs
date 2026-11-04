@@ -16,13 +16,14 @@ const STYLE: &str = include_str!("../assets/app.css");
 pub fn root() -> Element {
     let app = use_signal(|| {
         let store = FileStore::in_data_dir().expect("the platform has an application data dir");
-        App::open(Arc::new(store), sys_locale::get_locale())
+        App::open(Arc::new(store), sys_locale::get_locale().as_deref())
     });
     let busy = use_signal(|| false);
     use_hook(move || act(app, busy, async |app: &mut App| app.start().await));
 
     let screen = app.read().screen().clone();
     rsx! {
+        document::Title { {app.read().text(Text::AppName)} }
         style { {STYLE} }
         main {
             match screen {
@@ -68,6 +69,8 @@ fn NoticeView(app: Signal<App>, notice: Option<Notice>) -> Element {
 fn BridgeUrlScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>) -> Element {
     let initial = use_hook(|| app.peek().bridge_url().unwrap_or_default().to_owned());
     let mut url = use_signal(|| initial.clone());
+    // Re-renders only when emptiness flips, not on every keystroke.
+    let url_empty = use_memo(move || url.read().trim().is_empty());
     let text = |text| app.read().text(text);
     rsx! {
         h1 { {text(Text::BridgeUrlTitle)} }
@@ -95,7 +98,7 @@ fn BridgeUrlScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>)
             NoticeView { app, notice }
             button {
                 r#type: "submit",
-                disabled: busy() || url.read().trim().is_empty(),
+                disabled: busy() || url_empty(),
                 {text(if busy() { Text::Busy } else { Text::BridgeUrlConnect })}
             }
         }
@@ -116,6 +119,7 @@ fn LoginScreen(
     let mut picked = use_signal(|| None::<String>);
     // Only in this screen's state: it goes when a login moves on to Settings.
     let mut api_key = use_signal(String::new);
+    let key_empty = use_memo(move || api_key.read().trim().is_empty());
     let text = |text| app.read().text(text);
     let bridge_url = app.read().bridge_url().unwrap_or_default().to_owned();
     let has_servers = !library_servers.is_empty();
@@ -139,7 +143,7 @@ fn LoginScreen(
                             option {
                                 key: "{server.base_url}",
                                 value: "{server.base_url}",
-                                {server.name.clone().unwrap_or_else(|| server.base_url.clone())}
+                                {server.name.as_deref().unwrap_or(&server.base_url)}
                             }
                         }
                     }
@@ -162,7 +166,7 @@ fn LoginScreen(
             if has_servers {
                 button {
                     r#type: "submit",
-                    disabled: busy() || api_key.read().trim().is_empty(),
+                    disabled: busy() || key_empty(),
                     {text(if busy() { Text::Busy } else { Text::LoginSubmit })}
                 }
             } else {
@@ -193,12 +197,18 @@ fn LoginScreen(
 #[component]
 fn SettingsScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>) -> Element {
     let text = |text| app.read().text(text);
-    let Some(session) = app.read().session().cloned() else {
-        return rsx! {};
+    let (library_server, username, bridge_url, choice) = {
+        let app = app.read();
+        let Some(session) = app.session() else {
+            return rsx! {};
+        };
+        (
+            session.library_server.clone(),
+            session.user.username.clone(),
+            app.bridge_url().unwrap_or_default().to_owned(),
+            app.language_choice(),
+        )
     };
-    let library_server = session.library_server;
-    let bridge_url = app.read().bridge_url().unwrap_or_default().to_owned();
-    let choice = app.read().language_choice();
     rsx! {
         h1 { {text(Text::SettingsTitle)} }
         NoticeView { app, notice }
@@ -211,13 +221,15 @@ fn SettingsScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>) 
                 span { class: "url", "{library_server.base_url}" }
             }
             dt { {text(Text::SettingsAccount)} }
-            dd { "{session.user.username}" }
+            dd { "{username}" }
             dt { {text(Text::Bridge)} }
             dd { "{bridge_url}" }
         }
         label {
             {text(Text::SettingsLanguage)}
             select {
+                // A change during logout would be lost when the logout's result replaces the App.
+                disabled: busy(),
                 onchange: move |event| {
                     let picked = LanguageChoice::ALL
                         .into_iter()

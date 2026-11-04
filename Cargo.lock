@@ -135,7 +135,6 @@ dependencies = [
  "sys-locale",
  "tempfile",
  "test-support",
- "thiserror 2.0.21",
  "tokio",
  "tracing",
  "unic-langid",

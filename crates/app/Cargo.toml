@@ -9,13 +9,14 @@ publish.workspace = true
 
 [dependencies]
 api.workspace = true
+# No `fullstack` here: `dx` would then also build and launch a server half on the host (a
+# desktop window). `api` enables it, which gives the App the server function client.
 dioxus = { workspace = true, features = ["mobile", "launch", "lib", "logger"] }
 dirs.workspace = true
 fluent-bundle.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sys-locale.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 unic-langid.workspace = true
 url.workspace = true

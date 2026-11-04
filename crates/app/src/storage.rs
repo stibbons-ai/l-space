@@ -55,14 +55,8 @@ impl FileStore {
     /// sandbox), or `None` if the platform has none.
     pub fn in_data_dir() -> Option<Self> {
         Some(Self::new(
-            dirs::data_dir()?
-                .join("ai.stibbons.lspace")
-                .join("app.json"),
+            dirs::data_dir()?.join("ai.stibbons.ook").join("app.json"),
         ))
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
     }
 }
 

@@ -19,7 +19,7 @@ Crates live in `crates/`: `api` (the App API contract), `bridge` (the Bridge bin
 
 ## Build and run the App
 
-The App is a [Dioxus](https://dioxuslabs.com) 0.8 mobile app (ADR 0007), built with Dioxus's CLI `dx`, which `crates/app/mise.toml` pins to the workspace's `dioxus` version (0.8.0-alpha.3). It also points `DEVELOPER_DIR` at `/Applications/Xcode.app`, so iOS builds use Xcode without `xcode-select -s`. Run `dx` from `crates/app` through mise, which also shadows Homebrew's unrelated `dx` (Deno):
+The App (shipped as Ook; its screens call the Bridge Clacks) is a [Dioxus](https://dioxuslabs.com) 0.8 mobile app (ADR 0007), built with Dioxus's CLI `dx`, which `crates/app/mise.toml` pins to the workspace's `dioxus` version (0.8.0-alpha.3). It also points `DEVELOPER_DIR` at `/Applications/Xcode.app`, so iOS builds use Xcode without `xcode-select -s`. Run `dx` from `crates/app` through mise, which also shadows Homebrew's unrelated `dx` (Deno):
 
 ```sh
 cd crates/app
@@ -29,7 +29,7 @@ mise exec -- dx serve --ios --release --device "<iPhone name>" \
   --codesign --apple-team-id "Apple Development: <Name> (<TEAMID>)"   # a phone; device setup as in spikes/ios-audio/README.md
 ```
 
-The bundle identifier is `ai.stibbons.lspace`. On first launch the App asks for the Bridge's address, for example `http://192.168.1.10:8080` (the Simulator reaches a Bridge on the same Mac at `http://127.0.0.1:8080`); the Bridge answers with its Library Servers, and the App remembers the address. Then a person picks a Library Server and enters their Audiobookshelf API key (see [Log in](#log-in)). The App keeps the address, the session and the language choice in `Application Support/ai.stibbons.lspace/app.json` inside its sandbox, readable by its owner only; the API key is not kept. The session lasts across launches until logout, or until the Bridge reports the key revoked or the session ended; if the Bridge can't be reached at launch the App stays logged in. Logout also forgets the session when the Bridge can't be reached.
+The bundle identifier is `ai.stibbons.ook`. On first launch the App asks for the Bridge's address, for example `http://192.168.1.10:8080` (the Simulator reaches a Bridge on the same Mac at `http://127.0.0.1:8080`); the Bridge answers with its Library Servers, and the App remembers the address. Then a person picks a Library Server and enters their Audiobookshelf API key (see [Log in](#log-in)). The App keeps the address, the session and the language choice in `Application Support/ai.stibbons.ook/app.json` inside its sandbox, readable by its owner only; the API key is not kept. The session lasts across launches until logout, or until the Bridge reports the key revoked or the session ended; if the Bridge can't be reached at launch the App stays logged in. Logout also forgets the session when the Bridge can't be reached.
 
 Every string comes from Fluent (`crates/app/locales/en.ftl`, `de.ftl`, embedded in the binary). The App shows German on a German device and English otherwise, unless Settings picks a language.
 

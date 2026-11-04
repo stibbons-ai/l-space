@@ -1,13 +1,14 @@
 [application]
-name = "LSpace"
+name = "Ook"
 
 [bundle]
-identifier = "ai.stibbons.lspace"
+identifier = "ai.stibbons.ook"
 publisher = "stibbons-ai"
 
 [ios.plist]
 # The Bridge may be a plain-HTTP address on the LAN.
-NSLocalNetworkUsageDescription = "Connects to your L-Space Bridge on your network."
+NSLocalNetworkUsageDescription = "Ook connects to Clacks on your network."
+CFBundleDisplayName = "Ook"
 
 [ios.plist.NSAppTransportSecurity]
 NSAllowsArbitraryLoads = true
