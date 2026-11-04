@@ -1,0 +1,33 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+api = { path = "crates/api" }
+
+axum = "0.8.9"
+clap = { version = "4.6.7", features = ["derive", "env"] }
+dioxus = { version = "0.7.10", default-features = false, features = ["fullstack"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.140"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+url = "2.5.8"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
