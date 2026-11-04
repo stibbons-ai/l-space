@@ -1,0 +1,19 @@
+[package]
+name = "store"
+description = "The Bridge's storage traits, and the contract test suite every implementation must pass"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# The shared contract test suite (`store::contract`), for implementations' tests.
+contract = []
+
+[dependencies]
+abs.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

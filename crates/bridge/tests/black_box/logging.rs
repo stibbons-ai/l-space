@@ -15,10 +15,11 @@ fn logged_by(bridge: &TestBridge, target: &str) -> Vec<String> {
 fn default_level_is_info_without_dioxus_index_html_noise() {
     let bridge = TestBridge::start("");
 
-    // Control for the tests below: at the default level Dioxus's info event shows.
-    assert_eq!(
-        logged_by(&bridge, "dioxus_server::server"),
-        ["INFO"],
+    // Control for the tests below: at the default level Dioxus's info events (one per route)
+    // show.
+    let dioxus_server = logged_by(&bridge, "dioxus_server::server");
+    assert!(
+        !dioxus_server.is_empty() && dioxus_server.iter().all(|level| level == "INFO"),
         "{:#?}",
         bridge.startup_output()
     );

@@ -1,0 +1,169 @@
+//! The App API's view of this Bridge: configured Library Servers, logins and sessions.
+
+use std::fmt::Write;
+
+use abs::ApiKey;
+use api::server::{BoxFuture, Bridge};
+use api::{ApiError, CurrentUser, LibraryServer, Session, SessionToken};
+use store::{LibraryUser, SessionId, Store};
+
+use crate::config::{LibraryServerConfig, LibraryServerUrl};
+
+/// Serves the App API from the configured Library Servers and the [`Store`].
+#[derive(Debug)]
+pub struct AppApi<S> {
+    library_servers: Vec<LibraryServer>,
+    abs: abs::Client,
+    store: S,
+}
+
+impl<S: Store> AppApi<S> {
+    pub fn new(library_servers: Vec<LibraryServerConfig>, store: S) -> Self {
+        let library_servers = library_servers
+            .into_iter()
+            .map(|server| LibraryServer {
+                base_url: server.url.into_string(),
+                name: server.name,
+            })
+            .collect();
+        Self {
+            library_servers,
+            abs: abs::Client::new(),
+            store,
+        }
+    }
+
+    /// The configured Library Server that `url` (in any spelling) normalizes to.
+    fn configured(&self, url: &str) -> Option<&LibraryServer> {
+        let url = LibraryServerUrl::parse(url).ok()?.into_string();
+        self.library_servers
+            .iter()
+            .find(|server| server.base_url == url)
+    }
+
+    async fn login(&self, library_server: String, api_key: String) -> Result<Session, ApiError> {
+        let library_server = &self
+            .configured(&library_server)
+            .ok_or(ApiError::LibraryServerNotConfigured)?
+            .base_url;
+        let api_key = ApiKey::new(api_key);
+        let user = self
+            .abs
+            .me(library_server, &api_key)
+            .await
+            .map_err(|error| abs_error(library_server, error))?;
+
+        let token = new_session_token()?;
+        let owner = LibraryUser {
+            library_server: library_server.clone(),
+            user_id: user.id.clone(),
+        };
+        self.store
+            .open_session(&SessionId::of_token(token.expose()), &owner, &api_key)
+            .await
+            .map_err(storage_error)?;
+        Ok(Session {
+            token,
+            user: CurrentUser {
+                library_server: owner.library_server,
+                user_id: user.id,
+                username: user.username,
+            },
+        })
+    }
+
+    async fn logout(&self, token: SessionToken) -> Result<(), ApiError> {
+        let closed = self
+            .store
+            .close_session(&SessionId::of_token(token.expose()))
+            .await
+            .map_err(storage_error)?;
+        if closed {
+            Ok(())
+        } else {
+            Err(ApiError::SessionInvalid)
+        }
+    }
+
+    /// Asks the session's Library Server who its key belongs to. A rejected key ends every
+    /// session opened with it.
+    async fn current_user(&self, token: SessionToken) -> Result<CurrentUser, ApiError> {
+        let session = self
+            .store
+            .session(&SessionId::of_token(token.expose()))
+            .await
+            .map_err(storage_error)?
+            .ok_or(ApiError::SessionInvalid)?;
+        // The operator may have removed the Library Server since the login.
+        let library_server = &self
+            .configured(&session.user.library_server)
+            .ok_or(ApiError::SessionInvalid)?
+            .base_url;
+        match self.abs.me(library_server, &session.api_key).await {
+            Ok(user) => Ok(CurrentUser {
+                library_server: library_server.clone(),
+                user_id: user.id,
+                username: user.username,
+            }),
+            Err(abs::Error::Rejected) => {
+                self.store
+                    .revoke_api_key(&session.user, &session.api_key)
+                    .await
+                    .map_err(storage_error)?;
+                Err(ApiError::ApiKeyRejected)
+            }
+            Err(error) => Err(abs_error(library_server, error)),
+        }
+    }
+}
+
+impl<S: Store> Bridge for AppApi<S> {
+    fn library_servers(&self) -> Vec<LibraryServer> {
+        self.library_servers.clone()
+    }
+
+    fn login(
+        &self,
+        library_server: String,
+        api_key: String,
+    ) -> BoxFuture<'_, Result<Session, ApiError>> {
+        Box::pin(self.login(library_server, api_key))
+    }
+
+    fn logout(&self, token: SessionToken) -> BoxFuture<'_, Result<(), ApiError>> {
+        Box::pin(self.logout(token))
+    }
+
+    fn current_user(&self, token: SessionToken) -> BoxFuture<'_, Result<CurrentUser, ApiError>> {
+        Box::pin(self.current_user(token))
+    }
+}
+
+/// 256 random bits from the operating system, hex-encoded.
+fn new_session_token() -> Result<SessionToken, ApiError> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        tracing::error!(%error, "no randomness for a session token");
+        ApiError::Internal
+    })?;
+    let mut token = String::with_capacity(2 * bytes.len());
+    for byte in bytes {
+        write!(token, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(SessionToken::new(token))
+}
+
+fn abs_error(library_server: &str, error: abs::Error) -> ApiError {
+    match error {
+        abs::Error::Rejected => ApiError::ApiKeyRejected,
+        abs::Error::Unavailable(_) => {
+            tracing::warn!(library_server, %error, "Library Server unavailable");
+            ApiError::LibraryServerUnreachable
+        }
+    }
+}
+
+fn storage_error(error: store::Error) -> ApiError {
+    tracing::error!(%error, "storage failed");
+    ApiError::Internal
+}

@@ -2,6 +2,7 @@
 //!
 //! ```toml
 //! listen = "0.0.0.0:8080"
+//! database = "/var/lib/clacks/bridge.db"
 //!
 //! [[library_servers]]
 //! url = "https://abs.example.com"
@@ -11,7 +12,7 @@
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use url::Url;
@@ -21,6 +22,9 @@ use url::Url;
 pub struct Config {
     /// Where the App API listens. Port 0 picks a free port.
     pub listen: SocketAddr,
+    /// The SQLite file holding the Bridge's state, created if missing. A relative path is
+    /// relative to the working directory.
+    pub database: PathBuf,
     /// In file order; no two share a [`LibraryServerUrl`].
     pub library_servers: Vec<LibraryServerConfig>,
 }
@@ -36,6 +40,7 @@ pub struct LibraryServerConfig {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     listen: SocketAddr,
+    database: PathBuf,
     #[serde(default)]
     library_servers: Vec<RawLibraryServer>,
 }
@@ -125,6 +130,7 @@ impl std::str::FromStr for Config {
         }
         Ok(Self {
             listen: raw.listen,
+            database: raw.database,
             library_servers,
         })
     }
@@ -132,7 +138,8 @@ impl std::str::FromStr for Config {
 
 /// The TOML error without its source snippet, positioned by 1-based line and column. A missing
 /// top-level field has no position (the parser reports it as the empty span at the start of
-/// the file), so none is given; a field missing inside a table points at the table's header.
+/// the file), so none is given; a field missing inside a table points at the table (its
+/// header, or the inline table).
 ///
 /// The message itself can quote a value too (`invalid type: string "s3cret", expected a
 /// sequence`), so everything from its first to its last double quote becomes `REDACTED`.
@@ -404,6 +411,7 @@ mod tests {
     fn rejects_two_entries_for_one_server() {
         let error = r#"
             listen = "127.0.0.1:0"
+            database = "bridge.db"
             [[library_servers]]
             url = "https://abs.lan/"
             [[library_servers]]
@@ -427,6 +435,7 @@ mod tests {
     fn keeps_servers_that_differ_only_in_path() {
         let config = r#"
             listen = "127.0.0.1:0"
+            database = "bridge.db"
             [[library_servers]]
             url = "https://home.lan/abs"
             [[library_servers]]
@@ -441,6 +450,7 @@ mod tests {
     fn keeps_a_password_out_of_the_error() {
         let error = r#"
             listen = "127.0.0.1:0"
+            database = "bridge.db"
             [[library_servers]]
             url = "https://alice:hunter2@abs.lan"
         "#

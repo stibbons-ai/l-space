@@ -1,0 +1,21 @@
+[package]
+name = "store-sqlite"
+description = "The SQLite implementation of the Bridge's storage traits"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+abs.workspace = true
+rusqlite.workspace = true
+store.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+store = { workspace = true, features = ["contract"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,5 +1,6 @@
 //! The Bridge binary: loads the operator's configuration and serves the App API.
 
+mod app_api;
 mod config;
 mod telemetry;
 
@@ -10,9 +11,11 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
+use store_sqlite::SqliteStore;
 use tokio::net::TcpListener;
 
-use crate::config::{Config, LibraryServerConfig};
+use crate::app_api::AppApi;
+use crate::config::Config;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "The L-Space Bridge (Clacks)")]
@@ -20,31 +23,6 @@ struct Args {
     /// Path to the configuration file (TOML).
     #[arg(long, env = "BRIDGE_CONFIG")]
     config: PathBuf,
-}
-
-/// The App API's view of this Bridge.
-#[derive(Debug)]
-struct AppApiState {
-    library_servers: Vec<api::LibraryServer>,
-}
-
-impl AppApiState {
-    fn new(library_servers: Vec<LibraryServerConfig>) -> Self {
-        let library_servers = library_servers
-            .into_iter()
-            .map(|server| api::LibraryServer {
-                base_url: server.url.into_string(),
-                name: server.name,
-            })
-            .collect();
-        Self { library_servers }
-    }
-}
-
-impl api::server::Bridge for AppApiState {
-    fn library_servers(&self) -> Vec<api::LibraryServer> {
-        self.library_servers.clone()
-    }
 }
 
 /// Binds the App API's address, resolving port 0 to the port actually bound.
@@ -67,6 +45,14 @@ async fn main() -> ExitCode {
         }
     };
 
+    let store = match SqliteStore::open(&config.database) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(database = %config.database.display(), %error, "cannot open the database");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let (listener, addr) = match listen(config.listen).await {
         Ok(bound) => bound,
         Err(error) => {
@@ -74,7 +60,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let router = api::server::router(Arc::new(AppApiState::new(config.library_servers)));
+    let router = api::server::router(Arc::new(AppApi::new(config.library_servers, store)));
 
     tracing::info!(%addr, "listening");
     if let Err(error) = axum::serve(listener, router).await {
