@@ -62,11 +62,14 @@ pub enum Notice {
     Api(ApiError),
     /// What was entered is not a Bridge address.
     BridgeUrlInvalid,
+    /// Nothing answered at the address entered on the Bridge URL screen, where a typo is the
+    /// likeliest cause.
+    BridgeUrlUnreachable,
     /// What the App saved on the device could not be read; it was moved aside and the App
     /// started afresh.
     StorageLoad,
-    /// What the App saved on the device could not be read nor moved aside; the App leaves it
-    /// untouched and saves nothing during this launch.
+    /// What the App saved on the device could neither be read nor moved aside; the App
+    /// leaves it untouched and saves nothing during this launch.
     StorageStuck,
     /// The device storage could not be written.
     StorageSave,
@@ -79,6 +82,7 @@ impl Notice {
         match self {
             Self::Api(error) => error.into(),
             Self::BridgeUrlInvalid => Text::ErrorBridgeUrlInvalid,
+            Self::BridgeUrlUnreachable => Text::ErrorBridgeUrlUnreachable,
             Self::StorageLoad => Text::ErrorStorageLoad,
             Self::StorageStuck => Text::ErrorStorageStuck,
             Self::StorageSave => Text::ErrorStorageSave,
@@ -102,7 +106,7 @@ pub struct App {
     screen: Screen,
     /// Why the stored state could not be loaded, for the first screen.
     load_notice: Option<Notice>,
-    /// Set when what was saved couldn't be read nor moved aside: saving would destroy it.
+    /// Set when what was saved could neither be read nor moved aside: saving would destroy it.
     read_only: bool,
     call_timeout: Duration,
 }
@@ -209,8 +213,12 @@ impl App {
             }
             Err(error) => {
                 set_server_url(previous);
+                let notice = match error {
+                    ApiError::BridgeUnreachable => Notice::BridgeUrlUnreachable,
+                    error => Notice::Api(error),
+                };
                 self.screen = Screen::BridgeUrl {
-                    notice: Some(Notice::Api(error)),
+                    notice: Some(notice),
                 };
             }
         }
@@ -360,9 +368,9 @@ impl App {
     /// Saves what the App remembers. Returns a notice if that failed.
     fn save(&self) -> Option<Notice> {
         if self.read_only {
-            // The person was told at launch (`Notice::StorageStuck`).
+            // Not kept after a restart: the person needs to know with every change.
             tracing::debug!("not saving: the unreadable saved state stays untouched");
-            return None;
+            return Some(Notice::StorageStuck);
         }
         let error = self.store.save(&self.stored).err()?;
         tracing::warn!(%error, "cannot save the App's state on the device");

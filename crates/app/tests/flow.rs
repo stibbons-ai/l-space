@@ -247,8 +247,13 @@ fn the_bridge_url_is_entered_once_and_remembered() {
         assert_eq!(
             app.screen(),
             &Screen::BridgeUrl {
-                notice: Some(Notice::Api(ApiError::BridgeUnreachable))
+                notice: Some(Notice::BridgeUrlUnreachable)
             }
+        );
+        // Here the address can be changed, so the message says to check it.
+        assert_eq!(
+            notice_texts(&mut app),
+            both(Text::ErrorBridgeUrlUnreachable)
         );
         // An address that didn't answer isn't remembered.
         assert_eq!(
@@ -300,12 +305,19 @@ fn an_address_that_is_not_a_bridge_is_named_as_such_and_not_remembered() {
         }
 
         // A proxy whose Bridge is down.
-        let proxy = web_server("503 Service Unavailable", "text/html", "<h1>503</h1>");
-        app.submit_bridge_url(&proxy).await;
-        assert_eq!(
-            app.screen().notice(),
-            Some(&Notice::Api(ApiError::BridgeUnreachable))
-        );
+        for status in [
+            "502 Bad Gateway",
+            "503 Service Unavailable",
+            "504 Gateway Timeout",
+        ] {
+            let proxy = web_server(status, "text/html", "<h1>proxy</h1>");
+            app.submit_bridge_url(&proxy).await;
+            assert_eq!(
+                app.screen().notice(),
+                Some(&Notice::BridgeUrlUnreachable),
+                "{status}"
+            );
+        }
     });
 }
 
@@ -514,16 +526,19 @@ fn a_bridge_that_never_answers_counts_as_unreachable() {
 
         within(limit, app.log_out()).await;
         assert_eq!(app.session(), None);
-        assert_eq!(device.launch().await.session(), None);
+        let relaunched = within(limit, device.launch_impatient()).await;
+        assert_eq!(relaunched.session(), None);
 
         let fresh = Device::new();
         let mut app = fresh.launch_impatient().await;
         within(limit, app.submit_bridge_url(&silent)).await;
-        assert_eq!(
-            app.screen().notice(),
-            Some(&Notice::Api(ApiError::BridgeUnreachable))
-        );
+        assert_eq!(app.screen().notice(), Some(&Notice::BridgeUrlUnreachable));
         assert_eq!(fresh.launch().await.bridge_url(), None);
+
+        // The App's default bound applies too (15 s; `within` fails long after).
+        let mut app = fresh.launch().await;
+        within(Duration::from_secs(25), app.submit_bridge_url(&silent)).await;
+        assert_eq!(app.screen().notice(), Some(&Notice::BridgeUrlUnreachable));
     });
 }
 
@@ -554,7 +569,7 @@ fn a_captive_portal_at_the_stored_address_keeps_the_session() {
         let before = session(&logged_in(&device, &bridge, &abs, &user).await);
         device.edit(|json| json["bridge_url"] = html.clone().into());
 
-        let app = device.launch().await;
+        let mut app = device.launch().await;
         assert_eq!(
             app.screen(),
             &Screen::Settings {
@@ -562,6 +577,8 @@ fn a_captive_portal_at_the_stored_address_keeps_the_session() {
             }
         );
         assert_eq!(app.session().map(|stored| &stored.user), Some(&before.user));
+        // Settings can't change the address, so the message doesn't say to check it.
+        assert_eq!(notice_texts(&mut app), both(Text::ErrorBridgeUnreachable));
     });
 }
 
@@ -642,7 +659,12 @@ fn failed_saves_are_reported_until_a_save_succeeds() {
         );
         assert_eq!(app.text(Text::ErrorStorageSave), notice_text(&app));
 
-        // Picking a language: fails, then works and clears the notice.
+        // Picking a language: a working save clears the notice; a failing one, from a clean
+        // screen, shows it again.
+        device.fail_saves.store(false, Ordering::SeqCst);
+        app.set_language(LanguageChoice::English);
+        assert_eq!(app.screen().notice(), None);
+        device.fail_saves.store(true, Ordering::SeqCst);
         app.set_language(LanguageChoice::German);
         assert_eq!(app.screen().notice(), Some(&Notice::StorageSave));
         assert_eq!(app.language(), Language::German);
@@ -727,11 +749,17 @@ fn an_unreadable_device_file_is_set_aside_and_reported() {
             std::fs::write(device.path(), b"{}").unwrap();
             std::fs::set_permissions(device.path(), std::fs::Permissions::from_mode(0o000))
                 .unwrap();
-            let app = device.launch().await;
-            assert_eq!(app.screen().notice(), Some(&Notice::StorageLoad));
-            assert!(dir.join("app.json.bad.3").exists());
+            // Root reads it anyway; then there's nothing to test here.
+            if std::fs::read(device.path()).is_err() {
+                let app = device.launch().await;
+                assert_eq!(app.screen().notice(), Some(&Notice::StorageLoad));
+                assert!(dir.join("app.json.bad.3").exists());
+            } else {
+                std::fs::remove_file(device.path()).unwrap();
+            }
         }
 
+        // Every set-aside above removed the original.
         assert!(!device.path().exists());
         assert_eq!(
             device.launch().await.screen(),
@@ -750,6 +778,14 @@ fn an_unreadable_device_file_that_cannot_be_set_aside_is_left_alone() {
         std::fs::write(device.path(), b"{ not json").unwrap();
         let dir = device.dir.path();
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Root writes there anyway; then there's nothing to test.
+        let probe = dir.join("probe");
+        if std::fs::write(&probe, b"").is_ok() {
+            std::fs::remove_file(&probe).unwrap();
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipped: running with privileges that ignore directory permissions");
+            return;
+        }
 
         let mut app = device.launch().await;
         assert_eq!(
@@ -759,9 +795,16 @@ fn an_unreadable_device_file_that_cannot_be_set_aside_is_left_alone() {
             }
         );
         assert_eq!(notice_texts(&mut app), both(Text::ErrorStorageStuck));
-        // Usable for this launch, without touching the file.
+        // Usable for this launch, without touching the file, and every change says it won't
+        // be kept.
         app.submit_bridge_url(bridge.url()).await;
-        assert!(matches!(app.screen(), Screen::Login { notice: None, .. }));
+        assert!(matches!(
+            app.screen(),
+            Screen::Login {
+                notice: Some(Notice::StorageStuck),
+                ..
+            }
+        ));
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(std::fs::read(device.path()).unwrap(), b"{ not json");
         assert_eq!(device.files(), ["app.json"]);

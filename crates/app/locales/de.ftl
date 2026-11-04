@@ -28,7 +28,8 @@ language-english = English
 language-german = Deutsch
 
 error-bridge-url-invalid = Das ist keine Clacks-Adresse. Gib sie mit http:// oder https:// ein, zum Beispiel http://192.168.1.10:8080.
-error-storage-load = Ook konnte nicht lesen, was es auf diesem Gerät gespeichert hat, und hat neu begonnen. Die unlesbare Datei liegt daneben.
+error-bridge-url-unreachable = Unter dieser Adresse antwortet nichts. Prüfe sie und ob dieses Telefon in deinem Heimnetz oder VPN ist.
+error-storage-load = Ook konnte nicht lesen, was es auf diesem Gerät gespeichert hat, und hat neu begonnen. Die unlesbare Datei liegt neben der neuen.
 error-storage-stuck = Ook konnte nicht lesen, was es auf diesem Gerät gespeichert hat, und lässt es unverändert. Was du jetzt änderst, ist nach einem Neustart nicht mehr da.
 error-storage-save = Ook konnte nicht auf diesem Gerät speichern. Nach einem Neustart musst du dich eventuell erneut anmelden.
 error-logout-not-saved = Du bist abgemeldet, aber Ook konnte das nicht auf diesem Gerät speichern: Nach einem Neustart bist du eventuell wieder angemeldet. Melde dich dann erneut ab.

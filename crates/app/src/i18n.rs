@@ -137,6 +137,7 @@ texts! {
     LanguageEnglish => "language-english",
     LanguageGerman => "language-german",
     ErrorBridgeUrlInvalid => "error-bridge-url-invalid",
+    ErrorBridgeUrlUnreachable => "error-bridge-url-unreachable",
     ErrorStorageLoad => "error-storage-load",
     ErrorStorageStuck => "error-storage-stuck",
     ErrorStorageSave => "error-storage-save",

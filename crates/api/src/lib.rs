@@ -314,6 +314,34 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_without_an_app_api_code_is_a_gateway_failure_or_not_a_bridge() {
+        use dioxus::fullstack::ServerFnError;
+        let without_code = |code| ServerFnError::ServerError {
+            message: format!("HTTP {code}: <html>"),
+            code,
+            details: None,
+        };
+        for code in [502, 503, 504] {
+            assert_eq!(
+                ApiError::from(without_code(code)),
+                ApiError::BridgeUnreachable,
+                "{code}"
+            );
+        }
+        for code in [200, 404, 405, 422, 500, 501, 505] {
+            assert_eq!(
+                ApiError::from(without_code(code)),
+                ApiError::NotABridge,
+                "{code}"
+            );
+        }
+        assert_eq!(
+            ApiError::from(ServerFnError::Deserialization("<html>".into())),
+            ApiError::NotABridge
+        );
+    }
+
+    #[test]
     fn debug_output_hides_secrets() {
         assert_eq!(
             format!("{:?}", SessionToken::new("s3cret")),

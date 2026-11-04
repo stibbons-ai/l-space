@@ -54,11 +54,11 @@ pub enum LoadError {
     /// What was saved couldn't be read, and was moved aside: saving again is safe.
     #[error("cannot read the saved state ({error}); kept it as {}", kept_as.display())]
     SetAside { error: io::Error, kept_as: PathBuf },
-    /// What was saved couldn't be read, nor moved aside: saving again would destroy it.
-    #[error("cannot read the saved state ({error}), nor set it aside ({set_aside})")]
+    /// What was saved could neither be read nor moved aside: saving again would destroy it.
+    #[error("cannot read the saved state ({error}), nor set it aside ({set_aside_error})")]
     Stuck {
         error: io::Error,
-        set_aside: io::Error,
+        set_aside_error: io::Error,
     },
 }
 
@@ -84,7 +84,8 @@ impl FileStore {
 
 impl DeviceStore for FileStore {
     /// A file that can't be read, or isn't valid JSON for [`Stored`], is moved aside to the
-    /// first free `app.json.bad`, `app.json.bad.2`, … next to it.
+    /// first free `app.json.bad`, `app.json.bad.2`, … next to it ([`LoadError::SetAside`]); if
+    /// it can't be moved, it stays where it is ([`LoadError::Stuck`]).
     fn load(&self) -> Result<Stored, LoadError> {
         let error = match std::fs::read(&self.path) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -96,7 +97,10 @@ impl DeviceStore for FileStore {
         };
         match self.set_aside() {
             Ok(kept_as) => Err(LoadError::SetAside { error, kept_as }),
-            Err(set_aside) => Err(LoadError::Stuck { error, set_aside }),
+            Err(set_aside_error) => Err(LoadError::Stuck {
+                error,
+                set_aside_error,
+            }),
         }
     }
 
@@ -124,10 +128,18 @@ impl FileStore {
             // A hard link fails instead of replacing an existing file.
             match std::fs::hard_link(&self.path, &candidate) {
                 Ok(()) => {
-                    std::fs::remove_file(&self.path)?;
+                    // The copy is safe; a save may replace the original later.
+                    if let Err(error) = std::fs::remove_file(&self.path) {
+                        tracing::warn!(%error, "kept a copy, but cannot remove the original");
+                    }
                     return Ok(candidate);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                // No hard links here: a rename to a name not taken does the same.
+                Err(_) if !candidate.exists() => {
+                    std::fs::rename(&self.path, &candidate)?;
+                    return Ok(candidate);
+                }
                 Err(error) => return Err(error),
             }
         }
