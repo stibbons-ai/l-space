@@ -1,7 +1,9 @@
-//! The Bridge binary: loads the operator's configuration and serves the App API.
+//! The Bridge binary: loads the operator's configuration and encryption key, and serves the App
+//! API.
 
 mod app_api;
 mod config;
+mod encryption_key;
 mod telemetry;
 
 use std::io;
@@ -57,7 +59,25 @@ async fn main() -> ExitCode {
         }
     };
 
-    let store = match SqliteStore::open(&config.database) {
+    let key = match encryption_key::load() {
+        Ok(loaded) => {
+            if loaded.ignored_value_var {
+                tracing::warn!(
+                    "both {} and {} are set; using {}",
+                    encryption_key::FILE_VAR,
+                    encryption_key::VALUE_VAR,
+                    encryption_key::FILE_VAR
+                );
+            }
+            loaded.key
+        }
+        Err(error) => {
+            tracing::error!(%error, "cannot load the encryption key");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let store = match SqliteStore::open(&config.database, &key) {
         Ok(store) => store,
         Err(error) => {
             let error = error_chain(&error);

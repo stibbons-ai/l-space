@@ -121,11 +121,12 @@ pub enum ApiError {
     #[error("library_server_unreachable")]
     LibraryServerUnreachable,
     /// The call needs a session and has none: no token, an unknown one, one whose session
-    /// ended, or one whose Library Server is not configured (any more). An ended session needs
-    /// a new login; one whose Library Server is unconfigured may work again once the operator
-    /// re-adds it. The App tells the two apart by whether [`library_servers`] still lists the
-    /// session's Library Server. [`logout`] doesn't check the configuration: it ends the
-    /// session either way.
+    /// ended (also because the Bridge can no longer decrypt its stored API key, after the
+    /// operator changed the encryption key), or one whose Library Server is not configured (any
+    /// more). An ended session needs a new login; one whose Library Server is unconfigured may
+    /// work again once the operator re-adds it. The App tells the two apart by whether
+    /// [`library_servers`] still lists the session's Library Server. [`logout`] doesn't check
+    /// the configuration: it ends the session either way.
     #[error("session_invalid")]
     SessionInvalid,
     /// A code this build of the App does not know yet, from a newer Bridge. Produced only on

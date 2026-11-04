@@ -3,9 +3,14 @@
 //! One database file holds all state. Its schema is migrated forward on open; a file written
 //! by a newer Bridge (a schema this build does not know) is refused rather than guessed at.
 //!
-//! API keys are compared and looked up only by their SHA-256 fingerprint, and the key itself
-//! goes in and out of the database only through one `Sealing` (seal and unseal), which is
-//! `PLAIN`, the identity, for now; encrypting stored keys replaces just that pair.
+//! API keys are stored encrypted under the operator's [`EncryptionKey`], each bound to its row,
+//! and compared and looked up only by a fingerprint keyed by it (see `sealing`). A key that no
+//! longer decrypts (the Bridge runs with another encryption key, or the row was tampered with)
+//! is removed with its sessions when one of them is looked up: the session is gone, and its
+//! user logs in again. On open, the store warns if it holds keys sealed under another
+//! encryption key.
+
+mod sealing;
 
 use std::fmt;
 use std::path::Path;
@@ -13,49 +18,22 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use abs::ApiKey;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use sha2::{Digest, Sha256};
 use store::{Error, LibraryUser, Session, SessionId, Store};
+
+pub use crate::sealing::EncryptionKey;
+use crate::sealing::{Fingerprint, Row, Sealing};
 
 /// Schema migrations in order; the database's `user_version` counts those applied. Append
 /// only: a released migration never changes.
-const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_sessions.sql")];
-
-/// How API keys are stored: `seal` turns a key into what the database holds, `unseal` turns
-/// that back into the key.
-#[derive(Clone, Copy)]
-struct Sealing {
-    seal: fn(&ApiKey) -> Vec<u8>,
-    unseal: fn(Vec<u8>) -> Result<ApiKey, String>,
-}
-
-impl fmt::Debug for Sealing {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Sealing")
-    }
-}
-
-/// Plain text, until stored keys are encrypted.
-const PLAIN: Sealing = Sealing { seal, unseal };
-
-fn seal(api_key: &ApiKey) -> Vec<u8> {
-    api_key.expose().as_bytes().to_vec()
-}
-
-fn unseal(sealed: Vec<u8>) -> Result<ApiKey, String> {
-    String::from_utf8(sealed)
-        .map(ApiKey::new)
-        .map_err(|_| "a stored API key is not UTF-8".to_owned())
-}
-
-/// What stored keys are compared by, instead of the (sealed) key itself.
-fn fingerprint(api_key: &ApiKey) -> [u8; 32] {
-    Sha256::digest(api_key.expose().as_bytes()).into()
-}
+const MIGRATIONS: &[&str] = &[
+    include_str!("migrations/0001_sessions.sql"),
+    include_str!("migrations/0002_encrypted_api_keys.sql"),
+];
 
 /// A [`Store`] in one SQLite database file.
 pub struct SqliteStore {
     connection: Arc<Mutex<Connection>>,
-    sealing: Sealing,
+    sealing: Arc<Sealing>,
 }
 
 impl fmt::Debug for SqliteStore {
@@ -66,22 +44,26 @@ impl fmt::Debug for SqliteStore {
 
 impl SqliteStore {
     /// Opens the database at `path`, creating it if it does not exist (its directory must),
-    /// on Unix makes it readable by its owner only, since it holds API keys, and migrates its
-    /// schema.
-    pub fn open(path: &Path) -> Result<Self, Error> {
-        Self::open_sealing(path, PLAIN)
-    }
-
-    fn open_sealing(path: &Path, sealing: Sealing) -> Result<Self, Error> {
+    /// on Unix makes it readable by its owner only, and migrates its schema. API keys are
+    /// stored encrypted under `key`.
+    pub fn open(path: &Path, key: &EncryptionKey) -> Result<Self, Error> {
         create_private(path)?;
         let mut connection = Connection::open(path).map_err(step("open the database"))?;
         connection
             .pragma_update(None, "foreign_keys", true)
             .map_err(step("enable foreign keys"))?;
+        // Deleted keys, and the plain-text keys of databases from before encryption, are
+        // overwritten rather than left in free pages.
+        connection
+            .pragma_update(None, "secure_delete", true)
+            .map_err(step("enable secure delete"))?;
         migrate(&mut connection).map_err(step("migrate the schema"))?;
+        let sealing = Sealing::new(key);
+        warn_of_keys_sealed_under_another_key(&connection, &sealing)
+            .map_err(step("count keys sealed under another encryption key"))?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
-            sealing,
+            sealing: Arc::new(sealing),
         })
     }
 
@@ -169,6 +151,35 @@ fn migrate(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error 
     Ok(())
 }
 
+/// Warns once if stored keys were sealed under another encryption key than `sealing`'s: their
+/// sessions will end at their next call.
+fn warn_of_keys_sealed_under_another_key(
+    connection: &Connection,
+    sealing: &Sealing,
+) -> rusqlite::Result<()> {
+    let keys: i64 = connection.query_row(
+        "SELECT count(*) FROM api_keys WHERE key_id <> ?1",
+        params![sealing.key_id()],
+        |row| row.get(0),
+    )?;
+    if keys > 0 {
+        tracing::warn!(
+            keys,
+            "stored API keys were encrypted with another encryption key; their sessions end \
+             at their next call, and their users must log in again"
+        );
+    }
+    Ok(())
+}
+
+/// A session looked up in the database.
+enum Lookup {
+    Open(Session),
+    /// The session's key does not open: it and its sessions were removed.
+    Unreadable(LibraryUser),
+    Unknown,
+}
+
 impl Store for SqliteStore {
     async fn open_session(
         &self,
@@ -177,21 +188,33 @@ impl Store for SqliteStore {
         api_key: &ApiKey,
     ) -> Result<(), Error> {
         let (id, user) = (*id, user.clone());
-        let (fingerprint, sealed) = (fingerprint(api_key), (self.sealing.seal)(api_key));
+        let fingerprint = self.sealing.fingerprint(api_key);
+        let row = Row {
+            library_server: &user.library_server,
+            user_id: &user.user_id,
+            fingerprint: &fingerprint,
+        };
+        let sealed = self.sealing.seal(&row, api_key).map_err(Error::new)?;
+        let key_id = *self.sealing.key_id();
         self.transaction(move |tx| {
-            // A key already stored for the user keeps its row, and logging in re-seals this
-            // row, so a changed sealing (a new encryption key) takes effect for this key at its
-            // next login.
+            // A key already stored for the user keeps its row; logging in re-seals it.
             let api_key_id: i64 = tx
                 .prepare_cached(
-                    "INSERT INTO api_keys (library_server, user_id, key_fingerprint, sealed_key)
-                     VALUES (?1, ?2, ?3, ?4)
+                    "INSERT INTO api_keys
+                         (library_server, user_id, key_fingerprint, sealed_key, key_id)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT (library_server, user_id, key_fingerprint)
-                     DO UPDATE SET sealed_key = excluded.sealed_key
+                     DO UPDATE SET sealed_key = excluded.sealed_key, key_id = excluded.key_id
                      RETURNING id",
                 )?
                 .query_row(
-                    params![user.library_server, user.user_id, fingerprint, sealed],
+                    params![
+                        user.library_server,
+                        user.user_id,
+                        fingerprint,
+                        sealed,
+                        key_id
+                    ],
                     |row| row.get(0),
                 )?;
             tx.prepare_cached("INSERT INTO sessions (id, api_key_id) VALUES (?1, ?2)")?
@@ -202,32 +225,57 @@ impl Store for SqliteStore {
     }
 
     async fn session(&self, id: &SessionId) -> Result<Option<Session>, Error> {
-        let (id, unseal) = (*id, self.sealing.unseal);
-        self.transaction(move |tx| {
-            tx.prepare_cached(
-                "SELECT k.library_server, k.user_id, k.sealed_key
-                 FROM sessions s JOIN api_keys k ON k.id = s.api_key_id
-                 WHERE s.id = ?1",
-            )?
-            .query_row(params![id.as_bytes()], |row| {
-                let api_key = unseal(row.get(2)?).map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        2,
-                        rusqlite::types::Type::Blob,
-                        error.into(),
-                    )
-                })?;
-                Ok(Session {
-                    user: LibraryUser {
-                        library_server: row.get(0)?,
-                        user_id: row.get(1)?,
-                    },
-                    api_key,
-                })
+        let (id, sealing) = (*id, Arc::clone(&self.sealing));
+        let lookup = self
+            .transaction(move |tx| {
+                let Some((api_key_id, user, fingerprint, sealed)) = tx
+                    .prepare_cached(
+                        "SELECT k.id, k.library_server, k.user_id, k.key_fingerprint, k.sealed_key
+                         FROM sessions s JOIN api_keys k ON k.id = s.api_key_id
+                         WHERE s.id = ?1",
+                    )?
+                    .query_row(params![id.as_bytes()], |row| {
+                        let user = LibraryUser {
+                            library_server: row.get(1)?,
+                            user_id: row.get(2)?,
+                        };
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            user,
+                            row.get::<_, Fingerprint>(3)?,
+                            row.get::<_, Vec<u8>>(4)?,
+                        ))
+                    })
+                    .optional()?
+                else {
+                    return Ok(Lookup::Unknown);
+                };
+                let row = Row {
+                    library_server: &user.library_server,
+                    user_id: &user.user_id,
+                    fingerprint: &fingerprint,
+                };
+                if let Some(api_key) = sealing.open(&row, &sealed) {
+                    return Ok(Lookup::Open(Session { user, api_key }));
+                }
+                tx.prepare_cached("DELETE FROM api_keys WHERE id = ?1")?
+                    .execute(params![api_key_id])?;
+                Ok(Lookup::Unreadable(user))
             })
-            .optional()
+            .await?;
+        Ok(match lookup {
+            Lookup::Open(session) => Some(session),
+            Lookup::Unreadable(user) => {
+                tracing::warn!(
+                    library_server = user.library_server,
+                    user_id = user.user_id,
+                    "a stored API key does not decrypt with the current encryption key (or was \
+                     tampered with); it was removed and the sessions opened with it ended"
+                );
+                None
+            }
+            Lookup::Unknown => None,
         })
-        .await
     }
 
     async fn close_session(&self, id: &SessionId) -> Result<bool, Error> {
@@ -242,7 +290,7 @@ impl Store for SqliteStore {
     }
 
     async fn revoke_api_key(&self, user: &LibraryUser, api_key: &ApiKey) -> Result<bool, Error> {
-        let (user, fingerprint) = (user.clone(), fingerprint(api_key));
+        let (user, fingerprint) = (user.clone(), self.sealing.fingerprint(api_key));
         self.transaction(move |tx| {
             let deleted = tx
                 .prepare_cached(
@@ -261,11 +309,12 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use abs::ApiKey;
+    use rusqlite::params;
     use store::contract::Backend;
     use store::{LibraryUser, SessionId, Store};
     use tempfile::TempDir;
 
-    use super::{MIGRATIONS, SqliteStore};
+    use super::{EncryptionKey, MIGRATIONS, SqliteStore};
 
     /// A database file in a temporary directory, opened anew each time.
     struct TempDatabase {
@@ -279,149 +328,206 @@ mod tests {
             let path = dir.path().join("bridge.db");
             Self { _dir: dir, path }
         }
+
+        /// Opens the store with encryption key number `n`.
+        fn open_with(&self, n: u8) -> SqliteStore {
+            SqliteStore::open(&self.path, &EncryptionKey::new([n; EncryptionKey::LEN]))
+                .expect("open database")
+        }
+
+        fn raw(&self) -> rusqlite::Connection {
+            rusqlite::Connection::open(&self.path).unwrap()
+        }
+
+        /// The sealed key stored for user `user_id`, who has exactly one.
+        fn sealed_key(&self, user_id: &str) -> Vec<u8> {
+            self.raw()
+                .query_row(
+                    "SELECT sealed_key FROM api_keys WHERE user_id = ?1",
+                    params![user_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        }
+
+        fn set_sealed_key(&self, user_id: &str, sealed: &[u8]) {
+            self.raw()
+                .execute(
+                    "UPDATE api_keys SET sealed_key = ?2 WHERE user_id = ?1",
+                    params![user_id, sealed],
+                )
+                .unwrap();
+        }
     }
 
     impl Backend for TempDatabase {
         type Store = SqliteStore;
 
         async fn open(&self) -> SqliteStore {
-            SqliteStore::open(&self.path).expect("open database")
+            self.open_with(1)
         }
     }
 
     store::store_contract_tests!(TempDatabase::new());
 
-    /// Logs `user` in twice with one key, and counts the stored keys.
-    async fn stored_keys_after_two_logins_with_one_key(store: SqliteStore, path: &Path) -> i64 {
-        let user = LibraryUser {
+    fn alice() -> LibraryUser {
+        LibraryUser {
             library_server: "https://abs.lan".into(),
             user_id: "alice-id".into(),
-        };
-        for token in ["first", "second"] {
-            store
-                .open_session(
-                    &SessionId::of_token(token),
-                    &user,
-                    &ApiKey::new("alice-key"),
-                )
-                .await
-                .unwrap();
         }
-        rusqlite::Connection::open(path)
-            .unwrap()
-            .query_row("SELECT count(*) FROM api_keys", [], |row| row.get(0))
-            .unwrap()
+    }
+
+    fn bob() -> LibraryUser {
+        LibraryUser {
+            user_id: "bob-id".into(),
+            ..alice()
+        }
+    }
+
+    fn token(n: u8) -> SessionId {
+        SessionId::of_token(&format!("token-{n}"))
+    }
+
+    async fn login(store: &SqliteStore, n: u8, user: &LibraryUser, key: &str) {
+        store
+            .open_session(&token(n), user, &ApiKey::new(key))
+            .await
+            .unwrap();
+    }
+
+    async fn api_key(store: &SqliteStore, n: u8) -> Option<ApiKey> {
+        store
+            .session(&token(n))
+            .await
+            .expect("an unreadable key is no error")
+            .map(|session| session.api_key)
+    }
+
+    /// Every byte the database file holds.
+    fn file_bytes(path: &Path) -> Vec<u8> {
+        std::fs::read(path).unwrap()
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
     }
 
     #[tokio::test]
     async fn a_key_used_twice_is_stored_once() {
         let database = TempDatabase::new();
-        let store = SqliteStore::open(&database.path).unwrap();
-        assert_eq!(
-            stored_keys_after_two_logins_with_one_key(store, &database.path).await,
-            1
-        );
+        let store = database.open_with(1);
+        login(&store, 1, &alice(), "alice-key").await;
+        login(&store, 2, &alice(), "alice-key").await;
+
+        let stored: i64 = database
+            .raw()
+            .query_row("SELECT count(*) FROM api_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, 1);
     }
 
-    /// The contract with a sealing that, like encryption, never stores the same key the same
-    /// way twice: nothing may depend on comparing sealed keys.
-    mod randomly_sealed {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::time::{SystemTime, UNIX_EPOCH};
+    #[tokio::test]
+    async fn the_file_holds_no_plain_key() {
+        let database = TempDatabase::new();
+        let store = database.open_with(1);
+        login(&store, 1, &alice(), "alice-secret-key").await;
+        drop(store);
 
-        use abs::ApiKey;
-        use store::contract::Backend;
-        use store::{LibraryUser, SessionId, Store};
+        assert!(!contains(&file_bytes(&database.path), b"alice-secret-key"));
+    }
 
-        use super::TempDatabase;
-        use crate::{Sealing, SqliteStore};
+    #[tokio::test]
+    async fn another_encryption_key_ends_the_session_and_a_new_login_works() {
+        let database = TempDatabase::new();
+        login(&database.open_with(1), 1, &alice(), "alice-key").await;
 
-        const NONCE_LEN: usize = 16;
+        let other = database.open_with(2);
+        assert_eq!(api_key(&other, 1).await, None);
+        login(&other, 2, &alice(), "alice-key").await;
+        assert_eq!(api_key(&other, 2).await, Some(ApiKey::new("alice-key")));
 
-        fn seal(api_key: &ApiKey) -> Vec<u8> {
-            static SEALED: AtomicU64 = AtomicU64::new(0);
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64;
-            let mut sealed = Vec::with_capacity(NONCE_LEN + api_key.expose().len());
-            sealed.extend_from_slice(&nanos.to_le_bytes());
-            sealed.extend_from_slice(&SEALED.fetch_add(1, Ordering::Relaxed).to_le_bytes());
-            sealed.extend_from_slice(api_key.expose().as_bytes());
-            sealed
+        // The unreadable key was removed, not just hidden: the original encryption key no
+        // longer finds the session either.
+        assert_eq!(api_key(&database.open_with(1), 1).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_tampered_key_ends_its_sessions_only() {
+        let database = TempDatabase::new();
+        let store = database.open_with(1);
+        login(&store, 1, &alice(), "alice-key").await;
+        login(&store, 2, &alice(), "alice-key").await;
+        login(&store, 3, &bob(), "bob-key").await;
+        let mut sealed = database.sealed_key("alice-id");
+        sealed[30] ^= 1;
+        database.set_sealed_key("alice-id", &sealed);
+
+        assert_eq!(api_key(&store, 1).await, None);
+        assert_eq!(api_key(&store, 2).await, None);
+        assert_eq!(api_key(&store, 3).await, Some(ApiKey::new("bob-key")));
+    }
+
+    /// A sealed key moved to another row (another user, say) doesn't open there.
+    #[tokio::test]
+    async fn swapped_keys_open_for_neither_row() {
+        let database = TempDatabase::new();
+        let store = database.open_with(1);
+        login(&store, 1, &alice(), "alice-key").await;
+        login(&store, 2, &bob(), "bob-key").await;
+        let (alices, bobs) = (
+            database.sealed_key("alice-id"),
+            database.sealed_key("bob-id"),
+        );
+        database.set_sealed_key("alice-id", &bobs);
+        database.set_sealed_key("bob-id", &alices);
+
+        assert_eq!(api_key(&store, 1).await, None);
+        assert_eq!(api_key(&store, 2).await, None);
+    }
+
+    /// A database from before encryption (schema version 1) loses its plain-text keys and
+    /// their sessions, and the file no longer holds them.
+    #[tokio::test]
+    async fn plain_text_keys_from_before_encryption_are_dropped() {
+        let database = TempDatabase::new();
+        {
+            let v1 = database.raw();
+            v1.execute_batch(MIGRATIONS[0]).unwrap();
+            v1.pragma_update(None, "user_version", 1).unwrap();
+            v1.execute(
+                "INSERT INTO api_keys (library_server, user_id, key_fingerprint, sealed_key)
+                 VALUES ('https://abs.lan', 'alice-id', zeroblob(32), CAST(?1 AS BLOB))",
+                params!["legacy-plain-key"],
+            )
+            .unwrap();
+            v1.execute(
+                "INSERT INTO sessions (id, api_key_id) VALUES (?1, 1)",
+                params![token(1).as_bytes()],
+            )
+            .unwrap();
         }
+        assert!(contains(&file_bytes(&database.path), b"legacy-plain-key"));
 
-        fn unseal(sealed: Vec<u8>) -> Result<ApiKey, String> {
-            String::from_utf8(sealed[NONCE_LEN..].to_vec())
-                .map(ApiKey::new)
-                .map_err(|error| error.to_string())
-        }
+        let store = database.open_with(1);
 
-        struct RandomlySealed(TempDatabase);
-
-        impl Backend for RandomlySealed {
-            type Store = SqliteStore;
-
-            async fn open(&self) -> SqliteStore {
-                SqliteStore::open_sealing(&self.0.path, Sealing { seal, unseal })
-                    .expect("open database")
-            }
-        }
-
-        store::store_contract_tests!(RandomlySealed(TempDatabase::new()));
-
-        #[tokio::test]
-        async fn a_key_used_twice_is_stored_once() {
-            let database = RandomlySealed(TempDatabase::new());
-            let store = database.open().await;
-            assert_eq!(
-                super::stored_keys_after_two_logins_with_one_key(store, &database.0.path).await,
-                1
-            );
-        }
-
-        /// A login with a key stored under another sealing re-seals it: sessions read it back
-        /// through the current sealing.
-        #[tokio::test]
-        async fn logging_in_again_re_seals_the_stored_key() {
-            let database = RandomlySealed(TempDatabase::new());
-            let user = LibraryUser {
-                library_server: "https://abs.lan".into(),
-                user_id: "alice-id".into(),
-            };
-            let key = ApiKey::new("alice-key");
-            database
-                .open()
-                .await
-                .open_session(&SessionId::of_token("first"), &user, &key)
-                .await
-                .unwrap();
-
-            let plain = SqliteStore::open(&database.0.path).unwrap();
-            plain
-                .open_session(&SessionId::of_token("second"), &user, &key)
-                .await
-                .unwrap();
-
-            let session = plain
-                .session(&SessionId::of_token("first"))
-                .await
-                .unwrap()
-                .expect("still open");
-            assert_eq!(session.api_key, key);
-        }
+        assert_eq!(api_key(&store, 1).await, None);
+        assert!(!contains(&file_bytes(&database.path), b"legacy-plain-key"));
+        login(&store, 2, &alice(), "alice-key").await;
+        assert_eq!(api_key(&store, 2).await, Some(ApiKey::new("alice-key")));
     }
 
     #[test]
     fn refuses_a_database_from_a_newer_bridge() {
         let database = TempDatabase::new();
         let newer = MIGRATIONS.len() as i64 + 1;
-        rusqlite::Connection::open(&database.path)
-            .unwrap()
+        database
+            .raw()
             .pragma_update(None, "user_version", newer)
             .unwrap();
 
-        let error = SqliteStore::open(&database.path).unwrap_err();
+        let error = SqliteStore::open(&database.path, &EncryptionKey::new([1; 32])).unwrap_err();
         assert_eq!(error.to_string(), "migrate the schema");
         let cause = std::error::Error::source(&error)
             .expect("a cause")
@@ -438,7 +544,6 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         use super::TempDatabase;
-        use crate::SqliteStore;
 
         fn mode(database: &TempDatabase) -> u32 {
             std::fs::metadata(&database.path)
@@ -451,7 +556,7 @@ mod tests {
         #[test]
         fn only_the_owner_can_read_a_new_database() {
             let database = TempDatabase::new();
-            SqliteStore::open(&database.path).unwrap();
+            database.open_with(1);
             assert_eq!(mode(&database), 0o600);
         }
 
@@ -461,7 +566,7 @@ mod tests {
             std::fs::write(&database.path, b"").unwrap();
             std::fs::set_permissions(&database.path, Permissions::from_mode(0o644)).unwrap();
 
-            SqliteStore::open(&database.path).unwrap();
+            database.open_with(1);
 
             assert_eq!(mode(&database), 0o600);
         }

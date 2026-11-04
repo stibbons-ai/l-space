@@ -1,11 +1,12 @@
 //! A Bridge that cannot start properly stops before it serves: a non-zero exit and one error
-//! event saying what is wrong, without repeating any secret from the configuration.
+//! event saying what is wrong, without repeating any secret from the configuration or the
+//! encryption key.
 
 use std::net::TcpListener;
 
 use crate::support::{
-    DATABASE, Exited, LISTEN, RUST_LOG, config_file, is_listening, library_server_toml,
-    run_until_exit,
+    DATABASE, Exited, KEY, KeyEnv, KeyFile, LISTEN, RUST_LOG, config_file, is_listening,
+    library_server_toml, run_until_exit, run_until_exit_with_key,
 };
 
 /// Asserts the Bridge refused to start with one error event `message`, and returns that
@@ -187,4 +188,108 @@ fn wrongly_typed_value_is_named_without_its_value() {
         "s3cret",
     );
     assert!(error.contains("TOML at line 3"), "{error}");
+}
+
+const KEY_HINT: &str = "generate a key with `openssl rand -base64 32`";
+
+/// Asserts the Bridge refused to start with the encryption key variables `key`, naming
+/// neither the key nor any of `secrets`, and returns its error.
+fn refused_key(key: &KeyEnv, secrets: &[&str]) -> String {
+    let (_dir, path) = config_file(&format!("{LISTEN}{DATABASE}"));
+    let exited = run_until_exit_with_key(&path, RUST_LOG, key);
+    let error = refused(&exited, "cannot load the encryption key");
+    // On failure, the output isn't printed: it would repeat the secret.
+    for secret in secrets {
+        assert!(!exited.output_contains(secret), "a key secret leaked");
+    }
+    assert!(error.ends_with(KEY_HINT), "{error}");
+    error
+}
+
+#[test]
+fn no_encryption_key() {
+    let error = refused_key(&KeyEnv::default(), &[]);
+    assert!(
+        error.starts_with("neither BRIDGE_ENCRYPTION_KEY_FILE nor BRIDGE_ENCRYPTION_KEY is set"),
+        "{error}"
+    );
+}
+
+#[test]
+fn unusable_encryption_key_value() {
+    for (value, problem) in [
+        ("", "is empty"),
+        (" \n", "is empty"),
+        ("s3cret-is-not-base64!", "is not base64"),
+        ("i6n08ZhvCMQSMfsPMru0Tw==", "decodes to 16 bytes, not 32"),
+        (
+            "XI5RQJRCfpAnYDpji+U84BcbVNSWHdXV0RL2qChwW5Qj",
+            "decodes to 33 bytes, not 32",
+        ),
+    ] {
+        let secrets: &[&str] = if value.trim().is_empty() {
+            &[]
+        } else {
+            &[value, &value[..8]]
+        };
+        let error = refused_key(&KeyEnv::value(value), secrets);
+        assert!(
+            error.starts_with(&format!("BRIDGE_ENCRYPTION_KEY {problem}; ")),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn unusable_encryption_key_file() {
+    for (contents, problem) in [
+        ("", "is empty"),
+        ("\n\n", "is empty"),
+        ("s3cret-is-not-base64!\n", "is not base64"),
+        ("i6n08ZhvCMQSMfsPMru0Tw==\n", "decodes to 16 bytes, not 32"),
+    ] {
+        let secrets: &[&str] = if contents.trim().is_empty() {
+            &[]
+        } else {
+            &[contents.trim(), &contents[..8]]
+        };
+        let error = refused_key(&KeyEnv::file(contents), secrets);
+        assert!(
+            error.starts_with("BRIDGE_ENCRYPTION_KEY_FILE: the file \""),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("encryption-key\" {problem}; ")),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn missing_encryption_key_file() {
+    let error = refused_key(
+        &KeyEnv {
+            file: Some(KeyFile::Missing),
+            value: None,
+        },
+        &[],
+    );
+    assert!(
+        error.starts_with("BRIDGE_ENCRYPTION_KEY_FILE: cannot read \""),
+        "{error}"
+    );
+    assert!(error.contains("no-such-key-file\": "), "{error}");
+}
+
+/// The key file wins even when it is unusable: the Bridge never falls back to the other.
+#[test]
+fn an_unusable_key_file_is_not_replaced_by_the_value() {
+    let error = refused_key(
+        &KeyEnv {
+            file: Some(KeyFile::Holding("not base64!".into())),
+            value: Some(KEY.into()),
+        },
+        &[KEY],
+    );
+    assert!(error.contains("is not base64"), "{error}");
 }
