@@ -14,14 +14,18 @@
 //!
 //! - [`TestBridge::start`] writes the configuration to a temporary directory, adding [`LISTEN`]
 //!   (loopback, port 0, so tests can run in parallel without port clashes) and [`DATABASE`] (a
-//!   file in that directory, the Bridge's working directory).
+//!   file in that directory, the Bridge's working directory), and passes the encryption key
+//!   [`KEY`] in `BRIDGE_ENCRYPTION_KEY`. [`TestBridge::start_with_key`] passes other
+//!   [`KeyEnv`] variables: none, a key file (written to that directory), or both.
 //! - Readiness comes from the Bridge itself: it logs a `listening` event with the address it
 //!   bound, and `start` waits for that event. No sleeps.
-//! - [`TestBridge::restart`] stops the Bridge and starts it again on the same configuration
-//!   and database. Dropping the [`TestBridge`] kills the process.
+//! - [`TestBridge::restart`] stops the Bridge and starts it again on the same configuration,
+//!   key and database; [`TestBridge::restart_with`] and [`TestBridge::restart_with_key`]
+//!   change the configuration or the key. Dropping the [`TestBridge`] kills the process.
+//! - [`TestBridge::database_files`] reads the database file and its side files raw.
 //! - [`run_until_exit`] is for a Bridge that must not start: it returns the exit status and
 //!   every output line, stdout and stderr. JSON lines (log events) are objects; any other line
-//!   becomes a [`Value::String`].
+//!   becomes a [`Value::String`]. [`run_until_exit_with_key`] passes other key variables.
 //! - A rejected call is checked with [`AppApi::get_error`] or [`AppApi::post_error`], which
 //!   return the status and the decoded [`ApiError`] code.
 //!
@@ -38,6 +42,8 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+use crate::audiobookshelf::{AbsUser, Audiobookshelf};
+
 /// Generous: the Bridge is up within milliseconds, but CI machines can be slow.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -51,12 +57,57 @@ pub const DATABASE: &str = "database = \"bridge.db\"\n";
 /// setting cannot hide the events the harness waits for.
 pub const RUST_LOG: &str = "info";
 
+/// The encryption key a Bridge starts with unless a test asks for another.
+pub const KEY: &str = "BFpyGJHZOBgdHWxJN1ruoe2qmw9GlH9CJLJJNTkXQHo=";
+
+/// Another valid encryption key.
+pub const OTHER_KEY: &str = "twM8/bCobQ3lox9OulG0A+XcRBR0b6v1uk+Sz8Xk/ZI=";
+
+/// The encryption key variables a Bridge starts with; unset when `None`. The developer's own
+/// settings never reach the Bridge.
+#[derive(Debug, Clone, Default)]
+pub struct KeyEnv {
+    /// `BRIDGE_ENCRYPTION_KEY_FILE`.
+    pub file: Option<KeyFile>,
+    /// `BRIDGE_ENCRYPTION_KEY`.
+    pub value: Option<String>,
+}
+
+impl KeyEnv {
+    /// Only `BRIDGE_ENCRYPTION_KEY`, set to `value`.
+    pub fn value(value: &str) -> Self {
+        Self {
+            value: Some(value.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    /// Only `BRIDGE_ENCRYPTION_KEY_FILE`, naming a file that holds `contents`.
+    pub fn file(contents: &str) -> Self {
+        Self {
+            file: Some(KeyFile::Holding(contents.to_owned())),
+            ..Self::default()
+        }
+    }
+}
+
+/// What `BRIDGE_ENCRYPTION_KEY_FILE` names.
+#[derive(Debug, Clone)]
+pub enum KeyFile {
+    /// A file holding this, in the Bridge's directory.
+    Holding(String),
+    /// This, verbatim, as the variable's value: a path relative to the Bridge's directory where
+    /// there may be no file, the empty string, or a mistake like the key itself.
+    Named(String),
+}
+
 /// A running Bridge, killed on drop.
 pub struct TestBridge {
     running: Running,
     config: PathBuf,
     rust_log: String,
-    _dir: TempDir,
+    key: KeyEnv,
+    dir: TempDir,
 }
 
 /// One Bridge process, serving.
@@ -77,20 +128,30 @@ impl TestBridge {
     /// [`TestBridge::start`] with the given `RUST_LOG`, which must let the `bridge` target's
     /// `listening` event through.
     pub fn start_logging(config: &str, rust_log: &str) -> Self {
+        Self::new(config, rust_log, KeyEnv::value(KEY))
+    }
+
+    /// [`TestBridge::start`] with the encryption key variables `key`.
+    pub fn start_with_key(config: &str, key: KeyEnv) -> Self {
+        Self::new(config, RUST_LOG, key)
+    }
+
+    fn new(config: &str, rust_log: &str, key: KeyEnv) -> Self {
         let (dir, config) = config_file(&format!("{LISTEN}{DATABASE}{config}"));
         Self {
-            running: launch(&config, rust_log),
+            running: launch(&config, rust_log, &key),
             config,
             rust_log: rust_log.to_owned(),
-            _dir: dir,
+            key,
+            dir,
         }
     }
 
-    /// Stops the Bridge and starts it again on the same configuration and database. It may
-    /// listen on another port; [`TestBridge::api`] follows it.
+    /// Stops the Bridge and starts it again on the same configuration, key and database. It
+    /// may listen on another port; [`TestBridge::api`] follows it.
     pub fn restart(&mut self) {
         stop(&mut self.running.child);
-        self.running = launch(&self.config, &self.rust_log);
+        self.running = launch(&self.config, &self.rust_log, &self.key);
     }
 
     /// [`TestBridge::restart`] with `config` (TOML, as for [`TestBridge::start`]) replacing
@@ -98,6 +159,29 @@ impl TestBridge {
     pub fn restart_with(&mut self, config: &str) {
         std::fs::write(&self.config, format!("{LISTEN}{DATABASE}{config}")).expect("write config");
         self.restart();
+    }
+
+    /// [`TestBridge::restart`] with the encryption key variables `key`; the database stays.
+    pub fn restart_with_key(&mut self, key: KeyEnv) {
+        self.key = key;
+        self.restart();
+    }
+
+    /// The name and raw bytes of the database file and each of its side files (journal, WAL,
+    /// shared memory) that exists.
+    pub fn database_files(&self) -> Vec<(String, Vec<u8>)> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(self.dir.path()).expect("list the Bridge's directory") {
+            let entry = entry.expect("directory entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("bridge.db") {
+                files.push((
+                    name,
+                    std::fs::read(entry.path()).expect("read database file"),
+                ));
+            }
+        }
+        files
     }
 
     /// Stops the Bridge and returns everything it wrote since it last started.
@@ -126,8 +210,8 @@ impl Drop for TestBridge {
 }
 
 /// Starts a Bridge and waits for its `listening` event.
-fn launch(config: &Path, rust_log: &str) -> Running {
-    let (mut child, output) = spawn(config, rust_log);
+fn launch(config: &Path, rust_log: &str, key: &KeyEnv) -> Running {
+    let (mut child, output) = spawn(config, rust_log, key);
     let deadline = Instant::now() + TIMEOUT;
     let mut startup = Vec::new();
     loop {
@@ -177,6 +261,24 @@ fn bearer(session: &Session) -> String {
 /// The configuration entry for a Library Server at `url`.
 pub fn library_server_toml(url: &str) -> String {
     format!("[[library_servers]]\nurl = \"{url}\"\n")
+}
+
+/// The rejection of a call without a usable session.
+pub const SESSION_INVALID: (StatusCode, ApiError) =
+    (StatusCode::UNAUTHORIZED, ApiError::SessionInvalid);
+
+/// Who a session of `user` on `abs` acts as.
+pub fn acting_as(abs: &Audiobookshelf, user: &AbsUser) -> CurrentUser {
+    acting_on(abs.base_url(), user)
+}
+
+/// Who a session of `user` on the Library Server at `library_server` acts as.
+pub fn acting_on(library_server: &str, user: &AbsUser) -> CurrentUser {
+    CurrentUser {
+        library_server: library_server.to_owned(),
+        user_id: user.id.clone(),
+        username: user.username.clone(),
+    }
 }
 
 /// The App API as the App calls it, over HTTP. Paths and payloads follow the `api` crate's
@@ -346,10 +448,16 @@ pub fn output_contains(output: &[Value], text: &str) -> bool {
     })
 }
 
-/// Runs a Bridge with the configuration file at `config` (which may be missing) and the given
-/// `RUST_LOG`, and waits for it to exit. Panics if it is still running after the timeout.
+/// Runs a Bridge with the configuration file at `config` (which may be missing), the given
+/// `RUST_LOG` and the encryption key [`KEY`], and waits for it to exit. Panics if it is still
+/// running after the timeout.
 pub fn run_until_exit(config: &Path, rust_log: &str) -> Exited {
-    let (mut child, output) = spawn(config, rust_log);
+    run_until_exit_with_key(config, rust_log, &KeyEnv::value(KEY))
+}
+
+/// [`run_until_exit`] with the encryption key variables `key`.
+pub fn run_until_exit_with_key(config: &Path, rust_log: &str, key: &KeyEnv) -> Exited {
+    let (mut child, output) = spawn(config, rust_log, key);
     let deadline = Instant::now() + TIMEOUT;
     let mut events = Vec::new();
     loop {
@@ -375,20 +483,37 @@ pub fn config_file(contents: &str) -> (TempDir, PathBuf) {
 }
 
 /// Starts the Bridge in the config file's directory and forwards its output lines until it
-/// closes stdout and stderr (exits).
-fn spawn(config: &Path, rust_log: &str) -> (Child, Receiver<Value>) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_bridge"))
+/// closes stdout and stderr (exits). A key file is written to that directory.
+fn spawn(config: &Path, rust_log: &str, key: &KeyEnv) -> (Child, Receiver<Value>) {
+    let dir = config.parent().expect("config file in a directory");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bridge"));
+    command
         .arg("--config")
         .arg(config)
-        .current_dir(config.parent().expect("config file in a directory"))
+        .current_dir(dir)
         .env("RUST_LOG", rust_log)
         .env_remove("BRIDGE_CONFIG")
+        .env_remove("BRIDGE_ENCRYPTION_KEY_FILE")
+        .env_remove("BRIDGE_ENCRYPTION_KEY")
         // Dioxus reads static files from here; a developer's setting must not change the logs.
         .env_remove("DIOXUS_PUBLIC_PATH")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn bridge");
+        .stderr(Stdio::piped());
+    match &key.file {
+        Some(KeyFile::Holding(contents)) => {
+            let path = dir.join("encryption-key");
+            std::fs::write(&path, contents).expect("write key file");
+            command.env("BRIDGE_ENCRYPTION_KEY_FILE", path);
+        }
+        Some(KeyFile::Named(value)) => {
+            command.env("BRIDGE_ENCRYPTION_KEY_FILE", value);
+        }
+        None => {}
+    }
+    if let Some(value) = &key.value {
+        command.env("BRIDGE_ENCRYPTION_KEY", value);
+    }
+    let mut child = command.spawn().expect("spawn bridge");
     let (sender, receiver) = mpsc::channel();
     forward(child.stdout.take().expect("piped stdout"), sender.clone());
     forward(child.stderr.take().expect("piped stderr"), sender);

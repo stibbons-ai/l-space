@@ -1,11 +1,12 @@
 //! A Bridge that cannot start properly stops before it serves: a non-zero exit and one error
-//! event saying what is wrong, without repeating any secret from the configuration.
+//! event saying what is wrong, without repeating any secret from the configuration or the
+//! encryption key.
 
 use std::net::TcpListener;
 
 use crate::support::{
-    DATABASE, Exited, LISTEN, RUST_LOG, config_file, is_listening, library_server_toml,
-    run_until_exit,
+    DATABASE, Exited, KEY, KeyEnv, KeyFile, LISTEN, RUST_LOG, config_file, is_listening,
+    library_server_toml, run_until_exit, run_until_exit_with_key,
 };
 
 /// Asserts the Bridge refused to start with one error event `message`, and returns that
@@ -29,8 +30,12 @@ fn refused(exited: &Exited, message: &str) -> String {
 }
 
 fn run_with(config: &str) -> Exited {
+    run_with_key(config, &KeyEnv::value(KEY))
+}
+
+fn run_with_key(config: &str, key: &KeyEnv) -> Exited {
     let (_dir, path) = config_file(config);
-    run_until_exit(&path, RUST_LOG)
+    run_until_exit_with_key(&path, RUST_LOG, key)
 }
 
 fn refused_with(config: &str) -> String {
@@ -187,4 +192,188 @@ fn wrongly_typed_value_is_named_without_its_value() {
         "s3cret",
     );
     assert!(error.contains("TOML at line 3"), "{error}");
+}
+
+const KEY_HINT: &str = "generate a key with `openssl rand -base64 32`";
+
+/// Asserts the Bridge refused to start with the encryption key variables `key`, writing none
+/// of `secrets`, and returns its error.
+fn refused_key(key: &KeyEnv, secrets: &[&str]) -> String {
+    let exited = run_with_key(&format!("{LISTEN}{DATABASE}"), key);
+    let error = refused(&exited, "cannot load the encryption key");
+    // On failure, the output isn't printed: it would repeat the secret.
+    for secret in secrets {
+        assert!(!exited.output_contains(secret), "a key secret leaked");
+    }
+    assert!(error.ends_with(KEY_HINT), "{error}");
+    error
+}
+
+fn named_file(value: &str) -> Option<KeyFile> {
+    Some(KeyFile::Named(value.into()))
+}
+
+/// A variable set to the empty string (as compose's `${VAR:-}` does) counts as unset.
+#[test]
+fn no_encryption_key() {
+    for key in [
+        KeyEnv::default(),
+        KeyEnv::value(""),
+        KeyEnv {
+            file: named_file(""),
+            value: None,
+        },
+        KeyEnv {
+            file: named_file(""),
+            value: Some(String::new()),
+        },
+    ] {
+        let error = refused_key(&key, &[]);
+        assert!(
+            error.starts_with(
+                "neither BRIDGE_ENCRYPTION_KEY_FILE nor BRIDGE_ENCRYPTION_KEY is set (or both \
+                 are empty); "
+            ),
+            "{key:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn unusable_encryption_key_value() {
+    for (value, problem) in [
+        (" \n", "is empty"),
+        ("s3cret-is-not-base64!", "is not base64"),
+        ("i6n08ZhvCMQSMfsPMru0Tw==", "decodes to 16 bytes, not 32"),
+        (
+            "XI5RQJRCfpAnYDpji+U84BcbVNSWHdXV0RL2qChwW5Qj",
+            "decodes to 33 bytes, not 32",
+        ),
+    ] {
+        let secrets: &[&str] = if value.trim().is_empty() {
+            &[]
+        } else {
+            &[value, &value[..8]]
+        };
+        let error = refused_key(&KeyEnv::value(value), secrets);
+        assert!(
+            error.starts_with(&format!("BRIDGE_ENCRYPTION_KEY {problem}; ")),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn unusable_encryption_key_file() {
+    let too_long = format!("{KEY}{}", " ".repeat(1024));
+    for (contents, problem) in [
+        ("", "is empty"),
+        ("\n\n", "is empty"),
+        ("s3cret-is-not-base64!\n", "is not base64"),
+        ("i6n08ZhvCMQSMfsPMru0Tw==\n", "decodes to 16 bytes, not 32"),
+        (&too_long, "is longer than 1024 bytes, too long for a key"),
+    ] {
+        let secrets: &[&str] = if contents.trim().is_empty() {
+            &[]
+        } else {
+            &[contents.trim(), &contents[..8]]
+        };
+        let error = refused_key(&KeyEnv::file(contents), secrets);
+        assert!(
+            error.starts_with(&format!(
+                "BRIDGE_ENCRYPTION_KEY_FILE: the file it names {problem}; "
+            )),
+            "{error}"
+        );
+    }
+}
+
+/// An endless file, like `/dev/zero`, is refused rather than read forever.
+#[cfg(unix)]
+#[test]
+fn endless_encryption_key_file() {
+    let error = refused_key(
+        &KeyEnv {
+            file: named_file("/dev/zero"),
+            value: None,
+        },
+        &[],
+    );
+    assert!(error.contains("too long for a key"), "{error}");
+}
+
+#[test]
+fn missing_encryption_key_file() {
+    let error = refused_key(
+        &KeyEnv {
+            file: named_file("no-such-key-file"),
+            value: None,
+        },
+        &[],
+    );
+    assert!(
+        error.starts_with("BRIDGE_ENCRYPTION_KEY_FILE: cannot read the file it names: "),
+        "{error}"
+    );
+}
+
+/// Putting the key itself in the file variable by mistake never logs it: the error leaves the
+/// path out.
+#[test]
+fn a_key_given_as_the_file_path_is_not_logged() {
+    let error = refused_key(
+        &KeyEnv {
+            file: named_file(KEY),
+            value: None,
+        },
+        &[KEY, &KEY[..8]],
+    );
+    assert!(
+        error.starts_with("BRIDGE_ENCRYPTION_KEY_FILE: cannot read the file it names: "),
+        "{error}"
+    );
+}
+
+/// The key file wins even when it is unusable or missing: the Bridge never falls back to the
+/// other.
+#[test]
+fn an_unusable_key_file_is_not_replaced_by_the_value() {
+    for (file, problem) in [
+        (KeyFile::Holding("not base64!".into()), "is not base64"),
+        (KeyFile::Named("no-such-key-file".into()), "cannot read"),
+    ] {
+        let error = refused_key(
+            &KeyEnv {
+                file: Some(file),
+                value: Some(KEY.into()),
+            },
+            &[KEY],
+        );
+        assert!(error.contains(problem), "{error}");
+    }
+}
+
+/// `--help` lists no value of the key variables.
+#[test]
+fn help_shows_no_key() {
+    let (dir, _config) = config_file("");
+    std::fs::write(dir.path().join("key"), KEY).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_bridge"))
+        .arg("--help")
+        .env("BRIDGE_ENCRYPTION_KEY", KEY)
+        .env("BRIDGE_ENCRYPTION_KEY_FILE", dir.path().join("key"))
+        .output()
+        .expect("run bridge --help");
+    assert!(output.status.success(), "{output:?}");
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(printed.contains("--config"), "{printed}");
+    assert!(!printed.contains(KEY), "--help printed the key");
+    assert!(
+        !printed.contains(&KEY[..8]),
+        "--help printed part of the key"
+    );
 }
