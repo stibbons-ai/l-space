@@ -2,26 +2,16 @@
 //! environment, never readable from the database files, and a different key ends the sessions
 //! cleanly instead of decrypting them.
 
-use api::{ApiError, CurrentUser};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use reqwest::StatusCode;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::audiobookshelf::{AbsUser, Audiobookshelf};
-use crate::support::{KEY, KeyEnv, KeyFile, OTHER_KEY, TestBridge, library_server_toml};
-
-const SESSION_INVALID: (StatusCode, ApiError) =
-    (StatusCode::UNAUTHORIZED, ApiError::SessionInvalid);
-
-fn acting_as(abs: &Audiobookshelf, user: &AbsUser) -> CurrentUser {
-    CurrentUser {
-        library_server: abs.base_url().to_owned(),
-        user_id: user.id.clone(),
-        username: user.username.clone(),
-    }
-}
+use crate::audiobookshelf::Audiobookshelf;
+use crate::support::{
+    KEY, KeyEnv, KeyFile, OTHER_KEY, SESSION_INVALID, TestBridge, acting_as, library_server_toml,
+    output_contains,
+};
 
 fn events<'a>(output: &'a [Value], message: &'a str) -> impl Iterator<Item = &'a Value> {
     output
@@ -91,10 +81,7 @@ async fn the_key_file_wins_over_the_environment() {
 
     let output = bridge.stop();
     for key in [KEY, OTHER_KEY] {
-        assert!(
-            !crate::support::output_contains(&output, key),
-            "an encryption key leaked"
-        );
+        assert!(!output_contains(&output, key), "an encryption key leaked");
     }
 }
 

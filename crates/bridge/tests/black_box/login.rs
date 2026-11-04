@@ -4,13 +4,15 @@
 use std::net::TcpListener;
 use std::sync::Arc;
 
-use api::{ApiError, CurrentUser};
+use api::ApiError;
 use reqwest::StatusCode;
 use serde_json::json;
 
-use crate::audiobookshelf::{AbsUser, Audiobookshelf};
+use crate::audiobookshelf::Audiobookshelf;
 use crate::forwarder::Forwarder;
-use crate::support::{TestBridge, library_server_toml, output_contains};
+use crate::support::{
+    SESSION_INVALID, TestBridge, acting_as, acting_on, library_server_toml, output_contains,
+};
 
 /// The configuration naming `abs` as the one Library Server.
 fn abs_config(abs: &Audiobookshelf) -> String {
@@ -24,18 +26,6 @@ fn bridge_with_abs() -> (TestBridge, Arc<Audiobookshelf>) {
     (bridge, abs)
 }
 
-fn acting_as(abs: &Audiobookshelf, user: &AbsUser) -> CurrentUser {
-    acting_on(abs.base_url(), user)
-}
-
-fn acting_on(library_server: &str, user: &AbsUser) -> CurrentUser {
-    CurrentUser {
-        library_server: library_server.to_owned(),
-        user_id: user.id.clone(),
-        username: user.username.clone(),
-    }
-}
-
 /// A loopback address nothing listens on.
 fn closed_port() -> std::net::SocketAddr {
     TcpListener::bind("127.0.0.1:0")
@@ -44,8 +34,6 @@ fn closed_port() -> std::net::SocketAddr {
         .unwrap()
 }
 
-const SESSION_INVALID: (StatusCode, ApiError) =
-    (StatusCode::UNAUTHORIZED, ApiError::SessionInvalid);
 const KEY_REJECTED: (StatusCode, ApiError) = (StatusCode::UNAUTHORIZED, ApiError::ApiKeyRejected);
 
 #[tokio::test]

@@ -30,8 +30,12 @@ fn refused(exited: &Exited, message: &str) -> String {
 }
 
 fn run_with(config: &str) -> Exited {
+    run_with_key(config, &KeyEnv::value(KEY))
+}
+
+fn run_with_key(config: &str, key: &KeyEnv) -> Exited {
     let (_dir, path) = config_file(config);
-    run_until_exit(&path, RUST_LOG)
+    run_until_exit_with_key(&path, RUST_LOG, key)
 }
 
 fn refused_with(config: &str) -> String {
@@ -192,11 +196,10 @@ fn wrongly_typed_value_is_named_without_its_value() {
 
 const KEY_HINT: &str = "generate a key with `openssl rand -base64 32`";
 
-/// Asserts the Bridge refused to start with the encryption key variables `key`, naming
-/// neither the key nor any of `secrets`, and returns its error.
+/// Asserts the Bridge refused to start with the encryption key variables `key`, writing none
+/// of `secrets`, and returns its error.
 fn refused_key(key: &KeyEnv, secrets: &[&str]) -> String {
-    let (_dir, path) = config_file(&format!("{LISTEN}{DATABASE}"));
-    let exited = run_until_exit_with_key(&path, RUST_LOG, key);
+    let exited = run_with_key(&format!("{LISTEN}{DATABASE}"), key);
     let error = refused(&exited, "cannot load the encryption key");
     // On failure, the output isn't printed: it would repeat the secret.
     for secret in secrets {

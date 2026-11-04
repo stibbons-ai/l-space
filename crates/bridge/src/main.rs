@@ -60,17 +60,7 @@ async fn main() -> ExitCode {
     };
 
     let key = match encryption_key::load() {
-        Ok(loaded) => {
-            if loaded.ignored_value_var {
-                tracing::warn!(
-                    "both {} and {} are set; using {}",
-                    encryption_key::FILE_VAR,
-                    encryption_key::VALUE_VAR,
-                    encryption_key::FILE_VAR
-                );
-            }
-            loaded.key
-        }
+        Ok(key) => key,
         Err(error) => {
             tracing::error!(%error, "cannot load the encryption key");
             return ExitCode::FAILURE;

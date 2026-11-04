@@ -19,10 +19,11 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use store::LibraryUser;
 
 /// The secret the Bridge's stored API keys are encrypted with: 32 bytes the operator
 /// provides. It never prints.
-pub struct EncryptionKey([u8; 32]);
+pub struct EncryptionKey([u8; EncryptionKey::LEN]);
 
 impl EncryptionKey {
     pub const LEN: usize = 32;
@@ -59,7 +60,16 @@ pub struct Row<'a> {
     pub fingerprint: &'a Fingerprint,
 }
 
-impl Row<'_> {
+impl<'a> Row<'a> {
+    /// The row of `user`'s key with `fingerprint`.
+    pub fn of(user: &'a LibraryUser, fingerprint: &'a Fingerprint) -> Self {
+        Self {
+            library_server: &user.library_server,
+            user_id: &user.user_id,
+            fingerprint,
+        }
+    }
+
     /// The row as associated data, each variable-length field prefixed with its length so no
     /// two rows encode alike.
     fn associated_data(&self) -> Vec<u8> {
@@ -144,8 +154,8 @@ impl Sealing {
     /// The key [`Sealing::seal`] sealed for `row`, or `None` if `sealed` doesn't open: it was
     /// sealed under another encryption key, for another row, or is damaged.
     pub fn open(&self, row: &Row<'_>, sealed: &[u8]) -> Option<ApiKey> {
-        let (nonce, ciphertext) = sealed.split_at_checked(NONCE_LEN)?;
-        let nonce = XNonce::from(<[u8; NONCE_LEN]>::try_from(nonce).ok()?);
+        let (nonce, ciphertext) = sealed.split_first_chunk::<NONCE_LEN>()?;
+        let nonce = XNonce::from(*nonce);
         let plaintext = self
             .cipher
             .decrypt(
@@ -169,13 +179,13 @@ pub struct SealError;
 mod tests {
     use abs::ApiKey;
 
-    use super::{EncryptionKey, Row, Sealing};
+    use super::{EncryptionKey, Fingerprint, Row, Sealing};
 
     fn under(byte: u8) -> Sealing {
         Sealing::new(&EncryptionKey::new([byte; EncryptionKey::LEN]))
     }
 
-    const FINGERPRINT: [u8; 32] = [9; 32];
+    const FINGERPRINT: Fingerprint = [9; 32];
 
     fn row<'a>(library_server: &'a str, user_id: &'a str) -> Row<'a> {
         Row {

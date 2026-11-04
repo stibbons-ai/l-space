@@ -42,6 +42,8 @@ use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+use crate::audiobookshelf::{AbsUser, Audiobookshelf};
+
 /// Generous: the Bridge is up within milliseconds, but CI machines can be slow.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -258,6 +260,24 @@ fn bearer(session: &Session) -> String {
 /// The configuration entry for a Library Server at `url`.
 pub fn library_server_toml(url: &str) -> String {
     format!("[[library_servers]]\nurl = \"{url}\"\n")
+}
+
+/// The rejection of a call without a usable session.
+pub const SESSION_INVALID: (StatusCode, ApiError) =
+    (StatusCode::UNAUTHORIZED, ApiError::SessionInvalid);
+
+/// Who a session of `user` on `abs` acts as.
+pub fn acting_as(abs: &Audiobookshelf, user: &AbsUser) -> CurrentUser {
+    acting_on(abs.base_url(), user)
+}
+
+/// Who a session of `user` on the Library Server at `library_server` acts as.
+pub fn acting_on(library_server: &str, user: &AbsUser) -> CurrentUser {
+    CurrentUser {
+        library_server: library_server.to_owned(),
+        user_id: user.id.clone(),
+        username: user.username.clone(),
+    }
 }
 
 /// The App API as the App calls it, over HTTP. Paths and payloads follow the `api` crate's

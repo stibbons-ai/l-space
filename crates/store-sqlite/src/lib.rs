@@ -189,12 +189,10 @@ impl Store for SqliteStore {
     ) -> Result<(), Error> {
         let (id, user) = (*id, user.clone());
         let fingerprint = self.sealing.fingerprint(api_key);
-        let row = Row {
-            library_server: &user.library_server,
-            user_id: &user.user_id,
-            fingerprint: &fingerprint,
-        };
-        let sealed = self.sealing.seal(&row, api_key).map_err(Error::new)?;
+        let sealed = self
+            .sealing
+            .seal(&Row::of(&user, &fingerprint), api_key)
+            .map_err(Error::new)?;
         let key_id = *self.sealing.key_id();
         self.transaction(move |tx| {
             // A key already stored for the user keeps its row; logging in re-seals it.
@@ -250,12 +248,7 @@ impl Store for SqliteStore {
                 else {
                     return Ok(Lookup::Unknown);
                 };
-                let row = Row {
-                    library_server: &user.library_server,
-                    user_id: &user.user_id,
-                    fingerprint: &fingerprint,
-                };
-                if let Some(api_key) = sealing.open(&row, &sealed) {
+                if let Some(api_key) = sealing.open(&Row::of(&user, &fingerprint), &sealed) {
                     return Ok(Lookup::Open(Session { user, api_key }));
                 }
                 tx.prepare_cached("DELETE FROM api_keys WHERE id = ?1")?
@@ -527,7 +520,8 @@ mod tests {
             .pragma_update(None, "user_version", newer)
             .unwrap();
 
-        let error = SqliteStore::open(&database.path, &EncryptionKey::new([1; 32])).unwrap_err();
+        let error = SqliteStore::open(&database.path, &EncryptionKey::new([1; EncryptionKey::LEN]))
+            .unwrap_err();
         assert_eq!(error.to_string(), "migrate the schema");
         let cause = std::error::Error::source(&error)
             .expect("a cause")

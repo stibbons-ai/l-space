@@ -6,52 +6,41 @@
 //! around it is ignored. Errors name the variable (and the file) and what is wrong, never the
 //! key or the file's contents.
 
-use std::fmt;
 use std::path::PathBuf;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use store_sqlite::EncryptionKey;
 
-pub const FILE_VAR: &str = "BRIDGE_ENCRYPTION_KEY_FILE";
-pub const VALUE_VAR: &str = "BRIDGE_ENCRYPTION_KEY";
+const FILE_VAR: &str = "BRIDGE_ENCRYPTION_KEY_FILE";
+const VALUE_VAR: &str = "BRIDGE_ENCRYPTION_KEY";
 
 /// Ends every error message.
 const HINT: &str = "generate a key with `openssl rand -base64 32`";
 
-/// The key, and whether [`VALUE_VAR`] was ignored because [`FILE_VAR`] was set too.
-#[derive(Debug)]
-pub struct Loaded {
-    pub key: EncryptionKey,
-    pub ignored_value_var: bool,
-}
-
-/// Loads the key from the process environment.
-pub fn load() -> Result<Loaded, LoadError> {
+/// Loads the key from the process environment, warning if [`VALUE_VAR`] is ignored because
+/// [`FILE_VAR`] is set too.
+pub fn load() -> Result<EncryptionKey, LoadError> {
     let (file, value) = (std::env::var_os(FILE_VAR), std::env::var_os(VALUE_VAR));
-    let ignored_value_var = file.is_some() && value.is_some();
+    let ignored_value = file.is_some() && value.is_some();
     let key = match (file, value) {
         (Some(path), _) => load_file(PathBuf::from(path))?,
         (None, Some(value)) => {
-            decode(value.as_encoded_bytes()).map_err(|problem| LoadError::Unusable {
-                origin: Origin::Value,
-                problem,
-            })?
+            decode(value.as_encoded_bytes()).map_err(LoadError::UnusableValue)?
         }
         (None, None) => return Err(LoadError::Missing),
     };
-    Ok(Loaded {
-        key,
-        ignored_value_var,
-    })
+    if ignored_value {
+        tracing::warn!("both {FILE_VAR} and {VALUE_VAR} are set; using {FILE_VAR}");
+    }
+    Ok(key)
 }
 
 fn load_file(path: PathBuf) -> Result<EncryptionKey, LoadError> {
     match std::fs::read(&path) {
-        Ok(contents) => decode(&contents).map_err(|problem| LoadError::Unusable {
-            origin: Origin::File(path),
-            problem,
-        }),
+        Ok(contents) => {
+            decode(&contents).map_err(|problem| LoadError::UnusableFile { path, problem })
+        }
         Err(error) => Err(LoadError::Unreadable { path, error }),
     }
 }
@@ -79,24 +68,10 @@ pub enum LoadError {
         path: PathBuf,
         error: std::io::Error,
     },
-    #[error("{origin} {problem}; {HINT}")]
-    Unusable { origin: Origin, problem: Problem },
-}
-
-/// Where an unusable key came from.
-#[derive(Debug)]
-pub enum Origin {
-    File(PathBuf),
-    Value,
-}
-
-impl fmt::Display for Origin {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::File(path) => write!(f, "{FILE_VAR}: the file \"{}\"", path.display()),
-            Self::Value => f.write_str(VALUE_VAR),
-        }
-    }
+    #[error("{FILE_VAR}: the file \"{}\" {problem}; {HINT}", path.display())]
+    UnusableFile { path: PathBuf, problem: Problem },
+    #[error("{VALUE_VAR} {0}; {HINT}")]
+    UnusableValue(Problem),
 }
 
 #[derive(Debug, thiserror::Error)]
