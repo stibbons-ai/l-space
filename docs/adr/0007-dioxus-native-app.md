@@ -21,9 +21,9 @@ The spike in `spikes/ios-audio` (issue #2) ran a release `dx` build on an iPhone
 | # | Check | Result |
 |---|-------|--------|
 | 1 | `dx` build installs | Pass, but only on Dioxus 0.8 (see below) |
-| 2 | 10+ minutes locked | Pass: 11 minutes of 60-second heartbeats while playing, with no stalls |
+| 2 | 10+ minutes locked | Pass: the phone stayed locked for 11+ minutes, with 60-second heartbeats while playing and no stalls |
 | 3 | Lock-screen pause and resume reach Rust | Pass: `MPRemoteCommandCenter` pause and play handlers ran in Rust |
-| 4 | A call interrupts and playback resumes | Pass: interruption began, then ended with `shouldResume`, and playback resumed |
+| 4 | A call interrupts and playback resumes | Pass for an outgoing call: interruption began, then ended with `shouldResume`, and playback resumed. Not yet tested with an incoming call |
 | 5 | AirPlay from Control Center | Pass: the route changed to AirPlay and playback continued |
 
 AirPods also worked. Taking them out paused playback, as iOS does when headphones disconnect, and the next play used the speaker.
