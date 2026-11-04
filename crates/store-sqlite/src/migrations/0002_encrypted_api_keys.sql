@@ -4,9 +4,9 @@
 -- migrating from schema version 1, `SqliteStore::open` runs `VACUUM`, which drops the free
 -- pages where keys the earlier Bridge deleted may linger (if it fails, nothing is migrated and
 -- the next start retries), and it sets `PRAGMA secure_delete = ON`, so the pages this
--- migration frees are zeroed. One gap remains: while this migration runs, the rollback
--- journal holds copies of the dropped pages; it is unlinked after commit, not zeroed, and a
--- crash leaves it as a hot journal until the next open rolls it back.
+-- migration frees are zeroed. One gap remains: while the `VACUUM` and this migration run,
+-- their rollback journals hold copies of the old pages; each is unlinked after its commit, not
+-- zeroed, and a crash leaves it as a hot journal until the next open rolls it back.
 
 DROP TABLE sessions;
 DROP TABLE api_keys;

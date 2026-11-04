@@ -55,6 +55,8 @@ pub struct Session {
 pub struct Error(Box<dyn std::error::Error + Send + Sync>);
 
 impl Error {
+    /// Wraps `source`. The wrapped error and its sources are logged; they must not carry
+    /// secrets or row data.
     pub fn new(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self(source.into())
     }

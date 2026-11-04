@@ -213,13 +213,21 @@ async fn a_logged_out_key_under_another_encryption_key_is_forgotten_quietly() {
     let session = bridge.api().login(abs.base_url(), &alice.api_key.key).await;
     bridge.api().logout(&session).await;
 
-    for start in ["first", "second"] {
+    for (start, removed) in [("first", 1), ("second", 0)] {
         bridge.restart_with_key(KeyEnv::value(OTHER_KEY));
         assert_eq!(
             events(bridge.startup_output(), OTHER_KEY_WARNING).count(),
             0,
             "{start} start with the other key"
         );
+        let removals: Vec<_> = events(bridge.startup_output(), UNUSED_KEYS_REMOVED).collect();
+        if removed == 0 {
+            assert!(removals.is_empty(), "{start} start: {removals:#?}");
+        } else {
+            assert_eq!(removals.len(), 1, "{start} start");
+            assert_eq!(removals[0]["level"], "INFO");
+            assert_eq!(removals[0]["removed"], removed);
+        }
     }
     let fresh = bridge.api().login(abs.base_url(), &alice.api_key.key).await;
     assert_eq!(
@@ -227,3 +235,6 @@ async fn a_logged_out_key_under_another_encryption_key_is_forgotten_quietly() {
         acting_as(&abs, &alice)
     );
 }
+
+const UNUSED_KEYS_REMOVED: &str = "removed stored API keys that were encrypted with another \
+                                   encryption key and that no session used";

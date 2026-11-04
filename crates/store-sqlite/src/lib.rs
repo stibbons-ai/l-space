@@ -539,44 +539,56 @@ mod tests {
         assert_eq!((keys_of("alice-id"), keys_of("bob-id")), (1, 0));
     }
 
+    /// Writes a database as the Bridge before encryption (schema version 1) left it: plain-text
+    /// keys, one session, and most keys deleted without `secure_delete`, so their plain text
+    /// lingers in free pages.
+    fn seed_plain_text_database(database: &TempDatabase) {
+        let v1 = database.raw();
+        v1.execute_batch(MIGRATIONS[0]).unwrap();
+        v1.pragma_update(None, "user_version", 1).unwrap();
+        for n in 0..200 {
+            v1.execute(
+                "INSERT INTO api_keys (library_server, user_id, key_fingerprint, sealed_key)
+                 VALUES ('https://abs.lan', ?1, zeroblob(32), CAST(?2 AS BLOB))",
+                params![
+                    format!("user-{n}"),
+                    format!("legacy-plain-key-{n:04}-{}", "x".repeat(100))
+                ],
+            )
+            .unwrap();
+        }
+        v1.execute(
+            "INSERT INTO sessions (id, api_key_id) VALUES (?1, 1)",
+            params![token(1).as_bytes()],
+        )
+        .unwrap();
+        v1.execute("DELETE FROM api_keys WHERE id > 50", [])
+            .unwrap();
+        let free_pages: i64 = v1
+            .pragma_query_value(None, "freelist_count", |row| row.get(0))
+            .unwrap();
+        assert!(free_pages > 0, "the deleted keys left no free pages");
+        drop(v1);
+        assert!(contains(
+            &file_bytes(&database.path),
+            b"legacy-plain-key-0150"
+        ));
+    }
+
+    fn schema_version(database: &TempDatabase) -> i64 {
+        database
+            .raw()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap()
+    }
+
     /// A database from before encryption (schema version 1) loses its plain-text keys and
     /// their sessions, and the file no longer holds them: neither the keys still stored nor
     /// those the earlier Bridge deleted, which it left in free pages.
     #[tokio::test]
     async fn plain_text_keys_from_before_encryption_are_dropped() {
         let database = TempDatabase::new();
-        {
-            let v1 = database.raw();
-            v1.execute_batch(MIGRATIONS[0]).unwrap();
-            v1.pragma_update(None, "user_version", 1).unwrap();
-            for n in 0..200 {
-                v1.execute(
-                    "INSERT INTO api_keys (library_server, user_id, key_fingerprint, sealed_key)
-                     VALUES ('https://abs.lan', ?1, zeroblob(32), CAST(?2 AS BLOB))",
-                    params![
-                        format!("user-{n}"),
-                        format!("legacy-plain-key-{n:04}-{}", "x".repeat(100))
-                    ],
-                )
-                .unwrap();
-            }
-            v1.execute(
-                "INSERT INTO sessions (id, api_key_id) VALUES (?1, 1)",
-                params![token(1).as_bytes()],
-            )
-            .unwrap();
-            // As the earlier Bridge revoked keys: without `secure_delete`.
-            v1.execute("DELETE FROM api_keys WHERE id > 50", [])
-                .unwrap();
-            let free_pages: i64 = v1
-                .pragma_query_value(None, "freelist_count", |row| row.get(0))
-                .unwrap();
-            assert!(free_pages > 0, "the deleted keys left no free pages");
-        }
-        assert!(contains(
-            &file_bytes(&database.path),
-            b"legacy-plain-key-0150"
-        ));
+        seed_plain_text_database(&database);
 
         let store = database.open_with(1);
 
@@ -584,6 +596,28 @@ mod tests {
         assert!(!contains(&file_bytes(&database.path), b"legacy-plain-key"));
         login(&store, 2, &alice(), "alice-key").await;
         assert_eq!(api_key(&store, 2).await, Some(ApiKey::new("alice-key")));
+    }
+
+    /// If rebuilding the file fails (here: another connection is reading it), nothing is
+    /// migrated, so the next open rebuilds it and the plain text still goes.
+    #[test]
+    fn a_failed_rebuild_is_retried_at_the_next_open() {
+        let database = TempDatabase::new();
+        seed_plain_text_database(&database);
+        let reader = database.raw();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM api_keys;")
+            .unwrap();
+
+        let error = SqliteStore::open(&database.path, &EncryptionKey::new([1; EncryptionKey::LEN]))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "drop plain-text keys from free pages");
+        assert_eq!(schema_version(&database), 1);
+
+        drop(reader);
+        drop(database.open_with(1));
+        assert_eq!(schema_version(&database), MIGRATIONS.len() as i64);
+        assert!(!contains(&file_bytes(&database.path), b"legacy-plain-key"));
     }
 
     #[test]
