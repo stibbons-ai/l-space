@@ -35,6 +35,8 @@ Findings that bind the App:
 - **The Swift runtime path.** In the iOS 27 SDK, CoreMedia links `@rpath/libswiftCoreMedia.dylib`, and `dx` doesn't add `/usr/lib/swift` to the runpath the way Xcode does. A `build.rs` passes `-Wl,-rpath,/usr/lib/swift`.
 - **Signing.** `dx` signs with any Apple Development profile matching the bundle ID. Xcode's wildcard team profile works.
 
+We build the App on the Dioxus 0.8 alpha now and move to 0.8 stable when it ships, rather than waiting. This bumps the whole workspace, including the API crate's server functions, to Dioxus 0.8.
+
 ## Considered Options
 
 - **SwiftUI**: the best iOS feel, but API types would come from code generation (OpenAPI or protobuf) and Android would be a separate app.
