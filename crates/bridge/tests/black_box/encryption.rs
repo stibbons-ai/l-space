@@ -23,6 +23,9 @@ const OTHER_KEY_WARNING: &str = "stored API keys were encrypted with another enc
                                  their sessions end at their next call, and their users must \
                                  log in again";
 
+const BOTH_SET_WARNING: &str = "both BRIDGE_ENCRYPTION_KEY_FILE and BRIDGE_ENCRYPTION_KEY are set; using \
+     BRIDGE_ENCRYPTION_KEY_FILE";
+
 #[tokio::test]
 async fn a_key_file_and_the_same_key_in_the_environment_open_the_same_sessions() {
     let abs = Audiobookshelf::shared();
@@ -44,6 +47,17 @@ async fn a_key_file_and_the_same_key_in_the_environment_open_the_same_sessions()
         bridge.api().current_user(&session).await,
         acting_as(&abs, &alice)
     );
+
+    // An empty file variable (compose's `${VAR:-}`) counts as unset.
+    bridge.restart_with_key(KeyEnv {
+        file: Some(KeyFile::Named(String::new())),
+        value: Some(KEY.into()),
+    });
+    assert_eq!(events(bridge.startup_output(), BOTH_SET_WARNING).count(), 0);
+    assert_eq!(
+        bridge.api().current_user(&session).await,
+        acting_as(&abs, &alice)
+    );
 }
 
 /// With both variables set, the file's key is the one in use, and the warning names both
@@ -58,18 +72,7 @@ async fn the_key_file_wins_over_the_environment() {
             value: Some(OTHER_KEY.into()),
         },
     );
-    let warnings: Vec<_> = bridge
-        .startup_output()
-        .iter()
-        .filter(|event| event["level"] == "WARN")
-        .collect();
-    assert_eq!(warnings.len(), 1, "{warnings:#?}");
-    let warning = warnings[0]["message"].as_str().expect("message");
-    assert!(
-        warning.contains("BRIDGE_ENCRYPTION_KEY_FILE")
-            && warning.contains("BRIDGE_ENCRYPTION_KEY "),
-        "{warning}"
-    );
+    assert_eq!(events(bridge.startup_output(), BOTH_SET_WARNING).count(), 1);
     let alice = abs.new_user().await;
     let session = bridge.api().login(abs.base_url(), &alice.api_key.key).await;
 
@@ -145,10 +148,9 @@ async fn another_encryption_key_ends_sessions_until_a_fresh_login() {
     );
 
     bridge.restart_with_key(KeyEnv::value(OTHER_KEY));
-    assert_eq!(
-        events(bridge.startup_output(), OTHER_KEY_WARNING).count(),
-        1
-    );
+    let warnings: Vec<_> = events(bridge.startup_output(), OTHER_KEY_WARNING).collect();
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["keys"], 1);
     assert_eq!(bridge.api().current_user_error(&old).await, SESSION_INVALID);
     assert_eq!(bridge.api().current_user_error(&old).await, SESSION_INVALID);
 
@@ -191,3 +193,28 @@ async fn another_encryption_key_ends_sessions_until_a_fresh_login() {
 const KEY_REMOVED: &str = "a stored API key does not decrypt with the current encryption key \
                            (or was tampered with); it was removed and the sessions opened with \
                            it ended";
+
+/// A key whose sessions all ended (here by logout) is useless once the encryption key
+/// changed: it is removed at the next start, with no warning about it then or later.
+#[tokio::test]
+async fn a_logged_out_key_under_another_encryption_key_is_forgotten_quietly() {
+    let abs = Audiobookshelf::shared();
+    let mut bridge = TestBridge::start(&library_server_toml(abs.base_url()));
+    let alice = abs.new_user().await;
+    let session = bridge.api().login(abs.base_url(), &alice.api_key.key).await;
+    bridge.api().logout(&session).await;
+
+    for start in ["first", "second"] {
+        bridge.restart_with_key(KeyEnv::value(OTHER_KEY));
+        assert_eq!(
+            events(bridge.startup_output(), OTHER_KEY_WARNING).count(),
+            0,
+            "{start} start with the other key"
+        );
+    }
+    let fresh = bridge.api().login(abs.base_url(), &alice.api_key.key).await;
+    assert_eq!(
+        bridge.api().current_user(&fresh).await,
+        acting_as(&abs, &alice)
+    );
+}

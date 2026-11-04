@@ -96,8 +96,9 @@ impl KeyEnv {
 pub enum KeyFile {
     /// A file holding this, in the Bridge's directory.
     Holding(String),
-    /// A path where there is no file.
-    Missing,
+    /// This, verbatim, as the variable's value: a path relative to the Bridge's directory where
+    /// there may be no file, the empty string, or a mistake like the key itself.
+    Named(String),
 }
 
 /// A running Bridge, killed on drop.
@@ -504,8 +505,8 @@ fn spawn(config: &Path, rust_log: &str, key: &KeyEnv) -> (Child, Receiver<Value>
             std::fs::write(&path, contents).expect("write key file");
             command.env("BRIDGE_ENCRYPTION_KEY_FILE", path);
         }
-        Some(KeyFile::Missing) => {
-            command.env("BRIDGE_ENCRYPTION_KEY_FILE", dir.join("no-such-key-file"));
+        Some(KeyFile::Named(value)) => {
+            command.env("BRIDGE_ENCRYPTION_KEY_FILE", value);
         }
         None => {}
     }

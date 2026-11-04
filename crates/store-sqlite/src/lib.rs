@@ -7,8 +7,8 @@
 //! and compared and looked up only by a fingerprint keyed by it (see `sealing`). A key that no
 //! longer decrypts (the Bridge runs with another encryption key, or the row was tampered with)
 //! is removed with its sessions when one of them is looked up: the session is gone, and its
-//! user logs in again. On open, the store warns if it holds keys sealed under another
-//! encryption key.
+//! user logs in again. On open, the store removes keys sealed under another encryption key
+//! that no session uses, and warns if any such keys still have sessions.
 
 mod sealing;
 
@@ -52,15 +52,21 @@ impl SqliteStore {
         connection
             .pragma_update(None, "foreign_keys", true)
             .map_err(step("enable foreign keys"))?;
-        // Deleted keys, and the plain-text keys of databases from before encryption, are
-        // overwritten rather than left in free pages.
+        // Deleted keys are overwritten rather than left in free pages.
         connection
             .pragma_update(None, "secure_delete", true)
             .map_err(step("enable secure delete"))?;
-        migrate(&mut connection).map_err(step("migrate the schema"))?;
+        let applied = migrate(&mut connection).map_err(step("migrate the schema"))?;
+        if (1..FIRST_ENCRYPTED_SCHEMA).contains(&applied) {
+            // The earlier Bridge stored keys in plain text and never set `secure_delete`, so
+            // keys it deleted may linger in free pages; rebuilding the file drops them.
+            connection
+                .execute_batch("VACUUM")
+                .map_err(step("drop plain-text keys from free pages"))?;
+        }
         let sealing = Sealing::new(key);
-        warn_of_keys_sealed_under_another_key(&connection, &sealing)
-            .map_err(step("count keys sealed under another encryption key"))?;
+        forget_keys_sealed_under_another_key(&connection, &sealing)
+            .map_err(step("forget keys sealed under another encryption key"))?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             sealing: Arc::new(sealing),
@@ -130,7 +136,11 @@ fn create_private(_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn migrate(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// The schema version from which API keys are stored encrypted.
+const FIRST_ENCRYPTED_SCHEMA: usize = 2;
+
+/// Migrates the schema to the newest, returning the version the database had.
+fn migrate(connection: &mut Connection) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let known = MIGRATIONS.len();
     let transaction = connection.transaction()?;
     let applied: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -141,22 +151,29 @@ fn migrate(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error 
             format!("the database has schema version {applied}, newer than this Bridge's {known}")
         })?;
     if applied == known {
-        return Ok(());
+        return Ok(applied);
     }
     for migration in &MIGRATIONS[applied..] {
         transaction.execute_batch(migration)?;
     }
     transaction.pragma_update(None, "user_version", known as i64)?;
     transaction.commit()?;
-    Ok(())
+    Ok(applied)
 }
 
-/// Warns once if stored keys were sealed under another encryption key than `sealing`'s: their
-/// sessions will end at their next call.
-fn warn_of_keys_sealed_under_another_key(
+/// Removes keys sealed under another encryption key than `sealing`'s that no session uses
+/// (nothing would ever look them up again), and warns once if others remain: their sessions
+/// end at their next call.
+fn forget_keys_sealed_under_another_key(
     connection: &Connection,
     sealing: &Sealing,
 ) -> rusqlite::Result<()> {
+    connection.execute(
+        "DELETE FROM api_keys
+         WHERE key_id <> ?1
+           AND NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.api_key_id = api_keys.id)",
+        params![sealing.key_id()],
+    )?;
     let keys: i64 = connection.query_row(
         "SELECT count(*) FROM api_keys WHERE key_id <> ?1",
         params![sealing.key_id()],
@@ -202,7 +219,7 @@ impl Store for SqliteStore {
                          (library_server, user_id, key_fingerprint, sealed_key, key_id)
                      VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT (library_server, user_id, key_fingerprint)
-                     DO UPDATE SET sealed_key = excluded.sealed_key, key_id = excluded.key_id
+                     DO UPDATE SET sealed_key = excluded.sealed_key
                      RETURNING id",
                 )?
                 .query_row(
@@ -480,8 +497,39 @@ mod tests {
         assert_eq!(api_key(&store, 2).await, None);
     }
 
+    /// Keys sealed under another encryption key that no session uses are removed on open;
+    /// those with sessions stay until a session looks them up.
+    #[tokio::test]
+    async fn opening_with_another_key_removes_keys_no_session_uses() {
+        let database = TempDatabase::new();
+        {
+            let store = database.open_with(1);
+            login(&store, 1, &alice(), "alice-key").await;
+            login(&store, 2, &bob(), "bob-key").await;
+            assert!(store.close_session(&token(2)).await.unwrap());
+        }
+        let keys_of = |user_id: &str| -> i64 {
+            database
+                .raw()
+                .query_row(
+                    "SELECT count(*) FROM api_keys WHERE user_id = ?1",
+                    params![user_id],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+
+        // The same key keeps both.
+        drop(database.open_with(1));
+        assert_eq!((keys_of("alice-id"), keys_of("bob-id")), (1, 1));
+
+        drop(database.open_with(2));
+        assert_eq!((keys_of("alice-id"), keys_of("bob-id")), (1, 0));
+    }
+
     /// A database from before encryption (schema version 1) loses its plain-text keys and
-    /// their sessions, and the file no longer holds them.
+    /// their sessions, and the file no longer holds them: neither the keys still stored nor
+    /// those the earlier Bridge deleted, which it left in free pages.
     #[tokio::test]
     async fn plain_text_keys_from_before_encryption_are_dropped() {
         let database = TempDatabase::new();
@@ -489,19 +537,34 @@ mod tests {
             let v1 = database.raw();
             v1.execute_batch(MIGRATIONS[0]).unwrap();
             v1.pragma_update(None, "user_version", 1).unwrap();
-            v1.execute(
-                "INSERT INTO api_keys (library_server, user_id, key_fingerprint, sealed_key)
-                 VALUES ('https://abs.lan', 'alice-id', zeroblob(32), CAST(?1 AS BLOB))",
-                params!["legacy-plain-key"],
-            )
-            .unwrap();
+            for n in 0..200 {
+                v1.execute(
+                    "INSERT INTO api_keys (library_server, user_id, key_fingerprint, sealed_key)
+                     VALUES ('https://abs.lan', ?1, zeroblob(32), CAST(?2 AS BLOB))",
+                    params![
+                        format!("user-{n}"),
+                        format!("legacy-plain-key-{n:04}-{}", "x".repeat(100))
+                    ],
+                )
+                .unwrap();
+            }
             v1.execute(
                 "INSERT INTO sessions (id, api_key_id) VALUES (?1, 1)",
                 params![token(1).as_bytes()],
             )
             .unwrap();
+            // As the earlier Bridge revoked keys: without `secure_delete`.
+            v1.execute("DELETE FROM api_keys WHERE id > 50", [])
+                .unwrap();
+            let free_pages: i64 = v1
+                .pragma_query_value(None, "freelist_count", |row| row.get(0))
+                .unwrap();
+            assert!(free_pages > 0, "the deleted keys left no free pages");
         }
-        assert!(contains(&file_bytes(&database.path), b"legacy-plain-key"));
+        assert!(contains(
+            &file_bytes(&database.path),
+            b"legacy-plain-key-0150"
+        ));
 
         let store = database.open_with(1);
 

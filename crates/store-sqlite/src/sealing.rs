@@ -134,7 +134,7 @@ impl Sealing {
     /// `api_key` encrypted for `row`: a random nonce, then the ciphertext and its tag.
     pub fn seal(&self, row: &Row<'_>, api_key: &ApiKey) -> Result<Vec<u8>, SealError> {
         let mut nonce = [0; NONCE_LEN];
-        getrandom::fill(&mut nonce).map_err(|_| SealError)?;
+        getrandom::fill(&mut nonce).map_err(SealError::NoRandomness)?;
         let ciphertext = self
             .cipher
             .encrypt(
@@ -144,7 +144,7 @@ impl Sealing {
                     aad: &row.associated_data(),
                 },
             )
-            .map_err(|_| SealError)?;
+            .map_err(|_| SealError::Encrypt)?;
         let mut sealed = Vec::with_capacity(NONCE_LEN + ciphertext.len());
         sealed.extend_from_slice(&nonce);
         sealed.extend_from_slice(&ciphertext);
@@ -170,10 +170,15 @@ impl Sealing {
     }
 }
 
-/// Sealing an API key failed: the system had no randomness for its nonce.
+/// Sealing an API key failed.
 #[derive(Debug, thiserror::Error)]
-#[error("cannot seal the API key: no randomness for its nonce")]
-pub struct SealError;
+pub enum SealError {
+    #[error("cannot seal the API key: no randomness for its nonce")]
+    NoRandomness(#[source] getrandom::Error),
+    /// The cipher refused the key (only a key far too long to be one makes it).
+    #[error("cannot seal the API key: encryption failed")]
+    Encrypt,
+}
 
 #[cfg(test)]
 mod tests {
