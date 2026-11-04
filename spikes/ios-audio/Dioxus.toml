@@ -1,0 +1,24 @@
+[application]
+name = "LSpaceSpike"
+
+[bundle]
+identifier = "ai.stibbons.lspace.spike"
+publisher = "stibbons-ai"
+
+[ios.plist]
+# Keeps AVPlayer running while the phone is locked (gate check 2).
+UIBackgroundModes = ["audio"]
+# The Bridge serves media over plain HTTP on the LAN.
+NSLocalNetworkUsageDescription = "Streams audio from your l-space Bridge."
+
+[ios.plist.NSAppTransportSecurity]
+NSAllowsArbitraryLoads = true
+
+# The iOS 27 SDK refuses to launch apps without a static UIScene manifest. tao (0.37+) vends
+# `TaoSceneDelegate`; the validator only reads Info.plist, so name it here.
+[ios.plist.UIApplicationSceneManifest]
+UIApplicationSupportsMultipleScenes = false
+
+[[ios.plist.UIApplicationSceneManifest.UISceneConfigurations.UIWindowSceneSessionRoleApplication]]
+UISceneConfigurationName = "Default Configuration"
+UISceneDelegateClassName = "TaoSceneDelegate"
