@@ -1,6 +1,6 @@
 //! How `RUST_LOG` shapes what an operator sees.
 
-use crate::support::TestBridge;
+use test_support::bridge::TestBridge;
 
 fn logged_by(bridge: &TestBridge, target: &str) -> Vec<String> {
     bridge
@@ -39,18 +39,6 @@ fn rust_log_directives_may_be_padded_with_spaces() {
     assert_eq!(
         logged_by(&bridge, "dioxus_server::server"),
         Vec::<String>::new(),
-        "{:#?}",
-        bridge.startup_output()
-    );
-}
-
-#[test]
-fn operator_rust_log_overrides_the_dioxus_suppression() {
-    let bridge = TestBridge::start_logging("", "dioxus_server::config=warn");
-
-    assert_eq!(
-        logged_by(&bridge, "dioxus_server::config"),
-        ["WARN"],
         "{:#?}",
         bridge.startup_output()
     );

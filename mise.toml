@@ -1,20 +1,33 @@
 [tools]
-rust = { version = "1.99.1", profile = "minimal", components = ["clippy", "rustfmt"] }
+# The iOS targets build the App (`crates/app`, which also pins `dx`).
+rust = { version = "1.99.1", profile = "minimal", components = ["clippy", "rustfmt"], targets = "aarch64-apple-ios,aarch64-apple-ios-sim" }
+
+# The App (`app`) always builds on its own. Built with the Bridge, `api` gets its `server`
+# feature, and the App's server function calls would run in-process instead of reaching the
+# Bridge over HTTP; the `bridge` binary would also differ from the one the tests expect.
 
 [tasks.build]
 description = "Build every crate and target"
-run = "cargo build --workspace --all-targets --locked"
+run = [
+  "cargo build --workspace --exclude app --all-targets --locked",
+  "cargo build --package app --all-targets --locked",
+]
 
 [tasks.test]
-description = "Run every test, including the black-box Bridge tests"
-run = "cargo test --workspace --all-targets --locked"
+description = "Run every test, including the black-box Bridge tests and the App's flow tests"
+run = [
+  # Also builds the `bridge` binary the App's tests start.
+  "cargo test --workspace --exclude app --all-targets --locked",
+  "cargo test --package app --all-targets --locked",
+]
 
 [tasks.lint]
 description = "Clippy with warnings denied, and rustfmt in check mode"
 run = [
-  "cargo clippy --workspace --all-targets --locked -- -D warnings",
-  # The workspace build enables `api/server` (the Bridge needs it); this checks the App's side.
+  "cargo clippy --workspace --exclude app --all-targets --locked -- -D warnings",
+  # The workspace build enables `api/server` (the Bridge needs it); these check the App's side.
   "cargo clippy --package api --all-targets --locked -- -D warnings",
+  "cargo clippy --package app --all-targets --locked -- -D warnings",
   "cargo fmt --all --check",
 ]
 

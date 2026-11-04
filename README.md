@@ -9,13 +9,29 @@ Toolchain and tasks come from [mise](https://mise.jdx.dev). In a fresh clone run
 | Task | Does |
 |---|---|
 | `mise run build` | builds every crate and target |
-| `mise run test` | runs every test, including the black-box Bridge tests |
+| `mise run test` | runs every test, including the black-box Bridge tests and the App's flow tests |
 | `mise run lint` | clippy with warnings denied, and `cargo fmt --check` |
 | `mise run check` | all of the above |
 
-The black-box Bridge tests start a real Audiobookshelf in a container ([testcontainers](https://crates.io/crates/testcontainers)), so `mise run test` needs a running Docker; the first run pulls the Audiobookshelf image.
+The black-box Bridge tests start a real Audiobookshelf in a container ([testcontainers](https://crates.io/crates/testcontainers)), so `mise run test` needs a running Docker; the first run pulls the Audiobookshelf image. The App's flow tests (`crates/app/tests`) drive the App's state and actions, without rendering, against a real Bridge and Audiobookshelf; they start the `bridge` binary from the same target directory, so run them through `mise run test` (or `cargo build -p bridge` before `cargo test -p app`). They run apart from the rest of the workspace: built together with the Bridge, `api` gets its `server` feature, and the App's server function calls would run in-process instead of over HTTP.
 
-Crates live in `crates/`: `api` (the App API contract), `bridge` (the Bridge binary), `abs` (the Audiobookshelf client), `store` (the storage traits and their contract test suite) and `store-sqlite` (their SQLite implementation).
+Crates live in `crates/`: `api` (the App API contract), `bridge` (the Bridge binary), `app` (the App), `abs` (the Audiobookshelf client), `store` (the storage traits and their contract test suite), `store-sqlite` (their SQLite implementation) and `test-support` (the test harness the Bridge's and the App's tests share).
+
+## Build and run the App
+
+The App is a [Dioxus](https://dioxuslabs.com) 0.8 mobile app (ADR 0007), built with Dioxus's CLI `dx`, which `crates/app/mise.toml` pins to the workspace's `dioxus` version (0.8.0-alpha.3). It also points `DEVELOPER_DIR` at `/Applications/Xcode.app`, so iOS builds use Xcode without `xcode-select -s`. Run `dx` from `crates/app` through mise, which also shadows Homebrew's unrelated `dx` (Deno):
+
+```sh
+cd crates/app
+mise trust && mise install                  # once: Rust's iOS targets and dx
+mise exec -- dx serve --ios                 # iOS Simulator: builds, installs and launches on the booted simulator
+mise exec -- dx serve --ios --release --device "<iPhone name>" \
+  --codesign --apple-team-id "Apple Development: <Name> (<TEAMID>)"   # a phone; device setup as in spikes/ios-audio/README.md
+```
+
+The bundle identifier is `ai.stibbons.lspace`. On first launch the App asks for the Bridge's address, for example `http://192.168.1.10:8080` (the Simulator reaches a Bridge on the same Mac at `http://127.0.0.1:8080`); the Bridge answers with its Library Servers, and the App remembers the address. Then a person picks a Library Server and enters their Audiobookshelf API key (see [Log in](#log-in)). The App keeps the address, the session and the language choice in `Application Support/ai.stibbons.lspace/app.json` inside its sandbox, readable by its owner only; the API key is not kept. The session lasts across launches until logout, or until the Bridge reports the key revoked or the session ended; if the Bridge can't be reached at launch the App stays logged in. Logout also forgets the session when the Bridge can't be reached.
+
+Every string comes from Fluent (`crates/app/locales/en.ftl`, `de.ftl`, embedded in the binary). The App shows German on a German device and English otherwise, unless Settings picks a language.
 
 ## Run the Bridge
 

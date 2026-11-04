@@ -1,0 +1,20 @@
+[package]
+name = "test-support"
+description = "Test harness shared by the Bridge's and the App's tests: a real Bridge process and a real Audiobookshelf container"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+api.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+testcontainers.workspace = true
+tokio = { workspace = true, features = ["time"] }
+
+[lints]
+workspace = true

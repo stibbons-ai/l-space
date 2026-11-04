@@ -3,7 +3,7 @@
 
 use std::net::TcpListener;
 
-use crate::support::{
+use test_support::bridge::{
     DATABASE, Exited, LISTEN, RUST_LOG, config_file, is_listening, library_server_toml,
     run_until_exit,
 };

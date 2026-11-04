@@ -1,0 +1,29 @@
+[package]
+name = "app"
+description = "The L-Space App (shipped as Ook): a Dioxus mobile app that is a remote for the Bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+api.workspace = true
+dioxus = { workspace = true, features = ["mobile", "launch", "lib", "logger"] }
+dirs.workspace = true
+fluent-bundle.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sys-locale.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+unic-langid.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+test-support.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

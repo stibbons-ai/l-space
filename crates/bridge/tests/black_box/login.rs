@@ -1,16 +1,17 @@
 //! Logging in with an Audiobookshelf API key, the session it opens, and how that session ends
 //! (ADR 0011), against a real Audiobookshelf.
 
-use std::net::TcpListener;
 use std::sync::Arc;
 
 use api::{ApiError, CurrentUser};
 use reqwest::StatusCode;
 use serde_json::json;
 
-use crate::audiobookshelf::{AbsUser, Audiobookshelf};
+use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
+use test_support::bridge::{TestBridge, library_server_toml, output_contains};
+use test_support::closed_port;
+
 use crate::forwarder::Forwarder;
-use crate::support::{TestBridge, library_server_toml, output_contains};
 
 /// The configuration naming `abs` as the one Library Server.
 fn abs_config(abs: &Audiobookshelf) -> String {
@@ -34,14 +35,6 @@ fn acting_on(library_server: &str, user: &AbsUser) -> CurrentUser {
         user_id: user.id.clone(),
         username: user.username.clone(),
     }
-}
-
-/// A loopback address nothing listens on.
-fn closed_port() -> std::net::SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
 }
 
 const SESSION_INVALID: (StatusCode, ApiError) =

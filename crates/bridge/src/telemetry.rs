@@ -5,9 +5,8 @@
 
 use tracing_subscriber::EnvFilter;
 
-/// Our directives, which the operator's `RUST_LOG` extends or overrides. Dioxus warns on every
-/// start that the Bridge has no `index.html`; it serves no pages.
-const DEFAULT_DIRECTIVES: &str = "info,dioxus_server::config=error";
+/// Our directives, which the operator's `RUST_LOG` extends or overrides.
+const DEFAULT_DIRECTIVES: &str = "info";
 
 /// Writes events to stdout as JSON, one object per line, with event fields at the top level.
 /// `RUST_LOG` directives are appended to [`DEFAULT_DIRECTIVES`], each trimmed of surrounding
