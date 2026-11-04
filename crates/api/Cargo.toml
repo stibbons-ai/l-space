@@ -10,9 +10,10 @@ publish.workspace = true
 [features]
 # The Bridge's side: server function bodies and the axum router that serves them.
 # Without it, each server function is an HTTP client call to the Bridge (the App's side).
-server = ["dioxus/server"]
+server = ["dioxus/server", "dep:abs"]
 
 [dependencies]
+abs = { workspace = true, optional = true }
 dioxus.workspace = true
 serde.workspace = true
 thiserror.workspace = true

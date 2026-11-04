@@ -53,7 +53,8 @@ pub enum Error {
     /// No usable answer: the Library Server could not be reached in time, or answered with
     /// something other than success or a rejection (a 403, which may come from a proxy in
     /// front of it, a server error, a redirect, a body that is not what Audiobookshelf sends).
-    /// The message describes the cause in full, without the URL.
+    /// The message describes the cause in full, without the URL; a cause may still name the
+    /// host (a TLS certificate that doesn't match it, for example).
     #[error("the Library Server gave no usable answer: {0}")]
     Unavailable(String),
 }
@@ -89,8 +90,9 @@ impl Client {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)
-            // reqwest drops `Authorization` on a redirect to another origin, but would send the
-            // key again to wherever the same origin points; an API call has no reason to move.
+            // reqwest drops `Authorization` on a redirect to another host or port, but would
+            // send the key along to a new path on the same one; an API call has no reason to
+            // move.
             .redirect(redirect::Policy::none())
             .build()
             .expect("the TLS backend and system configuration load");

@@ -1,17 +1,34 @@
 //! A TCP forwarder on loopback in front of another server, that a test can take down and
-//! bring back on the same port: a Library Server outage, or a second Library Server URL for
-//! the same Audiobookshelf.
+//! bring back: a Library Server outage, or a second Library Server URL for the same
+//! Audiobookshelf.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
+
+/// How long to wait before accepting again after `accept` failed, so a persistent failure
+/// (out of file descriptors) doesn't spin.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Forwards connections on its own port to `target`; stops forwarding when dropped.
 #[derive(Debug)]
 pub struct Forwarder {
     port: u16,
+    state: Arc<State>,
+    serving: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct State {
     target: String,
-    serving: Option<JoinHandle<()>>,
+    /// While false, connections are accepted and dropped at once.
+    forwarding: AtomicBool,
+    connections: Mutex<JoinSet<()>>,
 }
 
 impl Forwarder {
@@ -21,11 +38,15 @@ impl Forwarder {
             .await
             .expect("bind forwarder");
         let port = listener.local_addr().expect("forwarder address").port();
-        let target = target.to_owned();
-        let serving = Some(tokio::spawn(serve(listener, target.clone())));
+        let state = Arc::new(State {
+            target: target.to_owned(),
+            forwarding: AtomicBool::new(true),
+            connections: Mutex::new(JoinSet::new()),
+        });
+        let serving = tokio::spawn(serve(listener, Arc::clone(&state)));
         Self {
             port,
-            target,
+            state,
             serving,
         }
     }
@@ -35,40 +56,44 @@ impl Forwarder {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// Closes the port and every connection through it: connecting is refused until
-    /// [`Forwarder::resume`].
-    pub async fn stop(&mut self) {
-        if let Some(serving) = self.serving.take() {
-            serving.abort();
-            let _ = serving.await;
-        }
+    /// Closes every connection through the forwarder, and closes new ones as soon as they
+    /// open, until [`Forwarder::resume`].
+    pub async fn stop(&self) {
+        self.state.forwarding.store(false, Ordering::SeqCst);
+        let mut connections = self.state.connections.lock().await;
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
     }
 
-    /// Forwards again, on the same port.
-    pub async fn resume(&mut self) {
-        let listener = TcpListener::bind(("127.0.0.1", self.port))
-            .await
-            .expect("rebind forwarder");
-        self.serving = Some(tokio::spawn(serve(listener, self.target.clone())));
+    /// Forwards again.
+    pub fn resume(&self) {
+        self.state.forwarding.store(true, Ordering::SeqCst);
     }
 }
 
 impl Drop for Forwarder {
     fn drop(&mut self) {
-        if let Some(serving) = &self.serving {
-            serving.abort();
-        }
+        self.serving.abort();
     }
 }
 
-/// Accepts and forwards until aborted; aborting drops every open connection with it.
-async fn serve(listener: TcpListener, target: String) {
-    let mut connections = JoinSet::new();
+/// Accepts until aborted; aborting drops every open connection with it.
+async fn serve(listener: TcpListener, state: Arc<State>) {
     loop {
-        let Ok((mut inbound, _)) = listener.accept().await else {
-            continue;
+        let mut inbound = match listener.accept().await {
+            Ok((inbound, _)) => inbound,
+            Err(_) => {
+                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                continue;
+            }
         };
-        let target = target.clone();
+        // Checked under the lock `stop` holds, so no connection slips past a stop; while
+        // stopped, `inbound` drops here, closing the connection.
+        let mut connections = state.connections.lock().await;
+        if !state.forwarding.load(Ordering::SeqCst) {
+            continue;
+        }
+        let target = state.target.clone();
         connections.spawn(async move {
             if let Ok(mut outbound) = TcpStream::connect(&target).await {
                 let _ = copy_bidirectional(&mut inbound, &mut outbound).await;

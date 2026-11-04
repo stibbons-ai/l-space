@@ -74,6 +74,9 @@ pub trait Store: Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
     /// The open session `id`, if any.
+    ///
+    /// Whoever acts with the session's key must check that Audiobookshelf still reports the
+    /// session's user for it: an admin can move a key to another user.
     fn session(
         &self,
         id: &SessionId,

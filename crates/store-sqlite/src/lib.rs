@@ -4,9 +4,10 @@
 //! by a newer Bridge (a schema this build does not know) is refused rather than guessed at.
 //!
 //! API keys are compared and looked up only by their SHA-256 fingerprint, and the key itself
-//! goes in and out of the database only through [`seal`] and [`unseal`]. Both are the identity
-//! for now; encrypting stored keys replaces just that pair.
+//! goes in and out of the database only through one `Sealing` (seal and unseal), which is
+//! `PLAIN`, the identity, for now; encrypting stored keys replaces just that pair.
 
+use std::fmt;
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -21,10 +22,16 @@ const MIGRATIONS: &[&str] = &[include_str!("migrations/0001_sessions.sql")];
 
 /// How API keys are stored: `seal` turns a key into what the database holds, `unseal` turns
 /// that back into the key.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Sealing {
     seal: fn(&ApiKey) -> Vec<u8>,
     unseal: fn(Vec<u8>) -> Result<ApiKey, String>,
+}
+
+impl fmt::Debug for Sealing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Sealing")
+    }
 }
 
 /// Plain text, until stored keys are encrypted.
@@ -46,21 +53,27 @@ fn fingerprint(api_key: &ApiKey) -> [u8; 32] {
 }
 
 /// A [`Store`] in one SQLite database file.
-#[derive(Debug)]
 pub struct SqliteStore {
     connection: Arc<Mutex<Connection>>,
     sealing: Sealing,
 }
 
+impl fmt::Debug for SqliteStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SqliteStore").finish_non_exhaustive()
+    }
+}
+
 impl SqliteStore {
     /// Opens the database at `path`, creating it if it does not exist (its directory must),
-    /// makes it readable by its owner only, since it holds API keys, and migrates its schema.
+    /// on Unix makes it readable by its owner only, since it holds API keys, and migrates its
+    /// schema.
     pub fn open(path: &Path) -> Result<Self, Error> {
         Self::open_sealing(path, PLAIN)
     }
 
     fn open_sealing(path: &Path, sealing: Sealing) -> Result<Self, Error> {
-        create_private(path).map_err(Error::new)?;
+        create_private(path)?;
         let mut connection = Connection::open(path).map_err(Error::new)?;
         connection
             .pragma_update(None, "foreign_keys", true)
@@ -95,7 +108,7 @@ impl SqliteStore {
 
 /// Creates the file if missing and restricts it to its owner, also when it already existed.
 #[cfg(unix)]
-fn create_private(path: &Path) -> std::io::Result<()> {
+fn create_private(path: &Path) -> Result<(), Error> {
     use std::fs::{OpenOptions, Permissions};
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let file = OpenOptions::new()
@@ -103,12 +116,14 @@ fn create_private(path: &Path) -> std::io::Result<()> {
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(path)?;
+        .open(path)
+        .map_err(|error| Error::new(format!("create the database file: {error}")))?;
     file.set_permissions(Permissions::from_mode(0o600))
+        .map_err(|error| Error::new(format!("make the database owner-only: {error}")))
 }
 
 #[cfg(not(unix))]
-fn create_private(_path: &Path) -> std::io::Result<()> {
+fn create_private(_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
@@ -148,14 +163,14 @@ impl Store for SqliteStore {
         let (id, user) = (*id, user.clone());
         let (fingerprint, sealed) = (fingerprint(api_key), (self.sealing.seal)(api_key));
         self.transaction(move |tx| {
-            // A key already stored for the user keeps its row (and sealed value); the no-op
-            // update only makes `RETURNING` report the existing row.
+            // A key already stored for the user keeps its row; it is sealed anew, so a
+            // changed sealing (a new encryption key) takes effect at the next login.
             let api_key_id: i64 = tx
                 .prepare_cached(
                     "INSERT INTO api_keys (library_server, user_id, key_fingerprint, sealed_key)
                      VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT (library_server, user_id, key_fingerprint)
-                     DO UPDATE SET key_fingerprint = excluded.key_fingerprint
+                     DO UPDATE SET sealed_key = excluded.sealed_key
                      RETURNING id",
                 )?
                 .query_row(
@@ -225,9 +240,11 @@ impl Store for SqliteStore {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
+    use abs::ApiKey;
     use store::contract::Backend;
+    use store::{LibraryUser, SessionId, Store};
     use tempfile::TempDir;
 
     use super::{MIGRATIONS, SqliteStore};
@@ -255,6 +272,38 @@ mod tests {
     }
 
     store::store_contract_tests!(TempDatabase::new());
+
+    /// Logs `user` in twice with one key, and counts the stored keys.
+    async fn stored_keys_after_two_logins_with_one_key(store: SqliteStore, path: &Path) -> i64 {
+        let user = LibraryUser {
+            library_server: "https://abs.lan".into(),
+            user_id: "alice-id".into(),
+        };
+        for token in ["first", "second"] {
+            store
+                .open_session(
+                    &SessionId::of_token(token),
+                    &user,
+                    &ApiKey::new("alice-key"),
+                )
+                .await
+                .unwrap();
+        }
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM api_keys", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_key_used_twice_is_stored_once() {
+        let database = TempDatabase::new();
+        let store = SqliteStore::open(&database.path).unwrap();
+        assert_eq!(
+            stored_keys_after_two_logins_with_one_key(store, &database.path).await,
+            1
+        );
+    }
 
     /// The contract with a sealing that, like encryption, never stores the same key the same
     /// way twice: nothing may depend on comparing sealed keys.
@@ -301,6 +350,16 @@ mod tests {
         }
 
         store::store_contract_tests!(RandomlySealed(TempDatabase::new()));
+
+        #[tokio::test]
+        async fn a_key_used_twice_is_stored_once() {
+            let database = RandomlySealed(TempDatabase::new());
+            let store = database.open().await;
+            assert_eq!(
+                super::stored_keys_after_two_logins_with_one_key(store, &database.0.path).await,
+                1
+            );
+        }
     }
 
     #[test]

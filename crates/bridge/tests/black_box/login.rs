@@ -209,21 +209,24 @@ async fn each_key_of_a_user_keeps_its_own_sessions() {
 }
 
 #[tokio::test]
-async fn a_key_moved_to_another_user_ends_its_sessions() {
+async fn a_key_moved_to_another_user_ends_only_the_old_users_sessions() {
     let (bridge, abs) = bridge_with_abs();
     let alice = abs.new_user().await;
     let bob = abs.new_user().await;
-    let session = bridge.api().login(abs.base_url(), &alice.api_key.key).await;
+    let alices = bridge.api().login(abs.base_url(), &alice.api_key.key).await;
 
     abs.move_api_key(&alice.api_key, &bob.id).await;
+    assert_eq!(abs.whose_key(&alice.api_key).await["id"], bob.id);
+    let bobs = bridge.api().login(abs.base_url(), &alice.api_key.key).await;
 
+    assert_eq!(bridge.api().current_user_error(&alices).await, KEY_REJECTED);
     assert_eq!(
-        bridge.api().current_user_error(&session).await,
-        KEY_REJECTED
+        bridge.api().current_user_error(&alices).await,
+        SESSION_INVALID
     );
     assert_eq!(
-        bridge.api().current_user_error(&session).await,
-        SESSION_INVALID
+        bridge.api().current_user(&bobs).await,
+        acting_as(&abs, &bob)
     );
 }
 
@@ -265,7 +268,7 @@ async fn an_unreachable_library_server_is_reported() {
 #[tokio::test]
 async fn an_outage_keeps_the_session() {
     let abs = Audiobookshelf::shared();
-    let mut library_server = Forwarder::to(abs.address()).await;
+    let library_server = Forwarder::to(abs.address()).await;
     let bridge = TestBridge::start(&library_server_toml(&library_server.url()));
     let alice = abs.new_user().await;
     let session = bridge
@@ -279,7 +282,7 @@ async fn an_outage_keeps_the_session() {
         (StatusCode::BAD_GATEWAY, ApiError::LibraryServerUnreachable)
     );
 
-    library_server.resume().await;
+    library_server.resume();
     assert_eq!(
         bridge.api().current_user(&session).await,
         acting_on(&library_server.url(), &alice)
@@ -307,6 +310,22 @@ async fn sessions_on_two_library_servers_stay_apart() {
         bridge.api().current_user(&home_session).await,
         acting_as(&abs, &alice)
     );
+    assert_eq!(
+        bridge.api().current_user(&office_session).await,
+        acting_on(&office.url(), &alice)
+    );
+
+    // An outage of one Library Server leaves the other's sessions working.
+    office.stop().await;
+    assert_eq!(
+        bridge.api().current_user_error(&office_session).await,
+        (StatusCode::BAD_GATEWAY, ApiError::LibraryServerUnreachable)
+    );
+    assert_eq!(
+        bridge.api().current_user(&home_session).await,
+        acting_as(&abs, &alice)
+    );
+    office.resume();
 
     abs.delete_api_key(&office_key).await;
 
@@ -341,16 +360,21 @@ async fn sessions_and_logouts_survive_a_bridge_restart() {
 }
 
 #[tokio::test]
-async fn removing_the_library_server_from_the_configuration_ends_its_sessions() {
+async fn a_removed_library_server_makes_its_sessions_unusable_until_re_added() {
     let (mut bridge, abs) = bridge_with_abs();
     let alice = abs.new_user().await;
     let session = bridge.api().login(abs.base_url(), &alice.api_key.key).await;
 
     bridge.restart_with("");
-
     assert_eq!(
         bridge.api().current_user_error(&session).await,
         SESSION_INVALID
+    );
+
+    bridge.restart_with(&abs_config(&abs));
+    assert_eq!(
+        bridge.api().current_user(&session).await,
+        acting_as(&abs, &alice)
     );
 }
 

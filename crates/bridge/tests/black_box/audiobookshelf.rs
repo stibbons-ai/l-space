@@ -6,8 +6,9 @@
 //! [`Audiobookshelf::new_user`] and acting only on those. The seeded Library is shared by all
 //! tests, and users are never deleted while the container runs.
 //!
-//! Setup goes through Audiobookshelf's REST API as its root user, the way an admin would:
-//! users and API keys are created, changed and deleted there, never in its database.
+//! Setup goes through Audiobookshelf's REST API as its root user, the way an admin would,
+//! never through its database: users are created there, and API keys created, moved and
+//! deleted.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -36,12 +37,12 @@ static SHARED: Mutex<Weak<Audiobookshelf>> = Mutex::new(Weak::new());
 pub struct AbsUser {
     pub id: String,
     pub username: String,
-    pub api_key: ApiKey,
+    pub api_key: IssuedKey,
 }
 
 /// An API key as Audiobookshelf issued it.
 #[derive(Debug)]
-pub struct ApiKey {
+pub struct IssuedKey {
     /// Audiobookshelf's id for the key, to delete it by.
     pub id: String,
     /// The key itself.
@@ -110,7 +111,7 @@ impl Audiobookshelf {
     }
 
     /// Creates another API key for user `user_id`.
-    pub async fn new_api_key(&self, user_id: &str) -> ApiKey {
+    pub async fn new_api_key(&self, user_id: &str) -> IssuedKey {
         let created = self
             .admin(
                 reqwest::Method::POST,
@@ -118,7 +119,7 @@ impl Audiobookshelf {
                 Some(json!({"name": "l-space test", "userId": user_id, "isActive": true})),
             )
             .await;
-        ApiKey {
+        IssuedKey {
             id: created["apiKey"]["id"].as_str().expect("key id").to_owned(),
             key: created["apiKey"]["apiKey"]
                 .as_str()
@@ -128,7 +129,7 @@ impl Audiobookshelf {
     }
 
     /// Deletes `api_key`, as an admin revoking it would.
-    pub async fn delete_api_key(&self, api_key: &ApiKey) {
+    pub async fn delete_api_key(&self, api_key: &IssuedKey) {
         self.admin(
             reqwest::Method::DELETE,
             &format!("/api/api-keys/{}", api_key.id),
@@ -138,7 +139,7 @@ impl Audiobookshelf {
     }
 
     /// Makes `api_key` act for user `user_id` instead, as an admin editing it would.
-    pub async fn move_api_key(&self, api_key: &ApiKey, user_id: &str) {
+    pub async fn move_api_key(&self, api_key: &IssuedKey, user_id: &str) {
         self.admin(
             reqwest::Method::PATCH,
             &format!("/api/api-keys/{}", api_key.id),
@@ -148,7 +149,7 @@ impl Audiobookshelf {
     }
 
     /// Who `api_key` acts for, according to Audiobookshelf itself.
-    pub async fn whose_key(&self, api_key: &ApiKey) -> Value {
+    pub async fn whose_key(&self, api_key: &IssuedKey) -> Value {
         self.http
             .get(format!("{}/api/me", self.base_url))
             .bearer_auth(&api_key.key)

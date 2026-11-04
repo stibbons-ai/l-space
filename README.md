@@ -37,7 +37,7 @@ Each Library Server is identified by its normalized base URL: lowercase scheme a
 
 A configuration that can't be read or parsed, or a bad Library Server URL, stops the Bridge with exit code 1 and one `invalid configuration` error event. For a bad URL the event names the entry and shows only the URL's scheme, host, port and path (a query or fragment as `REDACTED`), or nothing of it when it contains `@`, isn't written as `scheme://…`, can't be parsed or has no host. For a TOML error it gives the line and column (a field missing inside a table points at the table (its header, or the inline table); a missing top-level field has none), never the source line. If the database can't be opened, the Bridge exits with code 1 after one `cannot open the database` error event; if the `listen` address can't be bound, after one `cannot listen` error event.
 
-The database holds the Bridge's state: App sessions and the Audiobookshelf API keys users logged in with, in plain text for now, so the Bridge makes it readable by its owner only, also when it already existed. Logout ends only the session: the key stays stored, and so do keys and sessions of Library Servers removed from the configuration. A database written by a newer Bridge is refused.
+The database holds the Bridge's state: App sessions and the Audiobookshelf API keys users logged in with, in plain text for now, so on Unix the Bridge makes it readable by its owner only, also when it already existed. Logout ends only the session: the key stays stored, and so do keys and sessions of Library Servers removed from the configuration. A database written by a newer Bridge is refused.
 
 Logs are JSON on stdout, one event per line. `RUST_LOG` adds to the default level `info`: `RUST_LOG=hyper=debug` raises one target and leaves the rest at `info`, and `RUST_LOG=warn` lowers the default.
 
@@ -46,7 +46,8 @@ Logs are JSON on stdout, one event per line. `RUST_LOG` adds to the default leve
 An App user logs in by picking a configured Library Server and entering an Audiobookshelf API key, which an Audiobookshelf admin creates for them (Settings → API Keys). The Bridge checks the key with Audiobookshelf and opens a session, which survives Bridge restarts and lasts until one of these:
 
 - the user logs out;
-- Audiobookshelf rejects the key (HTTP 401: deleted, deactivated or expired key, or deactivated user), or the key now acts for another user; this ends every session opened with that key;
-- the operator removes the Library Server from the configuration.
+- on a session call, Audiobookshelf rejects the key (HTTP 401: deleted, deactivated or expired key, or deactivated user), or the key now acts for another user; this ends this user's sessions opened with that key (a rejected login ends nothing).
+
+While the operator has removed its Library Server from the configuration, a session is unusable (`session_invalid`); re-adding the Library Server makes it usable again, and Audiobookshelf still checks the key on every call.
 
 A user may log in with several keys, for example one per device; each session depends only on its own key. While Audiobookshelf can't be reached (or answers anything but success or 401, such as a 403 from a proxy in front of it), calls fail with `library_server_unreachable` and sessions stay.

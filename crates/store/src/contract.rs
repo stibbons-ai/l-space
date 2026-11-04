@@ -39,6 +39,7 @@ macro_rules! store_contract_tests {
             a_new_key_never_inherits_the_sessions_of_a_revoked_one,
             revoking_is_scoped_to_the_library_server,
             revoked_keys_stay_revoked_after_reopening,
+            revoking_a_key_for_one_user_keeps_it_for_another,
             users_are_distinct_per_library_server,
         );
     };
@@ -283,6 +284,24 @@ pub async fn revoked_keys_stay_revoked_after_reopening(backend: &impl Backend) {
     assert_eq!(
         session(&store, session_id(2)).await,
         acting_as(&bob(), "bob-key")
+    );
+}
+
+/// An admin can move a key to another user, so one key may be stored for two users.
+pub async fn revoking_a_key_for_one_user_keeps_it_for_another(backend: &impl Backend) {
+    let store = backend.open().await;
+    open(&store, session_id(1), &alice(), "moved-key").await;
+    open(&store, session_id(2), &bob(), "moved-key").await;
+
+    store
+        .revoke_api_key(&alice(), &key("moved-key"))
+        .await
+        .expect("revoke");
+
+    assert_eq!(session(&store, session_id(1)).await, None);
+    assert_eq!(
+        session(&store, session_id(2)).await,
+        acting_as(&bob(), "moved-key")
     );
 }
 

@@ -4,12 +4,12 @@
 
 CREATE TABLE api_keys (
     id INTEGER PRIMARY KEY,
-    library_server TEXT NOT NULL,
-    user_id TEXT NOT NULL,
+    library_server TEXT NOT NULL CHECK (length(library_server) > 0),
+    user_id TEXT NOT NULL CHECK (length(user_id) > 0),
     -- SHA-256 of the key: what keys are compared and looked up by, so the stored key itself
     -- can be sealed (encrypted) without changing any query.
     key_fingerprint BLOB NOT NULL CHECK (length(key_fingerprint) = 32),
-    sealed_key BLOB NOT NULL,
+    sealed_key BLOB NOT NULL CHECK (length(sealed_key) > 0),
     UNIQUE (library_server, user_id, key_fingerprint)
 ) STRICT;
 

@@ -2,7 +2,6 @@
 
 use std::fmt::Write;
 
-use abs::ApiKey;
 use api::server::{BoxFuture, Bridge};
 use api::{ApiError, CurrentUser, LibraryServer, Session, SessionToken};
 use store::{LibraryUser, SessionId, Store};
@@ -55,7 +54,7 @@ impl<S: Store> AppApi<S> {
         let library_server = self
             .configured(&library_server)
             .ok_or(ApiError::LibraryServerNotConfigured)?;
-        let api_key = ApiKey::new(api_key.expose());
+        let api_key = abs::ApiKey::from(api_key);
         let user = self
             .abs
             .me(library_server, &api_key)
@@ -95,8 +94,8 @@ impl<S: Store> AppApi<S> {
     }
 
     /// Asks the session's Library Server who its key belongs to. A key the Library Server
-    /// rejects, or that now belongs to another user, is revoked, ending every session opened
-    /// with it.
+    /// rejects, or that now belongs to another user, is revoked, ending this user's sessions
+    /// opened with it.
     async fn current_user(&self, token: SessionToken) -> Result<CurrentUser, ApiError> {
         let session = self
             .store
@@ -125,23 +124,36 @@ impl<S: Store> AppApi<S> {
         }
     }
 
-    /// Revokes the session's key because of `reason`, ending every session opened with it.
-    /// Returns the error the call answers with.
+    /// Revokes the session's key for its user because of `reason`, ending this user's sessions
+    /// opened with it. Returns the error the call answers with.
     async fn revoke(&self, session: &store::Session, reason: &str) -> ApiError {
-        if let Err(error) = self
+        let (library_server, user_id) = (&session.user.library_server, &session.user.user_id);
+        match self
             .store
             .revoke_api_key(&session.user, &session.api_key)
             .await
         {
-            return storage_error("revoke an API key")(error);
+            Ok(()) => {
+                tracing::info!(
+                    library_server,
+                    user_id,
+                    reason,
+                    "API key revoked, its sessions ended"
+                );
+                ApiError::ApiKeyRejected
+            }
+            Err(error) => {
+                tracing::error!(
+                    operation = "revoke an API key",
+                    library_server,
+                    user_id,
+                    reason,
+                    %error,
+                    "storage failed"
+                );
+                ApiError::Internal
+            }
         }
-        tracing::info!(
-            library_server = session.user.library_server,
-            user_id = session.user.user_id,
-            reason,
-            "API key revoked, its sessions ended"
-        );
-        ApiError::ApiKeyRejected
     }
 }
 

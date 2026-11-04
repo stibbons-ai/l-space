@@ -33,9 +33,10 @@ pub struct LibraryServer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     /// Authenticates the session's calls. It survives Bridge restarts and lasts until
-    /// [`logout`], until the Library Server rejects the API key the session was opened with
-    /// (or the key now acts for another user), or until the operator removes the Library
-    /// Server from the configuration.
+    /// [`logout`], or until the Library Server rejects the API key the session was opened with
+    /// (or the key now acts for another user). While the operator has removed the Library
+    /// Server from the configuration the session is unusable; re-adding it makes the session
+    /// usable again (the Library Server still checks the key on every call).
     pub token: SessionToken,
     pub user: CurrentUser,
 }
@@ -109,7 +110,8 @@ pub enum ApiError {
     Internal,
     /// The Library Server rejected the API key: it is wrong, or was deleted, deactivated or
     /// expired, or its user was deactivated; or the key now acts for another user than the
-    /// session's. Every session opened with the key has ended.
+    /// session's. On a session call, this user's sessions opened with the key have ended; a
+    /// rejected login ends nothing.
     #[error("api_key_rejected")]
     ApiKeyRejected,
     /// The Library Server is not one the operator configured on this Bridge.
@@ -118,8 +120,9 @@ pub enum ApiError {
     /// The Library Server could not be reached, or gave no usable answer.
     #[error("library_server_unreachable")]
     LibraryServerUnreachable,
-    /// The call needs a session and has none: no token, an unknown one, or one whose session
-    /// ended. The App must log in again.
+    /// The call needs a session and has none: no token, an unknown one, one whose session
+    /// ended, or one whose Library Server is not configured (any more). The App must log in
+    /// again.
     #[error("session_invalid")]
     SessionInvalid,
     /// A code this build of the App does not know yet, from a newer Bridge. Produced only on
@@ -223,6 +226,13 @@ pub mod server {
 
     /// How server functions reach the [`Bridge`].
     pub type BridgeHandle = Arc<dyn Bridge>;
+
+    /// The one place a key from the App becomes the key the Bridge sends to Audiobookshelf.
+    impl From<ApiKey> for abs::ApiKey {
+        fn from(key: ApiKey) -> Self {
+            Self::new(key.0)
+        }
+    }
 
     /// An axum router serving every App API server function, backed by `bridge`.
     pub fn router(bridge: BridgeHandle) -> Router {
