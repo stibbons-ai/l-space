@@ -167,7 +167,8 @@ pub mod server {
 
     use dioxus::fullstack::HeaderMap;
     use dioxus::fullstack::axum::{Extension, Router};
-    use dioxus::fullstack::http::header::AUTHORIZATION;
+    use dioxus::fullstack::headers::HeaderMapExt;
+    use dioxus::fullstack::headers::authorization::{Authorization, Bearer};
     use dioxus::server::{DioxusRouterExt, FullstackState};
 
     use crate::{ApiError, CurrentUser, LibraryServer, Session, SessionToken};
@@ -208,16 +209,13 @@ pub mod server {
 
     /// The session token from `Authorization: Bearer <token>`.
     pub(crate) fn session_token(headers: &HeaderMap) -> Result<SessionToken, ApiError> {
-        let value = headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
+        let authorization = headers
+            .typed_get::<Authorization<Bearer>>()
             .ok_or(ApiError::SessionInvalid)?;
-        let (scheme, token) = value.split_once(' ').ok_or(ApiError::SessionInvalid)?;
-        let token = token.trim();
-        if !scheme.eq_ignore_ascii_case("bearer") || token.is_empty() {
-            return Err(ApiError::SessionInvalid);
+        match authorization.token().trim() {
+            "" => Err(ApiError::SessionInvalid),
+            token => Ok(SessionToken::new(token)),
         }
-        Ok(SessionToken::new(token))
     }
 }
 

@@ -3,7 +3,9 @@
 
 use std::net::TcpListener;
 
-use crate::support::{Exited, REQUIRED, RUST_LOG, config_file, is_listening, run_until_exit};
+use crate::support::{
+    DATABASE, Exited, LISTEN, RUST_LOG, config_file, is_listening, run_until_exit,
+};
 
 /// Asserts the Bridge refused to start with one error event `message`, and returns that
 /// event's `error` field.
@@ -49,7 +51,7 @@ fn refused_without_leaking(config: &str, secret: &str) -> String {
 #[test]
 fn malformed_library_server_url_is_named_by_entry_only() {
     let error = refused_with(&format!(
-        "{REQUIRED}[[library_servers]]\nurl = \"https://abs lan\"\n"
+        "{LISTEN}{DATABASE}[[library_servers]]\nurl = \"https://abs lan\"\n"
     ));
     assert!(error.contains("library_servers[0].url"), "{error}");
     assert!(!error.contains("abs lan"), "{error}");
@@ -58,7 +60,7 @@ fn malformed_library_server_url_is_named_by_entry_only() {
 #[test]
 fn unsupported_scheme() {
     let error = refused_with(&format!(
-        "{REQUIRED}[[library_servers]]\nurl = \"https://ok.lan\"\n[[library_servers]]\nurl = \"ftp://abs.lan\"\n"
+        "{LISTEN}{DATABASE}[[library_servers]]\nurl = \"https://ok.lan\"\n[[library_servers]]\nurl = \"ftp://abs.lan\"\n"
     ));
     assert!(error.contains("library_servers[1].url"), "{error}");
     assert!(error.contains("ftp://abs.lan"), "{error}");
@@ -67,7 +69,7 @@ fn unsupported_scheme() {
 #[test]
 fn two_entries_for_the_same_library_server() {
     let error = refused_with(&format!(
-        "{REQUIRED}[[library_servers]]\nurl = \"https://abs.lan/\"\n[[library_servers]]\nurl = \"HTTPS://ABS.lan:443\"\n"
+        "{LISTEN}{DATABASE}[[library_servers]]\nurl = \"https://abs.lan/\"\n[[library_servers]]\nurl = \"HTTPS://ABS.lan:443\"\n"
     ));
     assert!(error.contains("library_servers[1].url"), "{error}");
     assert!(error.contains("library_servers[0]"), "{error}");
@@ -77,7 +79,9 @@ fn two_entries_for_the_same_library_server() {
 #[test]
 fn url_with_a_query_is_named_without_its_value() {
     let error = refused_without_leaking(
-        &format!("{REQUIRED}[[library_servers]]\nurl = \"https://abs.lan/?token=s3cret\"\n"),
+        &format!(
+            "{LISTEN}{DATABASE}[[library_servers]]\nurl = \"https://abs.lan/?token=s3cret\"\n"
+        ),
         "s3cret",
     );
     assert!(error.contains("library_servers[0].url"), "{error}");
@@ -94,7 +98,7 @@ fn url_with_an_at_sign_is_named_by_entry_only() {
         "https://alice:123/hunter2@abs.lan",
     ] {
         let error = refused_without_leaking(
-            &format!("{REQUIRED}[[library_servers]]\nurl = \"{url}\"\n"),
+            &format!("{LISTEN}{DATABASE}[[library_servers]]\nurl = \"{url}\"\n"),
             "hunter2",
         );
         assert!(error.contains("library_servers[0].url:"), "{error}");
@@ -104,7 +108,7 @@ fn url_with_an_at_sign_is_named_by_entry_only() {
 #[test]
 fn invalid_toml_is_positioned_without_quoting_the_line() {
     let error = refused_without_leaking(
-        &format!("{REQUIRED}[[library_servers]]\nurl = \"https://alice:hunter2@abs.lan\n"),
+        &format!("{LISTEN}{DATABASE}[[library_servers]]\nurl = \"https://alice:hunter2@abs.lan\n"),
         "hunter2",
     );
     assert!(error.contains("TOML at line 4"), "{error}");
@@ -112,25 +116,26 @@ fn invalid_toml_is_positioned_without_quoting_the_line() {
 
 #[test]
 fn unknown_setting_is_named_without_its_value() {
-    let error = refused_without_leaking(&format!("{REQUIRED}token = \"s3cret\"\n"), "s3cret");
+    let error =
+        refused_without_leaking(&format!("{LISTEN}{DATABASE}token = \"s3cret\"\n"), "s3cret");
     assert!(error.contains("token"), "{error}");
 }
 
 #[test]
 fn missing_listen_address() {
-    let error = refused_with("database = \"bridge.db\"\n");
+    let error = refused_with(DATABASE);
     assert!(error.contains("listen"), "{error}");
 }
 
 #[test]
 fn missing_database() {
-    let error = refused_with("listen = \"127.0.0.1:0\"\n");
+    let error = refused_with(LISTEN);
     assert!(error.contains("database"), "{error}");
 }
 
 #[test]
 fn database_that_cannot_be_opened() {
-    let exited = run_with("listen = \"127.0.0.1:0\"\ndatabase = \"missing-dir/bridge.db\"\n");
+    let exited = run_with(&format!("{LISTEN}database = \"missing-dir/bridge.db\"\n"));
     refused(&exited, "cannot open the database");
     let event = exited.errors().next().unwrap();
     assert_eq!(event["database"], "missing-dir/bridge.db");
@@ -149,7 +154,7 @@ fn missing_file() {
 #[test]
 fn rust_log_for_other_targets_keeps_the_startup_error() {
     let (_dir, path) = config_file(&format!(
-        "{REQUIRED}[[library_servers]]\nurl = \"ftp://abs.lan\"\n"
+        "{LISTEN}{DATABASE}[[library_servers]]\nurl = \"ftp://abs.lan\"\n"
     ));
     let exited = run_until_exit(&path, "hyper=debug");
     let error = refused(&exited, "invalid configuration");
@@ -160,14 +165,14 @@ fn rust_log_for_other_targets_keeps_the_startup_error() {
 fn listen_address_in_use() {
     let taken = TcpListener::bind("127.0.0.1:0").expect("bind a port");
     let addr = taken.local_addr().expect("local addr");
-    let exited = run_with(&format!("listen = \"{addr}\"\ndatabase = \"bridge.db\"\n"));
+    let exited = run_with(&format!("listen = \"{addr}\"\n{DATABASE}"));
     refused(&exited, "cannot listen");
 }
 
 #[test]
 fn wrongly_typed_value_is_named_without_its_value() {
     let error = refused_without_leaking(
-        &format!("{REQUIRED}library_servers = \"s3cret\"\n"),
+        &format!("{LISTEN}{DATABASE}library_servers = \"s3cret\"\n"),
         "s3cret",
     );
     assert!(error.contains("TOML at line 3"), "{error}");

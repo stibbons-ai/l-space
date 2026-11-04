@@ -69,7 +69,7 @@ fn key(key: &str) -> ApiKey {
 }
 
 fn session_id(n: u8) -> SessionId {
-    SessionId::from_bytes([n; 32])
+    SessionId::of_token(&format!("token-{n}"))
 }
 
 async fn open(store: &impl Store, id: SessionId, user: &LibraryUser, api_key: &str) {

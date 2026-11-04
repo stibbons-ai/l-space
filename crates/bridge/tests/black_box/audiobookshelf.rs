@@ -31,7 +31,7 @@ const ROOT_PASSWORD: &str = "root-password";
 static SHARED: Mutex<Weak<Audiobookshelf>> = Mutex::new(Weak::new());
 
 /// An Audiobookshelf user a test created, with an API key for it.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AbsUser {
     pub id: String,
     pub username: String,
@@ -39,7 +39,7 @@ pub struct AbsUser {
 }
 
 /// An API key as Audiobookshelf issued it.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ApiKey {
     /// Audiobookshelf's id for the key, to delete it by.
     pub id: String,

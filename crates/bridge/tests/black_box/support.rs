@@ -12,9 +12,9 @@
 //! let servers = bridge.api().library_servers().await;
 //! ```
 //!
-//! - [`TestBridge::start`] writes the configuration to a temporary directory, adding
-//!   [`REQUIRED`]: a `listen` address on loopback with port 0, so tests can run in parallel
-//!   without port clashes, and a `database` in that directory, the Bridge's working directory.
+//! - [`TestBridge::start`] writes the configuration to a temporary directory, adding [`LISTEN`]
+//!   (loopback, port 0, so tests can run in parallel without port clashes) and [`DATABASE`] (a
+//!   file in that directory, the Bridge's working directory).
 //! - Readiness comes from the Bridge itself: it logs a `listening` event with the address it
 //!   bound, and `start` waits for that event. No sleeps.
 //! - [`TestBridge::restart`] stops the Bridge and starts it again on the same configuration
@@ -41,9 +41,11 @@ use tempfile::TempDir;
 /// Generous: the Bridge is up within milliseconds, but CI machines can be slow.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The settings every configuration needs: a free loopback port, so tests can run in parallel,
-/// and a database file in the Bridge's working directory.
-pub const REQUIRED: &str = "listen = \"127.0.0.1:0\"\ndatabase = \"bridge.db\"\n";
+/// A free loopback port, so tests can run in parallel.
+pub const LISTEN: &str = "listen = \"127.0.0.1:0\"\n";
+
+/// A database file in the Bridge's working directory.
+pub const DATABASE: &str = "database = \"bridge.db\"\n";
 
 /// The `RUST_LOG` the harness sets unless a test asks for another, so the developer's own
 /// setting cannot hide the events the harness waits for.
@@ -51,18 +53,23 @@ pub const RUST_LOG: &str = "info";
 
 /// A running Bridge, killed on drop.
 pub struct TestBridge {
-    child: Child,
-    output: Receiver<Value>,
-    api: AppApi,
-    startup: Vec<Value>,
+    running: Running,
     config: PathBuf,
     rust_log: String,
     _dir: TempDir,
 }
 
+/// One Bridge process, serving.
+struct Running {
+    child: Child,
+    output: Receiver<Value>,
+    api: AppApi,
+    startup: Vec<Value>,
+}
+
 impl TestBridge {
-    /// Starts a Bridge with `config` (TOML, without [`REQUIRED`]) and waits until it serves.
-    /// Panics if it exits or does not get ready in time.
+    /// Starts a Bridge with `config` (TOML, without [`LISTEN`] and [`DATABASE`]) and waits
+    /// until it serves. Panics if it exits or does not get ready in time.
     pub fn start(config: &str) -> Self {
         Self::start_logging(config, RUST_LOG)
     }
@@ -70,13 +77,9 @@ impl TestBridge {
     /// [`TestBridge::start`] with the given `RUST_LOG`, which must let the `bridge` target's
     /// `listening` event through.
     pub fn start_logging(config: &str, rust_log: &str) -> Self {
-        let (dir, config) = config_file(&format!("{REQUIRED}{config}"));
-        let (child, output, api, startup) = launch(&config, rust_log);
+        let (dir, config) = config_file(&format!("{LISTEN}{DATABASE}{config}"));
         Self {
-            child,
-            output,
-            api,
-            startup,
+            running: launch(&config, rust_log),
             config,
             rust_log: rust_log.to_owned(),
             _dir: dir,
@@ -86,37 +89,37 @@ impl TestBridge {
     /// Stops the Bridge and starts it again on the same configuration and database. It may
     /// listen on another port; [`TestBridge::api`] follows it.
     pub fn restart(&mut self) {
-        stop(&mut self.child);
-        (self.child, self.output, self.api, self.startup) = launch(&self.config, &self.rust_log);
+        stop(&mut self.running.child);
+        self.running = launch(&self.config, &self.rust_log);
     }
 
     /// Stops the Bridge and returns everything it wrote since it last started.
     pub fn stop(mut self) -> Vec<Value> {
-        stop(&mut self.child);
-        let mut output = std::mem::take(&mut self.startup);
-        output.extend(self.output.iter());
+        stop(&mut self.running.child);
+        let mut output = std::mem::take(&mut self.running.startup);
+        output.extend(self.running.output.iter());
         output
     }
 
     /// A client for this Bridge's App API.
     pub fn api(&self) -> &AppApi {
-        &self.api
+        &self.running.api
     }
 
     /// Everything the Bridge wrote up to and including its `listening` event.
     pub fn startup_output(&self) -> &[Value] {
-        &self.startup
+        &self.running.startup
     }
 }
 
 impl Drop for TestBridge {
     fn drop(&mut self) {
-        stop(&mut self.child);
+        stop(&mut self.running.child);
     }
 }
 
 /// Starts a Bridge and waits for its `listening` event.
-fn launch(config: &Path, rust_log: &str) -> (Child, Receiver<Value>, AppApi, Vec<Value>) {
+fn launch(config: &Path, rust_log: &str) -> Running {
     let (mut child, output) = spawn(config, rust_log);
     let deadline = Instant::now() + TIMEOUT;
     let mut startup = Vec::new();
@@ -132,7 +135,12 @@ fn launch(config: &Path, rust_log: &str) -> (Child, Receiver<Value>, AppApi, Vec
                     base_url: format!("http://{addr}"),
                 };
                 startup.push(event);
-                return (child, output, api, startup);
+                return Running {
+                    child,
+                    output,
+                    api,
+                    startup,
+                };
             }
             Ok(event) => startup.push(event),
             Err(RecvTimeoutError::Disconnected) => {
@@ -155,7 +163,7 @@ pub fn is_listening(event: &Value) -> bool {
 }
 
 /// The `Authorization` header value that authenticates as `session`.
-pub fn bearer(session: &Session) -> String {
+fn bearer(session: &Session) -> String {
     format!("Bearer {}", session.token.expose())
 }
 
@@ -194,11 +202,22 @@ impl AppApi {
         decode(response).await
     }
 
+    /// Asks who `session` acts for, expecting a rejection.
+    pub async fn current_user_error(&self, session: &Session) -> (StatusCode, ApiError) {
+        self.get_error("/api/me", Some(&bearer(session))).await
+    }
+
     pub async fn logout(&self, session: &Session) {
         let response = self
             .post("/api/logout", Some(&bearer(session)), json!({}))
             .await;
         decode::<Value>(response).await;
+    }
+
+    /// Logs `session` out, expecting a rejection.
+    pub async fn logout_error(&self, session: &Session) -> (StatusCode, ApiError) {
+        self.post_error("/api/logout", Some(&bearer(session)), json!({}))
+            .await
     }
 
     /// GETs `path` and decodes the successful response body, typed or as raw JSON.
@@ -278,12 +297,12 @@ async fn decode<T: serde::de::DeserializeOwned>(response: reqwest::Response) -> 
 async fn api_error(response: reqwest::Response) -> (StatusCode, ApiError) {
     let status = response.status();
     let url = response.url().path().to_owned();
-    let body: Value = response
+    let mut body: Value = response
         .json()
         .await
         .unwrap_or_else(|error| panic!("{url}: {status}: body is not JSON: {error}"));
     assert!(!status.is_success(), "{url} succeeded: {body}");
-    let code = serde_json::from_value(body["data"].clone())
+    let code = serde_json::from_value(body["data"].take())
         .unwrap_or_else(|error| panic!("{url}: {status}: no error code: {error}: {body}"));
     (status, code)
 }

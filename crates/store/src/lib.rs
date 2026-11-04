@@ -11,13 +11,11 @@
 #[cfg(feature = "contract")]
 pub mod contract;
 
-use std::fmt;
-
 use abs::ApiKey;
 use sha2::{Digest, Sha256};
 
 /// An Audiobookshelf user on one Library Server: user ids are only unique per server.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LibraryUser {
     /// The Library Server's normalized base URL (ADR 0006).
     pub library_server: String,
@@ -27,7 +25,7 @@ pub struct LibraryUser {
 
 /// Identifies an App session: the SHA-256 of its token. The token itself is never stored, so
 /// whoever reads the store cannot use the sessions in it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionId([u8; 32]);
 
 impl SessionId {
@@ -39,10 +37,6 @@ impl SessionId {
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
-
-    pub fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
 }
 
 /// An open session: whose it is and the API key it acts with.
@@ -53,24 +47,13 @@ pub struct Session {
 }
 
 /// A storage failure. The store's state is unchanged by the failed operation.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
 pub struct Error(Box<dyn std::error::Error + Send + Sync>);
 
 impl Error {
     pub fn new(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self(source.into())
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "storage failed: {}", self.0)
-    }
-}
-
-impl std::error::Error for Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&*self.0)
     }
 }
 

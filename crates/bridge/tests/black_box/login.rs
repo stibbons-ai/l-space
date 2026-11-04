@@ -9,15 +9,20 @@ use reqwest::StatusCode;
 use serde_json::json;
 
 use crate::audiobookshelf::{AbsUser, Audiobookshelf};
-use crate::support::{TestBridge, bearer, output_contains};
+use crate::support::{TestBridge, output_contains};
+
+/// The configuration naming `abs` as the one Library Server.
+fn abs_config(abs: &Audiobookshelf) -> String {
+    format!(
+        "[[library_servers]]\nurl = \"{}\"\nname = \"Home\"\n",
+        abs.base_url()
+    )
+}
 
 /// A Bridge with the shared Audiobookshelf as its one Library Server.
 fn bridge_with_abs() -> (TestBridge, Arc<Audiobookshelf>) {
     let abs = Audiobookshelf::shared();
-    let bridge = TestBridge::start(&format!(
-        "[[library_servers]]\nurl = \"{}\"\nname = \"Home\"\n",
-        abs.base_url()
-    ));
+    let bridge = TestBridge::start(&abs_config(&abs));
     (bridge, abs)
 }
 
@@ -139,26 +144,14 @@ async fn a_revoked_key_ends_its_sessions() {
     abs.delete_api_key(&alice.api_key).await;
 
     // The first call after the revocation learns it from Audiobookshelf...
-    assert_eq!(
-        bridge
-            .api()
-            .get_error("/api/me", Some(&bearer(&first)))
-            .await,
-        KEY_REJECTED
-    );
+    assert_eq!(bridge.api().current_user_error(&first).await, KEY_REJECTED);
     // ...and every session opened with the key has ended.
     assert_eq!(
-        bridge
-            .api()
-            .get_error("/api/me", Some(&bearer(&first)))
-            .await,
+        bridge.api().current_user_error(&first).await,
         SESSION_INVALID
     );
     assert_eq!(
-        bridge
-            .api()
-            .get_error("/api/me", Some(&bearer(&second)))
-            .await,
+        bridge.api().current_user_error(&second).await,
         SESSION_INVALID
     );
     assert_eq!(
@@ -184,10 +177,7 @@ async fn logging_in_with_a_new_key_ends_the_sessions_of_the_old_one() {
     let new_key = abs.new_api_key(&alice.id).await;
     let new = bridge.api().login(abs.base_url(), &new_key.key).await;
 
-    assert_eq!(
-        bridge.api().get_error("/api/me", Some(&bearer(&old))).await,
-        SESSION_INVALID
-    );
+    assert_eq!(bridge.api().current_user_error(&old).await, SESSION_INVALID);
     assert_eq!(
         bridge.api().current_user(&new).await,
         acting_as(&abs, &alice)
@@ -256,19 +246,10 @@ async fn logout_ends_only_that_session() {
     bridge.api().logout(&phone).await;
 
     assert_eq!(
-        bridge
-            .api()
-            .get_error("/api/me", Some(&bearer(&phone)))
-            .await,
+        bridge.api().current_user_error(&phone).await,
         SESSION_INVALID
     );
-    assert_eq!(
-        bridge
-            .api()
-            .post_error("/api/logout", Some(&bearer(&phone)), json!({}))
-            .await,
-        SESSION_INVALID
-    );
+    assert_eq!(bridge.api().logout_error(&phone).await, SESSION_INVALID);
     assert_eq!(
         bridge.api().current_user(&tablet).await,
         acting_as(&abs, &alice)
@@ -305,18 +286,12 @@ async fn calls_without_a_valid_session_are_rejected() {
 #[tokio::test]
 async fn keys_and_session_tokens_stay_out_of_the_logs() {
     let abs = Audiobookshelf::shared();
-    let bridge = TestBridge::start_logging(
-        &format!("[[library_servers]]\nurl = \"{}\"\n", abs.base_url()),
-        "trace",
-    );
+    let bridge = TestBridge::start_logging(&abs_config(&abs), "trace");
     let alice = abs.new_user().await;
     let session = bridge.api().login(abs.base_url(), &alice.api_key.key).await;
     bridge.api().current_user(&session).await;
     abs.delete_api_key(&alice.api_key).await;
-    bridge
-        .api()
-        .get_error("/api/me", Some(&bearer(&session)))
-        .await;
+    bridge.api().current_user_error(&session).await;
 
     let output = bridge.stop();
     for secret in [alice.api_key.key.as_str(), session.token.expose()] {

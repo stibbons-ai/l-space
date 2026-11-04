@@ -57,8 +57,8 @@ pub enum Error {
     Unavailable(String),
 }
 
-/// A client for any number of Library Servers. Cheap to clone; clones share connections.
-#[derive(Debug, Clone)]
+/// A client for any number of Library Servers.
+#[derive(Debug)]
 pub struct Client {
     http: reqwest::Client,
 }

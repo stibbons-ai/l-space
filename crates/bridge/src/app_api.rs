@@ -33,19 +33,20 @@ impl<S: Store> AppApi<S> {
         }
     }
 
-    /// The configured Library Server that `url` (in any spelling) normalizes to.
-    fn configured(&self, url: &str) -> Option<&LibraryServer> {
+    /// The base URL of the configured Library Server that `url` (in any spelling) normalizes
+    /// to.
+    fn configured(&self, url: &str) -> Option<&str> {
         let url = LibraryServerUrl::parse(url).ok()?.into_string();
         self.library_servers
             .iter()
-            .find(|server| server.base_url == url)
+            .map(|server| server.base_url.as_str())
+            .find(|&base_url| base_url == url)
     }
 
     async fn login(&self, library_server: String, api_key: String) -> Result<Session, ApiError> {
-        let library_server = &self
+        let library_server = self
             .configured(&library_server)
-            .ok_or(ApiError::LibraryServerNotConfigured)?
-            .base_url;
+            .ok_or(ApiError::LibraryServerNotConfigured)?;
         let api_key = ApiKey::new(api_key);
         let user = self
             .abs
@@ -55,8 +56,8 @@ impl<S: Store> AppApi<S> {
 
         let token = new_session_token()?;
         let owner = LibraryUser {
-            library_server: library_server.clone(),
-            user_id: user.id.clone(),
+            library_server: library_server.to_owned(),
+            user_id: user.id,
         };
         self.store
             .open_session(&SessionId::of_token(token.expose()), &owner, &api_key)
@@ -66,7 +67,7 @@ impl<S: Store> AppApi<S> {
             token,
             user: CurrentUser {
                 library_server: owner.library_server,
-                user_id: user.id,
+                user_id: owner.user_id,
                 username: user.username,
             },
         })
@@ -95,10 +96,14 @@ impl<S: Store> AppApi<S> {
             .map_err(storage_error)?
             .ok_or(ApiError::SessionInvalid)?;
         // The operator may have removed the Library Server since the login.
-        let library_server = &self
-            .configured(&session.user.library_server)
-            .ok_or(ApiError::SessionInvalid)?
-            .base_url;
+        let library_server = &session.user.library_server;
+        if !self
+            .library_servers
+            .iter()
+            .any(|server| &server.base_url == library_server)
+        {
+            return Err(ApiError::SessionInvalid);
+        }
         match self.abs.me(library_server, &session.api_key).await {
             Ok(user) => Ok(CurrentUser {
                 library_server: library_server.clone(),
