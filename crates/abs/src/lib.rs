@@ -46,15 +46,31 @@ pub struct User {
 /// Why a request to a Library Server failed.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The Library Server does not accept the API key: unknown, deleted, deactivated or expired,
-    /// or its user is deactivated (HTTP 401 or 403).
+    /// The Library Server does not accept the API key (HTTP 401): unknown, deleted,
+    /// deactivated or expired, or its user is deactivated.
     #[error("the Library Server rejected the API key")]
     Rejected,
     /// No usable answer: the Library Server could not be reached in time, or answered with
-    /// something other than success or a rejection (a server error, a redirect, a body that is
-    /// not what Audiobookshelf sends).
+    /// something other than success or a rejection (a 403, which may come from a proxy in
+    /// front of it, a server error, a redirect, a body that is not what Audiobookshelf sends).
+    /// The message describes the cause in full, without the URL.
     #[error("the Library Server gave no usable answer: {0}")]
     Unavailable(String),
+}
+
+impl Error {
+    /// `Unavailable`, described by `error` and every error that caused it.
+    fn unavailable(error: reqwest::Error) -> Self {
+        let error = error.without_url();
+        let mut message = error.to_string();
+        let mut source = std::error::Error::source(&error);
+        while let Some(cause) = source {
+            message.push_str(": ");
+            message.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        Self::Unavailable(message)
+    }
 }
 
 /// A client for any number of Library Servers.
@@ -73,7 +89,8 @@ impl Client {
     pub fn new() -> Self {
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)
-            // A redirect would carry the API key to wherever it points.
+            // reqwest drops `Authorization` on a redirect to another origin, but would send the
+            // key again to wherever the same origin points; an API call has no reason to move.
             .redirect(redirect::Policy::none())
             .build()
             .expect("the TLS backend and system configuration load");
@@ -94,13 +111,10 @@ impl Client {
             .header(AUTHORIZATION, authorization)
             .send()
             .await
-            .map_err(|error| Error::Unavailable(error.without_url().to_string()))?;
+            .map_err(Error::unavailable)?;
         match response.status() {
-            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Err(Error::Rejected),
-            status if status.is_success() => response
-                .json()
-                .await
-                .map_err(|error| Error::Unavailable(error.without_url().to_string())),
+            StatusCode::UNAUTHORIZED => Err(Error::Rejected),
+            status if status.is_success() => response.json().await.map_err(Error::unavailable),
             status => Err(Error::Unavailable(format!("HTTP {status}"))),
         }
     }
@@ -171,11 +185,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forbidden_is_a_rejection() {
+    async fn unauthorized_is_a_rejection() {
         assert!(matches!(
-            me_from(StatusCode::FORBIDDEN).await,
+            me_from(StatusCode::UNAUTHORIZED).await,
             Err(Error::Rejected)
         ));
+    }
+
+    /// A proxy or auth wall in front of the Library Server answers 403 too; that must not
+    /// count as the key being revoked.
+    #[tokio::test]
+    async fn forbidden_is_unavailable_not_a_rejection() {
+        assert!(matches!(
+            me_from(StatusCode::FORBIDDEN).await,
+            Err(Error::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_is_described_down_to_the_cause() {
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let Err(Error::Unavailable(message)) = Client::new()
+            .me(&format!("http://{closed}"), &ApiKey::new("s3cret"))
+            .await
+        else {
+            panic!("expected Unavailable");
+        };
+        assert!(message.to_lowercase().contains("refused"), "{message}");
+        assert!(!message.contains(&closed.to_string()), "{message}");
+        assert!(!message.contains("s3cret"), "{message}");
     }
 
     #[tokio::test]

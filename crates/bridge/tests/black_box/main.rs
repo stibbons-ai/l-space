@@ -4,6 +4,7 @@
 //! new areas as modules here so they share one binary.
 
 mod audiobookshelf;
+mod forwarder;
 mod library_servers;
 mod logging;
 mod login;

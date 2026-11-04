@@ -47,11 +47,15 @@ impl<S: Store> AppApi<S> {
             .find(|&configured| configured == base_url)
     }
 
-    async fn login(&self, library_server: String, api_key: String) -> Result<Session, ApiError> {
+    async fn login(
+        &self,
+        library_server: String,
+        api_key: api::ApiKey,
+    ) -> Result<Session, ApiError> {
         let library_server = self
             .configured(&library_server)
             .ok_or(ApiError::LibraryServerNotConfigured)?;
-        let api_key = ApiKey::new(api_key);
+        let api_key = ApiKey::new(api_key.expose());
         let user = self
             .abs
             .me(library_server, &api_key)
@@ -66,7 +70,7 @@ impl<S: Store> AppApi<S> {
         self.store
             .open_session(&SessionId::of_token(token.expose()), &owner, &api_key)
             .await
-            .map_err(storage_error)?;
+            .map_err(storage_error("open a session"))?;
         Ok(Session {
             token,
             user: CurrentUser {
@@ -82,7 +86,7 @@ impl<S: Store> AppApi<S> {
             .store
             .close_session(&SessionId::of_token(token.expose()))
             .await
-            .map_err(storage_error)?;
+            .map_err(storage_error("close a session"))?;
         if closed {
             Ok(())
         } else {
@@ -90,34 +94,54 @@ impl<S: Store> AppApi<S> {
         }
     }
 
-    /// Asks the session's Library Server who its key belongs to. A rejected key ends every
-    /// session opened with it.
+    /// Asks the session's Library Server who its key belongs to. A key the Library Server
+    /// rejects, or that now belongs to another user, is revoked, ending every session opened
+    /// with it.
     async fn current_user(&self, token: SessionToken) -> Result<CurrentUser, ApiError> {
         let session = self
             .store
             .session(&SessionId::of_token(token.expose()))
             .await
-            .map_err(storage_error)?
+            .map_err(storage_error("look up a session"))?
             .ok_or(ApiError::SessionInvalid)?;
         // The operator may have removed the Library Server since the login.
         let library_server = self
             .configured_base_url(&session.user.library_server)
             .ok_or(ApiError::SessionInvalid)?;
         match self.abs.me(library_server, &session.api_key).await {
-            Ok(user) => Ok(CurrentUser {
+            Ok(user) if user.id == session.user.user_id => Ok(CurrentUser {
                 library_server: library_server.to_owned(),
                 user_id: user.id,
                 username: user.username,
             }),
-            Err(abs::Error::Rejected) => {
-                self.store
-                    .revoke_api_key(&session.user, &session.api_key)
-                    .await
-                    .map_err(storage_error)?;
-                Err(ApiError::ApiKeyRejected)
-            }
+            // An admin can move a key to another user; the session must not follow it.
+            Ok(_) => Err(self
+                .revoke(&session, "the API key now acts for another user")
+                .await),
+            Err(abs::Error::Rejected) => Err(self
+                .revoke(&session, "the Library Server rejected the API key")
+                .await),
             Err(error) => Err(abs_error(library_server, error)),
         }
+    }
+
+    /// Revokes the session's key because of `reason`, ending every session opened with it.
+    /// Returns the error the call answers with.
+    async fn revoke(&self, session: &store::Session, reason: &str) -> ApiError {
+        if let Err(error) = self
+            .store
+            .revoke_api_key(&session.user, &session.api_key)
+            .await
+        {
+            return storage_error("revoke an API key")(error);
+        }
+        tracing::info!(
+            library_server = session.user.library_server,
+            user_id = session.user.user_id,
+            reason,
+            "API key revoked, its sessions ended"
+        );
+        ApiError::ApiKeyRejected
     }
 }
 
@@ -129,7 +153,7 @@ impl<S: Store> Bridge for AppApi<S> {
     fn login(
         &self,
         library_server: String,
-        api_key: String,
+        api_key: api::ApiKey,
     ) -> BoxFuture<'_, Result<Session, ApiError>> {
         Box::pin(self.login(library_server, api_key))
     }
@@ -167,7 +191,10 @@ fn abs_error(library_server: &str, error: abs::Error) -> ApiError {
     }
 }
 
-fn storage_error(error: store::Error) -> ApiError {
-    tracing::error!(%error, "storage failed");
-    ApiError::Internal
+/// Logs a storage failure during `operation` and hides it from the App.
+fn storage_error(operation: &'static str) -> impl FnOnce(store::Error) -> ApiError {
+    move |error| {
+        tracing::error!(operation, %error, "storage failed");
+        ApiError::Internal
+    }
 }

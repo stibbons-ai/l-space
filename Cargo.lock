@@ -3790,6 +3790,7 @@ version = "0.1.0"
 dependencies = [
  "abs",
  "rusqlite",
+ "sha2 0.11.1",
  "store",
  "tempfile",
  "tokio",

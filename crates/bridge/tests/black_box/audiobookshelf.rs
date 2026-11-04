@@ -3,10 +3,11 @@
 //! [`Audiobookshelf::shared`] starts the container on first use and hands every test the same
 //! one while any test holds it; the last holder's drop removes it, so no container outlives
 //! the test run. Tests stay apart by each creating their own users with
-//! [`Audiobookshelf::new_user`]: everything a test sees in Audiobookshelf is its own.
+//! [`Audiobookshelf::new_user`] and acting only on those. The seeded Library is shared by all
+//! tests, and users are never deleted while the container runs.
 //!
-//! Setup and teardown go through Audiobookshelf's REST API as its root user, the way an admin
-//! would: users and API keys are created and deleted there, never in its database.
+//! Setup goes through Audiobookshelf's REST API as its root user, the way an admin would:
+//! users and API keys are created, changed and deleted there, never in its database.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -78,6 +79,11 @@ impl Audiobookshelf {
         &self.base_url
     }
 
+    /// Its `host:port`, for a forwarder in front of it.
+    pub fn address(&self) -> &str {
+        self.base_url.trim_start_matches("http://")
+    }
+
     /// Creates a user with an API key, named uniquely across the test run.
     pub async fn new_user(&self) -> AbsUser {
         static USERS: AtomicUsize = AtomicUsize::new(0);
@@ -127,6 +133,16 @@ impl Audiobookshelf {
             reqwest::Method::DELETE,
             &format!("/api/api-keys/{}", api_key.id),
             None,
+        )
+        .await;
+    }
+
+    /// Makes `api_key` act for user `user_id` instead, as an admin editing it would.
+    pub async fn move_api_key(&self, api_key: &ApiKey, user_id: &str) {
+        self.admin(
+            reqwest::Method::PATCH,
+            &format!("/api/api-keys/{}", api_key.id),
+            Some(json!({"userId": user_id})),
         )
         .await;
     }

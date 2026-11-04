@@ -93,6 +93,13 @@ impl TestBridge {
         self.running = launch(&self.config, &self.rust_log);
     }
 
+    /// [`TestBridge::restart`] with `config` (TOML, as for [`TestBridge::start`]) replacing
+    /// the configuration; the database stays.
+    pub fn restart_with(&mut self, config: &str) {
+        std::fs::write(&self.config, format!("{LISTEN}{DATABASE}{config}")).expect("write config");
+        self.restart();
+    }
+
     /// Stops the Bridge and returns everything it wrote since it last started.
     pub fn stop(mut self) -> Vec<Value> {
         stop(&mut self.running.child);
@@ -165,6 +172,11 @@ pub fn is_listening(event: &Value) -> bool {
 /// The `Authorization` header value that authenticates as `session`.
 fn bearer(session: &Session) -> String {
     format!("Bearer {}", session.token.expose())
+}
+
+/// The configuration entry for a Library Server at `url`.
+pub fn library_server_toml(url: &str) -> String {
+    format!("[[library_servers]]\nurl = \"{url}\"\n")
 }
 
 /// The App API as the App calls it, over HTTP. Paths and payloads follow the `api` crate's

@@ -22,8 +22,8 @@ use url::Url;
 pub struct Config {
     /// Where the App API listens. Port 0 picks a free port.
     pub listen: SocketAddr,
-    /// The SQLite file holding the Bridge's state, created if missing. A relative path is
-    /// relative to the working directory.
+    /// The SQLite file holding the Bridge's state, created if missing; its directory must
+    /// exist. A relative path is relative to the working directory.
     pub database: PathBuf,
     /// In file order; no two share a [`LibraryServerUrl`].
     pub library_servers: Vec<LibraryServerConfig>,
@@ -534,6 +534,16 @@ mod tests {
         let message = text.parse::<Config>().unwrap_err().to_string();
         assert!(message.contains("missing field `url`"), "{message}");
         assert!(message.contains("line 4, column 1"), "{message}");
+    }
+
+    #[test]
+    fn positions_a_field_missing_inside_an_inline_table_at_the_inline_table() {
+        let text = "listen = \"127.0.0.1:0\"\n\
+                    library_servers = [{ url = \"https://a.lan\" }, { name = \"Home\" }]\n";
+        let message = text.parse::<Config>().unwrap_err().to_string();
+        assert!(message.contains("missing field `url`"), "{message}");
+        // Column 47 is the `{` that opens the second inline table.
+        assert!(message.contains("line 2, column 47"), "{message}");
     }
 
     #[test]

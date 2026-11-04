@@ -33,9 +33,12 @@ macro_rules! store_contract_tests {
             closing_an_unknown_session_reports_it_was_not_open,
             sessions_and_keys_survive_reopening,
             logging_in_again_with_the_same_key_keeps_other_sessions,
-            a_new_key_ends_the_sessions_of_the_replaced_key,
+            a_second_key_for_the_same_user_keeps_the_first_keys_sessions,
             revoking_a_key_ends_all_its_sessions_and_nothing_else,
-            revoking_a_key_that_was_since_replaced_changes_nothing,
+            revoking_one_key_keeps_the_users_other_keys,
+            a_new_key_never_inherits_the_sessions_of_a_revoked_one,
+            revoking_is_scoped_to_the_library_server,
+            revoked_keys_stay_revoked_after_reopening,
             users_are_distinct_per_library_server,
         );
     };
@@ -167,23 +170,18 @@ pub async fn logging_in_again_with_the_same_key_keeps_other_sessions(backend: &i
     );
 }
 
-pub async fn a_new_key_ends_the_sessions_of_the_replaced_key(backend: &impl Backend) {
+pub async fn a_second_key_for_the_same_user_keeps_the_first_keys_sessions(backend: &impl Backend) {
     let store = backend.open().await;
-    open(&store, session_id(2), &bob(), "bob-key").await;
-    // Opened last, so a backend that reuses the newest row's identity would hand the old
-    // session to the new key.
-    open(&store, session_id(1), &alice(), "old-key").await;
+    open(&store, session_id(1), &alice(), "phone-key").await;
+    open(&store, session_id(2), &alice(), "tablet-key").await;
 
-    open(&store, session_id(3), &alice(), "new-key").await;
-
-    assert_eq!(session(&store, session_id(1)).await, None);
     assert_eq!(
-        session(&store, session_id(3)).await,
-        acting_as(&alice(), "new-key")
+        session(&store, session_id(1)).await,
+        acting_as(&alice(), "phone-key")
     );
     assert_eq!(
         session(&store, session_id(2)).await,
-        acting_as(&bob(), "bob-key")
+        acting_as(&alice(), "tablet-key")
     );
 }
 
@@ -205,7 +203,7 @@ pub async fn revoking_a_key_ends_all_its_sessions_and_nothing_else(backend: &imp
         acting_as(&bob(), "bob-key")
     );
 
-    // The user can log in again afterwards, with the same key or another.
+    // The user can log in again afterwards.
     open(&store, session_id(4), &alice(), "alice-key").await;
     assert_eq!(
         session(&store, session_id(4)).await,
@@ -213,19 +211,78 @@ pub async fn revoking_a_key_ends_all_its_sessions_and_nothing_else(backend: &imp
     );
 }
 
-pub async fn revoking_a_key_that_was_since_replaced_changes_nothing(backend: &impl Backend) {
+pub async fn revoking_one_key_keeps_the_users_other_keys(backend: &impl Backend) {
     let store = backend.open().await;
-    open(&store, session_id(1), &alice(), "old-key").await;
-    open(&store, session_id(2), &alice(), "new-key").await;
+    open(&store, session_id(1), &alice(), "phone-key").await;
+    open(&store, session_id(2), &alice(), "tablet-key").await;
 
+    store
+        .revoke_api_key(&alice(), &key("phone-key"))
+        .await
+        .expect("revoke");
+
+    assert_eq!(session(&store, session_id(1)).await, None);
+    assert_eq!(
+        session(&store, session_id(2)).await,
+        acting_as(&alice(), "tablet-key")
+    );
+}
+
+pub async fn a_new_key_never_inherits_the_sessions_of_a_revoked_one(backend: &impl Backend) {
+    let store = backend.open().await;
+    open(&store, session_id(2), &bob(), "bob-key").await;
+    // Stored last, so a backend that reuses the newest row's identity would hand its sessions
+    // to the next key.
+    open(&store, session_id(1), &alice(), "old-key").await;
     store
         .revoke_api_key(&alice(), &key("old-key"))
         .await
         .expect("revoke");
 
+    open(&store, session_id(3), &alice(), "new-key").await;
+
+    assert_eq!(session(&store, session_id(1)).await, None);
+    assert_eq!(
+        session(&store, session_id(3)).await,
+        acting_as(&alice(), "new-key")
+    );
+}
+
+pub async fn revoking_is_scoped_to_the_library_server(backend: &impl Backend) {
+    let store = backend.open().await;
+    let home = user("https://abs.lan", "same-id");
+    let office = user("https://abs.office.lan", "same-id");
+    open(&store, session_id(1), &home, "same-key").await;
+    open(&store, session_id(2), &office, "same-key").await;
+
+    store
+        .revoke_api_key(&home, &key("same-key"))
+        .await
+        .expect("revoke");
+
+    assert_eq!(session(&store, session_id(1)).await, None);
     assert_eq!(
         session(&store, session_id(2)).await,
-        acting_as(&alice(), "new-key")
+        acting_as(&office, "same-key")
+    );
+}
+
+pub async fn revoked_keys_stay_revoked_after_reopening(backend: &impl Backend) {
+    {
+        let store = backend.open().await;
+        open(&store, session_id(1), &alice(), "alice-key").await;
+        open(&store, session_id(2), &bob(), "bob-key").await;
+        store
+            .revoke_api_key(&alice(), &key("alice-key"))
+            .await
+            .expect("revoke");
+    }
+
+    let store = backend.open().await;
+    assert_eq!(session(&store, session_id(1)).await, None);
+    assert_eq!(
+        session(&store, session_id(2)).await,
+        acting_as(&bob(), "bob-key")
     );
 }
 

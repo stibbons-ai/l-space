@@ -32,8 +32,10 @@ pub struct LibraryServer {
 /// A logged-in App session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
-    /// Authenticates the session's calls. It lasts until [`logout`], or until the Library
-    /// Server rejects the API key the session was opened with.
+    /// Authenticates the session's calls. It survives Bridge restarts and lasts until
+    /// [`logout`], until the Library Server rejects the API key the session was opened with
+    /// (or the key now acts for another user), or until the operator removes the Library
+    /// Server from the configuration.
     pub token: SessionToken,
     pub user: CurrentUser,
 }
@@ -56,6 +58,28 @@ impl SessionToken {
 impl fmt::Debug for SessionToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SessionToken(REDACTED)")
+    }
+}
+
+/// An Audiobookshelf API key as the App sends it to log in. It never shows in `Debug`
+/// output.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ApiKey(String);
+
+impl ApiKey {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ApiKey(REDACTED)")
     }
 }
 
@@ -84,7 +108,8 @@ pub enum ApiError {
     #[error("internal")]
     Internal,
     /// The Library Server rejected the API key: it is wrong, or was deleted, deactivated or
-    /// expired, or its user was deactivated. A session whose key is rejected has ended.
+    /// expired, or its user was deactivated; or the key now acts for another user than the
+    /// session's. Every session opened with the key has ended.
     #[error("api_key_rejected")]
     ApiKeyRejected,
     /// The Library Server is not one the operator configured on this Bridge.
@@ -135,7 +160,7 @@ pub async fn library_servers() -> Result<Vec<LibraryServer>, ApiError> {
 /// Logs in to the Library Server at `library_server` (its base URL; any spelling that
 /// normalizes to a configured one) with an Audiobookshelf API key.
 #[post("/api/login", bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>)]
-pub async fn login(library_server: String, api_key: String) -> Result<Session, ApiError> {
+pub async fn login(library_server: String, api_key: ApiKey) -> Result<Session, ApiError> {
     bridge.login(library_server, api_key).await
 }
 
@@ -171,7 +196,7 @@ pub mod server {
     use dioxus::fullstack::headers::authorization::{Authorization, Bearer};
     use dioxus::server::{DioxusRouterExt, FullstackState};
 
-    use crate::{ApiError, CurrentUser, LibraryServer, Session, SessionToken};
+    use crate::{ApiError, ApiKey, CurrentUser, LibraryServer, Session, SessionToken};
 
     /// A boxed future, so [`Bridge`] stays object-safe.
     pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -185,7 +210,7 @@ pub mod server {
         fn login(
             &self,
             library_server: String,
-            api_key: String,
+            api_key: ApiKey,
         ) -> BoxFuture<'_, Result<Session, ApiError>>;
 
         /// See [`crate::logout`].
@@ -224,7 +249,7 @@ mod tests {
     use dioxus::fullstack::{AsStatusCode, StatusCode};
     use serde_json::json;
 
-    use super::{ApiError, SessionToken};
+    use super::{ApiError, ApiKey, SessionToken};
 
     #[test]
     fn error_codes_travel_as_a_code_field() {
@@ -259,11 +284,12 @@ mod tests {
     }
 
     #[test]
-    fn debug_output_hides_the_session_token() {
+    fn debug_output_hides_secrets() {
         assert_eq!(
             format!("{:?}", SessionToken::new("s3cret")),
             "SessionToken(REDACTED)"
         );
+        assert_eq!(format!("{:?}", ApiKey::new("s3cret")), "ApiKey(REDACTED)");
     }
 
     #[cfg(feature = "server")]
