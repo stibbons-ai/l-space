@@ -121,8 +121,9 @@ pub enum ApiError {
     #[error("library_server_unreachable")]
     LibraryServerUnreachable,
     /// The call needs a session and has none: no token, an unknown one, one whose session
-    /// ended, or one whose Library Server is not configured (any more). The App must log in
-    /// again.
+    /// ended, or one whose Library Server is not configured (any more). An ended session needs
+    /// a new login; one whose Library Server is unconfigured may work again once the operator
+    /// re-adds it.
     #[error("session_invalid")]
     SessionInvalid,
     /// A code this build of the App does not know yet, from a newer Bridge. Produced only on

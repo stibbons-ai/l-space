@@ -133,13 +133,16 @@ impl<S: Store> AppApi<S> {
             .revoke_api_key(&session.user, &session.api_key)
             .await
         {
-            Ok(()) => {
-                tracing::info!(
-                    library_server,
-                    user_id,
-                    reason,
-                    "API key revoked, its sessions ended"
-                );
+            Ok(revoked) => {
+                // A concurrent call may have revoked it first; that one logged it.
+                if revoked {
+                    tracing::info!(
+                        library_server,
+                        user_id,
+                        reason,
+                        "API key revoked, this user's sessions opened with it ended"
+                    );
+                }
                 ApiError::ApiKeyRejected
             }
             Err(error) => {

@@ -133,11 +133,11 @@ async fn session_wire_shape() {
 async fn a_wrong_key_is_rejected() {
     let (bridge, abs) = bridge_with_abs();
 
-    for key in ["not-a-key", "", "line\nbreak"] {
+    for (case, key) in ["not-a-key", "", "line\nbreak"].into_iter().enumerate() {
         assert_eq!(
             bridge.api().login_error(abs.base_url(), key).await,
             KEY_REJECTED,
-            "{key:?}"
+            "wrong key #{case}"
         );
     }
 }
@@ -155,7 +155,7 @@ async fn a_revoked_key_ends_its_sessions() {
 
     // The first call after the revocation learns it from Audiobookshelf...
     assert_eq!(bridge.api().current_user_error(&first).await, KEY_REJECTED);
-    // ...and every session opened with the key has ended.
+    // ...and every session alice opened with the key has ended.
     assert_eq!(
         bridge.api().current_user_error(&first).await,
         SESSION_INVALID
@@ -447,9 +447,8 @@ async fn keys_and_session_tokens_stay_out_of_the_logs() {
 
     let output = bridge.stop();
     assert!(
-        output
-            .iter()
-            .any(|event| event["message"] == "API key revoked, its sessions ended"),
+        output.iter().any(|event| event["message"]
+            == "API key revoked, this user's sessions opened with it ended"),
         "the revocation was not logged: {output:#?}"
     );
     for secret in [

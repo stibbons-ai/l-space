@@ -74,11 +74,11 @@ impl SqliteStore {
 
     fn open_sealing(path: &Path, sealing: Sealing) -> Result<Self, Error> {
         create_private(path)?;
-        let mut connection = Connection::open(path).map_err(Error::new)?;
+        let mut connection = Connection::open(path).map_err(step("open the database"))?;
         connection
             .pragma_update(None, "foreign_keys", true)
-            .map_err(Error::new)?;
-        migrate(&mut connection)?;
+            .map_err(step("enable foreign keys"))?;
+        migrate(&mut connection).map_err(step("migrate the schema"))?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
             sealing,
@@ -106,6 +106,27 @@ impl SqliteStore {
     }
 }
 
+/// Opening the database failed at `step`.
+#[derive(Debug, thiserror::Error)]
+#[error("{step}: {source}")]
+struct OpenError {
+    step: &'static str,
+    #[source]
+    source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// Wraps an error from `step` of opening the database, keeping it as the source.
+fn step<E: Into<Box<dyn std::error::Error + Send + Sync>>>(
+    step: &'static str,
+) -> impl FnOnce(E) -> Error {
+    move |source| {
+        Error::new(OpenError {
+            step,
+            source: source.into(),
+        })
+    }
+}
+
 /// Creates the file if missing and restricts it to its owner, also when it already existed.
 #[cfg(unix)]
 fn create_private(path: &Path) -> Result<(), Error> {
@@ -117,9 +138,9 @@ fn create_private(path: &Path) -> Result<(), Error> {
         .truncate(false)
         .mode(0o600)
         .open(path)
-        .map_err(|error| Error::new(format!("create the database file: {error}")))?;
+        .map_err(step("create the database file"))?;
     file.set_permissions(Permissions::from_mode(0o600))
-        .map_err(|error| Error::new(format!("make the database owner-only: {error}")))
+        .map_err(step("make the database owner-only"))
 }
 
 #[cfg(not(unix))]
@@ -127,30 +148,25 @@ fn create_private(_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn migrate(connection: &mut Connection) -> Result<(), Error> {
+fn migrate(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let known = MIGRATIONS.len();
-    let transaction = connection.transaction().map_err(Error::new)?;
-    let applied: i64 = transaction
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(Error::new)?;
+    let transaction = connection.transaction()?;
+    let applied: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
     let applied = usize::try_from(applied)
         .ok()
         .filter(|&applied| applied <= known)
         .ok_or_else(|| {
-            Error::new(format!(
-                "the database has schema version {applied}, newer than this Bridge's {known}"
-            ))
+            format!("the database has schema version {applied}, newer than this Bridge's {known}")
         })?;
     if applied == known {
         return Ok(());
     }
     for migration in &MIGRATIONS[applied..] {
-        transaction.execute_batch(migration).map_err(Error::new)?;
+        transaction.execute_batch(migration)?;
     }
-    transaction
-        .pragma_update(None, "user_version", known as i64)
-        .map_err(Error::new)?;
-    transaction.commit().map_err(Error::new)
+    transaction.pragma_update(None, "user_version", known as i64)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 impl Store for SqliteStore {
@@ -163,8 +179,8 @@ impl Store for SqliteStore {
         let (id, user) = (*id, user.clone());
         let (fingerprint, sealed) = (fingerprint(api_key), (self.sealing.seal)(api_key));
         self.transaction(move |tx| {
-            // A key already stored for the user keeps its row; it is sealed anew, so a
-            // changed sealing (a new encryption key) takes effect at the next login.
+            // A key already stored for the user keeps its row, and logging in re-seals this
+            // row, so a changed sealing (a new encryption key) takes effect at the next login.
             let api_key_id: i64 = tx
                 .prepare_cached(
                     "INSERT INTO api_keys (library_server, user_id, key_fingerprint, sealed_key)
@@ -224,15 +240,16 @@ impl Store for SqliteStore {
         .await
     }
 
-    async fn revoke_api_key(&self, user: &LibraryUser, api_key: &ApiKey) -> Result<(), Error> {
+    async fn revoke_api_key(&self, user: &LibraryUser, api_key: &ApiKey) -> Result<bool, Error> {
         let (user, fingerprint) = (user.clone(), fingerprint(api_key));
         self.transaction(move |tx| {
-            tx.prepare_cached(
-                "DELETE FROM api_keys
-                 WHERE library_server = ?1 AND user_id = ?2 AND key_fingerprint = ?3",
-            )?
-            .execute(params![user.library_server, user.user_id, fingerprint])?;
-            Ok(())
+            let deleted = tx
+                .prepare_cached(
+                    "DELETE FROM api_keys
+                     WHERE library_server = ?1 AND user_id = ?2 AND key_fingerprint = ?3",
+                )?
+                .execute(params![user.library_server, user.user_id, fingerprint])?;
+            Ok(deleted > 0)
         })
         .await
     }
@@ -313,6 +330,7 @@ mod tests {
 
         use abs::ApiKey;
         use store::contract::Backend;
+        use store::{LibraryUser, SessionId, Store};
 
         use super::TempDatabase;
         use crate::{Sealing, SqliteStore};
@@ -359,6 +377,37 @@ mod tests {
                 super::stored_keys_after_two_logins_with_one_key(store, &database.0.path).await,
                 1
             );
+        }
+
+        /// A login with a key stored under another sealing re-seals it: sessions read it back
+        /// through the current sealing.
+        #[tokio::test]
+        async fn logging_in_again_re_seals_the_stored_key() {
+            let database = RandomlySealed(TempDatabase::new());
+            let user = LibraryUser {
+                library_server: "https://abs.lan".into(),
+                user_id: "alice-id".into(),
+            };
+            let key = ApiKey::new("alice-key");
+            database
+                .open()
+                .await
+                .open_session(&SessionId::of_token("first"), &user, &key)
+                .await
+                .unwrap();
+
+            let plain = SqliteStore::open(&database.0.path).unwrap();
+            plain
+                .open_session(&SessionId::of_token("second"), &user, &key)
+                .await
+                .unwrap();
+
+            let session = plain
+                .session(&SessionId::of_token("first"))
+                .await
+                .unwrap()
+                .expect("still open");
+            assert_eq!(session.api_key, key);
         }
     }
 

@@ -40,13 +40,21 @@ pub struct AbsUser {
     pub api_key: IssuedKey,
 }
 
-/// An API key as Audiobookshelf issued it.
-#[derive(Debug)]
+/// An API key as Audiobookshelf issued it. `Debug` shows only its id, so a failing
+/// assertion never prints the key.
 pub struct IssuedKey {
-    /// Audiobookshelf's id for the key, to delete it by.
+    /// Audiobookshelf's id for the key, to delete or move it by.
     pub id: String,
     /// The key itself.
     pub key: String,
+}
+
+impl std::fmt::Debug for IssuedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedKey")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A running Audiobookshelf, removed on drop.

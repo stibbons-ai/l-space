@@ -87,10 +87,10 @@ pub trait Store: Send + Sync + 'static {
 
     /// Forgets `api_key` for `user` on `user`'s Library Server, ending every session opened
     /// with it. The user's other keys, and the same key stored for another Library Server or
-    /// user, stay.
+    /// user, stay. Returns whether the key was stored.
     fn revoke_api_key(
         &self,
         user: &LibraryUser,
         api_key: &ApiKey,
-    ) -> impl Future<Output = Result<(), Error>> + Send;
+    ) -> impl Future<Output = Result<bool, Error>> + Send;
 }

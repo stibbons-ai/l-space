@@ -77,12 +77,14 @@ impl Drop for Forwarder {
     }
 }
 
-/// Accepts until aborted; aborting drops every open connection with it.
+/// Accepts until aborted. Open connections live in `state.connections`: `stop` aborts them,
+/// and so does dropping the set once the forwarder and this task are both gone.
 async fn serve(listener: TcpListener, state: Arc<State>) {
     loop {
         let mut inbound = match listener.accept().await {
             Ok((inbound, _)) => inbound,
-            Err(_) => {
+            Err(error) => {
+                eprintln!("[forwarder] accept failed: {error}");
                 tokio::time::sleep(ACCEPT_BACKOFF).await;
                 continue;
             }
@@ -93,10 +95,15 @@ async fn serve(listener: TcpListener, state: Arc<State>) {
         if !state.forwarding.load(Ordering::SeqCst) {
             continue;
         }
+        // Reap connections that have ended, so the set holds only open ones.
+        while connections.try_join_next().is_some() {}
         let target = state.target.clone();
         connections.spawn(async move {
-            if let Ok(mut outbound) = TcpStream::connect(&target).await {
-                let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+            match TcpStream::connect(&target).await {
+                Ok(mut outbound) => {
+                    let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+                Err(error) => eprintln!("[forwarder] connect to {target} failed: {error}"),
             }
         });
     }

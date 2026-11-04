@@ -192,10 +192,19 @@ pub async fn revoking_a_key_ends_all_its_sessions_and_nothing_else(backend: &imp
     open(&store, session_id(2), &alice(), "alice-key").await;
     open(&store, session_id(3), &bob(), "bob-key").await;
 
-    store
-        .revoke_api_key(&alice(), &key("alice-key"))
-        .await
-        .expect("revoke");
+    assert!(
+        store
+            .revoke_api_key(&alice(), &key("alice-key"))
+            .await
+            .expect("revoke")
+    );
+    assert!(
+        !store
+            .revoke_api_key(&alice(), &key("alice-key"))
+            .await
+            .expect("revoke again"),
+        "a revoked key is no longer stored"
+    );
 
     assert_eq!(session(&store, session_id(1)).await, None);
     assert_eq!(session(&store, session_id(2)).await, None);

@@ -47,7 +47,8 @@ pub struct User {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The Library Server does not accept the API key (HTTP 401): unknown, deleted,
-    /// deactivated or expired, or its user is deactivated.
+    /// deactivated or expired, or its user is deactivated. Also a key that cannot be sent as
+    /// a header value, which is rejected without a request.
     #[error("the Library Server rejected the API key")]
     Rejected,
     /// No usable answer: the Library Server could not be reached in time, or answered with
@@ -91,8 +92,8 @@ impl Client {
         let http = reqwest::Client::builder()
             .timeout(TIMEOUT)
             // reqwest drops `Authorization` on a redirect to another host or port, but would
-            // send the key along to a new path on the same one; an API call has no reason to
-            // move.
+            // send the key along on a redirect to the same host and port, even over plain
+            // http; an API call has no reason to move.
             .redirect(redirect::Policy::none())
             .build()
             .expect("the TLS backend and system configuration load");
@@ -116,7 +117,13 @@ impl Client {
             .map_err(Error::unavailable)?;
         match response.status() {
             StatusCode::UNAUTHORIZED => Err(Error::Rejected),
-            status if status.is_success() => response.json().await.map_err(Error::unavailable),
+            status if status.is_success() => {
+                let user: User = response.json().await.map_err(Error::unavailable)?;
+                if user.id.is_empty() {
+                    return Err(Error::Unavailable("the answer names no user id".to_owned()));
+                }
+                Ok(user)
+            }
             status => Err(Error::Unavailable(format!("HTTP {status}"))),
         }
     }
@@ -233,6 +240,14 @@ mod tests {
     async fn a_redirect_is_not_followed() {
         assert!(matches!(
             me_from(Redirect::temporary("http://elsewhere.invalid/api/me")).await,
+            Err(Error::Unavailable(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_user_without_an_id_is_unavailable() {
+        assert!(matches!(
+            me_from(r#"{"id":"","username":"x"}"#).await,
             Err(Error::Unavailable(_))
         ));
     }
