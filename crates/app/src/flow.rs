@@ -486,14 +486,16 @@ impl App {
                 self.go_back();
                 self.set_notice(Notice::PlayingOn(name));
             }
-            Err(ApiError::GroupNotFound) => {
-                if let Ok(listed) = self.call(api::groups()).await
-                    && let Screen::PlayOn { groups, .. } = &mut self.screen
-                {
-                    *groups = listed;
+            Err(ApiError::GroupNotFound) => match self.call(api::groups()).await {
+                Ok(listed) => {
+                    if let Screen::PlayOn { groups, .. } = &mut self.screen {
+                        *groups = listed;
+                    }
+                    self.set_notice(Notice::Api(ApiError::GroupNotFound));
                 }
-                self.set_notice(Notice::Api(ApiError::GroupNotFound));
-            }
+                // Why the Groups could not be listed afresh matters more now.
+                Err(error) => self.failed(error).await,
+            },
             Err(error) => self.failed(error).await,
         }
     }

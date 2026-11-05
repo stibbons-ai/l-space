@@ -12,10 +12,20 @@ use sonos_fake::{Fault, Household, PlayerId};
 
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
 use test_support::bridge::{
-    SESSION_INVALID, TestBridge, acting_as, home_with_sonos_toml, output_contains,
+    KeyEnv, OTHER_KEY, SESSION_INVALID, TestBridge, acting_as, home_with_sonos_toml,
+    output_contains,
 };
 
 use crate::forwarder::Forwarder;
+
+/// The SOAP action that gives a Group a URL, as `sonos-fake` records it.
+const SET_URI: &str = "AVTransport#SetAVTransportURI";
+
+/// The SOAP action that has a Group play, as `sonos-fake` records it.
+const PLAY: &str = "AVTransport#Play";
+
+/// The WARN the Bridge logs when a Handoff's file breaks off from the Library Server.
+const BROKE_OFF: &str = "a Handoff's file broke off while streaming from its Library Server";
 
 /// A household of Kitchen (with Bath) and Office, a Bridge searching it with the shared
 /// Audiobookshelf as its Library Server, and a user logged in.
@@ -160,6 +170,28 @@ fn assert_quiet(output: &[serde_json::Value], key: &str) {
     assert!(!output_contains(output, "/stream/"));
 }
 
+/// How many WARN events with `message` the Bridge's `output` holds.
+fn warnings(output: &[serde_json::Value], message: &str) -> usize {
+    output
+        .iter()
+        .filter(|event| event["level"] == "WARN" && event["message"] == message)
+        .count()
+}
+
+/// GETs `path` as a speaker would, once more if the first answer is a 502: a test that just
+/// closed the forwarder's connections may leave the Bridge a closed one to the Library Server.
+async fn fetch_after_reconnect(
+    bridge: &TestBridge,
+    path: &str,
+    range: Option<&str>,
+) -> reqwest::Response {
+    let response = bridge.api().fetch(Method::GET, path, range).await;
+    if response.status() != StatusCode::BAD_GATEWAY {
+        return response;
+    }
+    bridge.api().fetch(Method::GET, path, range).await
+}
+
 #[tokio::test]
 async fn choosing_a_group_plays_the_episode_there_from_the_bridges_stream() {
     let setup = setup().await;
@@ -207,7 +239,7 @@ async fn choosing_a_group_plays_the_episode_there_from_the_bridges_stream() {
 
     // Neither the key nor the stream id shows in the Bridge's log.
     let output = setup.bridge.stop();
-    assert!(!output_contains(&output, &setup.user.api_key.key));
+    assert_quiet(&output, &setup.user.api_key.key);
     assert!(!output_contains(&output, id));
     // A Bridge on loopback (as in these tests) warns that speakers can't reach it.
     assert!(output_contains(&output, "listening on a loopback address"));
@@ -268,11 +300,6 @@ async fn byte_ranges_come_back_exactly_with_the_media_type() {
     assert_eq!(header(&whole, "content-type"), Some("audio/wav"));
     assert_eq!(header(&whole, "content-length"), Some(&*length.to_string()));
     assert!(whole.bytes().await.unwrap()[..] == file[..]);
-
-    // Several ranges at once aren't forwarded: the whole file.
-    let several = api.fetch(Method::GET, stream, Some("bytes=0-1,5-6")).await;
-    assert_eq!(several.status(), StatusCode::OK);
-    assert!(several.bytes().await.unwrap()[..] == file[..]);
 
     let beyond = api
         .fetch(Method::GET, stream, Some(&format!("bytes={length}-")))
@@ -500,7 +527,7 @@ async fn a_group_that_refuses_or_does_not_answer_keeps_no_handoff() {
         failed
     );
     // It failed at the coordinator's refusal, not before.
-    let set_uri = "AVTransport#SetAVTransportURI".to_owned();
+    let set_uri = SET_URI.to_owned();
     assert!(
         setup
             .household
@@ -552,8 +579,7 @@ async fn a_start_the_group_refuses_ends_its_previous_handoff() {
 async fn starts_on_one_group_take_turns() {
     let setup = setup().await;
     let api = setup.bridge.api();
-    // Office takes the first URL it is given a second late: without turns, the start that
-    // stored first (and was replaced) would load its dead URL last.
+    // Office takes each URL a second late.
     setup
         .household
         .set_fault(&setup.office, Fault::SlowPlayback(Duration::from_secs(1)));
@@ -568,7 +594,16 @@ async fn starts_on_one_group_take_turns() {
         (setup.office.uuid(), setup.office.uuid())
     );
 
-    // Office plays the stream of the Handoff listed for it, not one replaced meanwhile.
+    // One start's URL and Play, then the other's: never both URLs before a Play.
+    let started: Vec<String> = setup
+        .household
+        .actions_of(&setup.office)
+        .into_iter()
+        .filter(|action| action == SET_URI || action == PLAY)
+        .collect();
+    assert_eq!(started, [SET_URI, PLAY, SET_URI, PLAY]);
+
+    // Office plays the stream of the Handoff listed for it.
     let listed = api.handoffs(&setup.session).await;
     assert_eq!(listed.len(), 1);
     let uri = setup
@@ -584,6 +619,150 @@ async fn starts_on_one_group_take_turns() {
 }
 
 #[tokio::test]
+async fn a_start_on_a_hanging_group_doesnt_hold_up_another_group() {
+    let setup = setup().await;
+    setup.household.set_fault(&setup.kitchen, Fault::Hang);
+    let api = setup.bridge.api();
+
+    let hanging = async {
+        let failed = api
+            .start_handoff_error(&setup.session, &setup.episode(0), setup.kitchen.uuid())
+            .await;
+        (failed, Instant::now())
+    };
+    let other = async {
+        // Once Kitchen has been told its URL and hangs on it, Office starts.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !setup
+            .household
+            .actions_of(&setup.kitchen)
+            .iter()
+            .any(|a| a == SET_URI)
+        {
+            assert!(Instant::now() < deadline, "Kitchen was never given a URL");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let start = Instant::now();
+        setup.start(&setup.episode(1), &setup.office).await;
+        (start.elapsed(), Instant::now())
+    };
+    let ((failed, kitchen_done), (office_took, office_done)) = tokio::join!(hanging, other);
+
+    assert!(office_took < Duration::from_secs(3), "{office_took:?}");
+    assert!(
+        office_done < kitchen_done,
+        "Kitchen's start ended before Office's"
+    );
+    assert_eq!(failed, (StatusCode::BAD_GATEWAY, ApiError::GroupFailed));
+}
+
+#[tokio::test]
+async fn a_start_whose_client_hangs_up_still_finishes() {
+    let setup = setup().await;
+    // Office takes each URL a second late, so the client can hang up meanwhile.
+    setup
+        .household
+        .set_fault(&setup.office, Fault::SlowPlayback(Duration::from_secs(1)));
+    let episode = setup.episode(1);
+    let request = reqwest::Client::new()
+        .post(format!("{}/api/handoffs/start", setup.bridge.url()))
+        .bearer_auth(setup.session.token.expose())
+        .json(&serde_json::json!({"item": episode, "group": setup.office.uuid()}));
+    let client = tokio::spawn(request.send());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !setup
+        .household
+        .actions_of(&setup.office)
+        .iter()
+        .any(|a| a == SET_URI)
+    {
+        assert!(Instant::now() < deadline, "Office was never given a URL");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    client.abort();
+
+    // The start goes on without its client: Office plays the Handoff listed for it.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while setup.household.transport_state(&setup.office) != "PLAYING" {
+        assert!(Instant::now() < deadline, "Office never played");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let listed = setup.bridge.api().handoffs(&setup.session).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].item, episode);
+    let uri = setup.household.uri(&setup.office).expect("a URL");
+    let response = setup
+        .bridge
+        .api()
+        .fetch(Method::GET, path(&uri), Some("bytes=0-"))
+        .await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.bytes().await.unwrap().to_vec(),
+        setup.file(&episode).await
+    );
+}
+
+#[tokio::test]
+async fn several_ranges_are_not_forwarded() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let episode = setup.episode(1);
+    let (_, url) = setup.start(&episode, &setup.office).await;
+    setup.household.fetched(&setup.office).await;
+
+    forwarder.record_requests().await;
+    let response = fetch_after_reconnect(&setup.bridge, path(&url), Some("bytes=0-1,5-6")).await;
+
+    // The whole file, as if no range was asked for, and the Library Server was asked for no
+    // range either.
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_only_stream_headers(&response);
+    assert!(response.bytes().await.unwrap().to_vec() == setup.file(&episode).await);
+    let sent = forwarder.requests().to_ascii_lowercase();
+    assert!(sent.contains("/file/"), "{sent}");
+    assert!(!sent.contains("range:"), "{sent}");
+}
+
+#[tokio::test]
+async fn a_speaker_hanging_up_mid_file_logs_nothing() {
+    let setup = setup().await;
+    let (_, url) = setup.start(&setup.episode(2), &setup.office).await;
+
+    let mut response = setup
+        .bridge
+        .api()
+        .fetch(Method::GET, path(&url), Some("bytes=0-"))
+        .await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert!(response.chunk().await.unwrap().is_some());
+    drop(response);
+    // Give the Bridge time to notice and drop the stream.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert_eq!(warnings(&setup.bridge.stop(), BROKE_OFF), 0);
+}
+
+#[tokio::test]
+async fn another_encryption_key_warns_that_sessions_and_handoffs_end() {
+    let mut setup = setup().await;
+    // The user's one key is used by their session and their Handoff.
+    setup.start(&setup.episode(0), &setup.kitchen).await;
+
+    setup.bridge.restart_with_key(KeyEnv::value(OTHER_KEY));
+
+    let startup = setup.bridge.startup_output();
+    let sessions = "stored API keys were encrypted with another encryption key; their sessions \
+                    end at their next call, and their users must log in again";
+    let handoffs = "stored API keys Handoffs use were encrypted with another encryption key; \
+                    those Handoffs end";
+    assert_eq!(warnings(startup, sessions), 1);
+    assert_eq!(warnings(startup, handoffs), 1);
+}
+
+#[tokio::test]
 async fn a_library_server_failing_mid_file_is_logged_and_keeps_the_handoff() {
     let abs = Audiobookshelf::shared();
     let forwarder = Forwarder::to(abs.address()).await;
@@ -592,31 +771,20 @@ async fn a_library_server_failing_mid_file_is_logged_and_keeps_the_handoff() {
     let length = setup.file(&episode).await.len();
     let (_, url) = setup.start(&episode, &setup.office).await;
     setup.household.fetched(&setup.office).await;
-    let api = setup.bridge.api();
 
     forwarder.cut_after(50_000).await;
-    // The Bridge's pooled connection to the Library Server was just closed under it, so its
-    // first request may fail outright (502), as a speaker's retry would show; then the cut.
-    let mut response = api.fetch(Method::GET, path(&url), Some("bytes=0-")).await;
-    if response.status() == StatusCode::BAD_GATEWAY {
-        response = api.fetch(Method::GET, path(&url), Some("bytes=0-")).await;
-    }
+    let response = fetch_after_reconnect(&setup.bridge, path(&url), Some("bytes=0-")).await;
     assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
     let body = response.bytes().await;
     assert!(
         body.as_ref().map_or(true, |body| body.len() < length),
         "the whole file came through"
     );
+    let api = setup.bridge.api();
     assert_eq!(api.handoffs(&setup.session).await.len(), 1);
 
     let output = setup.bridge.stop();
-    let broke_off = "a Handoff's file broke off while streaming from its Library Server";
-    assert!(
-        output
-            .iter()
-            .any(|event| event["level"] == "WARN" && event["message"] == broke_off),
-        "no WARN that the file broke off"
-    );
+    assert_eq!(warnings(&output, BROKE_OFF), 1);
     assert_quiet(&output, &setup.user.api_key.key);
 }
 

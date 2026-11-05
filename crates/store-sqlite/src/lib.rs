@@ -174,7 +174,8 @@ fn migrate(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error 
 /// Removes keys sealed under another encryption key than `sealing`'s that no session or
 /// Handoff uses (nothing would ever look them up again), and warns once each if others remain:
 /// keys with sessions (those end at their next call, and their users log in again), and keys
-/// only Handoffs use (those end when their streams are next asked for, or listed).
+/// Handoffs use (those Handoffs end when their streams are next asked for, or listed). A key
+/// both use is counted in both.
 fn forget_keys_sealed_under_another_key(
     connection: &Connection,
     sealing: &Sealing,
@@ -193,12 +194,12 @@ fn forget_keys_sealed_under_another_key(
              no session or Handoff used"
         );
     }
-    let (with_sessions, handoffs_only): (i64, i64) = connection.query_row(
+    let (with_sessions, with_handoffs): (i64, i64) = connection.query_row(
         "SELECT
              count(*) FILTER (WHERE EXISTS
                  (SELECT 1 FROM sessions WHERE sessions.api_key_id = api_keys.id)),
-             count(*) FILTER (WHERE NOT EXISTS
-                 (SELECT 1 FROM sessions WHERE sessions.api_key_id = api_keys.id))
+             count(*) FILTER (WHERE EXISTS
+                 (SELECT 1 FROM handoffs WHERE handoffs.api_key_id = api_keys.id))
          FROM api_keys WHERE key_id <> ?1",
         params![sealing.key_id()],
         |row| Ok((row.get(0)?, row.get(1)?)),
@@ -210,11 +211,11 @@ fn forget_keys_sealed_under_another_key(
              at their next call, and their users must log in again"
         );
     }
-    if handoffs_only > 0 {
+    if with_handoffs > 0 {
         tracing::warn!(
-            keys = handoffs_only,
-            "stored API keys only Handoffs use were encrypted with another encryption key; \
-             those Handoffs end"
+            keys = with_handoffs,
+            "stored API keys Handoffs use were encrypted with another encryption key; those \
+             Handoffs end"
         );
     }
     Ok(())

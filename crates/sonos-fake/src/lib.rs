@@ -139,8 +139,8 @@ pub enum Fault {
     /// It answers `SetAVTransportURI` and `Play` with a SOAP fault (UPnP error 714, illegal
     /// MIME type), and everything else correctly.
     RefusePlayback,
-    /// It answers its next `SetAVTransportURI` correctly, but only after this long (in real
-    /// time), and takes the URL only then; from then on it answers correctly (no fault).
+    /// It answers each `SetAVTransportURI` correctly, but only after this long (in real time),
+    /// and takes the URL only then.
     SlowPlayback(Duration),
 }
 
@@ -758,9 +758,6 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             return upnp_fault(714);
         }
         Some(Fault::SlowPlayback(delay)) if action == "SetAVTransportURI" => {
-            if let Some(player) = served.shared.lock().find_mut(&served.uuid) {
-                player.fault = Fault::None;
-            }
             tokio::time::sleep(delay).await;
         }
         Some(

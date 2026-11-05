@@ -558,6 +558,10 @@ mod tests {
     use super::*;
     use crate::xml::ZoneMember;
 
+    /// The SOAP actions that give a Group a URL and have it play, as `sonos-fake` records them.
+    const SET_URI: &str = "AVTransport#SetAVTransportURI";
+    const PLAY: &str = "AVTransport#Play";
+
     fn member(uuid: &str, name: &str, visible: bool) -> ZoneMember {
         ZoneMember {
             uuid: uuid.into(),
@@ -919,7 +923,7 @@ mod tests {
         assert_eq!(url, "http://127.0.0.1:9/stream/abc/Episode%201.mp3");
         assert_eq!(household.uri(&kitchen).as_deref(), Some(url.as_str()));
         assert_eq!(household.transport_state(&kitchen), "PLAYING");
-        let started = ["AVTransport#SetAVTransportURI", "AVTransport#Play"];
+        let started = [SET_URI, PLAY];
         let calls = household.actions_of(&kitchen);
         assert!(calls.ends_with(&started.map(String::from)), "{calls:?}");
         assert!(
@@ -989,7 +993,7 @@ mod tests {
         );
         assert_eq!(household.transport_state(&kitchen), "STOPPED");
         // It failed at the coordinator's refusal, not before.
-        let set_uri = "AVTransport#SetAVTransportURI".to_owned();
+        let set_uri = SET_URI.to_owned();
         assert!(household.actions_of(&kitchen).contains(&set_uri));
 
         // The topology comes from Kitchen; Office never answers its own calls.

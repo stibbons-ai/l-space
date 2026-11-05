@@ -1,6 +1,7 @@
 //! A TCP forwarder on loopback in front of another server, that a test can take down and
 //! bring back: a Library Server outage, or a second Library Server URL for the same
-//! Audiobookshelf. It can also cut answers short: a Library Server failing mid-body.
+//! Audiobookshelf. It can also cut answers short (a Library Server failing mid-body), and
+//! record what clients send.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -31,6 +32,9 @@ struct State {
     /// When not 0, a connection opened since passes at most this many bytes back from
     /// `target`, then closes.
     cut_after: AtomicUsize,
+    /// While true, a connection opened since records what the client sends in `requests`.
+    recording: AtomicBool,
+    requests: std::sync::Mutex<Vec<u8>>,
     connections: Mutex<JoinSet<()>>,
 }
 
@@ -45,6 +49,8 @@ impl Forwarder {
             target: target.to_owned(),
             forwarding: AtomicBool::new(true),
             cut_after: AtomicUsize::new(0),
+            recording: AtomicBool::new(false),
+            requests: std::sync::Mutex::default(),
             connections: Mutex::new(JoinSet::new()),
         });
         let serving = tokio::spawn(serve(listener, Arc::clone(&state)));
@@ -77,6 +83,19 @@ impl Forwarder {
     pub async fn cut_after(&self, bytes: usize) {
         self.state.cut_after.store(bytes, Ordering::SeqCst);
         self.close_all().await;
+    }
+
+    /// Closes every connection through the forwarder; from now on it records every byte
+    /// clients send through new ones, from none.
+    pub async fn record_requests(&self) {
+        self.state.requests.lock().unwrap().clear();
+        self.state.recording.store(true, Ordering::SeqCst);
+        self.close_all().await;
+    }
+
+    /// What clients sent since [`Forwarder::record_requests`], as text.
+    pub fn requests(&self) -> String {
+        String::from_utf8_lossy(&self.state.requests.lock().unwrap()).into_owned()
     }
 
     async fn close_all(&self) {
@@ -114,6 +133,8 @@ async fn serve(listener: TcpListener, state: Arc<State>) {
         while connections.try_join_next().is_some() {}
         let target = state.target.clone();
         let cut_after = state.cut_after.load(Ordering::SeqCst);
+        let recording = state.recording.load(Ordering::SeqCst);
+        let shared = Arc::clone(&state);
         connections.spawn(async move {
             let mut outbound = match TcpStream::connect(&target).await {
                 Ok(outbound) => outbound,
@@ -122,16 +143,36 @@ async fn serve(listener: TcpListener, state: Arc<State>) {
                     return;
                 }
             };
-            if cut_after == 0 {
+            if cut_after == 0 && !recording {
                 let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
                 return;
             }
             let (mut from_client, mut to_client) = inbound.split();
             let (from_server, mut to_server) = outbound.split();
-            let mut limited = from_server.take(cut_after as u64);
+            let limit = if cut_after == 0 {
+                u64::MAX
+            } else {
+                cut_after as u64
+            };
+            let mut limited = from_server.take(limit);
+            let requests = async {
+                let mut buffer = [0; 8192];
+                while let Ok(read @ 1..) = from_client.read(&mut buffer).await {
+                    if recording {
+                        shared
+                            .requests
+                            .lock()
+                            .unwrap()
+                            .extend_from_slice(&buffer[..read]);
+                    }
+                    if to_server.write_all(&buffer[..read]).await.is_err() {
+                        break;
+                    }
+                }
+            };
             // Whichever ends first ends the connection.
             tokio::select! {
-                _ = copy(&mut from_client, &mut to_server) => {}
+                () = requests => {}
                 _ = copy(&mut limited, &mut to_client) => {}
             }
             let _ = to_client.shutdown().await;

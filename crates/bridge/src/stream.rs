@@ -2,7 +2,8 @@
 //! listener, which Groups fetch over the LAN. A stream id names one active Handoff and serves
 //! only its Item's audio file, forwarding byte ranges to the Library Server with the starter's
 //! API key. Speakers can't authenticate, so the id is the only capability: 256 random bits,
-//! stored only as its hash, never logged. Anything that doesn't name an active Handoff's file
+//! stored only as its hash, never logged at INFO or above (the SOAP bodies at DEBUG under
+//! `sonos::raw` carry the URL). Anything that doesn't name an active Handoff's file
 //! is a bare `404`, alike for an unknown id, a known one with another file name, and a path
 //! that isn't UTF-8.
 
@@ -38,8 +39,8 @@ impl StreamToken {
         Self(token)
     }
 
-    /// What the store knows the stream by.
-    pub fn id(&self) -> store::StreamId {
+    /// What the store knows the stream by: the id's hash.
+    pub fn hash(&self) -> store::StreamId {
         store::StreamId::of(&self.0)
     }
 
@@ -99,11 +100,15 @@ async fn serve<S: Store>(
     headers: HeaderMap,
 ) -> Response {
     // A path that isn't UTF-8 names nothing either.
-    let Ok(Path((id, file))) = path else {
-        return not_found();
+    let (id, file) = match path {
+        Ok(Path(path)) => path,
+        Err(rejection) => {
+            tracing::debug!(%rejection, "a stream path that names nothing");
+            return not_found();
+        }
     };
     let (library_server, store::ActiveHandoff { handoff, api_key }) =
-        match app.active_handoff(&id, &file).await {
+        match app.active_handoff(&StreamToken::new(id), &file).await {
             Ok(Some(active)) => active,
             Ok(None) => return not_found(),
             Err(error) => {
@@ -179,16 +184,23 @@ async fn serve<S: Store>(
     let body = if request == abs::FileRequest::Head {
         Body::empty()
     } else {
-        let group = handoff.group;
-        Body::from_stream(file.body.map(move |chunk| {
-            chunk.map_err(|error| {
+        let (group, library_server) = (handoff.group, library_server.to_owned());
+        let mut sent: u64 = 0;
+        Body::from_stream(file.body.map(move |chunk| match chunk {
+            Ok(chunk) => {
+                sent += chunk.len() as u64;
+                Ok(chunk)
+            }
+            Err(error) => {
                 tracing::warn!(
                     group,
+                    library_server,
+                    sent,
                     %error,
                     "a Handoff's file broke off while streaming from its Library Server"
                 );
-                axum::Error::new(error)
-            })
+                Err(axum::Error::new(error))
+            }
         }))
     };
     response
