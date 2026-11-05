@@ -29,6 +29,7 @@ language-german = Deutsch
 
 error-bridge-url-invalid = That is not a Clacks address. Enter it with http:// or https://, for example http://192.168.1.10:8080.
 error-bridge-url-unreachable = Nothing answers at this address. Check it, and that this phone is on your home network or VPN.
+error-session-library-server-not-configured = Your Library Server isn't set up on Clacks right now. You stay logged in: once whoever runs Clacks sets it up again, Ook works as before.
 error-storage-load = Ook couldn't read what it had saved on this device, so it started afresh. It kept the unreadable file next to the new one.
 error-storage-stuck = Ook couldn't read what it had saved on this device and leaves it untouched, so nothing you change now is kept after a restart.
 error-storage-save = Ook could not save on this device. You may have to log in again after restarting it.

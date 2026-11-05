@@ -138,6 +138,7 @@ texts! {
     LanguageGerman => "language-german",
     ErrorBridgeUrlInvalid => "error-bridge-url-invalid",
     ErrorBridgeUrlUnreachable => "error-bridge-url-unreachable",
+    ErrorSessionLibraryServerNotConfigured => "error-session-library-server-not-configured",
     ErrorStorageLoad => "error-storage-load",
     ErrorStorageStuck => "error-storage-stuck",
     ErrorStorageSave => "error-storage-save",

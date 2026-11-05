@@ -6,8 +6,8 @@
 //! launch starts from a cold client ([`Device::launch`]). The Bridge binary must be built first
 //! (`cargo build -p bridge`; `mise run test` does).
 
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
@@ -126,17 +126,29 @@ impl DeviceStore for Device {
     }
 }
 
+/// The configuration naming the shared Audiobookshelf `abs` as the Library Server "Home",
+/// followed by `unreachable`.
+fn home_config(abs: &Audiobookshelf, unreachable: &str) -> String {
+    format!(
+        "{}{}",
+        named_library_server_toml(abs.base_url(), "Home"),
+        library_server_toml(unreachable),
+    )
+}
+
 /// A Bridge with the shared Audiobookshelf as its Library Server "Home", followed by one
 /// nothing answers for.
 fn bridge_with_abs() -> (TestBridge, Arc<Audiobookshelf>, String) {
     let abs = Audiobookshelf::shared();
     let unreachable = format!("http://{}", closed_port());
-    let bridge = TestBridge::start(&format!(
-        "{}{}",
-        named_library_server_toml(abs.base_url(), "Home"),
-        library_server_toml(&unreachable),
-    ));
+    let bridge = TestBridge::start(&home_config(&abs, &unreachable));
     (bridge, abs, unreachable)
+}
+
+/// Restarts `bridge` on `config` and points `device` at it: it may listen on another port.
+fn restart_bridge(bridge: &mut TestBridge, device: &Device, config: &str) {
+    bridge.restart_with(config);
+    device.edit(|json| json["bridge_url"] = bridge.url().into());
 }
 
 /// Launches the App on `device`, enters `bridge`'s URL and logs in as `user` on `abs`.
@@ -224,6 +236,63 @@ fn html_page_server() -> String {
     web_server("200 OK", "text/html", "<html><body>Welcome</body></html>")
 }
 
+/// A loopback proxy that passes the first request on to `bridge` and answers every later one
+/// with `503 Service Unavailable`, as a reverse proxy does once the Bridge behind it is gone.
+fn bridge_then_gone(bridge: &str) -> String {
+    let target = bridge
+        .strip_prefix("http://")
+        .expect("an http:// Bridge URL")
+        .to_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let mut first = true;
+        for mut stream in listener.incoming().flatten() {
+            let request = read_request(&stream);
+            let response = if std::mem::take(&mut first) {
+                let mut bridge = TcpStream::connect(&target).unwrap();
+                bridge.write_all(&request).unwrap();
+                let mut response = Vec::new();
+                bridge.read_to_end(&mut response).unwrap();
+                response
+            } else {
+                b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    .to_vec()
+            };
+            let _ = stream.write_all(&response);
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// One HTTP/1.1 request from `stream`, rewritten to close the connection after the response,
+/// so the next request comes on a new one.
+fn read_request(stream: &TcpStream) -> Vec<u8> {
+    let mut reader = BufReader::new(stream);
+    let mut head = String::new();
+    let mut length = 0;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        let lower = line.to_ascii_lowercase();
+        if let Some(value) = lower.strip_prefix("content-length:") {
+            length = value.trim().parse().unwrap();
+        }
+        if !lower.starts_with("connection:") {
+            head.push_str(&line);
+        }
+    }
+    head.push_str("connection: close\r\n\r\n");
+    let mut request = head.into_bytes();
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    request.extend(body);
+    request
+}
+
 /// Fails the test instead of hanging when `action` outlives `limit`.
 async fn within<T>(limit: Duration, action: impl Future<Output = T>) -> T {
     tokio::time::timeout(limit, action)
@@ -261,7 +330,9 @@ fn the_bridge_url_is_entered_once_and_remembered() {
             &Screen::BridgeUrl { notice: None }
         );
 
-        app.submit_bridge_url(&format!(" {}/ ", bridge.url())).await;
+        // Without a scheme, as people type it: the App assumes `http://`.
+        let typed = bridge.url().strip_prefix("http://").unwrap();
+        app.submit_bridge_url(&format!(" {typed}/ ")).await;
         let login = Screen::Login {
             library_servers: vec![
                 LibraryServer {
@@ -480,6 +551,76 @@ fn a_session_the_bridge_ended_is_forgotten_at_the_next_launch() {
             Screen::Login { notice: None, .. }
         ));
         assert_eq!(relaunched.session(), None);
+    });
+}
+
+#[test]
+fn a_session_whose_library_server_is_unconfigured_for_a_while_stays() {
+    let (mut bridge, abs, unreachable) = bridge_with_abs();
+    let device = Device::with_locale("de-DE");
+    run(async move || {
+        let user = abs.new_user().await;
+        let before = session(&logged_in(&device, &bridge, &abs, &user).await);
+
+        // The operator takes the Library Server out of the configuration for a while.
+        restart_bridge(&mut bridge, &device, &library_server_toml(&unreachable));
+        let mut app = device.launch().await;
+        assert_eq!(
+            app.screen(),
+            &Screen::Settings {
+                notice: Some(Notice::SessionLibraryServerNotConfigured)
+            }
+        );
+        assert_eq!(session(&app), before);
+        assert_eq!(
+            notice_texts(&mut app),
+            both(Text::ErrorSessionLibraryServerNotConfigured)
+        );
+        drop(app);
+        let stored = device
+            .load()
+            .unwrap()
+            .session
+            .expect("session on the device");
+        assert_eq!(stored.token, before.token);
+
+        // Back in the configuration: the same session works again.
+        restart_bridge(&mut bridge, &device, &home_config(&abs, &unreachable));
+        let app = device.launch().await;
+        assert_eq!(app.screen(), &Screen::Settings { notice: None });
+        assert_eq!(session(&app), before);
+        assert_eq!(bridge.api().current_user(&before).await, before.user);
+    });
+}
+
+#[test]
+fn a_failed_library_server_listing_after_session_invalid_keeps_the_session() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let before = session(&logged_in(&device, &bridge, &abs, &user).await);
+        bridge.api().logout(&before).await;
+        // The Bridge answers `session_invalid`, then can't be reached for the listing that
+        // would tell an ended session from an unconfigured Library Server.
+        let proxy = bridge_then_gone(bridge.url());
+        device.edit(|json| json["bridge_url"] = proxy.clone().into());
+
+        let app = device.launch().await;
+        assert_eq!(
+            app.screen(),
+            &Screen::Settings {
+                notice: Some(Notice::Api(ApiError::BridgeUnreachable))
+            }
+        );
+        assert_eq!(session(&app), before);
+        drop(app);
+        let stored = device
+            .load()
+            .unwrap()
+            .session
+            .expect("session on the device");
+        assert_eq!(stored.token, before.token);
     });
 }
 

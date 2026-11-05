@@ -65,6 +65,9 @@ pub enum Notice {
     /// Nothing answered at the address entered on the Bridge URL screen, where a typo is the
     /// likeliest cause.
     BridgeUrlUnreachable,
+    /// The session's Library Server is not configured on the Bridge (any more); the session
+    /// stays, as it works again once the operator re-adds it.
+    SessionLibraryServerNotConfigured,
     /// What the App saved on the device could not be read; it was moved aside and the App
     /// started afresh.
     StorageLoad,
@@ -83,6 +86,7 @@ impl Notice {
             Self::Api(error) => error.into(),
             Self::BridgeUrlInvalid => Text::ErrorBridgeUrlInvalid,
             Self::BridgeUrlUnreachable => Text::ErrorBridgeUrlUnreachable,
+            Self::SessionLibraryServerNotConfigured => Text::ErrorSessionLibraryServerNotConfigured,
             Self::StorageLoad => Text::ErrorStorageLoad,
             Self::StorageStuck => Text::ErrorStorageStuck,
             Self::StorageSave => Text::ErrorStorageSave,
@@ -152,9 +156,11 @@ impl App {
     }
 
     /// Picks the first screen: the Bridge address if there is none, Login if there is no
-    /// session, else Settings once the Bridge confirmed the session. A session the Bridge
-    /// ended (`api_key_rejected`, `session_invalid`) is forgotten; on any other failure (the
-    /// Bridge or Library Server unreachable, for example) it stays.
+    /// session, else Settings once the Bridge confirmed the session. A session whose key the
+    /// Library Server rejected (`api_key_rejected`) is forgotten; so is one the Bridge reports
+    /// as `session_invalid` while its Library Server is still configured. On any other failure
+    /// (the Bridge or Library Server unreachable, the Library Server not configured for now, for
+    /// example) it stays.
     pub async fn start(&mut self) {
         let mut notice = self.load_notice.take();
         if self.stored.bridge_url.is_none() {
@@ -175,11 +181,12 @@ impl App {
                 }
                 self.screen = Screen::Settings { notice };
             }
-            Err(error @ (ApiError::ApiKeyRejected | ApiError::SessionInvalid)) => {
+            Err(error @ ApiError::ApiKeyRejected) => {
                 // The revocation matters more than a failed save, which `save` logged.
                 self.forget_session();
                 self.show_login(Some(Notice::Api(error))).await;
             }
+            Err(ApiError::SessionInvalid) => self.session_invalid().await,
             Err(error) => {
                 self.screen = Screen::Settings {
                     notice: Some(Notice::Api(error)),
@@ -358,6 +365,38 @@ impl App {
             library_servers,
             notice,
         };
+    }
+
+    /// After `session_invalid`: the session ended, or its Library Server is not configured on
+    /// the Bridge, maybe only for now. Whether the Bridge still lists that Library Server tells
+    /// the two apart; without the list, the session stays.
+    async fn session_invalid(&mut self) {
+        match self.call(api::library_servers()).await {
+            Ok(library_servers) => {
+                let configured = self.stored.session.as_ref().is_some_and(|session| {
+                    library_servers
+                        .iter()
+                        .any(|listed| listed.base_url == session.user.library_server)
+                });
+                if configured {
+                    // The ended session matters more than a failed save, which `save` logged.
+                    self.forget_session();
+                    self.screen = Screen::Login {
+                        library_servers,
+                        notice: Some(Notice::Api(ApiError::SessionInvalid)),
+                    };
+                } else {
+                    self.screen = Screen::Settings {
+                        notice: Some(Notice::SessionLibraryServerNotConfigured),
+                    };
+                }
+            }
+            Err(error) => {
+                self.screen = Screen::Settings {
+                    notice: Some(Notice::Api(error)),
+                };
+            }
+        }
     }
 
     /// Forgets the session on the device. Returns a notice if that could not be saved.
