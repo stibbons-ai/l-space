@@ -470,7 +470,9 @@ impl App {
 
     /// On the Group picker, starts the Item on Group `group` (its id), and goes back to the
     /// Item, noting where it plays; or shows why it could not start. A Group that is gone
-    /// (`group_not_found`) has the picker list the Groups afresh, keeping the notice.
+    /// (`group_not_found`) has the picker list the Groups afresh, with that notice; if they
+    /// can't be listed, the picker keeps its list and shows why instead (an ended session
+    /// leads to Login).
     pub async fn play_on(&mut self, group: &str) {
         let Screen::PlayOn { item, groups, .. } = &self.screen else {
             return;

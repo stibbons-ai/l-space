@@ -30,8 +30,9 @@ struct State {
     /// While false, connections are accepted and dropped at once.
     forwarding: AtomicBool,
     /// When not 0, a connection opened since passes at most this many bytes back from
-    /// `target`, then closes.
+    /// `target`, then closes, or with `stall` set, stays open and passes nothing more.
     cut_after: AtomicUsize,
+    stall: AtomicBool,
     /// While true, a connection opened since records what the client sends in `requests`.
     recording: AtomicBool,
     requests: std::sync::Mutex<Vec<u8>>,
@@ -49,6 +50,7 @@ impl Forwarder {
             target: target.to_owned(),
             forwarding: AtomicBool::new(true),
             cut_after: AtomicUsize::new(0),
+            stall: AtomicBool::new(false),
             recording: AtomicBool::new(false),
             requests: std::sync::Mutex::default(),
             connections: Mutex::new(JoinSet::new()),
@@ -83,6 +85,13 @@ impl Forwarder {
     pub async fn cut_after(&self, bytes: usize) {
         self.state.cut_after.store(bytes, Ordering::SeqCst);
         self.close_all().await;
+    }
+
+    /// Closes every connection through the forwarder; from now on each new one passes back
+    /// at most `bytes` of what `target` answers, then nothing more, staying open.
+    pub async fn stall_after(&self, bytes: usize) {
+        self.state.stall.store(true, Ordering::SeqCst);
+        self.cut_after(bytes).await;
     }
 
     /// Closes every connection through the forwarder; from now on it records every byte
@@ -134,6 +143,7 @@ async fn serve(listener: TcpListener, state: Arc<State>) {
         let target = state.target.clone();
         let cut_after = state.cut_after.load(Ordering::SeqCst);
         let recording = state.recording.load(Ordering::SeqCst);
+        let stall = state.stall.load(Ordering::SeqCst);
         let shared = Arc::clone(&state);
         connections.spawn(async move {
             let mut outbound = match TcpStream::connect(&target).await {
@@ -173,7 +183,12 @@ async fn serve(listener: TcpListener, state: Arc<State>) {
             // Whichever ends first ends the connection.
             tokio::select! {
                 () = requests => {}
-                _ = copy(&mut limited, &mut to_client) => {}
+                () = async {
+                    let _ = copy(&mut limited, &mut to_client).await;
+                    if stall {
+                        std::future::pending::<()>().await;
+                    }
+                } => {}
             }
             let _ = to_client.shutdown().await;
         });

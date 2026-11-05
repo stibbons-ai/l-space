@@ -1929,3 +1929,40 @@ fn a_session_ended_elsewhere_leads_from_play_on_to_login() {
         assert_eq!(household.uri(&kitchen), None);
     });
 }
+
+#[test]
+fn a_group_gone_whose_groups_cant_be_listed_afresh_says_why() {
+    let (household, _) = Household::with_manual_clock();
+    household.add_player("Kitchen");
+    let office = household.add_player("Office");
+    let (bridge, abs) = bridge_with_household(&household);
+    // In front of the Bridge: the first Groups listing (the picker's) passes, later ones get
+    // 503, as from a reverse proxy whose Bridge just went away.
+    let listings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let target = bridge.url().strip_prefix("http://").unwrap().to_owned();
+    let (proxy, _) = proxy(&target, move |_, request| {
+        request.starts_with(b"GET /api/groups") && listings.fetch_add(1, Ordering::SeqCst) > 0
+    });
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = device.launch().await;
+        app.submit_bridge_url(&proxy).await;
+        app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
+            .await;
+        open_episode(&mut app, &abs, 0).await;
+        app.open_play_on().await;
+        assert_eq!(picker_names(&app), ["Kitchen", "Office"]);
+
+        household.remove(&office);
+        app.play_on(office.uuid()).await;
+
+        // Why the Groups couldn't be listed, on the picker as it was.
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::BridgeUnreachable))
+        );
+        assert_eq!(picker_names(&app), ["Kitchen", "Office"]);
+        assert!(app.session().is_some());
+    });
+}
