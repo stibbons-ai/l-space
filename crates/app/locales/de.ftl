@@ -100,5 +100,5 @@ error-sonos-unreachable = Clacks hat deine Sonos-Lautsprecher gefunden, aber ger
 error-sonos-search-failed = Clacks kann dein Netzwerk gerade nicht nach Sonos-Lautsprechern durchsuchen. Bitte die Person, die Clacks betreibt, die Netzwerkeinrichtung und die Logs von Clacks zu prüfen.
 error-group-not-found = Diese Gruppe gibt es nicht mehr: Vielleicht wurde sie in der Sonos-App neu gruppiert. Wähle sie noch einmal aus der Liste.
 error-group-failed = Die Gruppe hat nicht angefangen zu spielen. Prüfe, ob sie eingeschaltet und in deinem Netzwerk ist, und versuche es noch einmal.
-error-item-not-playable = Clacks kann das noch nicht auf einer Gruppe abspielen: nur Episoden und Hörbücher in einer einzigen Datei, in einem Format, das Sonos abspielt.
+error-item-not-playable = Clacks kann das noch nicht auf einer Gruppe abspielen: nur Folgen und Hörbücher in einer einzigen Datei, in einem Format, das Sonos abspielt.
 error-unknown = Etwas Unerwartetes ist schiefgegangen. Ein Update von Ook kann helfen.

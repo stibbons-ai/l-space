@@ -52,6 +52,7 @@ macro_rules! store_contract_tests {
             starting_a_handoff_keeps_the_starters_sessions,
             ending_a_handoff_ends_only_it,
             revoking_a_key_ends_the_handoffs_acting_with_it,
+            ending_a_replaced_stream_leaves_its_replacement,
         );
     };
     (@tests $backend:expr; $($test:ident),* $(,)?) => {
@@ -514,6 +515,22 @@ pub async fn ending_a_handoff_ends_only_it(backend: &impl Backend) {
 
     assert_eq!(active(&store, stream(1)).await, None);
     assert_eq!(listed(&store).await, [office]);
+}
+
+pub async fn ending_a_replaced_stream_leaves_its_replacement(backend: &impl Backend) {
+    let store = backend.open().await;
+    let first = handoff("RINCON_K", "ep-1", &alice(), 1_000);
+    start(&store, stream(1), &first, "alice-key").await;
+    let second = handoff("RINCON_K", "ep-2", &bob(), 2_000);
+    start(&store, stream(2), &second, "bob-key").await;
+
+    assert!(!store.end_handoff(&stream(1)).await.expect("end replaced"));
+
+    assert_eq!(
+        active(&store, stream(2)).await,
+        acting_with(&second, "bob-key")
+    );
+    assert_eq!(listed(&store).await, [second]);
 }
 
 pub async fn revoking_a_key_ends_the_handoffs_acting_with_it(backend: &impl Backend) {

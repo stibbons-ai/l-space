@@ -172,7 +172,9 @@ pub trait Store: Send + Sync + 'static {
         stream: &StreamId,
     ) -> impl Future<Output = Result<Option<ActiveHandoff>, Error>> + Send;
 
-    /// Every active Handoff, the earliest started first (ties by Group id).
+    /// Every active Handoff, the earliest started first (ties by Group id). As for
+    /// [`Store::handoff`], a Handoff whose key can no longer be read is not listed, and the
+    /// implementation forgets that key, ending its sessions and Handoffs.
     fn handoffs(&self) -> impl Future<Output = Result<Vec<Handoff>, Error>> + Send;
 
     /// Ends the Handoff whose stream is `stream`. Returns whether it was active.

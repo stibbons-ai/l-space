@@ -2,9 +2,10 @@
 //! browsing a session's Library Server as its user, the household's Sonos Groups, and
 //! Handoffs.
 
+use std::collections::HashMap;
 use std::fmt::Write;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::server::{BoxFuture, Bridge};
@@ -13,11 +14,11 @@ use api::{
     LibraryEntry, LibraryServer, NowPlaying, Podcast, Session, SessionToken, TransportState,
 };
 use sonos::Sonos;
-use store::{ActiveHandoff, HandoffFile, LibraryUser, SessionId, Store, StreamId};
+use store::{ActiveHandoff, HandoffFile, LibraryUser, SessionId, Store};
 
 use crate::browse::{self, NoSingleFile};
 use crate::config::{LibraryServerConfig, LibraryServerUrl};
-use crate::stream;
+use crate::stream::StreamToken;
 
 /// Serves the App API from the configured Library Servers, the [`Store`] and [`Sonos`]; and,
 /// for the same Handoffs, the media streams (`crate::stream`).
@@ -29,6 +30,10 @@ pub struct AppApi<S> {
     sonos: Arc<dyn Sonos>,
     /// Where the Bridge listens, port 0 resolved: where Groups fetch streams.
     listen: SocketAddr,
+    /// One lock per Group a start is under way on, so starts on one Group take turns from
+    /// storing the Handoff to the Group playing it (or it ending again). An entry lives while
+    /// a start holds or waits for its lock.
+    starting: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl<S: Store> AppApi<S> {
@@ -51,6 +56,7 @@ impl<S: Store> AppApi<S> {
             store,
             sonos,
             listen,
+            starting: Mutex::default(),
         }
     }
 
@@ -75,7 +81,7 @@ impl<S: Store> AppApi<S> {
         id: &str,
         file: &str,
     ) -> Result<Option<(&str, ActiveHandoff)>, store::Error> {
-        let Some(active) = self.store.handoff(&StreamId::of(id)).await? else {
+        let Some(active) = self.store.handoff(&store::StreamId::of(id)).await? else {
             return Ok(None);
         };
         if file != active.handoff.file.name {
@@ -256,7 +262,8 @@ impl<S: Store> AppApi<S> {
 
     /// Starts Item `id` on Group `group` for the session's user: resolves the Item's audio
     /// file with the session's key, stores the Handoff (replacing the Group's), then has the
-    /// Group play its stream. If the Group doesn't, the Handoff ends again.
+    /// Group play its stream. If the Group doesn't, the new Handoff ends again, and the one it
+    /// replaced stays ended: the Group is left with none. Starts on one Group take turns.
     async fn start_handoff(
         &self,
         token: SessionToken,
@@ -316,8 +323,8 @@ impl<S: Store> AppApi<S> {
             return Err(ApiError::GroupNotFound);
         }
 
-        let stream_id = random_hex("a stream id")?;
-        let stream = StreamId::of(&stream_id);
+        let token = StreamToken::new(random_hex("a stream id")?);
+        let stream = token.id();
         let handoff = store::Handoff {
             group,
             library_item: library_item_id,
@@ -330,13 +337,15 @@ impl<S: Store> AppApi<S> {
             username: user.username,
             started_at: now_millis(),
         };
+        let turn = self.group_lock(&handoff.group);
+        let _turn = turn.lock().await;
         self.store
             .start_handoff(&stream, &handoff, &session.api_key)
             .await
             .map_err(storage_error("start a Handoff"))?;
         let target = sonos::Stream {
             listen: self.listen,
-            path: stream::path(&stream_id, &handoff.file.name),
+            path: token.path(&handoff.file.name),
         };
         if let Err(error) = self.sonos.play(&handoff.group, &target).await {
             tracing::warn!(group = handoff.group, %error, "a Group did not start a Handoff");
@@ -359,6 +368,18 @@ impl<S: Store> AppApi<S> {
             "Handoff started"
         );
         Ok(api_handoff(handoff))
+    }
+
+    /// The lock starts on Group `group` take turns with; forgets the locks no start holds.
+    fn group_lock(&self, group: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut starting = self.starting.lock().unwrap_or_else(PoisonError::into_inner);
+        starting.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = starting.get(group).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        starting.insert(group.to_owned(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Every active Handoff, for any valid session.

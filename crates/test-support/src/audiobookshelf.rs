@@ -31,9 +31,13 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long the seeded audiobooks and podcast may take to appear after a scan.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The seeded audio files: path in the container, length in seconds.
+/// The seeded audio files: path in the container, length in seconds. Silence's one file has a
+/// name with spaces, non-ASCII and URL-reserved characters.
 const AUDIO_FILES: [(&str, u32); 7] = [
-    ("/audiobooks/L-Space/Silence/silence.wav", 1),
+    (
+        "/audiobooks/L-Space/Silence/Folge 3 – Über & Co #1 (50%).wav",
+        1,
+    ),
     (
         "/audiobooks/Pratchett/The Long Book/01 - Part One.wav",
         2400,
@@ -65,8 +69,8 @@ pub const EPISODE_PUBLISHED_AT: [i64; 3] =
 /// What the shared Audiobookshelf holds, by Audiobookshelf id.
 #[derive(Debug, Clone, Default)]
 pub struct Seeded {
-    /// The audiobook Library "Audiobooks": [`Seeded::long_book`], "Silence" (one second, by
-    /// L-Space) and the ebook [`Seeded::ebook_only`].
+    /// The audiobook Library "Audiobooks": [`Seeded::long_book`], [`Seeded::silence`] and the
+    /// ebook [`Seeded::ebook_only`].
     pub audiobook_library: String,
     /// The podcast Library "Podcasts": [`Seeded::podcast`].
     pub podcast_library: String,
@@ -74,6 +78,9 @@ pub struct Seeded {
     /// 40, 30 and 2 minutes, one chapter each ("01 - Part One", "02 - Part Two",
     /// "03 - Part Three"), 72 minutes in all.
     pub long_book: String,
+    /// "Silence" by L-Space: one audio file of one second, named
+    /// `Folge 3 – Über & Co #1 (50%).wav`.
+    pub silence: String,
     /// "Only Words" by Rincewind: an ebook (a PDF) without audio, so not an audiobook.
     pub ebook_only: String,
     /// "The Clacks Hour" by Ankh-Morpork Radio.
@@ -408,6 +415,11 @@ impl Audiobookshelf {
             .find(|book| book["media"]["metadata"]["title"] == "The Long Book")
             .map(id)
             .expect("The Long Book");
+        let silence = books
+            .iter()
+            .find(|book| book["media"]["metadata"]["title"] == "Silence")
+            .map(id)
+            .expect("Silence");
         let ebook_only = books
             .iter()
             .find(|book| book["media"]["metadata"]["title"] == "Only Words")
@@ -461,6 +473,7 @@ impl Audiobookshelf {
             audiobook_library,
             podcast_library,
             long_book,
+            silence,
             ebook_only,
             podcast,
             episodes,
@@ -562,7 +575,7 @@ fn silence(seconds: u32) -> Vec<u8> {
     wav.extend_from_slice(&8u16.to_le_bytes()); // bits per sample
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_len.to_le_bytes());
-    // A xorshift generator's low four bits, around silence: ±8 of 255.
+    // A xorshift generator's low four bits, around silence: -8 to +7 of 255.
     let mut state = 0x2545_F491_u32 ^ seconds;
     wav.extend((0..data_len).map(|_| {
         state ^= state << 13;

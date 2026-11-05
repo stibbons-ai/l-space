@@ -2,8 +2,9 @@
 //! Control API can replace the local UPnP implementation, [`Upnp`], later.
 //!
 //! It reads every Group as set up in the Sonos app, with its members and what its coordinator
-//! plays, and starts a stream the Bridge serves on a Group ([`Sonos::play`]), if Sonos plays
-//! its format ([`media_type`]). It never changes volume or grouping.
+//! plays, and starts a stream the Bridge serves on a Group ([`Sonos::play`]). [`media_type`]
+//! tells which audio formats a Group plays; `play` doesn't check, the caller does. It never
+//! changes volume or grouping.
 //!
 //! Every SSDP datagram and SOAP body sent or received is logged at DEBUG under the target
 //! [`RAW`], and only there; INFO and above summarise without raw bodies.
@@ -38,14 +39,24 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>>;
 }
 
-/// A stream the Bridge serves over plain HTTP, for a Group to play.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A stream the Bridge serves over plain HTTP, for a Group to play. Its path is a capability,
+/// so `Debug` leaves it out.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Stream {
     /// Where the Bridge listens. An unspecified address (`0.0.0.0`, `::`) listens on all of
     /// the host's; the Group is then given the one on the route to its coordinator.
     pub listen: SocketAddr,
     /// The stream's path, starting with `/`, already percent-encoded as needed.
     pub path: String,
+}
+
+impl std::fmt::Debug for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stream")
+            .field("listen", &self.listen)
+            .field("path", &"REDACTED")
+            .finish()
+    }
 }
 
 impl Stream {

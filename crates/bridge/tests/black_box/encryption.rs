@@ -21,7 +21,7 @@ fn events<'a>(output: &'a [Value], message: &'a str) -> impl Iterator<Item = &'a
 
 const OTHER_KEY_WARNING: &str = "stored API keys were encrypted with another encryption key; \
                                  their sessions end at their next call, and their users must \
-                                 log in again; their Handoffs end";
+                                 log in again";
 
 const BOTH_SET_WARNING: &str = "both BRIDGE_ENCRYPTION_KEY_FILE and BRIDGE_ENCRYPTION_KEY are set; using \
      BRIDGE_ENCRYPTION_KEY_FILE";

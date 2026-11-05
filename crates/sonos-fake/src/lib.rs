@@ -139,6 +139,9 @@ pub enum Fault {
     /// It answers `SetAVTransportURI` and `Play` with a SOAP fault (UPnP error 714, illegal
     /// MIME type), and everything else correctly.
     RefusePlayback,
+    /// It answers its next `SetAVTransportURI` correctly, but only after this long (in real
+    /// time), and takes the URL only then; from then on it answers correctly (no fault).
+    SlowPlayback(Duration),
 }
 
 /// A fake Sonos household; dropping it stops every player.
@@ -754,13 +757,20 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         Some(Fault::RefusePlayback) if matches!(action, "SetAVTransportURI" | "Play") => {
             return upnp_fault(714);
         }
+        Some(Fault::SlowPlayback(delay)) if action == "SetAVTransportURI" => {
+            if let Some(player) = served.shared.lock().find_mut(&served.uuid) {
+                player.fault = Fault::None;
+            }
+            tokio::time::sleep(delay).await;
+        }
         Some(
             Fault::None
             | Fault::Padded(_)
             | Fault::SlowPosition(_)
             | Fault::NoTransportState
             | Fault::FailTransportInfo
-            | Fault::RefusePlayback,
+            | Fault::RefusePlayback
+            | Fault::SlowPlayback(_),
         ) => {}
         // Removed from the household: as good as unplugged.
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),

@@ -94,7 +94,9 @@ impl fmt::Debug for ApiKey {
     }
 }
 
-/// The Audiobookshelf user a session acts for.
+/// The Audiobookshelf user a session acts for. It also names who started a Handoff
+/// ([`Handoff::started_by`]), which every logged-in household member sees: whatever is added
+/// here goes out to all of them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CurrentUser {
     /// The normalized base URL of the user's Library Server.
@@ -531,7 +533,9 @@ pub async fn groups() -> Result<Vec<Group>, ApiError> {
 
 /// Starts the Item `item` on Group `group` from its beginning, replacing what the Group
 /// played and the Handoff it had, if any. The Bridge streams the Item to the Group, which
-/// keeps playing without the App. Only an Item with exactly one audio file plays so far.
+/// keeps playing without the App. Only an Item with exactly one audio file plays so far. Once
+/// the Item is found playable, the Group's Handoff is replaced before the Group is told to
+/// play: if it then doesn't start (a Sonos error), the Group is left with no Handoff.
 #[post(
     "/api/handoffs/start",
     headers: dioxus_fullstack::HeaderMap,

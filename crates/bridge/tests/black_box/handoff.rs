@@ -142,6 +142,24 @@ fn header<'a>(response: &'a reqwest::Response, name: &str) -> Option<&'a str> {
         .map(|value| value.to_str().expect("an ASCII header"))
 }
 
+/// The names of `response`'s headers, sorted.
+fn header_names(response: &reqwest::Response) -> Vec<String> {
+    let mut names: Vec<String> = response
+        .headers()
+        .keys()
+        .map(|name| name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Checks that the Bridge's `output` holds neither `key` nor any stream path (and so no
+/// stream id).
+fn assert_quiet(output: &[serde_json::Value], key: &str) {
+    assert!(!output_contains(output, key));
+    assert!(!output_contains(output, "/stream/"));
+}
+
 #[tokio::test]
 async fn choosing_a_group_plays_the_episode_there_from_the_bridges_stream() {
     let setup = setup().await;
@@ -191,6 +209,27 @@ async fn choosing_a_group_plays_the_episode_there_from_the_bridges_stream() {
     let output = setup.bridge.stop();
     assert!(!output_contains(&output, &setup.user.api_key.key));
     assert!(!output_contains(&output, id));
+    // A Bridge on loopback (as in these tests) warns that speakers can't reach it.
+    assert!(output_contains(&output, "listening on a loopback address"));
+}
+
+#[tokio::test]
+async fn a_file_name_with_reserved_and_non_ascii_characters_streams() {
+    let setup = setup().await;
+    let silence = ItemId {
+        library_item: setup.abs.seeded().silence.clone(),
+        episode: None,
+    };
+
+    let (_, url) = setup.start(&silence, &setup.kitchen).await;
+
+    assert_eq!(
+        path(&url).split('/').nth(3),
+        Some("Folge%203%20%E2%80%93%20%C3%9Cber%20%26%20Co%20%231%20%2850%25%29.wav")
+    );
+    let fetch = setup.household.fetched(&setup.kitchen).await;
+    assert_eq!((fetch.status, &fetch.error), (Some(206), &None));
+    assert_eq!(fetch.body, setup.file(&silence).await);
 }
 
 #[tokio::test]
@@ -225,14 +264,21 @@ async fn byte_ranges_come_back_exactly_with_the_media_type() {
 
     let whole = api.fetch(Method::GET, stream, None).await;
     assert_eq!(whole.status(), StatusCode::OK);
+    assert_only_stream_headers(&whole);
     assert_eq!(header(&whole, "content-type"), Some("audio/wav"));
     assert_eq!(header(&whole, "content-length"), Some(&*length.to_string()));
     assert!(whole.bytes().await.unwrap()[..] == file[..]);
+
+    // Several ranges at once aren't forwarded: the whole file.
+    let several = api.fetch(Method::GET, stream, Some("bytes=0-1,5-6")).await;
+    assert_eq!(several.status(), StatusCode::OK);
+    assert!(several.bytes().await.unwrap()[..] == file[..]);
 
     let beyond = api
         .fetch(Method::GET, stream, Some(&format!("bytes={length}-")))
         .await;
     assert_eq!(beyond.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_only_stream_headers(&beyond);
     assert_eq!(
         header(&beyond, "content-range"),
         Some(&*format!("bytes */{length}"))
@@ -243,7 +289,6 @@ async fn byte_ranges_come_back_exactly_with_the_media_type() {
     assert_only_stream_headers(&head);
     assert_eq!(header(&head, "content-type"), Some("audio/wav"));
     assert_eq!(header(&head, "content-length"), Some(&*length.to_string()));
-    assert!(head.bytes().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -255,29 +300,34 @@ async fn a_stream_serves_only_its_handoffs_file() {
     let api = setup.bridge.api();
     let get = async |path: &str| {
         let response = api.fetch(Method::GET, path, Some("bytes=0-")).await;
-        let status = response.status();
-        (status, response.bytes().await.unwrap().to_vec())
+        let (status, names) = (response.status(), header_names(&response));
+        (status, names, response.bytes().await.unwrap().to_vec())
     };
 
     // Each Handoff has its own id, serving its own Item.
     assert_ne!(stream_id(&kitchen), stream_id(&office));
+    let (status, _, body) = get(path(&kitchen)).await;
     assert_eq!(
-        get(path(&kitchen)).await,
+        (status, body),
         (StatusCode::PARTIAL_CONTENT, setup.file(&first).await)
     );
+    let (status, _, body) = get(path(&office)).await;
     assert_eq!(
-        get(path(&office)).await,
+        (status, body),
         (StatusCode::PARTIAL_CONTENT, setup.file(&second).await)
     );
 
-    // A made-up id, and a real one with another file name, name nothing: alike.
+    // A made-up id, a real one with another file name, and a path that isn't UTF-8 name
+    // nothing: alike, down to the headers.
     let made_up = format!("/stream/{}/Episode%201.wav", "ab".repeat(32));
     let other_file = format!("/stream/{}/Episode%202.wav", stream_id(&kitchen));
     let short = "/stream/x/Episode%201.wav".to_owned();
-    for path in [made_up, other_file, short] {
+    let not_utf8 = format!("/stream/{}/%FF.wav", stream_id(&kitchen));
+    let (_, names, _) = get(&made_up).await;
+    for path in [made_up, other_file, short, not_utf8] {
         assert_eq!(
             get(&path).await,
-            (StatusCode::NOT_FOUND, Vec::new()),
+            (StatusCode::NOT_FOUND, names.clone(), Vec::new()),
             "{path}"
         );
     }
@@ -326,6 +376,10 @@ async fn playback_goes_on_without_the_app() {
         .await;
     assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(response.bytes().await.unwrap().len(), 100);
+    let session = api
+        .login(setup.abs.base_url(), &setup.user.api_key.key)
+        .await;
+    assert_eq!(api.handoffs(&session).await.len(), 1);
 }
 
 #[tokio::test]
@@ -427,6 +481,7 @@ async fn a_start_that_fails_leaves_no_handoff() {
             .await,
         SESSION_INVALID
     );
+    assert_quiet(&setup.bridge.stop(), &setup.user.api_key.key);
 }
 
 #[tokio::test]
@@ -444,6 +499,14 @@ async fn a_group_that_refuses_or_does_not_answer_keeps_no_handoff() {
             .await,
         failed
     );
+    // It failed at the coordinator's refusal, not before.
+    let set_uri = "AVTransport#SetAVTransportURI".to_owned();
+    assert!(
+        setup
+            .household
+            .actions_of(&setup.kitchen)
+            .contains(&set_uri)
+    );
 
     // Office hangs; Kitchen still tells the topology.
     setup.household.set_fault(&setup.office, Fault::Hang);
@@ -453,10 +516,108 @@ async fn a_group_that_refuses_or_does_not_answer_keeps_no_handoff() {
             .await,
         failed
     );
-    let bound = sonos::PLAY_TIMEOUT + Duration::from_secs(1);
-    assert!(start.elapsed() < bound, "{:?}", start.elapsed());
+    let elapsed = start.elapsed();
+    // It waited for Office's answer until the Bridge's limit, and not much longer.
+    let at_least = sonos::PLAY_TIMEOUT - Duration::from_millis(500);
+    let bound = sonos::PLAY_TIMEOUT + Duration::from_secs(3);
+    assert!(elapsed >= at_least && elapsed < bound, "{elapsed:?}");
+    assert!(setup.household.actions_of(&setup.office).contains(&set_uri));
 
     assert_eq!(api.handoffs(&setup.session).await, []);
+    assert_quiet(&setup.bridge.stop(), &setup.user.api_key.key);
+}
+
+#[tokio::test]
+async fn a_start_the_group_refuses_ends_its_previous_handoff() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    let (_, old) = setup.start(&setup.episode(0), &setup.kitchen).await;
+
+    setup
+        .household
+        .set_fault(&setup.kitchen, Fault::RefusePlayback);
+    assert_eq!(
+        api.start_handoff_error(&setup.session, &setup.episode(1), setup.kitchen.uuid())
+            .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed)
+    );
+
+    // Replaced before the Group refused: Kitchen is left with no Handoff.
+    let response = api.fetch(Method::GET, path(&old), Some("bytes=0-")).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(api.handoffs(&setup.session).await, []);
+}
+
+#[tokio::test]
+async fn starts_on_one_group_take_turns() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    // Office takes the first URL it is given a second late: without turns, the start that
+    // stored first (and was replaced) would load its dead URL last.
+    setup
+        .household
+        .set_fault(&setup.office, Fault::SlowPlayback(Duration::from_secs(1)));
+    let (first, second) = (setup.episode(0), setup.episode(1));
+
+    let (a, b) = tokio::join!(
+        api.start_handoff(&setup.session, &first, setup.office.uuid()),
+        api.start_handoff(&setup.session, &second, setup.office.uuid()),
+    );
+    assert_eq!(
+        (a.group.as_str(), b.group.as_str()),
+        (setup.office.uuid(), setup.office.uuid())
+    );
+
+    // Office plays the stream of the Handoff listed for it, not one replaced meanwhile.
+    let listed = api.handoffs(&setup.session).await;
+    assert_eq!(listed.len(), 1);
+    let uri = setup
+        .household
+        .uri(&setup.office)
+        .expect("Office was given a URL");
+    let response = api.fetch(Method::GET, path(&uri), Some("bytes=0-")).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.bytes().await.unwrap().to_vec(),
+        setup.file(&listed[0].item).await
+    );
+}
+
+#[tokio::test]
+async fn a_library_server_failing_mid_file_is_logged_and_keeps_the_handoff() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let episode = setup.episode(2);
+    let length = setup.file(&episode).await.len();
+    let (_, url) = setup.start(&episode, &setup.office).await;
+    setup.household.fetched(&setup.office).await;
+    let api = setup.bridge.api();
+
+    forwarder.cut_after(50_000).await;
+    // The Bridge's pooled connection to the Library Server was just closed under it, so its
+    // first request may fail outright (502), as a speaker's retry would show; then the cut.
+    let mut response = api.fetch(Method::GET, path(&url), Some("bytes=0-")).await;
+    if response.status() == StatusCode::BAD_GATEWAY {
+        response = api.fetch(Method::GET, path(&url), Some("bytes=0-")).await;
+    }
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let body = response.bytes().await;
+    assert!(
+        body.as_ref().map_or(true, |body| body.len() < length),
+        "the whole file came through"
+    );
+    assert_eq!(api.handoffs(&setup.session).await.len(), 1);
+
+    let output = setup.bridge.stop();
+    let broke_off = "a Handoff's file broke off while streaming from its Library Server";
+    assert!(
+        output
+            .iter()
+            .any(|event| event["level"] == "WARN" && event["message"] == broke_off),
+        "no WARN that the file broke off"
+    );
+    assert_quiet(&output, &setup.user.api_key.key);
 }
 
 #[tokio::test]

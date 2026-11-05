@@ -172,9 +172,9 @@ fn migrate(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error 
 }
 
 /// Removes keys sealed under another encryption key than `sealing`'s that no session or
-/// Handoff uses (nothing would ever look them up again), and warns once if others remain:
-/// their sessions end at their next call, their Handoffs when their streams are next asked
-/// for.
+/// Handoff uses (nothing would ever look them up again), and warns once each if others remain:
+/// keys with sessions (those end at their next call, and their users log in again), and keys
+/// only Handoffs use (those end when their streams are next asked for, or listed).
 fn forget_keys_sealed_under_another_key(
     connection: &Connection,
     sealing: &Sealing,
@@ -193,16 +193,28 @@ fn forget_keys_sealed_under_another_key(
              no session or Handoff used"
         );
     }
-    let keys: i64 = connection.query_row(
-        "SELECT count(*) FROM api_keys WHERE key_id <> ?1",
+    let (with_sessions, handoffs_only): (i64, i64) = connection.query_row(
+        "SELECT
+             count(*) FILTER (WHERE EXISTS
+                 (SELECT 1 FROM sessions WHERE sessions.api_key_id = api_keys.id)),
+             count(*) FILTER (WHERE NOT EXISTS
+                 (SELECT 1 FROM sessions WHERE sessions.api_key_id = api_keys.id))
+         FROM api_keys WHERE key_id <> ?1",
         params![sealing.key_id()],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if keys > 0 {
+    if with_sessions > 0 {
         tracing::warn!(
-            keys,
+            keys = with_sessions,
             "stored API keys were encrypted with another encryption key; their sessions end \
-             at their next call, and their users must log in again; their Handoffs end"
+             at their next call, and their users must log in again"
+        );
+    }
+    if handoffs_only > 0 {
+        tracing::warn!(
+            keys = handoffs_only,
+            "stored API keys only Handoffs use were encrypted with another encryption key; \
+             those Handoffs end"
         );
     }
     Ok(())
@@ -774,6 +786,23 @@ mod tests {
             None
         );
         assert_eq!(database.open_with(1).handoffs().await.unwrap(), []);
+    }
+
+    /// Opening with another encryption key keeps a key only a Handoff uses (it is not unused),
+    /// so going back to the right encryption key finds the Handoff still active.
+    #[tokio::test]
+    async fn a_key_only_a_handoff_uses_survives_opening_with_another_encryption_key() {
+        let database = TempDatabase::new();
+        start_kitchen(&database.open_with(1), "stream-1", &alice(), "alice-key").await;
+
+        drop(database.open_with(2));
+
+        let store = database.open_with(1);
+        let active = store.handoff(&StreamId::of("stream-1")).await.unwrap();
+        assert_eq!(
+            active.map(|active| active.api_key),
+            Some(ApiKey::new("alice-key"))
+        );
     }
 
     #[tokio::test]

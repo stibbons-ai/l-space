@@ -312,9 +312,13 @@ impl Shared {
             );
             return Err(Error::GroupFailed);
         };
-        let Some(host) = route_to(coordinator.ip()) else {
-            tracing::warn!(group, "no route to a Group's coordinator");
-            return Err(Error::GroupFailed);
+        let host = match route_to(coordinator.ip()) {
+            Ok(host) => host,
+            Err(error) => {
+                let peer = coordinator.ip();
+                tracing::warn!(group, %peer, %error, "no route to a Group's coordinator");
+                return Err(Error::GroupFailed);
+            }
         };
         let url = stream.url(host);
         let call = async |action, arguments: &[(&str, &str)]| {
@@ -431,18 +435,21 @@ impl Shared {
     }
 }
 
-/// This host's address on the route to `peer`: where `peer` reaches it. None if there is no
-/// route. Connecting a UDP socket sends nothing; it only picks the route.
-fn route_to(peer: IpAddr) -> Option<IpAddr> {
+/// This host's address on the route to `peer`: where `peer` reaches it. Connecting a UDP
+/// socket sends nothing; it only picks the route.
+fn route_to(peer: IpAddr) -> std::io::Result<IpAddr> {
     let unspecified: IpAddr = match peer {
         IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
         IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
     };
-    let socket = UdpSocket::bind((unspecified, 0)).ok()?;
+    let socket = UdpSocket::bind((unspecified, 0))?;
     // Any port: nothing is sent.
-    socket.connect((peer, 9)).ok()?;
-    let local = socket.local_addr().ok()?.ip();
-    Some(local).filter(|local| !local.is_unspecified())
+    socket.connect((peer, 9))?;
+    let local = socket.local_addr()?.ip();
+    if local.is_unspecified() {
+        return Err(std::io::Error::other("the route has no local address"));
+    }
+    Ok(local)
 }
 
 /// The transport state in Group `group`'s `GetTransportInfo` answer: unknown, and logged with
@@ -981,6 +988,9 @@ mod tests {
             Err(Error::GroupFailed)
         );
         assert_eq!(household.transport_state(&kitchen), "STOPPED");
+        // It failed at the coordinator's refusal, not before.
+        let set_uri = "AVTransport#SetAVTransportURI".to_owned();
+        assert!(household.actions_of(&kitchen).contains(&set_uri));
 
         // The topology comes from Kitchen; Office never answers its own calls.
         let start = tokio::time::Instant::now();
@@ -995,6 +1005,11 @@ mod tests {
             Err(Error::GroupFailed)
         );
         let elapsed = start.elapsed();
-        assert!(elapsed < Duration::from_millis(1300), "{elapsed:?}");
+        // It waited for Office up to the deadline, then gave up.
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+        assert!(household.actions_of(&office).contains(&set_uri));
     }
 }

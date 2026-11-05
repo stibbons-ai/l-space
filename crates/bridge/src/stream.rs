@@ -2,14 +2,16 @@
 //! listener, which Groups fetch over the LAN. A stream id names one active Handoff and serves
 //! only its Item's audio file, forwarding byte ranges to the Library Server with the starter's
 //! API key. Speakers can't authenticate, so the id is the only capability: 256 random bits,
-//! stored only as its hash. Anything that doesn't name an active Handoff's file is `404`,
-//! alike for an unknown id and a known one with another file name.
+//! stored only as its hash, never logged. Anything that doesn't name an active Handoff's file
+//! is a bare `404`, alike for an unknown id, a known one with another file name, and a path
+//! that isn't UTF-8.
 
 use std::fmt::Write;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
@@ -27,9 +29,30 @@ pub fn router<S: Store>(app: Arc<AppApi<S>>) -> Router {
         .with_state(app)
 }
 
-/// The path of the stream `id` serving the file named `file_name`, percent-encoded.
-pub fn path(id: &str, file_name: &str) -> String {
-    format!("/stream/{id}/{}", path_segment(file_name))
+/// A stream's id as it appears in its URL: the capability that lets a Group fetch the stream.
+/// It never shows in `Debug` output; only its hash, [`store::StreamId`], is stored.
+pub struct StreamToken(String);
+
+impl StreamToken {
+    pub fn new(token: String) -> Self {
+        Self(token)
+    }
+
+    /// What the store knows the stream by.
+    pub fn id(&self) -> store::StreamId {
+        store::StreamId::of(&self.0)
+    }
+
+    /// The path of this stream serving the file named `file_name`, percent-encoded.
+    pub fn path(&self, file_name: &str) -> String {
+        format!("/stream/{}/{}", self.0, path_segment(file_name))
+    }
+}
+
+impl std::fmt::Debug for StreamToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StreamToken(REDACTED)")
+    }
 }
 
 /// `text` as one URL path segment: ASCII letters, digits and `-._~` as they are, every other
@@ -47,23 +70,38 @@ fn path_segment(text: &str) -> String {
 }
 
 /// The `Range` a request asks for, if it is one to forward: a single `bytes` range, as
-/// speakers send. Anything else is ignored, and the whole file served (RFC 9110, 14.2).
+/// speakers send, its first byte not after its last. Anything else is ignored, and the whole
+/// file served (RFC 9110, 14.2).
 fn range(headers: &HeaderMap) -> Option<&str> {
     let range = headers.get(RANGE)?.to_str().ok()?;
     let spec = range.strip_prefix("bytes=")?;
     let (first, last) = spec.split_once('-')?;
-    let digits = |part: &str| part.len() <= 20 && part.bytes().all(|byte| byte.is_ascii_digit());
-    let single = digits(first) && digits(last) && !(first.is_empty() && last.is_empty());
-    single.then_some(range)
+    // A part is absent (`None`), or a byte position of at most 20 digits; else no range.
+    let number = |part: &str| -> Option<Option<u64>> {
+        if part.is_empty() {
+            return Some(None);
+        }
+        let digits = part.len() <= 20 && part.bytes().all(|byte| byte.is_ascii_digit());
+        digits.then(|| part.parse().ok()).flatten().map(Some)
+    };
+    match (number(first)?, number(last)?) {
+        (None, None) => None,
+        (Some(first), Some(last)) if first > last => None,
+        _ => Some(range),
+    }
 }
 
 /// Serves a stream's file, or the part of it asked for.
 async fn serve<S: Store>(
     State(app): State<Arc<AppApi<S>>>,
-    Path((id, file)): Path<(String, String)>,
+    path: Result<Path<(String, String)>, PathRejection>,
     method: Method,
     headers: HeaderMap,
 ) -> Response {
+    // A path that isn't UTF-8 names nothing either.
+    let Ok(Path((id, file))) = path else {
+        return not_found();
+    };
     let (library_server, store::ActiveHandoff { handoff, api_key }) =
         match app.active_handoff(&id, &file).await {
             Ok(Some(active)) => active,
@@ -74,6 +112,11 @@ async fn serve<S: Store>(
             }
         };
     let Some(content_type) = sonos::media_type(&handoff.file.name) else {
+        tracing::warn!(
+            group = handoff.group,
+            library_item = handoff.library_item,
+            "a Handoff's file is in a format Sonos doesn't play"
+        );
         return not_found();
     };
     let request = if method == Method::HEAD {
@@ -136,7 +179,17 @@ async fn serve<S: Store>(
     let body = if request == abs::FileRequest::Head {
         Body::empty()
     } else {
-        Body::from_stream(file.body.map(|chunk| chunk.map_err(axum::Error::new)))
+        let group = handoff.group;
+        Body::from_stream(file.body.map(move |chunk| {
+            chunk.map_err(|error| {
+                tracing::warn!(
+                    group,
+                    %error,
+                    "a Handoff's file broke off while streaming from its Library Server"
+                );
+                axum::Error::new(error)
+            })
+        }))
     };
     response
         .body(body)
@@ -152,15 +205,17 @@ fn not_found() -> Response {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::{path, range};
+    use super::{StreamToken, range};
 
     #[test]
     fn a_file_name_is_one_percent_encoded_segment() {
+        let token = StreamToken::new("ab12".into());
         assert_eq!(
-            path("ab12", "Episode 1/../ä?#%.mp3"),
+            token.path("Episode 1/../ä?#%.mp3"),
             "/stream/ab12/Episode%201%2F..%2F%C3%A4%3F%23%25.mp3"
         );
-        assert_eq!(path("ab12", "a-b_c~d.mp3"), "/stream/ab12/a-b_c~d.mp3");
+        assert_eq!(token.path("a-b_c~d.mp3"), "/stream/ab12/a-b_c~d.mp3");
+        assert_eq!(format!("{token:?}"), "StreamToken(REDACTED)");
     }
 
     #[test]
@@ -170,7 +225,7 @@ mod tests {
             headers.insert("range", HeaderValue::from_str(value).unwrap());
             range(&headers).map(str::to_owned)
         };
-        for forwarded in ["bytes=0-", "bytes=100-199", "bytes=-500"] {
+        for forwarded in ["bytes=0-", "bytes=100-199", "bytes=-500", "bytes=5-5"] {
             assert_eq!(range_of(forwarded).as_deref(), Some(forwarded));
         }
         for ignored in [
@@ -180,6 +235,8 @@ mod tests {
             "bytes=a-b",
             "bytes= 0-1",
             "bytes=000000000000000000000-",
+            "bytes=5-1",
+            "bytes=99999999999999999999-",
         ] {
             assert_eq!(range_of(ignored), None, "{ignored:?}");
         }

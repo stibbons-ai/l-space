@@ -138,6 +138,11 @@ pub enum Notice {
 }
 
 impl Notice {
+    /// Whether it reports something done, rather than a problem.
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::PlayingOn(_))
+    }
+
     /// The notice as the person reads it in `language`.
     pub fn text(&self, language: Language) -> String {
         let text = match self {
@@ -443,6 +448,12 @@ impl App {
         .await;
     }
 
+    /// Whether the Item screen offers to play its Item on a Group: only an Item in one audio
+    /// file plays there so far.
+    pub fn can_play_on(&self) -> bool {
+        matches!(&self.screen, Screen::Item { item, .. } if item.audio_files.len() == 1)
+    }
+
     /// From the Item screen, lists every Group to play the Item on.
     pub async fn open_play_on(&mut self) {
         let Screen::Item { item, .. } = &self.screen else {
@@ -458,21 +469,30 @@ impl App {
     }
 
     /// On the Group picker, starts the Item on Group `group` (its id), and goes back to the
-    /// Item, noting where it plays; or shows why it could not start.
+    /// Item, noting where it plays; or shows why it could not start. A Group that is gone
+    /// (`group_not_found`) has the picker list the Groups afresh, keeping the notice.
     pub async fn play_on(&mut self, group: &str) {
         let Screen::PlayOn { item, groups, .. } = &self.screen else {
             return;
         };
-        let item = item.id.clone();
+        let id = item.id.clone();
         let name = groups
             .iter()
             .find(|listed| listed.id == group)
             .map_or_else(|| group.to_owned(), |listed| listed.name.clone());
-        match self.call(api::start_handoff(item, group.to_owned())).await {
+        match self.call(api::start_handoff(id, group.to_owned())).await {
             Ok(_) => {
                 // Back to the Item screen the picker was opened from.
                 self.go_back();
                 self.set_notice(Notice::PlayingOn(name));
+            }
+            Err(ApiError::GroupNotFound) => {
+                if let Ok(listed) = self.call(api::groups()).await
+                    && let Screen::PlayOn { groups, .. } = &mut self.screen
+                {
+                    *groups = listed;
+                }
+                self.set_notice(Notice::Api(ApiError::GroupNotFound));
             }
             Err(error) => self.failed(error).await,
         }

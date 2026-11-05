@@ -79,8 +79,7 @@ fn NoticeView(app: Signal<App>, notice: Option<Notice>) -> Element {
         return rsx! {};
     };
     let text = notice.text(app.read().language());
-    // Only "Playing on …" reports something done; every other notice is a problem.
-    if matches!(notice, Notice::PlayingOn(_)) {
+    if notice.is_success() {
         return rsx! {
             p { class: "notice done", role: "status", {text} }
         };
@@ -432,8 +431,7 @@ fn ItemScreen(app: Signal<App>, busy: Signal<bool>, item: Item, notice: Option<N
             p { class: "byline", "{by}" }
         }
         NoticeView { app, notice }
-        // Only an Item in one audio file plays on a Group so far.
-        if item.audio_files.len() == 1 {
+        if app.read().can_play_on() {
             button {
                 r#type: "button",
                 disabled: busy(),

@@ -85,6 +85,13 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if addr.ip().is_loopback() {
+        // Groups are given stream URLs on this address, which no speaker can reach.
+        tracing::warn!(
+            %addr,
+            "listening on a loopback address: Sonos Groups can't fetch the Bridge's streams"
+        );
+    }
     let discovery_address = config.sonos.discovery_address;
     tracing::info!(%discovery_address, "searching for Sonos players");
     let sonos = sonos::Upnp::start(discovery_address, Arc::new(clock::SystemClock));

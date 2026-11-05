@@ -1749,7 +1749,8 @@ fn a_session_ended_elsewhere_leads_from_the_groups_to_login() {
     });
 }
 
-/// Opens episode `n` (0-based) of the seeded podcast from the Libraries screen.
+/// Opens episode `n` (0-based) of the seeded podcast from the Libraries screen, which offers
+/// "Play on…": an episode is one audio file.
 async fn open_episode(app: &mut App, abs: &Audiobookshelf, n: usize) {
     let seeded = abs.seeded();
     app.open_library(podcasts(abs)).await;
@@ -1760,6 +1761,7 @@ async fn open_episode(app: &mut App, abs: &Audiobookshelf, n: usize) {
         "{:?}",
         app.screen()
     );
+    assert!(app.can_play_on());
 }
 
 /// The names of the Groups the picker lists.
@@ -1853,7 +1855,8 @@ fn a_start_that_fails_is_explained_on_the_picker() {
         );
         assert_eq!(notice_texts(&mut app), both(Text::ErrorGroupFailed));
 
-        // A Group unplugged since the list was shown is gone.
+        // A Group unplugged since the list was shown is gone; the picker lists the Groups
+        // afresh, keeping the notice.
         household.remove(&office);
         app.play_on(office.uuid()).await;
         assert_eq!(
@@ -1861,7 +1864,7 @@ fn a_start_that_fails_is_explained_on_the_picker() {
             Some(&Notice::Api(ApiError::GroupNotFound))
         );
         assert_eq!(notice_texts(&mut app), both(Text::ErrorGroupNotFound));
-        assert_eq!(picker_names(&app), ["Kitchen", "Office"]);
+        assert_eq!(picker_names(&app), ["Kitchen"]);
         assert_eq!(bridge.api().handoffs(&session(&app)).await, []);
     });
 }
@@ -1880,8 +1883,9 @@ fn an_item_in_several_files_is_not_offered_and_cannot_play_on_a_group() {
         let Screen::Item { item, .. } = app.screen() else {
             panic!("{:?}", app.screen());
         };
-        // The Item screen offers "Play on…" only for one audio file.
         assert_eq!(item.audio_files.len(), 3);
+        // The Item screen doesn't offer "Play on…".
+        assert!(!app.can_play_on());
 
         // Asked anyway, the Bridge refuses.
         app.open_play_on().await;
