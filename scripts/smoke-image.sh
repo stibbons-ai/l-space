@@ -35,11 +35,11 @@ database = "/var/lib/clacks/bridge.db"
 url = "https://library.example.com"
 name = "Smoke"
 EOF
-# A throwaway key, made for this run only. As the README says, it's readable only by the
-# container's user (65532); chowning to that user takes root, so without passwordless sudo (as
-# on a developer's Mac) the key is world-readable instead, inside this private temporary
-# directory.
-if sudo -n true 2>/dev/null; then
+# A throwaway key, made for this run only. On GitHub Actions it's readable only by the
+# container's user (65532), as the README says; chowning to that user takes root (passwordless
+# sudo there). Elsewhere (a developer's Mac, rootless Docker) UID 65532 may not map to the
+# host's owner, so the key is world-readable instead, inside this private temporary directory.
+if [[ ${GITHUB_ACTIONS:-} == true ]] && sudo -n true 2>/dev/null; then
   (umask 077 && openssl rand -base64 32 >"$work/bridge_encryption_key")
   sudo chown 65532:65532 "$work/bridge_encryption_key"
 else

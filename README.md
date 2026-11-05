@@ -117,8 +117,9 @@ Once there is an App, it reaches the Bridge over HTTPS at a stable hostname, suc
       traefik.http.routers.clacks.entrypoints: websecure   # your HTTPS entry point
       traefik.http.routers.clacks.tls.certresolver: letsencrypt   # your certificate resolver
       traefik.http.routers.clacks.middlewares: clacks-private
-      # Your LAN (which includes tailnet devices coming through a subnet router, as those
-      # appear with the router's LAN address), and the tailnet's addresses.
+      # Your LAN, which with the recommended subnet router on another LAN machine includes
+      # tailnet devices (they arrive with that router's LAN address), and the tailnet's
+      # addresses. Never add the Docker network's subnet.
       traefik.http.middlewares.clacks-private.ipallowlist.sourcerange: 192.168.1.0/24, 100.64.0.0/10
       traefik.http.services.clacks.loadbalancer.server.port: "8080"   # the `listen` port
 ```
@@ -131,8 +132,10 @@ The Bridge's own port answers plain HTTP outside Traefik and its allow list: wit
 
 Never forward a port to the Bridge or to its Traefik route: it has no public exposure. Away from home, the App reaches it through the household's [Tailscale](https://tailscale.com), in one of two ways, so the URL entered once works at home and away:
 
-- **A [subnet router](https://tailscale.com/kb/1019/subnets)** (on the Docker host or another LAN machine) advertises the LAN, and you approve the route in the admin console; iOS picks it up automatically. Tailnet devices then reach the host's LAN address, so the hostname resolves to that same address everywhere: add the household's DNS server as a restricted nameserver for the hostname's domain ([split DNS](https://tailscale.com/kb/1054/dns)).
-- **Tailscale on the Docker host, without a route**: tailnet devices reach only the host's tailnet address (`100.x.y.z`), so the hostname must resolve to that address for them, through a restricted nameserver that answers with it, while the LAN's DNS keeps answering the LAN address.
+- **Recommended: a [subnet router](https://tailscale.com/kb/1019/subnets) on another LAN machine** advertises the LAN, and you approve the route in the admin console; iOS picks it up automatically. By default the router masquerades tailnet traffic, so it reaches Traefik from the router's LAN address, inside the allow list above. Tailnet devices reach the host's LAN address, so the hostname resolves to that same address everywhere: add the household's DNS server as a restricted nameserver for the hostname's domain ([split DNS](https://tailscale.com/kb/1054/dns)).
+- **Tailscale on the Docker host** (advertising the LAN route or not): tailscaled masquerades the traffic it forwards into Docker, so Traefik sees the Docker network's gateway (`172.x`), which the allow list rejects with a 403. Turn that off with `sudo tailscale set --snat-subnet-routes=false` (Linux only; [subnet routers](https://tailscale.com/kb/1019/subnets), [CLI](https://tailscale.com/kb/1080/cli)), so Traefik sees the device's `100.x.y.z` address. If the host also advertises the LAN route, the other LAN devices then need a return route for `100.64.0.0/10` via the host. Without an advertised route, tailnet devices reach only the host's tailnet address, so the hostname must resolve to that address for them, through a restricted nameserver that answers with it, while the LAN's DNS keeps answering the LAN address.
+
+After setup, make one request from a tailnet device and check the client address in Traefik's [access log](https://doc.traefik.io/traefik/reference/install-configuration/observability/logs-and-accesslogs/) (`ClientHost`): a 403 from the allow list means the source address isn't the one the list expects.
 
 ### Sonos: keep UPnP enabled
 

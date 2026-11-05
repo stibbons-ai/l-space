@@ -92,8 +92,9 @@ jobs:
           name: digests-${{ matrix.pair }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
-          # Long enough for "Re-run failed jobs" on the merge job days later; the merge job
-          # refuses to publish unless both platforms' digests are there.
+          # Lets "Re-run failed jobs" on the merge job work days later; the merge job refuses
+          # to publish unless both platforms' digests are there. Re-run only the newest publish:
+          # an older main run re-run after a newer one succeeded moves `main` backwards.
           retention-days: 7
 
   merge:

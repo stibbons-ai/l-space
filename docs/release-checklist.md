@@ -43,7 +43,8 @@ Kind one pauses at the end of the current chapter (audiobook) or episode (podcas
 5. Start Local playback of an audiobook mid-chapter, set a Sleep timer for the end of the chapter, and lock the phone (the App stays running); then start Local playback with a 15-minute Sleep timer and lock the phone.
 
 - [ ] Steps 1–3: each Group pauses at the chapter's end, at the episode's end, or after 15 minutes, with the App closed.
-- [ ] Steps 1–3 and 5: each pause writes Progress at the paused position on the Library Server; the podcast episode is Finished only if playback reached its very end.
+- [ ] Steps 1–3 and 5: each pause writes Progress at the paused position on the Library Server.
+- [ ] Step 2: when the end-of-episode timer fires, playback has reached the episode's end, so the episode is Finished on the Library Server, and the Group stays paused or stopped: nothing else starts.
 - [ ] Step 4: the reopened App shows the running Sleep timer with its time left; extending moves it later, and after cancelling, the Group plays past the original time.
 - [ ] Step 5: Local playback pauses at the chapter's end and after 15 minutes, with the phone locked.
 
