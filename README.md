@@ -52,9 +52,7 @@ The Bridge encrypts the Audiobookshelf API keys it stores with a key you provide
 
 A variable set to the empty string counts as unset. When both are set, the file wins, even if it's missing or unusable (the Bridge never falls back to `BRIDGE_ENCRYPTION_KEY`); once the key has loaded, the Bridge logs one warning naming both variables. Without a usable key (neither variable set, an unreadable file, a blank value or file, not base64, or not 32 bytes) the Bridge exits with code 1 after one `cannot load the encryption key` error event, which names the variable and what is wrong, never the key, the file's contents or its path.
 
-With Docker, the key is a Compose secret: see [Run with Docker](#run-with-docker).
-
-The key file must be readable by the user the container runs as, and by no one else: if the container runs as another user than yours, `chown` the file to the container's user id (65532 in the Clacks image).
+With Docker, the key is a Compose secret that only the container's user can read: see [Run with Docker](#run-with-docker).
 
 Keep the key outside the database's backups, and keep it: with a different key the Bridge still starts, but can't decrypt the stored keys. It removes at once those that no session uses, and logs a warning if others remain. A session whose key it can't decrypt (another encryption key, or a tampered database) ends at its next call with `session_invalid`, and its stored key is removed, so the user logs in again. Switching back to the old key doesn't bring removed keys back.
 
@@ -72,7 +70,7 @@ The Bridge ships as the image `ghcr.io/stibbons-ai/clacks`, for `linux/amd64` an
 
 The image runs the Bridge as UID and GID 65532, with no shell. It reads the configuration from `/etc/clacks/bridge.toml` (set by `BRIDGE_CONFIG`) and keeps the database in `/var/lib/clacks`, which a fresh named volume takes over, owned by that user and readable only by it.
 
-Next to `compose.yaml`, create the encryption key, give it to the container's user, and write `bridge.toml` as in [Run the Bridge](#run-the-bridge), keeping that example's `listen` and `database`:
+Next to `compose.yaml`, create the encryption key and make the container's user its owner, so that it alone can read the key, and write `bridge.toml` as in [Run the Bridge](#run-the-bridge), keeping that example's `listen` and `database`:
 
 ```sh
 (umask 077; openssl rand -base64 32 > bridge_encryption_key)   # once; keep it, see "Encryption key"
@@ -99,7 +97,7 @@ secrets:
     file: ./bridge_encryption_key
 ```
 
-`docker compose up -d` starts it; `docker compose logs clacks` shows a `listening` event once it serves. Instead of the secret, `BRIDGE_ENCRYPTION_KEY` in `environment` works too, but then anyone who can run `docker inspect` on the host sees the key. To upgrade, `docker compose pull && docker compose up -d`; the database stays in the volume. Back up the volume, and keep the key out of that backup.
+`docker compose up -d` starts it; `docker compose logs clacks` shows a `listening` event once it serves. Instead of the secret, `BRIDGE_ENCRYPTION_KEY` in `environment` works too, but then anyone who can run `docker inspect` on the host sees the key. To upgrade, `docker compose pull && docker compose up -d`; the database stays in the volume. Back up the volume, without the key (see [Encryption key](#encryption-key)).
 
 Each URL in `[[library_servers]]` must be reachable from the host; with host networking, an Audiobookshelf on the same host is reachable at `http://127.0.0.1:<its port>`.
 

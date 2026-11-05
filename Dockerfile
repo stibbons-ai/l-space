@@ -7,16 +7,16 @@
 ARG RUST_VERSION=1.99.1
 
 FROM rust:${RUST_VERSION}-slim-trixie AS build
+# The data directory, created here because the runtime image has no shell. A fresh named volume
+# mounted over it takes its owner and mode, so the Bridge can create its database there, and
+# only the Bridge's user can list it.
+RUN mkdir -p /var/lib/clacks
 WORKDIR /src
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked --package bridge \
     && cp target/release/bridge /usr/local/bin/bridge
-# The data directory, created here because the runtime image has no shell. A fresh named volume
-# mounted over it takes its owner and mode, so the Bridge can create its database there, and
-# only the Bridge's user can list it.
-RUN install -d /var/lib/clacks
 
 # glibc, libgcc and CA roots, no shell; runs as `nonroot` (UID and GID 65532).
 FROM gcr.io/distroless/cc-debian13:nonroot

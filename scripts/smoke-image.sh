@@ -88,13 +88,14 @@ check_library_servers() {
 # can read them.
 check_database() {
   local listing dir db
+  # GNU tar lists `-rw------- 65532/65532 …`, bsdtar `-rw-------  0 65532  65532 …`.
+  local owned='65532[/ ]+65532 '
   listing=$(docker cp "$run_id-$1:/var/lib/clacks" - | tar --numeric-owner -tvf -) \
     || fail "cannot read the volume"
   dir=$(grep -E ' clacks/?$' <<<"$listing") || fail "no data directory in: $listing"
   db=$(grep -E ' clacks/bridge\.db$' <<<"$listing") || fail "no database in the volume: $listing"
-  # GNU tar lists `-rw------- 65532/65532 …`, bsdtar `-rw-------  0 65532  65532 …`.
-  [[ $dir =~ ^drwx------\ .*65532[/\ ]+65532\  ]] || fail "unexpected data directory: $dir"
-  [[ $db =~ ^-rw-------\ .*65532[/\ ]+65532\  ]] || fail "unexpected database file: $db"
+  [[ $dir =~ ^drwx------\ .*$owned ]] || fail "unexpected data directory: $dir"
+  [[ $db =~ ^-rw-------\ .*$owned ]] || fail "unexpected database file: $db"
 }
 
 echo "== $image: first start on a fresh volume"
@@ -105,7 +106,9 @@ check_database first
 echo "ok: listening on $addr, Library Server listed, database created in the volume"
 
 echo "== restart: a new container on the same volume"
-docker stop "$run_id-first" >/dev/null
+# The Bridge, as PID 1 without a SIGTERM handler, ignores `docker stop`'s SIGTERM; don't wait
+# the 10 s grace period for the SIGKILL that follows.
+docker stop --time 0 "$run_id-first" >/dev/null
 start second "${with_key[@]}"
 addr=$(listening_addr second)
 check_library_servers "$addr"
