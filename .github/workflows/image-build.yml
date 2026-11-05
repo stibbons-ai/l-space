@@ -1,7 +1,7 @@
 # Builds the Clacks image natively on one runner per platform, smoke-tests each build, and, when
 # publishing, pushes each platform by digest and joins them into one multi-arch manifest list.
-# Called by image.yml, whose calling job decides the token's permissions: this workflow
-# declares none, so it can't ask for more than its caller grants.
+# Called by image.yml, whose calling job decides the token's permissions: a called workflow can
+# only keep or downgrade its caller's permissions, and this one declares none, so it keeps them.
 name: image-build
 
 on:
@@ -67,8 +67,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # The same build again, from the builder's local cache, pushed by digest: the image
-      # published is the one just smoke-tested.
+      # The same commit built again from the builder's local cache, pushed by digest: the layers
+      # are the smoke-tested ones, though the image config (and so the digest) may differ.
       - id: push
         if: inputs.publish
         name: Push by digest
@@ -92,7 +92,9 @@ jobs:
           name: digests-${{ matrix.pair }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
-          retention-days: 1
+          # Long enough for "Re-run failed jobs" on the merge job days later; the merge job
+          # refuses to publish unless both platforms' digests are there.
+          retention-days: 7
 
   merge:
     if: inputs.publish
@@ -135,13 +137,34 @@ jobs:
       - name: Create the manifest list and push it
         working-directory: ${{ runner.temp }}/digests
         run: |
+          set -euo pipefail
+          shopt -s nullglob
+          digests=(*)
+          if ((${#digests[@]} != 2)); then
+            echo "::error::expected 2 platform digests, found ${#digests[@]}: ${digests[*]}"
+            exit 1
+          fi
+          tags=$(jq -r '.tags[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+          annotations=$(jq -r '.annotations[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+          if [[ -z $tags ]]; then
+            echo "::error::docker/metadata-action produced no tags"
+            exit 1
+          fi
           args=()
-          while IFS= read -r tag; do args+=(--tag "$tag"); done < <(jq -r '.tags[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
-          while IFS= read -r annotation; do args+=(--annotation "$annotation"); done < <(jq -r '.annotations[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
-          for digest in *; do args+=("$IMAGE@sha256:$digest"); done
+          while IFS= read -r tag; do args+=(--tag "$tag"); done <<<"$tags"
+          if [[ -n $annotations ]]; then
+            while IFS= read -r annotation; do args+=(--annotation "$annotation"); done <<<"$annotations"
+          fi
+          for digest in "${digests[@]}"; do args+=("$IMAGE@sha256:$digest"); done
           docker buildx imagetools create "${args[@]}"
 
-      - name: Inspect
+      - name: Check both platforms were published
         env:
           VERSION: ${{ steps.meta.outputs.version }}
-        run: docker buildx imagetools inspect "$IMAGE:$VERSION"
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+          docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' \
+            | jq --exit-status '[.manifests[].platform | "\(.os)/\(.architecture)"] as $published
+                | ["linux/amd64", "linux/arm64"] - $published == []' >/dev/null \
+            || { echo "::error::$IMAGE:$VERSION lacks linux/amd64 or linux/arm64"; exit 1; }

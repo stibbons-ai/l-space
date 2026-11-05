@@ -15,32 +15,37 @@ Copy this list into the release's pull request or issue and tick each item; a fa
 1. Start a Handoff of an Item with Progress to a Group.
 2. Force-quit the App as soon as the Group starts playing.
 3. Wait at least two minutes.
+4. Reopen the App.
 
 - [ ] The Group starts at the Item's Progress and keeps playing with the App closed.
 - [ ] The Item's Progress on the Library Server keeps advancing (written about every 30 seconds).
-- [ ] Reopening the App shows the Group playing the Item at its current position.
+- [ ] The reopened App shows the Group playing the Item at its current position.
 
 ## Leaving the house
 
-1. Start a Handoff to a Group.
-2. Take the phone out of the house, off the home Wi-Fi and the household's Tailscale, for at least five minutes.
-3. Come back; reopen the App.
+1. Start a Handoff of an Item to a Group; someone stays at home with it, or another device keeps the Sonos app open on that Group.
+2. With Tailscale on, take the phone out of the house, off the home Wi-Fi, for at least five minutes.
+3. Away from home, open the App at the same Bridge URL as at home.
+4. Come back.
 
-- [ ] The Group plays on, without a gap, the whole time the phone is away.
-- [ ] Progress keeps advancing on the Library Server while the phone is away.
-- [ ] Away from home, with Tailscale on, the App reaches the Bridge at the same URL and shows the Group playing.
+- [ ] The person at home (or the Sonos app) reports no pause, stop or restart while the phone was away.
+- [ ] On the Library Server, the Item's Progress kept advancing while the phone was away, in steps of about 30 seconds.
+- [ ] Away from home, the App reaches the Bridge at the same URL and shows the Group playing the Item.
 
 ## Both kinds of Sleep timer
 
-1. Start a Handoff of an audiobook mid-chapter and set a Sleep timer for the end of the chapter; force-quit the App.
-2. Start a Handoff of a podcast episode and set a Sleep timer for the end of the episode; force-quit the App.
-3. Start a Handoff and set a 15-minute Sleep timer; force-quit the App and lock the phone.
-4. Repeat one of the above in Local playback.
+Kind one pauses at the end of the current chapter (audiobook) or episode (podcast); kind two after a fixed number of minutes.
 
-- [ ] Each Group pauses at the chapter's end, the episode's end, or after 15 minutes, with the App closed.
-- [ ] Each pause writes Progress at the paused position on the Library Server; the podcast episode is Finished only if playback reached its end.
-- [ ] Before it fires, reopening the App shows the running Sleep timer, and extending and cancelling it work.
-- [ ] In Local playback the Sleep timer pauses the phone's playback the same way.
+1. Start a Handoff of an audiobook mid-chapter, set a Sleep timer for the end of the chapter, and force-quit the App.
+2. Start a Handoff of a podcast episode near its end, set a Sleep timer for the end of the episode, and force-quit the App.
+3. Start a Handoff, set a 15-minute Sleep timer, force-quit the App and lock the phone.
+4. Start a Handoff and set a 30-minute Sleep timer; force-quit the App, reopen it, extend the timer, then cancel it.
+5. Start Local playback of an audiobook mid-chapter, set a Sleep timer for the end of the chapter, and lock the phone (the App stays running); then start Local playback with a 15-minute Sleep timer and lock the phone.
+
+- [ ] Steps 1–3: each Group pauses at the chapter's end, at the episode's end, or after 15 minutes, with the App closed.
+- [ ] Steps 1–3 and 5: each pause writes Progress at the paused position on the Library Server; the podcast episode is Finished only if playback reached its very end.
+- [ ] Step 4: the reopened App shows the running Sleep timer with its time left; extending moves it later, and after cancelling, the Group plays past the original time.
+- [ ] Step 5: Local playback pauses at the chapter's end and after 15 minutes, with the phone locked.
 
 ## Takeover from the Sonos app
 

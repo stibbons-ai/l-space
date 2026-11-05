@@ -13,8 +13,9 @@ permissions:
 
 concurrency:
   group: image-${{ github.ref }}
-  # A newer push to a pull request supersedes its run; publishing runs queue instead, so an
-  # older commit never retags after a newer one.
+  # A newer push to a pull request cancels its running check. Publishing runs never cancel a
+  # running publish, so an older commit never retags after a newer one; but a newer run skips
+  # (cancels) a still-pending older one, so not every commit on main gets published.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -22,6 +23,8 @@ jobs:
   check:
     if: github.event_name == 'pull_request'
     uses: ./.github/workflows/image-build.yml
+    permissions:
+      contents: read
     with:
       publish: false
 

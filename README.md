@@ -65,8 +65,8 @@ The Bridge ships as the image `ghcr.io/stibbons-ai/clacks`, for `linux/amd64` an
 | `X.Y.Z`, `X.Y.Z-rc.1` | the release tagged `vX.Y.Z`, the pre-release tagged `vX.Y.Z-rc.1` |
 | `X.Y` | the most recently tagged release `vX.Y.*`, pre-releases excluded |
 | `latest` | the most recently tagged release, pre-releases excluded |
-| `main` | the newest commit on `main` |
-| `sha-<commit>` | one commit on `main`, by its 7-character hash |
+| `main` | the newest published commit on `main` |
+| `sha-<commit>` | a published commit on `main`, by its 7-character hash; a commit pushed while an earlier publish still runs may be skipped |
 
 The image runs the Bridge as UID and GID 65532, with no shell. It reads the configuration from `/etc/clacks/bridge.toml` (set by `BRIDGE_CONFIG`) and keeps the database in `/var/lib/clacks`, which a fresh named volume takes over, owned by that user and readable only by it.
 
@@ -83,6 +83,7 @@ services:
   clacks:
     image: ghcr.io/stibbons-ai/clacks:main   # or a release tag, such as 0.1.0
     restart: unless-stopped
+    init: true   # passes `docker stop`'s SIGTERM on; the Bridge has no signal handling yet, so without it, stopping waits 10 s and kills it
     network_mode: host
     environment:
       BRIDGE_ENCRYPTION_KEY_FILE: /run/secrets/bridge_encryption_key
@@ -107,7 +108,7 @@ The container shares the host's network, so the Bridge listens on the host's add
 
 ### HTTPS through Traefik
 
-The App reaches the Bridge over HTTPS at a stable hostname, such as `clacks.home.example.com`, with TLS terminated by Traefik. Traefik's Docker provider routes to a host-network container at `host.docker.internal` ([Traefik docs](https://doc.traefik.io/traefik/reference/install-configuration/providers/docker/#host-networking)), so give the Traefik container `extra_hosts: ["host.docker.internal:host-gateway"]`, and add to the `clacks` service:
+Once there is an App, it reaches the Bridge over HTTPS at a stable hostname, such as `clacks.home.example.com`, with TLS terminated by Traefik. Traefik's Docker provider routes to a host-network container at `host.docker.internal` ([Traefik docs](https://doc.traefik.io/traefik/reference/install-configuration/providers/docker/#host-networking)), so give the Traefik container `extra_hosts: ["host.docker.internal:host-gateway"]`, and add to the `clacks` service these labels, in Traefik v3 syntax (v2 called the allow list `ipwhitelist`):
 
 ```yaml
     labels:
@@ -116,20 +117,26 @@ The App reaches the Bridge over HTTPS at a stable hostname, such as `clacks.home
       traefik.http.routers.clacks.entrypoints: websecure   # your HTTPS entry point
       traefik.http.routers.clacks.tls.certresolver: letsencrypt   # your certificate resolver
       traefik.http.routers.clacks.middlewares: clacks-private
-      # Your LAN, and the tailnet's addresses.
+      # Your LAN (which includes tailnet devices coming through a subnet router, as those
+      # appear with the router's LAN address), and the tailnet's addresses.
       traefik.http.middlewares.clacks-private.ipallowlist.sourcerange: 192.168.1.0/24, 100.64.0.0/10
       traefik.http.services.clacks.loadbalancer.server.port: "8080"   # the `listen` port
 ```
 
-As the hostname is never reachable from the internet, a Let's Encrypt certificate needs the [DNS challenge](https://doc.traefik.io/traefik/reference/install-configuration/tls/certificate-resolvers/acme/). The [IP allow list](https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/ipallowlist/) is a second fence in case Traefik's entry point is ever exposed. The Bridge's own port still answers plain HTTP on the LAN; point the App only at the HTTPS hostname.
+As the hostname is never reachable from the internet, a Let's Encrypt certificate needs the [DNS challenge](https://doc.traefik.io/traefik/reference/install-configuration/tls/certificate-resolvers/acme/). The [IP allow list](https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/ipallowlist/) is a second fence in case Traefik's entry point is ever exposed.
+
+The Bridge's own port answers plain HTTP outside Traefik and its allow list: with host networking, `listen = "0.0.0.0:8080"` binds every interface of the host, including `tailscale0` when Tailscale runs on the host. Point the App only at the HTTPS hostname. To keep the plain port off other interfaces, set `listen` to the host's LAN address (say `"192.168.1.10:8080"`) and give Traefik that address instead: `extra_hosts: ["host.docker.internal:192.168.1.10"]`.
 
 ### Remote access through Tailscale only
 
-Never forward a port to the Bridge or to its Traefik route: it has no public exposure. Away from home, the App reaches it through the household's [Tailscale](https://tailscale.com): run a [subnet router](https://tailscale.com/kb/1019/subnets) that advertises the LAN (or Tailscale on the Docker host), and resolve the hostname to the same address for tailnet devices with [split DNS](https://tailscale.com/kb/1054/dns), so the URL entered once in the App works at home and away.
+Never forward a port to the Bridge or to its Traefik route: it has no public exposure. Away from home, the App reaches it through the household's [Tailscale](https://tailscale.com), in one of two ways, so the URL entered once works at home and away:
+
+- **A [subnet router](https://tailscale.com/kb/1019/subnets)** (on the Docker host or another LAN machine) advertises the LAN, and you approve the route in the admin console; iOS picks it up automatically. Tailnet devices then reach the host's LAN address, so the hostname resolves to that same address everywhere: add the household's DNS server as a restricted nameserver for the hostname's domain ([split DNS](https://tailscale.com/kb/1054/dns)).
+- **Tailscale on the Docker host, without a route**: tailnet devices reach only the host's tailnet address (`100.x.y.z`), so the hostname must resolve to that address for them, through a restricted nameserver that answers with it, while the LAN's DNS keeps answering the LAN address.
 
 ### Sonos: keep UPnP enabled
 
-L-Space controls Sonos over its local UPnP interface ([ADR 0005](docs/adr/0005-local-upnp-sonos-control.md)), which Sonos lets you turn off. Keep the UPnP setting in the Sonos app enabled: Account → Privacy & Security → Connection Security → UPnP. It is on by default ([Sonos: Adjust Connection Security settings](https://support.sonos.com/en-us/article/adjust-connection-security-settings)). It is the only setting L-Space needs on the Sonos side.
+L-Space will control Sonos over its local UPnP interface once Sonos control lands ([ADR 0005](docs/adr/0005-local-upnp-sonos-control.md)), and Sonos lets you turn that interface off. Keep the UPnP setting in the Sonos app enabled: Account → Privacy & Security → Connection Security → UPnP. It is on by default ([Sonos: Adjust Connection Security settings](https://support.sonos.com/en-us/article/adjust-connection-security-settings)). Leave Authentication on the same screen at its default, off: turned on, it requires third-party integrations that use Sonos's LAN APIs to authenticate.
 
 ### Releases
 

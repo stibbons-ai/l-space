@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # The Bridge (Clacks) as a container image. Built natively per platform (linux/amd64,
-# linux/arm64); see .github/workflows/image.yml and the README's "Run with Docker".
+# linux/arm64) by .github/workflows/image.yml through image-build.yml; see the README's
+# "Run with Docker".
 
 # Keep in step with the toolchain in mise.toml.
 ARG RUST_VERSION=1.99.1
