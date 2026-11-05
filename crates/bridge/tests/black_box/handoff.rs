@@ -36,6 +36,8 @@ struct Setup {
     kitchen: PlayerId,
     bath: PlayerId,
     office: PlayerId,
+    /// Players of their own Groups named by [`setup_with`], in order.
+    extra: Vec<PlayerId>,
     bridge: TestBridge,
     user: AbsUser,
     session: Session,
@@ -48,11 +50,20 @@ async fn setup() -> Setup {
 
 /// [`setup`] with the Library Server at `url`, which reaches `abs`.
 async fn setup_on(abs: Arc<Audiobookshelf>, url: &str) -> Setup {
+    setup_with(abs, url, &[]).await
+}
+
+/// [`setup_on`] with players named `extra`, each a Group of its own, in the household too.
+async fn setup_with(abs: Arc<Audiobookshelf>, url: &str, extra: &[&str]) -> Setup {
     let (household, clock) = Household::with_manual_clock();
     let kitchen = household.add_player("Kitchen");
     let bath = household.add_player("Bath");
     household.join(&bath, &kitchen);
     let office = household.add_player("Office");
+    let extra = extra
+        .iter()
+        .map(|name| household.add_player(name))
+        .collect();
     let bridge = TestBridge::start(&home_with_sonos_toml(url, household.ssdp()));
     let user = abs.new_user().await;
     let session = bridge.api().login(url, &user.api_key.key).await;
@@ -63,6 +74,7 @@ async fn setup_on(abs: Arc<Audiobookshelf>, url: &str) -> Setup {
         kitchen,
         bath,
         office,
+        extra,
         bridge,
         user,
         session,
@@ -195,12 +207,12 @@ fn called(household: &Household, player: &PlayerId, action: &str) -> bool {
         .any(|called| called == action)
 }
 
-/// How many WARN events with `message` the Bridge's `output` holds.
-fn warnings(output: &[serde_json::Value], message: &str) -> usize {
+/// The WARN events with `message` in the Bridge's `output`.
+fn warns<'a>(output: &'a [serde_json::Value], message: &str) -> Vec<&'a serde_json::Value> {
     output
         .iter()
         .filter(|event| event["level"] == "WARN" && event["message"] == message)
-        .count()
+        .collect()
 }
 
 /// GETs `path` as a speaker would, once more if the first answer is a 502: a test that just
@@ -552,13 +564,7 @@ async fn a_group_that_refuses_or_does_not_answer_keeps_no_handoff() {
         failed
     );
     // It failed at the coordinator's refusal, not before.
-    let set_uri = SET_URI.to_owned();
-    assert!(
-        setup
-            .household
-            .actions_of(&setup.kitchen)
-            .contains(&set_uri)
-    );
+    assert!(called(&setup.household, &setup.kitchen, SET_URI));
 
     // Office hangs; Kitchen still tells the topology.
     setup.household.set_fault(&setup.office, Fault::Hang);
@@ -573,10 +579,17 @@ async fn a_group_that_refuses_or_does_not_answer_keeps_no_handoff() {
     let at_least = sonos::PLAY_TIMEOUT - Duration::from_millis(500);
     let bound = sonos::PLAY_TIMEOUT + Duration::from_secs(3);
     assert!(elapsed >= at_least && elapsed < bound, "{elapsed:?}");
-    assert!(setup.household.actions_of(&setup.office).contains(&set_uri));
+    assert!(called(&setup.household, &setup.office, SET_URI));
 
     assert_eq!(api.handoffs(&setup.session).await, []);
-    assert_quiet(&setup.bridge.stop(), &setup.user.api_key.key, &[]);
+    // Neither failed start's stream id shows in the log at INFO or above.
+    let offered: Vec<String> = [&setup.kitchen, &setup.office]
+        .into_iter()
+        .flat_map(|player| setup.household.offered(player))
+        .collect();
+    assert_eq!(offered.len(), 2, "{offered:?}");
+    let ids: Vec<&str> = offered.iter().map(|uri| stream_id(uri)).collect();
+    assert_quiet(&setup.bridge.stop(), &setup.user.api_key.key, &ids);
 }
 
 #[tokio::test]
@@ -722,6 +735,14 @@ async fn a_start_whose_client_hangs_up_still_finishes() {
         response.bytes().await.unwrap().to_vec(),
         setup.file(&episode).await
     );
+    // Logged as started, though nobody was there to be told.
+    let output = setup.bridge.stop();
+    assert!(
+        output.iter().any(|event| event["level"] == "INFO"
+            && event["message"] == "Handoff started"
+            && event["group"] == setup.office.uuid()),
+        "no INFO that the Handoff started"
+    );
 }
 
 #[tokio::test]
@@ -762,27 +783,31 @@ async fn a_speaker_hanging_up_mid_file_logs_nothing() {
         .unwrap()
         .parse()
         .unwrap();
-    let first = response
-        .chunk()
-        .await
-        .unwrap()
-        .expect("the start of the file");
-    assert!(first.len() < length, "the whole file came at once");
+    // Read what comes until nothing more does for 200 ms: the Library Server really stalls,
+    // short of the whole file.
+    let mut received = 0;
+    while let Ok(chunk) = tokio::time::timeout(Duration::from_millis(200), response.chunk()).await {
+        let chunk = chunk.unwrap().expect("the file ends only after the stall");
+        received += chunk.len();
+    }
+    assert!(received > 0 && received < length, "{received} of {length}");
     drop(response);
     // Give the Bridge time to notice and drop the stream.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    assert_eq!(warnings(&setup.bridge.stop(), BROKE_OFF), 0);
+    assert_eq!(warns(&setup.bridge.stop(), BROKE_OFF).len(), 0);
 }
 
 #[tokio::test]
 async fn another_encryption_key_warns_that_sessions_and_handoffs_end() {
-    let mut setup = setup().await;
-    // The user's one key is used by their session and their Handoff...
+    let abs = Audiobookshelf::shared();
+    let mut setup = setup_with(Arc::clone(&abs), abs.base_url(), &["TV"]).await;
+    // The user's one key is used by their session and two Handoffs...
     setup.start(&setup.episode(0), &setup.kitchen).await;
+    setup.start(&setup.episode(2), &setup.extra[0]).await;
+    let api = setup.bridge.api();
     // ...and another user's only by their Handoff.
     let other = setup.abs.new_user().await;
-    let api = setup.bridge.api();
     let others = api.login(setup.abs.base_url(), &other.api_key.key).await;
     api.start_handoff(&others, &setup.episode(1), setup.office.uuid())
         .await;
@@ -793,10 +818,7 @@ async fn another_encryption_key_warns_that_sessions_and_handoffs_end() {
     let startup = setup.bridge.startup_output();
     // The `keys` count of the WARN with `message`, which must appear at most once.
     let keys = |message: &str| -> Option<serde_json::Value> {
-        let found: Vec<_> = startup
-            .iter()
-            .filter(|event| event["level"] == "WARN" && event["message"] == message)
-            .collect();
+        let found = warns(startup, message);
         assert!(found.len() <= 1, "{message}: more than once");
         found.first().map(|event| event["keys"].clone())
     };
@@ -805,6 +827,7 @@ async fn another_encryption_key_warns_that_sessions_and_handoffs_end() {
     let handoffs = "stored API keys Handoffs use were encrypted with another encryption key; \
                     those Handoffs end";
     assert_eq!(keys(sessions), Some(serde_json::json!(1)));
+    // Three Handoffs, two keys.
     assert_eq!(keys(handoffs), Some(serde_json::json!(2)));
 }
 
@@ -830,10 +853,7 @@ async fn a_library_server_failing_mid_file_is_logged_and_keeps_the_handoff() {
     assert_eq!(api.handoffs(&setup.session).await.len(), 1);
 
     let output = setup.bridge.stop();
-    let broke_off: Vec<_> = output
-        .iter()
-        .filter(|event| event["level"] == "WARN" && event["message"] == BROKE_OFF)
-        .collect();
+    let broke_off = warns(&output, BROKE_OFF);
     assert_eq!(broke_off.len(), 1);
     assert_eq!(broke_off[0]["library_server"], forwarder.url().as_str());
     let sent = broke_off[0]["sent"].as_u64().expect("bytes sent");
@@ -886,4 +906,9 @@ async fn a_library_server_that_goes_down_while_streaming_is_a_bad_gateway() {
     assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
     // The Handoff never ended.
     assert_eq!(api.handoffs(&setup.session).await.len(), 1);
+    assert_quiet(
+        &setup.bridge.stop(),
+        &setup.user.api_key.key,
+        &[stream_id(&url)],
+    );
 }

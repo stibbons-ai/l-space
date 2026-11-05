@@ -335,11 +335,12 @@ impl<S: Store> AppApi<S> {
             Arc::clone(&self.sonos),
         );
         let library_server = library_server.to_owned();
-        // On its own task, so nothing can cut it off between storing the Handoff and the Group
-        // playing it (or it ending again). Dioxus runs server functions detached today as
-        // well, so a client hanging up doesn't cancel them; this keeps the start whole should
-        // that change.
+        // On its own task, so no client hanging up can cut it off between storing the Handoff
+        // and the Group playing it (or it ending again); a panic in it is handled below.
+        // Dioxus runs server functions detached today as well, so a client hanging up doesn't
+        // cancel them; this keeps the start whole should that change.
         let task_group = group.clone();
+        let (logged_item, logged_episode) = (library_item_id.clone(), id.episode.clone());
         let started = tokio::spawn(async move {
             let _turn = turn.lock().await;
             let handoff = store::Handoff {
@@ -378,9 +379,16 @@ impl<S: Store> AppApi<S> {
         let handoff = match started {
             Ok(started) => started?,
             Err(error) => {
-                tracing::error!(group, %error, "starting a Handoff failed");
                 // It may have stored the Handoff before it failed.
-                end_unstarted(self.store.as_ref(), &stream, &group).await;
+                let ended = end_unstarted(self.store.as_ref(), &stream, &group).await;
+                tracing::error!(
+                    group,
+                    library_item = logged_item,
+                    episode = logged_episode,
+                    ended,
+                    %error,
+                    "starting a Handoff failed"
+                );
                 return Err(ApiError::Internal);
             }
         };
@@ -794,15 +802,20 @@ pub(crate) fn log_storage_error(operation: &'static str, error: &store::Error) {
     );
 }
 
-/// Ends the Handoff whose stream is `stream` on Group `group`, which did not start, if it
-/// was stored; a failure is logged.
-async fn end_unstarted<S: Store>(store: &S, stream: &store::StreamId, group: &str) {
-    if let Err(error) = store.end_handoff(stream).await {
-        tracing::error!(
-            operation = "end a Handoff that did not start",
-            group,
-            error = crate::error_chain(&error),
-            "storage failed"
-        );
-    }
+/// Ends the Handoff whose stream is `stream`, which did not start, if it was stored. Returns
+/// whether it was; none if storage failed, which is logged with `group` (the Group it was
+/// for, only for the log).
+async fn end_unstarted<S: Store>(store: &S, stream: &store::StreamId, group: &str) -> Option<bool> {
+    store
+        .end_handoff(stream)
+        .await
+        .inspect_err(|error| {
+            tracing::error!(
+                operation = "end a Handoff that did not start",
+                group,
+                error = crate::error_chain(error),
+                "storage failed"
+            );
+        })
+        .ok()
 }

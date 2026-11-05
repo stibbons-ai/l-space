@@ -169,6 +169,9 @@ struct HouseholdState {
     /// Every fetch of a URL a Group played, done, as the UUID of the coordinator and what it
     /// got.
     fetches: Vec<(String, Fetch)>,
+    /// Every `CurrentURI` a player was given with `SetAVTransportURI`, as the UUID of the
+    /// player and the URL, recorded on arrival, also when it then misbehaves.
+    offered: Vec<(String, String)>,
     /// How many M-SEARCHes for ZonePlayers were received.
     searches: usize,
     added: u32,
@@ -418,6 +421,14 @@ impl Household {
         let state = self.shared.lock();
         let actions = state.actions.iter().filter(|(uuid, _)| *uuid == player.0);
         actions.map(|(_, action)| action.clone()).collect()
+    }
+
+    /// Every URL `player` was given with `SetAVTransportURI`, in order, also those it then
+    /// refused or never answered.
+    pub fn offered(&self, player: &PlayerId) -> Vec<String> {
+        let state = self.shared.lock();
+        let offered = state.offered.iter().filter(|(uuid, _)| *uuid == player.0);
+        offered.map(|(_, uri)| uri.clone()).collect()
     }
 
     /// How many M-SEARCHes for ZonePlayers the household has received, counted as each
@@ -745,6 +756,11 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         state
             .actions
             .push((served.uuid.clone(), format!("{service}#{action}")));
+        if action == "SetAVTransportURI"
+            && let Some(uri) = input(&request, "CurrentURI")
+        {
+            state.offered.push((served.uuid.clone(), uri));
+        }
         state.find(&served.uuid).map(|player| player.fault)
     };
     match fault {
