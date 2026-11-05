@@ -246,10 +246,9 @@ fn bridge_then_gone(bridge: &str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     std::thread::spawn(move || {
-        let mut first = true;
-        for mut stream in listener.incoming().flatten() {
+        for (index, mut stream) in listener.incoming().flatten().enumerate() {
             let request = read_request(&stream);
-            let response = if std::mem::take(&mut first) {
+            let response = if index == 0 {
                 let mut bridge = TcpStream::connect(&target).unwrap();
                 bridge.write_all(&request).unwrap();
                 let mut response = Vec::new();
@@ -576,15 +575,8 @@ fn a_session_whose_library_server_is_unconfigured_for_a_while_stays() {
             notice_texts(&mut app),
             both(Text::ErrorSessionLibraryServerNotConfigured)
         );
-        drop(app);
-        let stored = device
-            .load()
-            .unwrap()
-            .session
-            .expect("session on the device");
-        assert_eq!(stored.token, before.token);
 
-        // Back in the configuration: the same session works again.
+        // Back in the configuration: the session kept on the device works again.
         restart_bridge(&mut bridge, &device, &home_config(&abs, &unreachable));
         let app = device.launch().await;
         assert_eq!(app.screen(), &Screen::Settings { notice: None });
@@ -614,13 +606,8 @@ fn a_failed_library_server_listing_after_session_invalid_keeps_the_session() {
             }
         );
         assert_eq!(session(&app), before);
-        drop(app);
-        let stored = device
-            .load()
-            .unwrap()
-            .session
-            .expect("session on the device");
-        assert_eq!(stored.token, before.token);
+        // Kept on the device: the next launch, with the Bridge gone, still holds it.
+        assert_eq!(session(&device.launch().await), before);
     });
 }
 

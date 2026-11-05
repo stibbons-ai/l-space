@@ -371,32 +371,31 @@ impl App {
     /// the Bridge, maybe only for now. Whether the Bridge still lists that Library Server tells
     /// the two apart; without the list, the session stays.
     async fn session_invalid(&mut self) {
-        match self.call(api::library_servers()).await {
-            Ok(library_servers) => {
-                let configured = self.stored.session.as_ref().is_some_and(|session| {
-                    library_servers
-                        .iter()
-                        .any(|listed| listed.base_url == session.user.library_server)
-                });
-                if configured {
-                    // The ended session matters more than a failed save, which `save` logged.
-                    self.forget_session();
-                    self.screen = Screen::Login {
-                        library_servers,
-                        notice: Some(Notice::Api(ApiError::SessionInvalid)),
-                    };
-                } else {
-                    self.screen = Screen::Settings {
-                        notice: Some(Notice::SessionLibraryServerNotConfigured),
-                    };
-                }
-            }
-            Err(error) => {
-                self.screen = Screen::Settings {
-                    notice: Some(Notice::Api(error)),
+        let notice = match self.call(api::library_servers()).await {
+            Ok(library_servers) if self.lists_session_library_server(&library_servers) => {
+                // The ended session matters more than a failed save, which `save` logged.
+                self.forget_session();
+                self.screen = Screen::Login {
+                    library_servers,
+                    notice: Some(Notice::Api(ApiError::SessionInvalid)),
                 };
+                return;
             }
-        }
+            Ok(_) => Notice::SessionLibraryServerNotConfigured,
+            Err(error) => Notice::Api(error),
+        };
+        self.screen = Screen::Settings {
+            notice: Some(notice),
+        };
+    }
+
+    /// Whether `library_servers` includes the session's Library Server.
+    fn lists_session_library_server(&self, library_servers: &[LibraryServer]) -> bool {
+        self.stored.session.as_ref().is_some_and(|session| {
+            library_servers
+                .iter()
+                .any(|listed| listed.base_url == session.user.library_server)
+        })
     }
 
     /// Forgets the session on the device. Returns a notice if that could not be saved.
