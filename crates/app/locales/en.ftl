@@ -42,6 +42,7 @@ item-chapters = Chapters
 
 progress-finished = Finished
 progress-not-started = Not started
+progress-started = Started
 progress-left = { $duration } left
 
 duration-hours-minutes = { $hours } h { $minutes } min

@@ -152,10 +152,15 @@ async fn episodes_are_filtered_by_the_users_progress_newest_first() {
     assert_eq!(
         listed,
         [
-            ("Episode 3", 3960.0, Some(EPISODE_PUBLISHED_AT[2]), None),
+            (
+                "Episode 3",
+                Some(3960.0),
+                Some(EPISODE_PUBLISHED_AT[2]),
+                None
+            ),
             (
                 "Episode 2",
-                900.0,
+                Some(900.0),
                 Some(EPISODE_PUBLISHED_AT[1]),
                 Some(Progress {
                     current_time: 300.0,
@@ -164,7 +169,7 @@ async fn episodes_are_filtered_by_the_users_progress_newest_first() {
             ),
             (
                 "Episode 1",
-                600.0,
+                Some(600.0),
                 Some(EPISODE_PUBLISHED_AT[0]),
                 Some(Progress {
                     current_time: 0.0,
@@ -204,7 +209,7 @@ async fn an_audiobook_shows_details_progress_chapters_and_audio_files_at_their_o
             author: Some("Pratchett".into()),
             podcast: None,
             description: Some("A book that goes on.".into()),
-            duration: 4320.0,
+            duration: Some(4320.0),
             published_at: None,
             progress: Some(Progress {
                 current_time: 3000.0,
@@ -258,7 +263,7 @@ async fn an_episode_shows_its_podcast_details_and_progress() {
             author: None,
             podcast: Some("The Clacks Hour".into()),
             description: Some("The first one.".into()),
-            duration: 600.0,
+            duration: Some(600.0),
             published_at: Some(EPISODE_PUBLISHED_AT[0]),
             progress: Some(Progress {
                 current_time: 0.0,
@@ -335,7 +340,8 @@ async fn ids_that_name_nothing_are_not_found() {
         (unknown, None),
         ("../me", None),
         ("..%2Fme", None),
-        // An audiobook has no episodes, and an episode needs its podcast.
+        // An audiobook has no episodes, a podcast alone is not an Item, and an episode
+        // must be one of its podcast's.
         (seeded.long_book.as_str(), Some(seeded.episodes[0].as_str())),
         (seeded.podcast.as_str(), None),
         (seeded.podcast.as_str(), Some(unknown)),
@@ -515,4 +521,135 @@ async fn a_deleted_key_ends_the_session_when_browsing() {
         bridge.api().current_user_error(&session).await,
         SESSION_INVALID
     );
+}
+
+/// Audiobookshelf records episode Progress without the podcast when a player names only the
+/// episode; logging in and browsing still work, and the episode shows that Progress.
+#[tokio::test]
+async fn episode_progress_recorded_without_its_podcast_still_shows() {
+    let abs = Audiobookshelf::shared();
+    let bridge = TestBridge::start(&named_library_server_toml(abs.base_url(), "Home"));
+    let seeded = abs.seeded();
+    let user = abs.new_user().await;
+    abs.as_user(
+        &user,
+        reqwest::Method::PATCH,
+        "/api/me/progress/batch/update",
+        Some(json!([{"episodeId": seeded.episodes[1], "currentTime": 120}])),
+    )
+    .await;
+    let recorded = abs
+        .as_user(&user, reqwest::Method::GET, "/api/me", None)
+        .await;
+    assert_eq!(recorded["mediaProgress"][0]["libraryItemId"], json!(null));
+
+    let session = bridge.api().login(abs.base_url(), &user.api_key.key).await;
+
+    let at_120 = Some(Progress {
+        current_time: 120.0,
+        finished: false,
+    });
+    let item = bridge
+        .api()
+        .item(&session, &seeded.podcast, Some(&seeded.episodes[1]))
+        .await;
+    assert_eq!(item.progress, at_120);
+    let listed = bridge
+        .api()
+        .podcast(&session, &seeded.podcast, EpisodeFilter::All)
+        .await;
+    let progress: Vec<_> = listed
+        .episodes
+        .iter()
+        .map(|episode| (episode.title.as_str(), episode.progress.clone()))
+        .collect();
+    assert_eq!(
+        progress,
+        [
+            ("Episode 3", None),
+            ("Episode 2", at_120),
+            ("Episode 1", None)
+        ]
+    );
+}
+
+/// A user an admin restricted to the audiobook Library: Audiobookshelf lists only that one
+/// and refuses (403) the podcast Library and the podcast, which name nothing for them. That
+/// ends nothing.
+#[tokio::test]
+async fn a_library_the_user_may_not_see_is_not_found() {
+    let abs = Audiobookshelf::shared();
+    let bridge = TestBridge::start(&named_library_server_toml(abs.base_url(), "Home"));
+    let seeded = abs.seeded();
+    let user = abs.new_user_seeing(&[&seeded.audiobook_library]).await;
+    let session = bridge.api().login(abs.base_url(), &user.api_key.key).await;
+    let api = bridge.api();
+
+    let listed: Vec<_> = api
+        .libraries(&session)
+        .await
+        .into_iter()
+        .map(|library| library.id)
+        .collect();
+    assert_eq!(listed, std::slice::from_ref(&seeded.audiobook_library));
+    assert_eq!(
+        api.get_as_error(
+            &session,
+            "/api/library-entries",
+            &[("library", &seeded.podcast_library)]
+        )
+        .await,
+        NOT_FOUND
+    );
+    assert_eq!(
+        api.get_as_error(
+            &session,
+            "/api/podcast",
+            &[
+                ("id", &seeded.podcast),
+                ("filter", filter_name(EpisodeFilter::All))
+            ]
+        )
+        .await,
+        NOT_FOUND
+    );
+    assert_eq!(
+        api.get_as_error(
+            &session,
+            "/api/item",
+            &item_query(&seeded.podcast, Some(&seeded.episodes[0]))
+        )
+        .await,
+        NOT_FOUND
+    );
+    // The session goes on.
+    assert_eq!(
+        api.library_entries(&session, &seeded.audiobook_library)
+            .await
+            .len(),
+        2
+    );
+}
+
+/// Without a filter, or with one this Bridge doesn't know (from a newer App), a podcast lists
+/// its unfinished episodes.
+#[tokio::test]
+async fn a_missing_or_unknown_episode_filter_lists_the_unfinished() {
+    let (bridge, abs, user, session) = logged_in().await;
+    let seeded = abs.seeded();
+    abs.set_progress(&user, &seeded.podcast, Some(&seeded.episodes[0]), 0.0, true)
+        .await;
+
+    for query in [
+        vec![("id", seeded.podcast.as_str())],
+        vec![("id", seeded.podcast.as_str()), ("filter", "starred")],
+    ] {
+        let listed: api::Podcast = bridge.api().get_as(&session, "/api/podcast", &query).await;
+        let titles: Vec<_> = listed
+            .episodes
+            .iter()
+            .map(|episode| episode.title.as_str())
+            .collect();
+        assert_eq!(titles, ["Episode 3", "Episode 2"], "{query:?}");
+    }
 }

@@ -32,8 +32,8 @@ pub fn library_entry(item: abs::LibraryItem) -> LibraryEntry {
     }
 }
 
-/// The podcast `item` with the episodes `filter` picks by `user`'s Progress, newest first;
-/// not found if `item` is an audiobook.
+/// The podcast `item` with the episodes `filter` picks by `user`'s Progress, newest first
+/// (episodes without a publish date last); not found if `item` is an audiobook.
 pub fn podcast(
     user: &abs::User,
     item: abs::LibraryItem,
@@ -42,22 +42,12 @@ pub fn podcast(
     let abs::Media::Podcast(media) = item.media else {
         return Err(ApiError::NotFound);
     };
-    // The first entry per episode, as `progress_entry` finds it.
-    let mut progress_by_episode = HashMap::new();
-    for entry in &user.media_progress {
-        if entry.library_item_id == item.id
-            && let Some(episode) = &entry.episode_id
-        {
-            progress_by_episode.entry(episode.as_str()).or_insert(entry);
-        }
-    }
+    let progress_of = ProgressIndex::of(user);
     let mut episodes: Vec<_> = media
         .episodes
         .into_iter()
         .map(|episode| Episode {
-            progress: progress_by_episode
-                .get(episode.id.as_str())
-                .map(|entry| progress(entry)),
+            progress: progress_of.episode(&episode.id),
             duration: episode_duration(&episode),
             id: episode.id,
             title: episode.title,
@@ -75,18 +65,6 @@ pub fn podcast(
     })
 }
 
-/// `user`'s Progress entry for the audiobook `library_item_id`, or for its episode
-/// `episode_id`: the first, should Audiobookshelf hold several.
-fn progress_entry<'a>(
-    user: &'a abs::User,
-    library_item_id: &str,
-    episode_id: Option<&str>,
-) -> Option<&'a abs::MediaProgress> {
-    user.media_progress.iter().find(|entry| {
-        entry.library_item_id == library_item_id && entry.episode_id.as_deref() == episode_id
-    })
-}
-
 /// The Item `id` in `library_item` (an audiobook, or the podcast holding the episode), with
 /// `user`'s Progress; not found if `library_item` has no such Item.
 pub fn item(
@@ -94,7 +72,7 @@ pub fn item(
     library_item: abs::LibraryItem,
     id: ItemId,
 ) -> Result<Item, ApiError> {
-    let progress = progress_entry(user, &library_item.id, id.episode.as_deref()).map(progress);
+    let progress_of = ProgressIndex::of(user);
     match (library_item.media, &id.episode) {
         (abs::Media::Book(book), None) => Ok(Item {
             title: book.metadata.title,
@@ -103,7 +81,7 @@ pub fn item(
             description: non_empty(book.metadata.description),
             duration: book.duration,
             published_at: None,
-            progress,
+            progress: progress_of.audiobook(&library_item.id),
             chapters: book.chapters.into_iter().map(chapter).collect(),
             audio_files: book.tracks.into_iter().map(audio_file).collect(),
             id,
@@ -116,18 +94,51 @@ pub fn item(
                 .ok_or(ApiError::NotFound)?;
             Ok(Item {
                 duration: episode_duration(&episode),
+                progress: progress_of.episode(&episode.id),
                 title: episode.title,
                 author: None,
                 podcast: Some(podcast.metadata.title),
                 description: non_empty(episode.description),
                 published_at: episode.published_at,
-                progress,
                 chapters: Vec::new(),
                 audio_files: episode.audio_track.into_iter().map(audio_file).collect(),
                 id,
             })
         }
         _ => Err(ApiError::NotFound),
+    }
+}
+
+/// A user's Progress by audiobook and by episode. An episode is found by its own id alone:
+/// Audiobookshelf ids are unique, and it may record episode Progress without the podcast.
+/// Should it hold several entries for one, the first counts.
+struct ProgressIndex<'a> {
+    audiobooks: HashMap<&'a str, &'a abs::MediaProgress>,
+    episodes: HashMap<&'a str, &'a abs::MediaProgress>,
+}
+
+impl<'a> ProgressIndex<'a> {
+    fn of(user: &'a abs::User) -> Self {
+        let mut index = Self {
+            audiobooks: HashMap::new(),
+            episodes: HashMap::new(),
+        };
+        for entry in &user.media_progress {
+            if let Some(episode) = &entry.episode_id {
+                index.episodes.entry(episode).or_insert(entry);
+            } else if let Some(audiobook) = &entry.library_item_id {
+                index.audiobooks.entry(audiobook).or_insert(entry);
+            }
+        }
+        index
+    }
+
+    fn audiobook(&self, id: &str) -> Option<Progress> {
+        self.audiobooks.get(id).map(|entry| progress(entry))
+    }
+
+    fn episode(&self, id: &str) -> Option<Progress> {
+        self.episodes.get(id).map(|entry| progress(entry))
     }
 }
 
@@ -154,15 +165,115 @@ fn audio_file(track: abs::Track) -> AudioFile {
     }
 }
 
-/// An episode's duration in seconds: its own, else its audio file's, else unknown (0).
-fn episode_duration(episode: &abs::Episode) -> f64 {
+/// An episode's duration in seconds: its own, else its audio file's, else unknown.
+fn episode_duration(episode: &abs::Episode) -> Option<f64> {
     episode
         .duration
         .or(episode.audio_track.as_ref().map(|track| track.duration))
-        .unwrap_or_default()
 }
 
 /// `text`, unless it is missing or blank.
 fn non_empty(text: Option<String>) -> Option<String> {
     text.filter(|text| !text.trim().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use api::{EpisodeFilter, Progress};
+
+    use super::podcast;
+
+    fn episode(id: &str, published_at: Option<i64>, duration: Option<f64>) -> abs::Episode {
+        abs::Episode {
+            id: id.into(),
+            title: id.into(),
+            description: None,
+            published_at,
+            duration,
+            audio_track: None,
+        }
+    }
+
+    fn the_podcast(episodes: Vec<abs::Episode>) -> abs::LibraryItem {
+        abs::LibraryItem {
+            id: "li-1".into(),
+            media: abs::Media::Podcast(abs::Podcast {
+                metadata: abs::PodcastMetadata {
+                    title: "Podcast".into(),
+                    author: None,
+                },
+                episodes,
+            }),
+        }
+    }
+
+    fn user(media_progress: Vec<abs::MediaProgress>) -> abs::User {
+        abs::User {
+            id: "u1".into(),
+            username: "alice".into(),
+            media_progress,
+        }
+    }
+
+    #[test]
+    fn episodes_are_newest_first_and_undated_ones_last() {
+        let item = the_podcast(vec![
+            episode("undated", None, None),
+            episode("old", Some(1), None),
+            episode("new", Some(3), None),
+            episode("middle", Some(2), None),
+        ]);
+        let listed = podcast(&user(Vec::new()), item, EpisodeFilter::All).unwrap();
+        let ids: Vec<_> = listed
+            .episodes
+            .iter()
+            .map(|episode| episode.id.as_str())
+            .collect();
+        assert_eq!(ids, ["new", "middle", "old", "undated"]);
+    }
+
+    #[test]
+    fn an_episodes_duration_is_its_own_else_its_audio_files_else_unknown() {
+        let mut from_file = episode("file", Some(2), None);
+        from_file.audio_track = Some(abs::Track {
+            ino: "1".into(),
+            start_offset: 0.0,
+            duration: 60.0,
+        });
+        let mut own = episode("own", Some(3), Some(30.0));
+        own.audio_track = from_file.audio_track.clone();
+        let item = the_podcast(vec![own, from_file, episode("unknown", Some(1), None)]);
+        let listed = podcast(&user(Vec::new()), item, EpisodeFilter::All).unwrap();
+        let durations: Vec<_> = listed
+            .episodes
+            .iter()
+            .map(|episode| episode.duration)
+            .collect();
+        assert_eq!(durations, [Some(30.0), Some(60.0), None]);
+    }
+
+    /// Audiobookshelf records episode Progress without the podcast when given only the
+    /// episode; it still counts, and the first of two entries wins.
+    #[test]
+    fn episode_progress_is_found_by_the_episode_alone() {
+        let entry = |library_item_id: Option<&str>, current_time| abs::MediaProgress {
+            library_item_id: library_item_id.map(Into::into),
+            episode_id: Some("ep".into()),
+            current_time,
+            is_finished: false,
+        };
+        let listed = podcast(
+            &user(vec![entry(None, 120.0), entry(Some("li-1"), 5.0)]),
+            the_podcast(vec![episode("ep", Some(1), None)]),
+            EpisodeFilter::All,
+        )
+        .unwrap();
+        assert_eq!(
+            listed.episodes[0].progress,
+            Some(Progress {
+                current_time: 120.0,
+                finished: false
+            })
+        );
+    }
 }

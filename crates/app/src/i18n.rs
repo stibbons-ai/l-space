@@ -11,7 +11,7 @@
 
 use std::sync::LazyLock;
 
-use api::{EpisodeFilter, LibraryKind, Progress};
+use api::{Episode, EpisodeFilter, Item, LibraryKind, Progress};
 use fluent_bundle::concurrent::FluentBundle;
 use fluent_bundle::{FluentArgs, FluentResource};
 use serde::{Deserialize, Serialize};
@@ -148,6 +148,7 @@ texts! {
     ItemChapters => "item-chapters",
     ProgressFinished => "progress-finished",
     ProgressNotStarted => "progress-not-started",
+    ProgressStarted => "progress-started",
     DurationUnderMinute => "duration-under-minute",
     SettingsTitle => "settings-title",
     SettingsLibraryServer => "settings-library-server",
@@ -300,18 +301,22 @@ pub fn duration(language: Language, seconds: f64) -> String {
     }
 }
 
-/// What a person reads about their `progress` in an Item `duration` seconds long: "Finished",
-/// "1 h 12 min left", or "Not started" without Progress or before the first second.
-pub fn progress(language: Language, progress: Option<&Progress>, duration: f64) -> String {
-    match progress {
-        Some(progress) if progress.finished => text(language, Text::ProgressFinished),
-        Some(progress) if progress.current_time > 0.0 => {
+/// What a person reads about their `progress` in an Item of `duration` seconds: "Finished",
+/// "1 h 12 min left", "Not started" without Progress or at 0 seconds, and "Started" when the
+/// duration is unknown.
+pub fn progress(language: Language, progress: Option<&Progress>, duration: Option<f64>) -> String {
+    match (progress, duration) {
+        (Some(progress), _) if progress.finished => text(language, Text::ProgressFinished),
+        (Some(progress), Some(duration)) if progress.current_time > 0.0 => {
             let mut args = FluentArgs::new();
             args.set(
                 "duration",
                 self::duration(language, duration - progress.current_time),
             );
             phrase(language, Phrase::ProgressLeft, &args)
+        }
+        (Some(progress), None) if progress.current_time > 0.0 => {
+            text(language, Text::ProgressStarted)
         }
         _ => text(language, Text::ProgressNotStarted),
     }
@@ -326,6 +331,32 @@ pub fn date(language: Language, millis: i64) -> String {
     args.set("month", month);
     args.set("day", day);
     phrase(language, Phrase::Date, &args)
+}
+
+/// What an episode's row says under its title: "March 31, 2026 · 1 h 6 min left", without
+/// the date when it has none.
+pub fn episode_summary(language: Language, episode: &Episode) -> String {
+    let progress = progress(language, episode.progress.as_ref(), episode.duration);
+    match episode.published_at {
+        Some(published_at) => format!("{} · {progress}", date(language, published_at)),
+        None => progress,
+    }
+}
+
+/// The facts the Item screen lists, each with its label: the person's Progress, the duration
+/// if known, and an episode's publish date.
+pub fn item_facts(language: Language, item: &Item) -> Vec<(Text, String)> {
+    let mut facts = vec![(
+        Text::ItemProgress,
+        progress(language, item.progress.as_ref(), item.duration),
+    )];
+    if let Some(seconds) = item.duration {
+        facts.push((Text::ItemDuration, duration(language, seconds)));
+    }
+    if let Some(published_at) = item.published_at {
+        facts.push((Text::ItemPublished, date(language, published_at)));
+    }
+    facts
 }
 
 /// A point `seconds` into an Item as a clock reading, the same in every language the App has:
@@ -386,10 +417,13 @@ fn format(language: Language, id: &str, args: Option<&FluentArgs>) -> Result<Str
 mod tests {
     use std::collections::BTreeSet;
 
-    use api::{ApiError, Progress};
+    use api::{ApiError, Episode, Item, ItemId, Progress};
     use fluent_bundle::FluentArgs;
 
-    use super::{Language, Phrase, Text, clock, date, duration, format, progress};
+    use super::{
+        Language, Phrase, Text, clock, date, duration, episode_summary, format, item_facts,
+        progress,
+    };
 
     #[test]
     fn every_message_exists_in_every_language_without_errors() {
@@ -461,52 +495,119 @@ mod tests {
             finished,
         };
         for (progress_made, duration, english, german) in [
-            (None, 4320.0, "Not started", "Nicht begonnen"),
+            (None, Some(4320.0), "Not started", "Nicht begonnen"),
             (
                 Some(at(0.0, false)),
-                4320.0,
+                Some(4320.0),
                 "Not started",
                 "Nicht begonnen",
             ),
             (
                 Some(at(2880.0, false)),
-                7200.0,
+                Some(7200.0),
                 "1 h 12 min left",
                 "noch 1 Std. 12 Min.",
             ),
             (
                 Some(at(3000.0, false)),
-                4320.0,
+                Some(4320.0),
                 "22 min left",
                 "noch 22 Min.",
             ),
             (
                 Some(at(4300.0, false)),
-                4320.0,
+                Some(4320.0),
                 "under 1 min left",
                 "noch unter 1 Min.",
             ),
             // Audiobookshelf may record a time past the end.
             (
                 Some(at(5000.0, false)),
-                4320.0,
+                Some(4320.0),
                 "under 1 min left",
                 "noch unter 1 Min.",
             ),
-            (Some(at(0.0, true)), 4320.0, "Finished", "Beendet"),
-            (Some(at(100.0, true)), 4320.0, "Finished", "Beendet"),
+            (Some(at(0.0, true)), Some(4320.0), "Finished", "Beendet"),
+            (Some(at(100.0, true)), Some(4320.0), "Finished", "Beendet"),
+            // Without a duration nothing is "left".
+            (Some(at(100.0, false)), None, "Started", "Begonnen"),
+            (Some(at(0.0, false)), None, "Not started", "Nicht begonnen"),
+            (Some(at(100.0, true)), None, "Finished", "Beendet"),
+            (None, None, "Not started", "Nicht begonnen"),
         ] {
             assert_eq!(
                 progress(Language::English, progress_made.as_ref(), duration),
                 english,
-                "{progress_made:?}"
+                "{progress_made:?} {duration:?}"
             );
             assert_eq!(
                 progress(Language::German, progress_made.as_ref(), duration),
                 german,
-                "{progress_made:?}"
+                "{progress_made:?} {duration:?}"
             );
         }
+    }
+
+    #[test]
+    fn an_episode_row_reads_date_and_progress() {
+        let episode = |published_at, duration, progress| Episode {
+            id: "ep".into(),
+            title: "Episode".into(),
+            duration,
+            published_at,
+            progress,
+        };
+        let started = Some(Progress {
+            current_time: 300.0,
+            finished: false,
+        });
+        for (episode, english, german) in [
+            (
+                episode(Some(1_774_915_200_000), Some(900.0), started.clone()),
+                "March 31, 2026 · 10 min left",
+                "31. März 2026 · noch 10 Min.",
+            ),
+            (episode(None, None, started), "Started", "Begonnen"),
+        ] {
+            assert_eq!(episode_summary(Language::English, &episode), english);
+            assert_eq!(episode_summary(Language::German, &episode), german);
+        }
+    }
+
+    #[test]
+    fn an_items_facts_leave_out_what_is_unknown() {
+        let item = Item {
+            id: ItemId {
+                library_item: "li".into(),
+                episode: Some("ep".into()),
+            },
+            title: "Episode".into(),
+            author: None,
+            podcast: Some("Podcast".into()),
+            description: None,
+            duration: None,
+            published_at: None,
+            progress: None,
+            chapters: Vec::new(),
+            audio_files: Vec::new(),
+        };
+        assert_eq!(
+            item_facts(Language::English, &item),
+            [(Text::ItemProgress, "Not started".to_owned())]
+        );
+        let item = Item {
+            duration: Some(3960.0),
+            published_at: Some(1_774_915_200_000),
+            ..item
+        };
+        assert_eq!(
+            item_facts(Language::German, &item),
+            [
+                (Text::ItemProgress, "Nicht begonnen".to_owned()),
+                (Text::ItemDuration, "1 Std. 6 Min.".to_owned()),
+                (Text::ItemPublished, "31. März 2026".to_owned()),
+            ]
+        );
     }
 
     #[test]

@@ -33,8 +33,8 @@ pub enum Screen {
         library_servers: Vec<LibraryServer>,
         notice: Option<Notice>,
     },
-    /// Logged in: every Library on the session's Library Server, audiobooks and podcasts.
-    /// Empty, with a notice, when they could not be listed.
+    /// Logged in: every Library the user can see on the session's Library Server,
+    /// audiobooks and podcasts. Empty, with a notice, when they could not be listed.
     Libraries {
         libraries: Vec<Library>,
         notice: Option<Notice>,
@@ -377,7 +377,7 @@ impl App {
     /// Opens podcast `id`, listing its unfinished episodes.
     pub async fn open_podcast(&mut self, id: &str) {
         let filter = EpisodeFilter::default();
-        self.go(api::podcast(id.to_owned(), filter), |podcast| {
+        self.go(api::podcast(id.to_owned(), Some(filter)), |podcast| {
             Screen::Podcast {
                 podcast,
                 filter,
@@ -392,7 +392,10 @@ impl App {
         let Screen::Podcast { podcast, .. } = &self.screen else {
             return;
         };
-        match self.call(api::podcast(podcast.id.clone(), filter)).await {
+        match self
+            .call(api::podcast(podcast.id.clone(), Some(filter)))
+            .await
+        {
             Ok(podcast) => {
                 self.screen = Screen::Podcast {
                     podcast,
@@ -424,7 +427,7 @@ impl App {
         .await;
     }
 
-    /// Opens Settings, from every Library.
+    /// Opens Settings, from the Libraries screen.
     pub fn open_settings(&mut self) {
         if self.stored.session.is_some() {
             self.back.clear();
@@ -437,7 +440,8 @@ impl App {
         !self.back.is_empty()
     }
 
-    /// Back to the screen the shown one was opened from, as it was.
+    /// Back to the screen the shown one was opened from, as it was apart from its notice,
+    /// which was cleared on leaving it.
     pub fn go_back(&mut self) {
         if let Some(screen) = self.back.pop() {
             self.screen = screen;

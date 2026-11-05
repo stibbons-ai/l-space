@@ -146,12 +146,15 @@ pub struct Item {
     /// An episode's podcast, by title.
     pub podcast: Option<String>,
     pub description: Option<String>,
-    pub duration: f64,
+    /// Unknown if the Library Server doesn't know it (an episode's may be missing).
+    pub duration: Option<f64>,
     /// When an episode was published, in milliseconds since the Unix epoch.
     pub published_at: Option<i64>,
-    /// The session user's Progress; none if they haven't started the Item.
+    /// The session user's Progress; none if the Library Server holds no Progress of theirs
+    /// for the Item.
     pub progress: Option<Progress>,
-    /// An audiobook's chapters, in order; an episode has none.
+    /// An audiobook's chapters, in the order the Library Server keeps them; an episode has
+    /// none.
     pub chapters: Vec<Chapter>,
     /// The audio files in playing order.
     pub audio_files: Vec<AudioFile>,
@@ -200,26 +203,32 @@ pub struct Episode {
     /// Audiobookshelf's id for the episode.
     pub id: String,
     pub title: String,
-    pub duration: f64,
+    /// Unknown if the Library Server doesn't know it.
+    pub duration: Option<f64>,
     /// Milliseconds since the Unix epoch.
     pub published_at: Option<i64>,
-    /// The session user's Progress; none if they haven't started the episode.
+    /// The session user's Progress; none if the Library Server holds no Progress of theirs
+    /// for the episode.
     pub progress: Option<Progress>,
 }
 
-/// Which of a podcast's episodes to list, by the session user's Progress.
+/// Which of a podcast's episodes to list, by the session user's Progress. A filter this
+/// Bridge doesn't know (from a newer App) counts as [`EpisodeFilter::Unfinished`], as does
+/// none at all.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EpisodeFilter {
-    /// Not Finished, started or not.
-    #[default]
-    Unfinished,
     Finished,
     All,
+    /// Not Finished, started or not. Last, as serde wants its catch-all.
+    #[default]
+    #[serde(other)]
+    Unfinished,
 }
 
 impl EpisodeFilter {
-    pub const ALL: [EpisodeFilter; 3] = [Self::Unfinished, Self::Finished, Self::All];
+    /// Every filter, in the order the App offers them.
+    pub const CHOICES: [EpisodeFilter; 3] = [Self::Unfinished, Self::Finished, Self::All];
 
     /// Whether an episode with `progress` passes.
     pub fn passes(self, progress: Option<&Progress>) -> bool {
@@ -388,15 +397,20 @@ pub async fn item(library_item: String, episode: Option<String>) -> Result<Item,
     bridge.item(server::session_token(&headers)?, id).await
 }
 
-/// The podcast `id` with the episodes `filter` picks by the session user's Progress.
+/// The podcast `id` with the episodes `filter` picks by the session user's Progress (by
+/// default, and for a filter this Bridge doesn't know, the unfinished ones).
 #[get(
     "/api/podcast?id&filter",
     headers: dioxus_fullstack::HeaderMap,
     bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
 )]
-pub async fn podcast(id: String, filter: EpisodeFilter) -> Result<Podcast, ApiError> {
+pub async fn podcast(id: String, filter: Option<EpisodeFilter>) -> Result<Podcast, ApiError> {
     bridge
-        .podcast(server::session_token(&headers)?, id, filter)
+        .podcast(
+            server::session_token(&headers)?,
+            id,
+            filter.unwrap_or_default(),
+        )
         .await
 }
 

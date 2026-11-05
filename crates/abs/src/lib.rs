@@ -14,15 +14,12 @@ use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use reqwest::{StatusCode, redirect};
-use serde::Deserialize;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, IgnoredAny};
+use serde::{Deserialize, Deserializer};
 
 /// How long one request to a Library Server may take, connecting included, before it counts
 /// as unreachable.
 const TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How many audiobooks or podcasts one request for a Library's contents asks for.
-const PAGE_SIZE: usize = 100;
 
 /// An Audiobookshelf API key. It never shows in `Debug` output, so it cannot leak into logs.
 #[derive(Clone, PartialEq, Eq)]
@@ -53,7 +50,8 @@ pub struct User {
     pub id: String,
     pub username: String,
     /// The user's Progress, one entry per audiobook or episode they started or Finished.
-    #[serde(default)]
+    /// An entry Audiobookshelf sends in a shape this client doesn't know is left out.
+    #[serde(default, deserialize_with = "known_entries")]
     pub media_progress: Vec<MediaProgress>,
 }
 
@@ -61,14 +59,47 @@ pub struct User {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MediaProgress {
-    pub library_item_id: String,
+    /// The audiobook, or the podcast of the episode; Audiobookshelf leaves it out (null) for
+    /// episode Progress written with only the episode's id.
+    pub library_item_id: Option<String>,
     /// The episode, for a podcast's.
     pub episode_id: Option<String>,
     /// Seconds into the audiobook or episode.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub current_time: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub is_finished: bool,
+}
+
+/// A value Audiobookshelf may send as null, as its type's default.
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// The entries of a list that decode as `T`; the others are dropped.
+fn known_entries<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry<T> {
+        Known(T),
+        Unknown(IgnoredAny),
+    }
+    let entries = Option::<Vec<Entry<T>>>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| match entry {
+            Entry::Known(known) => Some(known),
+            Entry::Unknown(_) => None,
+        })
+        .collect())
 }
 
 /// A Library: audiobooks or podcasts.
@@ -110,7 +141,7 @@ pub struct Book {
     pub metadata: BookMetadata,
     /// Seconds, all audio files together.
     #[serde(default)]
-    pub duration: f64,
+    pub duration: Option<f64>,
     #[serde(default)]
     pub chapters: Vec<Chapter>,
     /// The audio files in playing order.
@@ -121,6 +152,7 @@ pub struct Book {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BookMetadata {
+    #[serde(default, deserialize_with = "null_as_default")]
     pub title: String,
     pub author_name: Option<String>,
     pub description: Option<String>,
@@ -135,6 +167,7 @@ pub struct Podcast {
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PodcastMetadata {
+    #[serde(default, deserialize_with = "null_as_default")]
     pub title: String,
     pub author: Option<String>,
 }
@@ -143,6 +176,7 @@ pub struct PodcastMetadata {
 #[serde(rename_all = "camelCase")]
 pub struct Episode {
     pub id: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub title: String,
     pub description: Option<String>,
     /// Milliseconds since the Unix epoch.
@@ -155,6 +189,7 @@ pub struct Episode {
 /// A chapter; times in seconds into the whole audiobook.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Chapter {
+    #[serde(default, deserialize_with = "null_as_default")]
     pub title: String,
     pub start: f64,
     pub end: f64,
@@ -181,14 +216,16 @@ pub enum Error {
     #[error("the API key was rejected")]
     Rejected,
     /// No usable answer: the Library Server could not be reached in time, or answered with
-    /// something other than success, a rejection or a 404 (a 403, which may come from a proxy
-    /// in front of it, a server error, a redirect, a body that is not what Audiobookshelf
-    /// sends). The message describes the cause in full, without the URL; a cause may still
-    /// name the host (a TLS certificate that doesn't match it, for example).
+    /// something other than success, a rejection or a "not found" (a 403 or 404 on a path
+    /// that names no Library or item, which may come from a proxy in front of it, a server
+    /// error, a redirect, a body that is not what Audiobookshelf sends). The message
+    /// describes the cause in full, without the URL; a cause may still name the host (a TLS
+    /// certificate that doesn't match it, for example).
     #[error("the Library Server gave no usable answer: {0}")]
     Unavailable(String),
-    /// The Library Server has no Library or library item with this id for the user (HTTP
-    /// 404), or the id is not an Audiobookshelf id.
+    /// The Library Server has no Library or library item with this id that the user may see
+    /// (HTTP 404, or the 403 Audiobookshelf answers when the user may not), or the id is not
+    /// an Audiobookshelf id.
     #[error("no such Library or library item")]
     NotFound,
 }
@@ -237,13 +274,8 @@ impl Client {
     /// without a trailing slash, ADR 0006), with their Progress.
     pub async fn me(&self, base_url: &str, api_key: &ApiKey) -> Result<User, Error> {
         let user: User = self
-            .get(base_url, api_key, "/api/me")
-            .await
-            // Every Audiobookshelf has this endpoint: whatever answered is something else.
-            .map_err(|error| match error {
-                Error::NotFound => Error::Unavailable("HTTP 404 Not Found".to_owned()),
-                error => error,
-            })?;
+            .get(base_url, api_key, "/api/me", Names::Nothing)
+            .await?;
         if user.id.is_empty() {
             return Err(Error::Unavailable("the answer names no user id".to_owned()));
         }
@@ -256,11 +288,17 @@ impl Client {
         struct Libraries {
             libraries: Vec<Library>,
         }
-        let libraries: Libraries = self.get(base_url, api_key, "/api/libraries").await?;
+        let libraries: Libraries = self
+            .get(base_url, api_key, "/api/libraries", Names::Nothing)
+            .await?;
         Ok(libraries.libraries)
     }
 
     /// Every audiobook or podcast in Library `library_id`, by title, with metadata only.
+    ///
+    /// One request: without a `limit`, Audiobookshelf answers with all of them (2.37.2:
+    /// `LibraryController.getLibraryItems` defaults `limit` to 0, which its item queries
+    /// turn into no SQL `LIMIT`).
     pub async fn library_items(
         &self,
         base_url: &str,
@@ -268,25 +306,14 @@ impl Client {
         library_id: &str,
     ) -> Result<Vec<LibraryItem>, Error> {
         #[derive(Deserialize)]
-        struct Page {
+        struct Items {
             results: Vec<LibraryItem>,
-            total: usize,
         }
         let library_id = id_segment(library_id)?;
-        let mut items = Vec::new();
-        for page in 0.. {
-            let path = format!(
-                "/api/libraries/{library_id}/items?minified=1&sort=media.metadata.title\
-                 &limit={PAGE_SIZE}&page={page}"
-            );
-            let Page { results, total } = self.get(base_url, api_key, &path).await?;
-            let last = results.is_empty();
-            items.extend(results);
-            if last || items.len() >= total {
-                break;
-            }
-        }
-        Ok(items)
+        let path =
+            format!("/api/libraries/{library_id}/items?minified=1&sort=media.metadata.title");
+        let items: Items = self.get(base_url, api_key, &path, Names::One).await?;
+        Ok(items.results)
     }
 
     /// The audiobook or podcast `library_item_id` in full: chapters and audio files, or
@@ -298,20 +325,18 @@ impl Client {
         library_item_id: &str,
     ) -> Result<LibraryItem, Error> {
         let library_item_id = id_segment(library_item_id)?;
-        self.get(
-            base_url,
-            api_key,
-            &format!("/api/items/{library_item_id}?expanded=1"),
-        )
-        .await
+        let path = format!("/api/items/{library_item_id}?expanded=1");
+        self.get(base_url, api_key, &path, Names::One).await
     }
 
-    /// GETs `path_and_query` and decodes the answer.
+    /// GETs `path_and_query`, which `names` a Library or library item or not, and decodes the
+    /// answer.
     async fn get<T: DeserializeOwned>(
         &self,
         base_url: &str,
         api_key: &ApiKey,
         path_and_query: &str,
+        names: Names,
     ) -> Result<T, Error> {
         // A key that cannot be sent as a header value cannot be a valid key.
         let mut authorization = HeaderValue::try_from(format!("Bearer {}", api_key.expose()))
@@ -325,13 +350,23 @@ impl Client {
             .send()
             .await
             .map_err(Error::unavailable)?;
-        match response.status() {
-            StatusCode::UNAUTHORIZED => Err(Error::Rejected),
-            StatusCode::NOT_FOUND => Err(Error::NotFound),
-            status if status.is_success() => response.json().await.map_err(Error::unavailable),
-            status => Err(Error::Unavailable(format!("HTTP {status}"))),
+        match (response.status(), names) {
+            (StatusCode::UNAUTHORIZED, _) => Err(Error::Rejected),
+            // Audiobookshelf answers 403 for a Library or item the user may not see.
+            (StatusCode::FORBIDDEN | StatusCode::NOT_FOUND, Names::One) => Err(Error::NotFound),
+            (status, _) if status.is_success() => response.json().await.map_err(Error::unavailable),
+            // Every Audiobookshelf answers the other paths: something else did, a proxy in
+            // front of it for example.
+            (status, _) => Err(Error::Unavailable(format!("HTTP {status}"))),
         }
     }
+}
+
+/// Whether a request names one Library or library item, which then may not exist for the user.
+#[derive(Debug, Clone, Copy)]
+enum Names {
+    One,
+    Nothing,
 }
 
 /// `id` if it is an Audiobookshelf id, which goes into a path as it is.
@@ -348,19 +383,14 @@ mod tests {
     //! Answers a real Audiobookshelf never gives on its own, so the black-box tests cannot
     //! provoke them.
 
-    use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use axum::Router;
-    use axum::extract::Query;
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::{IntoResponse, Redirect};
     use axum::routing::get;
     use serde_json::json;
     use tokio::net::TcpListener;
 
-    use super::{ApiKey, Client, Error, Media, User};
+    use super::{ApiKey, Client, Error, LibraryItem, Media, MediaProgress, User};
 
     async fn serve(router: Router) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -494,67 +524,79 @@ mod tests {
         assert_eq!(format!("{:?}", ApiKey::new("s3cret")), "ApiKey(REDACTED)");
     }
 
-    /// A Library of `total` books, served in the pages asked for; counts the requests.
-    async fn library_of(total: usize, requests: Arc<AtomicUsize>) -> String {
-        serve(Router::new().route(
-            "/api/libraries/lib-1/items",
-            get(move |Query(query): Query<HashMap<String, String>>| {
-                let requests = requests.clone();
-                async move {
-                    requests.fetch_add(1, Ordering::SeqCst);
-                    let limit: usize = query["limit"].parse().unwrap();
-                    let page: usize = query["page"].parse().unwrap();
-                    let results: Vec<_> = (page * limit..total.min((page + 1) * limit))
-                        .map(|n| {
-                            json!({
-                                "id": format!("li-{n}"),
-                                "mediaType": "book",
-                                "media": {"metadata": {"title": format!("Book {n}"), "authorName": null}},
-                            })
-                        })
-                        .collect();
-                    axum::Json(json!({"results": results, "total": total, "limit": limit, "page": page}))
-                }
-            }),
-        ))
-        .await
-    }
-
-    #[tokio::test]
-    async fn a_library_is_read_to_its_last_page() {
-        let requests = Arc::new(AtomicUsize::new(0));
-        let base_url = library_of(250, requests.clone()).await;
-
-        let items = Client::new()
-            .library_items(&base_url, &ApiKey::new("key"), "lib-1")
-            .await
-            .unwrap();
-
-        let ids: Vec<_> = items.iter().map(|item| item.id.clone()).collect();
-        let expected: Vec<_> = (0..250).map(|n| format!("li-{n}")).collect();
-        assert_eq!(ids, expected);
-        assert!(
-            items
-                .iter()
-                .all(|item| matches!(item.media, Media::Book(_)))
+    /// Audiobookshelf writes episode Progress without its podcast when only the episode's id
+    /// is given, and its columns allow nulls: such entries still decode, and one this client
+    /// can't read is left out instead of failing the whole user.
+    #[test]
+    fn progress_with_nulls_decodes_and_an_unreadable_entry_is_left_out() {
+        let user: User = serde_json::from_value(json!({
+            "id": "u1",
+            "username": "alice",
+            "mediaProgress": [
+                {"libraryItemId": null, "episodeId": "ep-1", "currentTime": 120, "isFinished": false},
+                {"libraryItemId": "li-1", "episodeId": null, "currentTime": null, "isFinished": null},
+                {"libraryItemId": 7, "episodeId": "ep-2", "currentTime": "soon"},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(
+            user.media_progress,
+            [
+                MediaProgress {
+                    library_item_id: None,
+                    episode_id: Some("ep-1".into()),
+                    current_time: 120.0,
+                    is_finished: false,
+                },
+                MediaProgress {
+                    library_item_id: Some("li-1".into()),
+                    episode_id: None,
+                    current_time: 0.0,
+                    is_finished: false,
+                },
+            ]
         );
-        assert_eq!(requests.load(Ordering::SeqCst), 3);
     }
 
-    /// A total that overstates what the pages hold must not loop forever.
-    #[tokio::test]
-    async fn reading_a_library_stops_at_an_empty_page() {
-        let base_url = serve(Router::new().route(
-            "/api/libraries/lib-1/items",
-            get(|| async { axum::Json(json!({"results": [], "total": 5})) }),
-        ))
-        .await;
+    #[test]
+    fn a_null_title_decodes_as_empty() {
+        let item: LibraryItem = serde_json::from_value(json!({
+            "id": "li-1",
+            "mediaType": "podcast",
+            "media": {
+                "metadata": {"title": null, "author": null},
+                "episodes": [{"id": "ep-1", "title": null, "description": null,
+                              "publishedAt": null, "duration": null, "audioTrack": null}],
+            },
+        }))
+        .unwrap();
+        let Media::Podcast(podcast) = item.media else {
+            panic!("{item:?}");
+        };
+        assert_eq!(podcast.metadata.title, "");
+        assert_eq!(podcast.episodes[0].title, "");
+    }
 
-        let items = Client::new()
-            .library_items(&base_url, &ApiKey::new("key"), "lib-1")
-            .await
-            .unwrap();
-        assert!(items.is_empty());
+    /// Audiobookshelf answers 403 for a Library or item the user may not see.
+    #[tokio::test]
+    async fn a_forbidden_library_or_item_is_not_found() {
+        let forbidden = || async { StatusCode::FORBIDDEN };
+        let base_url = serve(
+            Router::new()
+                .route("/api/items/li-1", get(forbidden))
+                .route("/api/libraries/lib-1/items", get(forbidden)),
+        )
+        .await;
+        let client = Client::new();
+        let key = ApiKey::new("key");
+        assert!(matches!(
+            client.library_item(&base_url, &key, "li-1").await,
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            client.library_items(&base_url, &key, "lib-1").await,
+            Err(Error::NotFound)
+        ));
     }
 
     /// An id that could change the path (or the query) names nothing and is never sent: a

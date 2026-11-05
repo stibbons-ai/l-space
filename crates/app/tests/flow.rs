@@ -187,11 +187,23 @@ async fn logged_in(
     abs: &Audiobookshelf,
     user: &AbsUser,
 ) -> App {
+    let app = logged_in_behind(device, bridge, abs.base_url(), user).await;
+    assert_eq!(app.screen(), &libraries(abs, None));
+    app
+}
+
+/// Launches the App on `device`, enters `bridge`'s URL and logs in as `user` on the Library
+/// Server at `library_server`, whatever the login shows.
+async fn logged_in_behind(
+    device: &Device,
+    bridge: &TestBridge,
+    library_server: &str,
+    user: &AbsUser,
+) -> App {
     let mut app = device.launch().await;
     app.submit_bridge_url(bridge.url()).await;
-    app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
+    app.log_in(library_server, ApiKey::new(&user.api_key.key))
         .await;
-    assert_eq!(app.screen(), &libraries(abs, None));
     app
 }
 
@@ -211,7 +223,7 @@ fn notice_text(app: &App) -> String {
 }
 
 /// The screen's text in English and in German, by `read` from the App.
-fn texts_of(app: &mut App, read: impl Fn(&App) -> String) -> (String, String) {
+fn texts_of<T>(app: &mut App, read: impl Fn(&App) -> T) -> (T, T) {
     let choice = app.language_choice();
     app.set_language(LanguageChoice::English);
     let english = read(app);
@@ -298,15 +310,11 @@ fn bridge_then_gone(bridge: &str) -> (String, ProxyLog) {
             };
             record(&request);
             let response = if index == 0 {
-                let mut bridge = TcpStream::connect(&target).unwrap();
-                bridge.write_all(&request).unwrap();
-                let mut response = Vec::new();
-                bridge.read_to_end(&mut response).unwrap();
+                let response = forward(&target, &request);
                 record(&response);
                 response
             } else {
-                b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                    .to_vec()
+                UNAVAILABLE.to_vec()
             };
             let _ = stream.write_all(&response);
         }
@@ -340,6 +348,60 @@ fn read_request(stream: &TcpStream) -> Vec<u8> {
     reader.read_exact(&mut body).unwrap();
     request.extend(body);
     request
+}
+
+/// What a reverse proxy answers when what is behind it is gone.
+const UNAVAILABLE: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+/// Sends `request` (which closes its connection) to `target` (`host:port`) and returns the
+/// whole response.
+fn forward(target: &str, request: &[u8]) -> Vec<u8> {
+    let mut server = TcpStream::connect(target).unwrap();
+    server.write_all(request).unwrap();
+    let mut response = Vec::new();
+    server.read_to_end(&mut response).unwrap();
+    response
+}
+
+/// Which requests an [`abs_proxy`] fails: those whose request line starts with this.
+type Failing = Arc<Mutex<Option<&'static str>>>;
+
+/// A loopback proxy in front of Audiobookshelf at `abs` (`host:port`) that answers the
+/// requests `failing` names with `503 Service Unavailable` and passes every other one on.
+fn abs_proxy(abs: &str) -> (String, Failing) {
+    let target = abs.to_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let failing = Failing::default();
+    let fails = Arc::clone(&failing);
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let (target, fails) = (target.clone(), Arc::clone(&fails));
+            std::thread::spawn(move || {
+                let request = read_request(&stream);
+                let fail = fails
+                    .lock()
+                    .unwrap()
+                    .is_some_and(|prefix| request.starts_with(prefix.as_bytes()));
+                let response = if fail {
+                    UNAVAILABLE.to_vec()
+                } else {
+                    forward(&target, &request)
+                };
+                let _ = stream.write_all(&response);
+            });
+        }
+    });
+    (format!("http://{addr}"), failing)
+}
+
+/// A Bridge whose Library Server "Home" is the shared Audiobookshelf behind an [`abs_proxy`].
+fn bridge_behind_proxy() -> (TestBridge, Arc<Audiobookshelf>, String, Failing) {
+    let abs = Audiobookshelf::shared();
+    let (proxy, failing) = abs_proxy(abs.address());
+    let bridge = TestBridge::start(&named_library_server_toml(&proxy, "Home"));
+    (bridge, abs, proxy, failing)
 }
 
 /// Fails the test instead of hanging when `action` outlives `limit`.
@@ -1060,10 +1122,6 @@ fn the_language_follows_the_device_unless_settings_overrides_it() {
     });
 }
 
-fn pair(english: &str, german: &str) -> (String, String) {
-    (english.to_owned(), german.to_owned())
-}
-
 #[test]
 fn a_podcasts_episodes_are_filtered_by_the_persons_progress() {
     let (bridge, abs, _) = bridge_with_abs();
@@ -1135,22 +1193,23 @@ fn a_podcasts_episodes_are_filtered_by_the_persons_progress() {
             Screen::Podcast { podcast, .. } => podcast
                 .episodes
                 .iter()
-                .map(|episode| {
-                    format!(
-                        "{} · {}",
-                        i18n::date(app.language(), episode.published_at.unwrap()),
-                        i18n::progress(app.language(), episode.progress.as_ref(), episode.duration)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" | "),
+                .map(|episode| i18n::episode_summary(app.language(), episode))
+                .collect::<Vec<_>>(),
             screen => panic!("{screen:?}"),
         };
         assert_eq!(
             texts_of(&mut app, rows),
-            pair(
-                "March 31, 2026 · Not started | February 15, 2026 · 10 min left | January 1, 2026 · Finished",
-                "31. März 2026 · Nicht begonnen | 15. Februar 2026 · noch 10 Min. | 1. Januar 2026 · Beendet",
+            (
+                vec![
+                    "March 31, 2026 · Not started".to_owned(),
+                    "February 15, 2026 · 10 min left".to_owned(),
+                    "January 1, 2026 · Finished".to_owned(),
+                ],
+                vec![
+                    "31. März 2026 · Nicht begonnen".to_owned(),
+                    "15. Februar 2026 · noch 10 Min.".to_owned(),
+                    "1. Januar 2026 · Beendet".to_owned(),
+                ],
             )
         );
 
@@ -1204,29 +1263,32 @@ fn an_audiobook_shows_its_details_progress_and_chapters_in_english_and_german() 
                 finished: false
             })
         );
-        let item = item.clone();
-        let shown = |app: &App| {
-            let language = app.language();
-            let chapters: Vec<_> = item
-                .chapters
-                .iter()
-                .map(|chapter| format!("{} {}", chapter.title, i18n::clock(chapter.start)))
-                .collect();
-            format!(
-                "{}: {} / {}: {} / {}: {}",
-                app.text(Text::ItemProgress),
-                i18n::progress(language, item.progress.as_ref(), item.duration),
-                app.text(Text::ItemDuration),
-                i18n::duration(language, item.duration),
-                app.text(Text::ItemChapters),
-                chapters.join(", "),
-            )
-        };
+        let chapters: Vec<_> = item
+            .chapters
+            .iter()
+            .map(|chapter| (chapter.title.as_str(), i18n::clock(chapter.start)))
+            .collect();
         assert_eq!(
-            texts_of(&mut app, shown),
-            pair(
-                "Progress: 1 h 2 min left / Duration: 1 h 12 min / Chapters: 01 - Part One 0:00, 02 - Part Two 40:00, 03 - Part Three 1:10:00",
-                "Fortschritt: noch 1 Std. 2 Min. / Dauer: 1 Std. 12 Min. / Kapitel: 01 - Part One 0:00, 02 - Part Two 40:00, 03 - Part Three 1:10:00",
+            chapters,
+            [
+                ("01 - Part One", "0:00".to_owned()),
+                ("02 - Part Two", "40:00".to_owned()),
+                ("03 - Part Three", "1:10:00".to_owned()),
+            ]
+        );
+        let item = item.clone();
+        let facts = |app: &App| i18n::item_facts(app.language(), &item);
+        assert_eq!(
+            texts_of(&mut app, facts),
+            (
+                vec![
+                    (Text::ItemProgress, "1 h 2 min left".to_owned()),
+                    (Text::ItemDuration, "1 h 12 min".to_owned()),
+                ],
+                vec![
+                    (Text::ItemProgress, "noch 1 Std. 2 Min.".to_owned()),
+                    (Text::ItemDuration, "1 Std. 12 Min.".to_owned()),
+                ],
             )
         );
 
@@ -1265,20 +1327,20 @@ fn an_episode_shows_its_podcast_publish_date_and_progress() {
         );
         assert!(item.chapters.is_empty());
         let item = item.clone();
-        let shown = |app: &App| {
-            let language = app.language();
-            format!(
-                "{} / {} / {}",
-                i18n::progress(language, item.progress.as_ref(), item.duration),
-                i18n::duration(language, item.duration),
-                i18n::date(language, item.published_at.unwrap()),
-            )
-        };
+        let facts = |app: &App| i18n::item_facts(app.language(), &item);
         assert_eq!(
-            texts_of(&mut app, shown),
-            pair(
-                "Not started / 1 h 6 min / March 31, 2026",
-                "Nicht begonnen / 1 Std. 6 Min. / 31. März 2026"
+            texts_of(&mut app, facts),
+            (
+                vec![
+                    (Text::ItemProgress, "Not started".to_owned()),
+                    (Text::ItemDuration, "1 h 6 min".to_owned()),
+                    (Text::ItemPublished, "March 31, 2026".to_owned()),
+                ],
+                vec![
+                    (Text::ItemProgress, "Nicht begonnen".to_owned()),
+                    (Text::ItemDuration, "1 Std. 6 Min.".to_owned()),
+                    (Text::ItemPublished, "31. März 2026".to_owned()),
+                ],
             )
         );
 
@@ -1355,5 +1417,97 @@ fn a_key_revoked_while_browsing_ends_the_session() {
         assert_eq!(app.session(), None);
         assert!(!app.can_go_back());
         assert_eq!(device.launch().await.session(), None);
+    });
+}
+
+#[test]
+fn libraries_that_cannot_be_listed_are_explained_and_listed_on_retry() {
+    let (bridge, abs, proxy, failing) = bridge_behind_proxy();
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        *failing.lock().unwrap() = Some("GET /api/libraries ");
+        let failed = Screen::Libraries {
+            libraries: Vec::new(),
+            notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
+        };
+
+        // After login...
+        let mut app = logged_in_behind(&device, &bridge, &proxy, &user).await;
+        assert_eq!(app.screen(), &failed);
+        assert_eq!(
+            notice_texts(&mut app),
+            both(Text::ErrorLibraryServerUnreachable)
+        );
+        assert!(app.session().is_some());
+
+        // ...and at launch, the session staying.
+        let mut app = device.launch().await;
+        assert_eq!(app.screen(), &failed);
+
+        *failing.lock().unwrap() = None;
+        app.open_libraries().await;
+        assert_eq!(app.screen(), &libraries(&abs, None));
+    });
+}
+
+#[test]
+fn a_session_ended_elsewhere_while_browsing_leads_to_login() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.open_library(podcasts(&abs)).await;
+        app.open_entry(&seeded.podcast).await;
+        assert!(matches!(app.screen(), Screen::Podcast { .. }));
+        // Logged out on the Bridge, as from another device holding the session.
+        bridge.api().logout(&session(&app)).await;
+
+        app.filter_episodes(EpisodeFilter::All).await;
+
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Login {
+                    notice: Some(Notice::Api(ApiError::SessionInvalid)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(app.session(), None);
+        assert!(!app.can_go_back());
+    });
+}
+
+#[test]
+fn a_filter_that_fails_keeps_the_episodes_shown() {
+    let (bridge, abs, proxy, failing) = bridge_behind_proxy();
+    let device = Device::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        let mut app = logged_in_behind(&device, &bridge, &proxy, &user).await;
+        app.open_library(podcasts(&abs)).await;
+        app.open_entry(&seeded.podcast).await;
+        let Screen::Podcast { podcast, .. } = app.screen().clone() else {
+            panic!("{:?}", app.screen());
+        };
+
+        *failing.lock().unwrap() = Some("GET /api/items/");
+        app.filter_episodes(EpisodeFilter::Finished).await;
+
+        assert_eq!(
+            app.screen(),
+            &Screen::Podcast {
+                podcast,
+                filter: EpisodeFilter::Unfinished,
+                notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
+            }
+        );
+        assert!(app.session().is_some());
     });
 }

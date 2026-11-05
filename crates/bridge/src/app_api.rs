@@ -64,7 +64,7 @@ impl<S: Store> AppApi<S> {
             .abs
             .me(library_server, &api_key)
             .await
-            .map_err(|error| abs_error(library_server, error))?;
+            .map_err(|error| abs_error(library_server, Request::ME, error))?;
 
         let token = new_session_token()?;
         let owner = LibraryUser {
@@ -120,8 +120,12 @@ impl<S: Store> AppApi<S> {
     }
 
     async fn libraries(&self, token: SessionToken) -> Result<Vec<Library>, ApiError> {
+        let request = Request {
+            operation: "list the Libraries",
+            id: None,
+        };
         let (_, libraries) = self
-            .browse(token, async |server, key| {
+            .browse(token, request, async |server, key| {
                 self.abs.libraries(server, key).await
             })
             .await?;
@@ -133,8 +137,12 @@ impl<S: Store> AppApi<S> {
         token: SessionToken,
         library: String,
     ) -> Result<Vec<LibraryEntry>, ApiError> {
+        let request = Request {
+            operation: "list a Library",
+            id: Some(&library),
+        };
         let (_, items) = self
-            .browse(token, async |server, key| {
+            .browse(token, request, async |server, key| {
                 self.abs.library_items(server, key, &library).await
             })
             .await?;
@@ -147,8 +155,12 @@ impl<S: Store> AppApi<S> {
         podcast: String,
         filter: EpisodeFilter,
     ) -> Result<Podcast, ApiError> {
+        let request = Request {
+            operation: "fetch a podcast",
+            id: Some(&podcast),
+        };
         let (user, item) = self
-            .browse(token, async |server, key| {
+            .browse(token, request, async |server, key| {
                 self.abs.library_item(server, key, &podcast).await
             })
             .await?;
@@ -156,8 +168,12 @@ impl<S: Store> AppApi<S> {
     }
 
     async fn item(&self, token: SessionToken, id: ItemId) -> Result<Item, ApiError> {
+        let request = Request {
+            operation: "fetch an Item",
+            id: Some(&id.library_item),
+        };
         let (user, library_item) = self
-            .browse(token, async |server, key| {
+            .browse(token, request, async |server, key| {
                 self.abs.library_item(server, key, &id.library_item).await
             })
             .await?;
@@ -185,12 +201,13 @@ impl<S: Store> AppApi<S> {
         Ok((library_server, session))
     }
 
-    /// Fetches something with `fetch` from the session's Library Server as its user, and
-    /// checks at the same time that the session's key still acts for that user. Returns the
-    /// user, with their Progress, and what was fetched.
+    /// Fetches something with `fetch` (the `request`) from the session's Library Server as its
+    /// user, and checks at the same time that the session's key still acts for that user.
+    /// Returns the user, with their Progress, and what was fetched.
     async fn browse<T>(
         &self,
         token: SessionToken,
+        request: Request<'_>,
         fetch: impl AsyncFnOnce(&str, &abs::ApiKey) -> Result<T, abs::Error>,
     ) -> Result<(abs::User, T), ApiError> {
         let (library_server, session) = self.session(&token).await?;
@@ -201,7 +218,7 @@ impl<S: Store> AppApi<S> {
         let user = self.verified(library_server, &session, user).await?;
         match fetched {
             Ok(fetched) => Ok((user, fetched)),
-            Err(error) => Err(self.failure(library_server, &session, error).await),
+            Err(error) => Err(self.failure(library_server, &session, request, error).await),
         }
     }
 
@@ -220,16 +237,19 @@ impl<S: Store> AppApi<S> {
             Ok(_) => Err(self
                 .revoke(session, "the API key now acts for another user")
                 .await),
-            Err(error) => Err(self.failure(library_server, session, error).await),
+            Err(error) => Err(self
+                .failure(library_server, session, Request::ME, error)
+                .await),
         }
     }
 
-    /// The error a session call answers with when its Library Server failed with `error`. A
-    /// rejected key is revoked.
+    /// The error a session call answers with when its Library Server failed `request` with
+    /// `error`. A rejected key is revoked.
     async fn failure(
         &self,
         library_server: &str,
         session: &store::Session,
+        request: Request<'_>,
         error: abs::Error,
     ) -> ApiError {
         match error {
@@ -237,7 +257,7 @@ impl<S: Store> AppApi<S> {
                 self.revoke(session, "the Library Server rejected the API key")
                     .await
             }
-            error => abs_error(library_server, error),
+            error => abs_error(library_server, request, error),
         }
     }
 
@@ -338,12 +358,34 @@ fn new_session_token() -> Result<SessionToken, ApiError> {
     Ok(SessionToken::new(token))
 }
 
-fn abs_error(library_server: &str, error: abs::Error) -> ApiError {
+/// What the Bridge asked a Library Server for, for its log events.
+#[derive(Debug, Clone, Copy)]
+struct Request<'a> {
+    operation: &'static str,
+    /// The Library or library item asked for, if any.
+    id: Option<&'a str>,
+}
+
+impl Request<'_> {
+    /// The "who am I" check that proves an API key.
+    const ME: Request<'static> = Request {
+        operation: "check who the API key acts for",
+        id: None,
+    };
+}
+
+fn abs_error(library_server: &str, request: Request, error: abs::Error) -> ApiError {
     match error {
         abs::Error::Rejected => ApiError::ApiKeyRejected,
         abs::Error::NotFound => ApiError::NotFound,
         abs::Error::Unavailable(_) => {
-            tracing::warn!(library_server, %error, "Library Server unavailable");
+            tracing::warn!(
+                library_server,
+                operation = request.operation,
+                id = request.id,
+                %error,
+                "Library Server unavailable"
+            );
             ApiError::LibraryServerUnreachable
         }
     }

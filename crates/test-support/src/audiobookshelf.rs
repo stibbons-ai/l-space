@@ -179,19 +179,41 @@ impl Audiobookshelf {
 
     /// Creates a user with an API key, named uniquely across the test run.
     pub async fn new_user(&self) -> AbsUser {
+        self.create_user(json!({})).await
+    }
+
+    /// Creates a user with an API key who may see only the Libraries `library_ids`, as an
+    /// admin restricting them would.
+    pub async fn new_user_seeing(&self, library_ids: &[&str]) -> AbsUser {
+        self.create_user(json!({
+            "permissions": {"accessAllLibraries": false},
+            "librariesAccessible": library_ids,
+        }))
+        .await
+    }
+
+    /// Calls `path` as `user`, with their API key, as their own player would; panics unless
+    /// it succeeds.
+    pub async fn as_user(
+        &self,
+        user: &AbsUser,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Value {
+        self.call(&user.api_key.key, method, path, body).await
+    }
+
+    /// Creates a user with the settings in `extra`, and an API key for them.
+    async fn create_user(&self, mut extra: Value) -> AbsUser {
         static USERS: AtomicUsize = AtomicUsize::new(0);
         let username = format!("listener-{}", USERS.fetch_add(1, Ordering::Relaxed));
+        extra["username"] = username.clone().into();
+        extra["password"] = "password".into();
+        extra["type"] = "user".into();
+        extra["isActive"] = true.into();
         let created = self
-            .admin(
-                reqwest::Method::POST,
-                "/api/users",
-                Some(json!({
-                    "username": username,
-                    "password": "password",
-                    "type": "user",
-                    "isActive": true,
-                })),
-            )
+            .admin(reqwest::Method::POST, "/api/users", Some(extra))
             .await;
         let id = created["user"]["id"].as_str().expect("user id").to_owned();
         let api_key = self.new_api_key(&id).await;

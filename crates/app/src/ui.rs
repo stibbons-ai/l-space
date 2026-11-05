@@ -364,7 +364,7 @@ fn PodcastScreen(
             p { class: "byline", "{author}" }
         }
         div { class: "filters", role: "group",
-            for option in EpisodeFilter::ALL {
+            for option in EpisodeFilter::CHOICES {
                 button {
                     key: "{option:?}",
                     r#type: "button",
@@ -386,13 +386,7 @@ fn PodcastScreen(
                     key: "{episode.id}",
                     busy,
                     title: episode.title.clone(),
-                    detail: {
-                        let progress = i18n::progress(language, episode.progress.as_ref(), episode.duration);
-                        match episode.published_at {
-                            Some(published_at) => format!("{} · {progress}", i18n::date(language, published_at)),
-                            None => progress,
-                        }
-                    },
+                    detail: i18n::episode_summary(language, &episode),
                     onclick: {
                         let id = episode.id.clone();
                         move |_| {
@@ -419,13 +413,9 @@ fn ItemScreen(app: Signal<App>, busy: Signal<bool>, item: Item, notice: Option<N
         }
         NoticeView { app, notice }
         dl {
-            dt { {text(Text::ItemProgress)} }
-            dd { {i18n::progress(language, item.progress.as_ref(), item.duration)} }
-            dt { {text(Text::ItemDuration)} }
-            dd { {i18n::duration(language, item.duration)} }
-            if let Some(published_at) = item.published_at {
-                dt { {text(Text::ItemPublished)} }
-                dd { {i18n::date(language, published_at)} }
+            for (label, value) in i18n::item_facts(language, &item) {
+                dt { {text(label)} }
+                dd { "{value}" }
             }
         }
         if let Some(description) = &item.description {
