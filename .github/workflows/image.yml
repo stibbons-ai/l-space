@@ -1,0 +1,38 @@
+# The Clacks (Bridge) image: built and smoke-tested for linux/amd64 and linux/arm64 on every
+# pull request, and published to GHCR on pushes to main and on version tags.
+name: image
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  # A newer push to a pull request cancels its running check. Publishing runs never cancel a
+  # running publish, so an older commit never retags after a newer one; but a newer run skips
+  # (cancels) a still-pending older one, so not every commit on main gets published.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Pull request code never runs with a token that can write packages.
+  check:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/image-build.yml
+    permissions:
+      contents: read
+    with:
+      publish: false
+
+  publish:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/image-build.yml
+    permissions:
+      contents: read
+      packages: write
+    with:
+      publish: true
