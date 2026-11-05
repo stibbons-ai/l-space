@@ -21,3 +21,10 @@ run = [
 [tasks.check]
 description = "Everything CI-worthy: build, lint, test"
 depends = ["build", "lint", "test"]
+
+[tasks.image]
+description = "Build the Clacks image for this machine's platform and smoke-test it"
+run = [
+  "docker buildx build --load --tag clacks:local .",
+  "scripts/smoke-image.sh clacks:local",
+]
