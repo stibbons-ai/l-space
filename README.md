@@ -126,7 +126,7 @@ The container shares the host's network, so the Bridge listens on the host's add
 
 ### HTTPS through Traefik
 
-The App can reach the Bridge over HTTPS at a stable hostname, such as `clacks.home.example.com`, with TLS terminated by Traefik. Plain HTTP on the LAN, such as `http://192.168.1.10:8080`, keeps working (the App's `Dioxus.toml` allows it), but sends the session token unencrypted. Traefik's Docker provider routes to a host-network container at `host.docker.internal` ([Traefik docs](https://doc.traefik.io/traefik/reference/install-configuration/providers/docker/#host-networking)), so give the Traefik container `extra_hosts: ["host.docker.internal:host-gateway"]`, and add to the `clacks` service these labels, in Traefik v3 syntax (v2 called the allow list `ipwhitelist`):
+The App can reach the Bridge over HTTPS at a stable hostname, such as `clacks.home.example.com`, with TLS terminated by Traefik. Plain HTTP on the LAN, such as `http://192.168.1.10:8080`, keeps working (the App's `Dioxus.toml` allows it), but sends the Audiobookshelf API key (at login) and the session token unencrypted. Traefik's Docker provider routes to a host-network container at `host.docker.internal` ([Traefik docs](https://doc.traefik.io/traefik/reference/install-configuration/providers/docker/#host-networking)), so give the Traefik container `extra_hosts: ["host.docker.internal:host-gateway"]`, and add to the `clacks` service these labels, in Traefik v3 syntax (v2 called the allow list `ipwhitelist`):
 
 ```yaml
     labels:
