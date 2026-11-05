@@ -271,6 +271,10 @@ fn unusable_encryption_key_file() {
         ("\n\n", "is empty"),
         ("s3cret-is-not-base64!\n", "is not base64"),
         ("i6n08ZhvCMQSMfsPMru0Tw==\n", "decodes to 16 bytes, not 32"),
+        (
+            "XI5RQJRCfpAnYDpji+U84BcbVNSWHdXV0RL2qChwW5Qj\n",
+            "decodes to 33 bytes, not 32",
+        ),
         (&too_long, "is longer than 1024 bytes, too long for a key"),
     ] {
         let secrets: &[&str] = if contents.trim().is_empty() {

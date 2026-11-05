@@ -45,8 +45,10 @@ impl fmt::Debug for SqliteStore {
 impl SqliteStore {
     /// Opens the database at `path`, creating it if it does not exist (its directory must),
     /// on Unix makes it readable by its owner only, and migrates its schema. API keys are
-    /// stored encrypted under `key`.
-    pub fn open(path: &Path, key: &EncryptionKey) -> Result<Self, Error> {
+    /// stored encrypted under `key`, which is wiped once the store has derived what it needs
+    /// from it, before the database is touched.
+    pub fn open(path: &Path, key: EncryptionKey) -> Result<Self, Error> {
+        let sealing = Sealing::new(key);
         create_private(path)?;
         let mut connection = Connection::open(path).map_err(step("open the database"))?;
         connection
@@ -70,7 +72,6 @@ impl SqliteStore {
                 .map_err(step("drop plain-text keys from free pages"))?;
         }
         migrate(&mut connection).map_err(step("migrate the schema"))?;
-        let sealing = Sealing::new(key);
         forget_keys_sealed_under_another_key(&connection, &sealing)
             .map_err(step("forget keys sealed under another encryption key"))?;
         Ok(Self {
@@ -353,7 +354,7 @@ mod tests {
 
         /// Opens the store with encryption key number `n`.
         fn open_with(&self, n: u8) -> SqliteStore {
-            SqliteStore::open(&self.path, &EncryptionKey::new([n; EncryptionKey::LEN]))
+            SqliteStore::open(&self.path, EncryptionKey::new(&[n; EncryptionKey::LEN]))
                 .expect("open database")
         }
 
@@ -609,7 +610,7 @@ mod tests {
             .execute_batch("BEGIN; SELECT count(*) FROM api_keys;")
             .unwrap();
 
-        let error = SqliteStore::open(&database.path, &EncryptionKey::new([1; EncryptionKey::LEN]))
+        let error = SqliteStore::open(&database.path, EncryptionKey::new(&[1; EncryptionKey::LEN]))
             .unwrap_err();
         assert_eq!(error.to_string(), "drop plain-text keys from free pages");
         assert_eq!(schema_version(&database), 1);
@@ -629,7 +630,7 @@ mod tests {
             .pragma_update(None, "user_version", newer)
             .unwrap();
 
-        let error = SqliteStore::open(&database.path, &EncryptionKey::new([1; EncryptionKey::LEN]))
+        let error = SqliteStore::open(&database.path, EncryptionKey::new(&[1; EncryptionKey::LEN]))
             .unwrap_err();
         assert_eq!(error.to_string(), "migrate the schema");
         let cause = std::error::Error::source(&error)
