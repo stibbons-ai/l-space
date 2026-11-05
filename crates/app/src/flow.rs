@@ -28,7 +28,8 @@ pub enum Screen {
     Starting,
     /// Asks for the Bridge's address.
     BridgeUrl { notice: Option<Notice> },
-    /// Picks a Library Server and takes an API key.
+    /// Picks a Library Server and takes an API key; also offers the Library Servers with a
+    /// session to switch to, and Back when opened from Settings.
     Login {
         library_servers: Vec<LibraryServer>,
         notice: Option<Notice>,
@@ -65,8 +66,8 @@ pub enum Screen {
         groups: Vec<Group>,
         notice: Option<Notice>,
     },
-    /// Logged in: the Library Server, the account, the language, logout, and the other
-    /// Library Servers with a session to switch to.
+    /// Logged in: the Library Server, the account, the language, logout, the other Library
+    /// Servers with a session to switch to, and logging in to another Library Server.
     Settings { notice: Option<Notice> },
 }
 
@@ -309,8 +310,8 @@ impl App {
 
     /// Logs in to the Library Server with base URL `library_server`, adding its session and
     /// selecting it; the other sessions stay. A session already on that Library Server is
-    /// replaced and ended on the Bridge, as far as it can. The key is sent to the Bridge and not
-    /// kept.
+    /// replaced, and once that is saved, ended on the Bridge as far as it can. The key is sent
+    /// to the Bridge and not kept.
     pub async fn log_in(&mut self, library_server: &str, api_key: ApiKey) {
         if !matches!(self.screen, Screen::Login { .. }) {
             return;
@@ -342,7 +343,11 @@ impl App {
                 });
                 authorize_selected(&self.stored);
                 let notice = self.save();
-                if let Some(replaced) = replaced {
+                // Only once the device no longer holds it: a failed save keeps the replaced
+                // session in the file, which must stay usable then.
+                if let Some(replaced) = replaced
+                    && notice.is_none()
+                {
                     self.end_session(&replaced.token).await;
                 }
                 self.show_libraries(notice).await;
@@ -740,9 +745,12 @@ impl App {
         self.save()
     }
 
-    /// Ends the session with `token` on the Bridge, as far as it can: the device forgets it
-    /// anyway. Later calls send the selected session's token again.
+    /// Ends the session with `token` on the Bridge, as far as it can; callers forget it on the
+    /// device either way. Later calls send the selected session's token again.
     async fn end_session(&self, token: &SessionToken) {
+        // The process-wide header carries `token` until the restore below. No guard restores
+        // it if this future is dropped midway: safe while `act` runs every action to its end
+        // on the root component, which lives as long as the App.
         authorize(Some(token));
         match self.call(api::logout()).await {
             Ok(()) => {}

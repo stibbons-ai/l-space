@@ -14,6 +14,8 @@ use crate::i18n::LanguageChoice;
 /// output is redacted ([`SessionToken`]).
 ///
 /// Reads what earlier Apps wrote too: their single `session` becomes the only session, selected.
+/// A file holding several sessions on one Library Server keeps the last; a `selected` naming
+/// none of the sessions selects nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "StoredFile")]
 pub struct Stored {
@@ -131,12 +133,13 @@ impl From<StoredFile> for Stored {
             language: file.language,
             ..Self::default()
         };
-        // At most one per Library Server, whatever the file holds.
+        // At most one per Library Server, whatever the file holds: the last one wins.
         for session in file.sessions {
             stored.add(session);
         }
-        stored.selected = file.selected;
-        // An earlier App's one session is the one it used.
+        stored.selected = file.selected.filter(|url| stored.position(url).is_some());
+        // An earlier App's one session is the one it used; it wins over `sessions` (which such
+        // an App never wrote).
         if let Some(session) = file.session {
             stored.add(session);
         }
@@ -162,7 +165,8 @@ pub struct StoredSession {
 }
 
 impl StoredSession {
-    /// The base URL of the Library Server the session is bound to, as the Bridge names it.
+    /// The base URL of the Library Server the session is bound to, as the Bridge confirmed it
+    /// for the account (`user.library_server`).
     pub fn library_server_url(&self) -> &str {
         &self.user.library_server
     }
@@ -289,4 +293,107 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     file.write_all(contents)?;
     file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use api::{CurrentUser, LibraryServer, SessionToken};
+    use serde_json::json;
+
+    use super::{Stored, StoredSession};
+
+    fn session(library_server: &str, token: &str) -> StoredSession {
+        StoredSession {
+            token: SessionToken::new(token),
+            library_server: LibraryServer {
+                base_url: library_server.to_owned(),
+                name: None,
+            },
+            user: CurrentUser {
+                library_server: library_server.to_owned(),
+                user_id: "u1".to_owned(),
+                username: "anna".to_owned(),
+            },
+        }
+    }
+
+    fn load(json: serde_json::Value) -> Stored {
+        serde_json::from_value(json).expect("a readable file")
+    }
+
+    fn tokens<'a>(sessions: impl Iterator<Item = &'a StoredSession>) -> Vec<&'a str> {
+        sessions.map(|session| session.token.expose()).collect()
+    }
+
+    #[test]
+    fn an_earlier_apps_one_session_becomes_the_selected_one() {
+        let stored = load(json!({
+            "bridge_url": "http://bridge",
+            "session": session("http://home", "t-home"),
+            "language": "system",
+        }));
+        assert_eq!(stored.session(), Some(&session("http://home", "t-home")));
+        assert_eq!(tokens(stored.other_sessions()), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn one_session_per_library_server_the_last_in_the_file_wins() {
+        let stored = load(json!({
+            "bridge_url": "http://bridge",
+            "sessions": [
+                session("http://home", "t-old"),
+                session("http://second", "t-second"),
+                session("http://home", "t-new"),
+            ],
+            "selected": "http://home",
+        }));
+        assert_eq!(stored.session().map(|s| s.token.expose()), Some("t-new"));
+        assert_eq!(tokens(stored.other_sessions()), ["t-second"]);
+    }
+
+    #[test]
+    fn a_selected_library_server_without_a_session_selects_nothing() {
+        let stored = load(json!({
+            "bridge_url": "http://bridge",
+            "sessions": [session("http://home", "t-home")],
+            "selected": "http://gone",
+        }));
+        assert_eq!(stored.session(), None);
+        assert_eq!(tokens(stored.other_sessions()), ["t-home"]);
+        // Saved again, the dangling selection is gone.
+        let saved = serde_json::to_value(&stored).unwrap();
+        assert_eq!(saved["selected"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn an_old_session_beside_sessions_is_kept_and_selected() {
+        let stored = load(json!({
+            "bridge_url": "http://bridge",
+            "session": session("http://home", "t-old-app"),
+            "sessions": [
+                session("http://home", "t-home"),
+                session("http://second", "t-second"),
+            ],
+            "selected": "http://second",
+        }));
+        assert_eq!(
+            stored.session().map(|s| s.token.expose()),
+            Some("t-old-app")
+        );
+        assert_eq!(tokens(stored.other_sessions()), ["t-second"]);
+    }
+
+    #[test]
+    fn debug_output_shows_no_token() {
+        let stored = load(json!({
+            "bridge_url": "http://bridge",
+            "sessions": [
+                session("http://home", "secret-home-token"),
+                session("http://second", "secret-second-token"),
+            ],
+            "selected": "http://home",
+        }));
+        let debug = format!("{stored:?}");
+        assert!(!debug.contains("secret"), "{debug}");
+    }
 }

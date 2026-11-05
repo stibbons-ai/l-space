@@ -146,7 +146,7 @@ fn LoginScreen(
         .map(|server| server.base_url.clone());
     // `None` until the person picks one: the first listed.
     let mut picked = use_signal(|| None::<String>);
-    // Only in this screen's state: it goes when a login moves on to Settings.
+    // Only in this screen's state: it goes when the person leaves Login.
     let mut api_key = use_signal(String::new);
     let key_empty = use_memo(move || api_key.read().trim().is_empty());
     let text = |text| app.read().text(text);
