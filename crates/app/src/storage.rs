@@ -30,8 +30,7 @@ pub struct Stored {
 impl Stored {
     /// The session the App uses, if one is selected.
     pub fn session(&self) -> Option<&StoredSession> {
-        let index = self.position(self.selected.as_deref()?)?;
-        Some(&self.sessions[index])
+        Some(&self.sessions[self.selected_position()?])
     }
 
     /// The sessions other than the selected one, to switch to.
@@ -48,7 +47,7 @@ impl Stored {
 
     /// Sets the account of the selected session; whether that changed it.
     pub fn update_user(&mut self, user: CurrentUser) -> bool {
-        let Some(index) = self.selected.as_deref().and_then(|url| self.position(url)) else {
+        let Some(index) = self.selected_position() else {
             return false;
         };
         let session = &mut self.sessions[index];
@@ -57,12 +56,19 @@ impl Stored {
         changed
     }
 
-    /// Selects the session on the Library Server with base URL `library_server`; returns it,
-    /// or `None` (selecting nothing new) if there is none.
-    pub fn select(&mut self, library_server: &str) -> Option<&StoredSession> {
-        let index = self.position(library_server)?;
-        self.selected = Some(library_server.to_owned());
-        Some(&self.sessions[index])
+    /// Where the selected session is, if one is selected.
+    fn selected_position(&self) -> Option<usize> {
+        self.position(self.selected.as_deref()?)
+    }
+
+    /// Selects the session on the Library Server with base URL `library_server`; whether there
+    /// is one (without, the selection stays).
+    pub fn select(&mut self, library_server: &str) -> bool {
+        let found = self.position(library_server).is_some();
+        if found {
+            self.selected = Some(library_server.to_owned());
+        }
+        found
     }
 
     /// Adds `session` and selects it. Returns the session it replaces: the one on the same

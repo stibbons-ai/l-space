@@ -205,7 +205,7 @@ impl App {
         if let Some(url) = &stored.bridge_url {
             point_at(url);
         }
-        authorize(stored.session().map(|session| &session.token));
+        authorize_selected(&stored);
         Self {
             store,
             stored,
@@ -340,7 +340,7 @@ impl App {
                     library_server,
                     user,
                 });
-                authorize(self.stored.session().map(|session| &session.token));
+                authorize_selected(&self.stored);
                 let notice = self.save();
                 if let Some(replaced) = replaced {
                     self.end_session(&replaced.token).await;
@@ -379,10 +379,10 @@ impl App {
     /// login, and lists its Libraries afresh: from Settings or Login. Every later call acts on
     /// that session; the next launch starts with it.
     pub async fn switch_to(&mut self, library_server: &str) {
-        let Some(session) = self.stored.select(library_server) else {
+        if !self.stored.select(library_server) {
             return;
-        };
-        authorize(Some(&session.token));
+        }
+        authorize_selected(&self.stored);
         let notice = self.save();
         self.show_libraries(notice).await;
     }
@@ -736,7 +736,7 @@ impl App {
     fn forget_session(&mut self) -> Option<Notice> {
         self.stored.forget_selected();
         self.back.clear();
-        authorize(None);
+        authorize_selected(&self.stored);
         self.save()
     }
 
@@ -753,7 +753,7 @@ impl App {
                 tracing::warn!(%error, "the Bridge did not end the session; forgetting it anyway");
             }
         }
-        authorize(self.stored.session().map(|session| &session.token));
+        authorize_selected(&self.stored);
     }
 
     /// Saves what the App remembers. Returns a notice if that failed.
@@ -826,6 +826,12 @@ fn point_at(url: &str) {
     // The client keeps a `&'static str`. The App points at a new Bridge only when the person
     // enters one, so the leaked strings stay few and small.
     set_server_url(url.to_owned().leak());
+}
+
+/// Authenticates every server function call with the selected session's token, or with
+/// nothing when none is selected.
+fn authorize_selected(stored: &Stored) {
+    authorize(stored.session().map(|session| &session.token));
 }
 
 /// Authenticates every server function call with `token`, or with nothing.
