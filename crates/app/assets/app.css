@@ -125,7 +125,8 @@ h2 {
 }
 
 ul.entries,
-ol.chapters {
+ol.chapters,
+ul.groups {
   list-style: none;
   padding: 0;
   margin: 0;
@@ -148,12 +149,14 @@ button.entry {
 }
 
 .entry .title,
-.chapters .title {
+.chapters .title,
+.groups .title {
   font-weight: 600;
 }
 
 .entry .detail,
-.chapters .detail {
+.chapters .detail,
+.groups .detail {
   color: #888;
   font-size: 15px;
 }
@@ -183,4 +186,12 @@ ol.chapters li {
 .filters button.selected {
   background: #0a63d8;
   color: white;
+}
+
+ul.groups li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 0;
+  border-bottom: 1px solid #8884;
 }

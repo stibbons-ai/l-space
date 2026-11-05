@@ -1,5 +1,5 @@
-//! The Bridge binary: loads the operator's configuration and encryption key, and serves the App
-//! API.
+//! The Bridge binary: loads the operator's configuration and encryption key, searches for Sonos
+//! players, and serves the App API.
 
 mod app_api;
 mod browse;
@@ -84,7 +84,11 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let router = api::server::router(Arc::new(AppApi::new(config.library_servers, store)));
+    let discovery_address = config.sonos.discovery_address;
+    tracing::info!(%discovery_address, "searching for Sonos players");
+    let sonos = sonos::Upnp::start(discovery_address, Arc::new(clock::SystemClock));
+    let app_api = AppApi::new(config.library_servers, store, Arc::new(sonos));
+    let router = api::server::router(Arc::new(app_api));
 
     tracing::info!(%addr, "listening");
     if let Err(error) = axum::serve(listener, router).await {

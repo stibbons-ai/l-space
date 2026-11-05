@@ -1,0 +1,212 @@
+//! Finding players with SSDP: one M-SEARCH for Sonos ZonePlayers, sent to the standard
+//! multicast address (or, in tests, wherever `sonos-fake` listens), and the unicast answers
+//! that arrive within the search window.
+
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+use std::time::Duration;
+
+use tokio::net::UdpSocket;
+use url::Url;
+
+use crate::{RAW, xml};
+
+/// SSDP's multicast group and port, where every UPnP device on the LAN listens.
+pub const MULTICAST: SocketAddr =
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(239, 255, 255, 250), 1900));
+
+/// The device type Sonos players announce.
+const ZONE_PLAYER: &str = "urn:schemas-upnp-org:device:ZonePlayer:1";
+
+/// The longest answer read; a Sonos answer is a few hundred bytes.
+const MAX_DATAGRAM: usize = 2048;
+
+/// The most players kept from a search, or known at once: far more than a household has, few
+/// enough that a flood of made-up answers can't grow without bound.
+pub(crate) const MAX_PLAYERS: usize = 64;
+
+/// How long a player may wait before answering a search (`MX`).
+const MX: Duration = Duration::from_secs(1);
+
+/// How long a search waits for answers: `MX`, plus a second for the network.
+const SEARCH_WINDOW: Duration = Duration::from_secs(MX.as_secs() + 1);
+
+/// A player that answered a search.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Found {
+    pub uuid: String,
+    /// Where its UPnP services answer.
+    pub addr: SocketAddr,
+}
+
+/// Sends one M-SEARCH to `target` and collects the players that answer within the search
+/// window, once each and at most [`MAX_PLAYERS`]. A failure to receive ends the search with
+/// what was found so far; only a failure to search at all is an error.
+pub(crate) async fn search(target: SocketAddr) -> io::Result<Vec<Found>> {
+    let any = match target {
+        SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    let socket = UdpSocket::bind((any, 0)).await?;
+    let request = format!(
+        "M-SEARCH * HTTP/1.1\r\nHOST: {target}\r\nMAN: \"ssdp:discover\"\r\nMX: {}\r\nST: {ZONE_PLAYER}\r\n\r\n",
+        MX.as_secs()
+    );
+    tracing::debug!(target: RAW, peer = %target, datagram = request, "SSDP datagram sent");
+    socket.send_to(request.as_bytes(), target).await?;
+
+    let deadline = tokio::time::Instant::now() + SEARCH_WINDOW;
+    let mut found: Vec<Found> = Vec::new();
+    let mut buffer = [0; MAX_DATAGRAM];
+    while found.len() < MAX_PLAYERS
+        && let Ok(received) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buffer)).await
+    {
+        let (length, from) = match received {
+            Ok(received) => received,
+            Err(error) => {
+                tracing::warn!(%target, %error, "SSDP search ended early");
+                break;
+            }
+        };
+        let datagram = String::from_utf8_lossy(&buffer[..length]);
+        tracing::debug!(target: RAW, peer = %from, datagram = %datagram, "SSDP datagram received");
+        match answer(&datagram, from) {
+            Some(player) if !found.iter().any(|known| known.uuid == player.uuid) => {
+                found.push(player);
+            }
+            Some(_) => {}
+            None => {
+                tracing::debug!(peer = %from, "ignored an SSDP answer that is not a Sonos player's")
+            }
+        }
+    }
+    if found.len() == MAX_PLAYERS {
+        tracing::warn!(%target, players = MAX_PLAYERS, "SSDP search stopped at the most players kept");
+    }
+    Ok(found)
+}
+
+/// The player in an M-SEARCH answer from `from`: a `200` for [`ZONE_PLAYER`] with a
+/// `uuid:` USN holding a Sonos player UUID (see [`xml::is_player_uuid`]) and an `http`
+/// LOCATION at the IP address the answer came from. A LOCATION elsewhere is refused, so an
+/// answer can't point the Bridge at another host.
+fn answer(datagram: &str, from: SocketAddr) -> Option<Found> {
+    let mut lines = datagram.split("\r\n");
+    let status = lines.next()?;
+    if !status.starts_with("HTTP/1.1 200") {
+        return None;
+    }
+    let (mut search_target, mut usn, mut location) = (None, None, None);
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (name, value) = (name.trim(), value.trim());
+        if name.eq_ignore_ascii_case("ST") {
+            search_target = Some(value);
+        } else if name.eq_ignore_ascii_case("USN") {
+            usn = Some(value);
+        } else if name.eq_ignore_ascii_case("LOCATION") {
+            location = Some(value);
+        }
+    }
+    if search_target? != ZONE_PLAYER {
+        return None;
+    }
+    let uuid = usn?.strip_prefix("uuid:")?.split("::").next()?.trim();
+    if !xml::is_player_uuid(uuid) {
+        return None;
+    }
+    let addr = services_at(location?)?;
+    if addr.ip() != from.ip() {
+        return None;
+    }
+    Some(Found {
+        uuid: uuid.to_owned(),
+        addr,
+    })
+}
+
+/// Where the services of the player with device description URL `location` answer; none
+/// unless it is `http` to an IP address.
+fn services_at(location: &str) -> Option<SocketAddr> {
+    let location = Url::parse(location).ok()?;
+    let host: IpAddr = match location.host()? {
+        url::Host::Ipv4(ip) => ip.into(),
+        url::Host::Ipv6(ip) => ip.into(),
+        url::Host::Domain(_) => return None,
+    };
+    if location.scheme() != "http" {
+        return None;
+    }
+    Some(SocketAddr::new(host, location.port_or_known_default()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FROM: &str = "192.168.1.23:1900";
+
+    fn datagram(st: &str, usn: &str, location: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age = 1800\r\nEXT:\r\nLOCATION: {location}\r\nSERVER: Linux UPnP/1.0 Sonos/97.2-81220 (ZPS14)\r\nST: {st}\r\nUSN: {usn}\r\nX-RINCON-HOUSEHOLD: Sonos_x\r\n\r\n"
+        )
+    }
+
+    fn read(datagram: &str) -> Option<Found> {
+        answer(datagram, FROM.parse().unwrap())
+    }
+
+    #[test]
+    fn reads_a_sonos_answer() {
+        let found = read(&datagram(
+            ZONE_PLAYER,
+            "uuid:RINCON_48A6B8000001400::urn:schemas-upnp-org:device:ZonePlayer:1",
+            "http://192.168.1.23:1400/xml/device_description.xml",
+        ));
+        assert_eq!(
+            found,
+            Some(Found {
+                uuid: "RINCON_48A6B8000001400".into(),
+                addr: "192.168.1.23:1400".parse().unwrap(),
+            })
+        );
+        // Header names in any case.
+        let lower = "HTTP/1.1 200 OK\r\nlocation: http://192.168.1.23/d.xml\r\nst: urn:schemas-upnp-org:device:ZonePlayer:1\r\nusn: uuid:RINCON_A\r\n\r\n";
+        assert_eq!(
+            read(lower),
+            Some(Found {
+                uuid: "RINCON_A".into(),
+                addr: "192.168.1.23:80".parse().unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn refuses_other_devices_and_broken_or_misdirecting_answers() {
+        let usn = "uuid:RINCON_A::urn:schemas-upnp-org:device:ZonePlayer:1";
+        let here = "http://192.168.1.23:1400/xml/device_description.xml";
+        for datagram in [
+            String::new(),
+            "garbage".into(),
+            datagram(ZONE_PLAYER, usn, here).replace("200 OK", "404 Not Found"),
+            datagram("urn:schemas-upnp-org:device:MediaRenderer:1", usn, here),
+            datagram(ZONE_PLAYER, "RINCON_A", here),
+            datagram(ZONE_PLAYER, "uuid:::x", here),
+            datagram(ZONE_PLAYER, "uuid:not-a-sonos-uuid::x", here),
+            datagram(
+                ZONE_PLAYER,
+                &format!("uuid:RINCON_{}", "0".repeat(64)),
+                here,
+            ),
+            datagram(ZONE_PLAYER, usn, "not a url"),
+            datagram(ZONE_PLAYER, usn, "https://192.168.1.23:1443/x.xml"),
+            datagram(ZONE_PLAYER, usn, "http://192.168.1.99:1400/x.xml"),
+            datagram(ZONE_PLAYER, usn, "http://sonos.lan:1400/x.xml"),
+            "HTTP/1.1 200 OK\r\nST: urn:schemas-upnp-org:device:ZonePlayer:1\r\n\r\n".into(),
+        ] {
+            assert_eq!(read(&datagram), None, "{datagram:?}");
+        }
+    }
+}

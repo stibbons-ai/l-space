@@ -1,28 +1,31 @@
-//! The App API's view of this Bridge: configured Library Servers, logins and sessions, and
-//! browsing a session's Library Server as its user.
+//! The App API's view of this Bridge: configured Library Servers, logins and sessions,
+//! browsing a session's Library Server as its user, and the household's Sonos Groups.
 
 use std::fmt::Write;
+use std::sync::Arc;
 
 use api::server::{BoxFuture, Bridge};
 use api::{
-    ApiError, CurrentUser, EpisodeFilter, Item, ItemId, Library, LibraryEntry, LibraryServer,
-    Podcast, Session, SessionToken,
+    ApiError, CurrentUser, EpisodeFilter, Group, GroupMember, Item, ItemId, Library, LibraryEntry,
+    LibraryServer, NowPlaying, Podcast, Session, SessionToken, TransportState,
 };
+use sonos::Sonos;
 use store::{LibraryUser, SessionId, Store};
 
 use crate::browse;
 use crate::config::{LibraryServerConfig, LibraryServerUrl};
 
-/// Serves the App API from the configured Library Servers and the [`Store`].
+/// Serves the App API from the configured Library Servers, the [`Store`] and [`Sonos`].
 #[derive(Debug)]
 pub struct AppApi<S> {
     library_servers: Vec<LibraryServer>,
     abs: abs::Client,
     store: S,
+    sonos: Arc<dyn Sonos>,
 }
 
 impl<S: Store> AppApi<S> {
-    pub fn new(library_servers: Vec<LibraryServerConfig>, store: S) -> Self {
+    pub fn new(library_servers: Vec<LibraryServerConfig>, store: S, sonos: Arc<dyn Sonos>) -> Self {
         let library_servers = library_servers
             .into_iter()
             .map(|server| LibraryServer {
@@ -34,6 +37,7 @@ impl<S: Store> AppApi<S> {
             library_servers,
             abs: abs::Client::new(),
             store,
+            sonos,
         }
     }
 
@@ -185,6 +189,21 @@ impl<S: Store> AppApi<S> {
             .await?;
         browse::item(&user, library_item, id)
             .map_err(|reason| missing(library_server, request, episode.as_deref(), reason))
+    }
+
+    /// Every Sonos Group, for any valid session.
+    async fn groups(&self, token: SessionToken) -> Result<Vec<Group>, ApiError> {
+        self.session(&token).await?;
+        match self.sonos.groups().await {
+            Ok(groups) => Ok(groups.into_iter().map(group).collect()),
+            Err(error) => {
+                tracing::warn!(%error, "cannot list the Sonos Groups");
+                Err(match error {
+                    sonos::Error::Unreachable => ApiError::SonosUnreachable,
+                    sonos::Error::SearchFailed => ApiError::SonosSearchFailed,
+                })
+            }
+        }
     }
 
     /// The session `token` names, and the configured Library Server it belongs to.
@@ -356,6 +375,39 @@ impl<S: Store> Bridge for AppApi<S> {
         filter: EpisodeFilter,
     ) -> BoxFuture<'_, Result<Podcast, ApiError>> {
         Box::pin(self.podcast(token, podcast, filter))
+    }
+
+    fn groups(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Group>, ApiError>> {
+        Box::pin(self.groups(token))
+    }
+}
+
+/// A Group as the App API describes it.
+fn group(group: sonos::Group) -> Group {
+    Group {
+        id: group.id,
+        name: group.name,
+        members: group
+            .members
+            .into_iter()
+            .map(|member| GroupMember {
+                id: member.id,
+                name: member.name,
+            })
+            .collect(),
+        state: group.state.map(|state| match state {
+            sonos::TransportState::Playing => TransportState::Playing,
+            sonos::TransportState::Paused => TransportState::Paused,
+            sonos::TransportState::Stopped => TransportState::Stopped,
+            sonos::TransportState::Transitioning => TransportState::Transitioning,
+            sonos::TransportState::Unknown => TransportState::Unknown,
+        }),
+        now_playing: group.track.map(|track| NowPlaying {
+            title: track.title,
+            creator: track.creator,
+            position: track.position.map(|position| position.as_secs_f64()),
+            duration: track.duration.map(|duration| duration.as_secs_f64()),
+        }),
     }
 }
 

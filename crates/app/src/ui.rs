@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use api::{ApiKey, EpisodeFilter, Item, Library, LibraryEntry, LibraryServer};
+use api::{ApiKey, EpisodeFilter, Group, Item, Library, LibraryEntry, LibraryServer};
 use dioxus::prelude::*;
 
 use crate::flow::{App, Notice, Screen};
@@ -47,6 +47,9 @@ pub fn root() -> Element {
                 },
                 Screen::Item { item, notice } => rsx! {
                     ItemScreen { app, busy, item, notice }
+                },
+                Screen::Groups { groups, notice } => rsx! {
+                    GroupsScreen { app, busy, groups, notice }
                 },
                 Screen::Settings { notice } => rsx! {
                     SettingsScreen { app, busy, notice }
@@ -211,18 +214,16 @@ fn LoginScreen(
     }
 }
 
-/// A button above the screen's title, to move between screens.
+/// A button above the screen's title, in its `nav`, to move between screens.
 #[component]
 fn NavButton(busy: Signal<bool>, label: String, onclick: EventHandler<MouseEvent>) -> Element {
     rsx! {
-        nav {
-            button {
-                r#type: "button",
-                class: "secondary",
-                disabled: busy(),
-                onclick: move |event| onclick.call(event),
-                {label}
-            }
+        button {
+            r#type: "button",
+            class: "secondary",
+            disabled: busy(),
+            onclick: move |event| onclick.call(event),
+            {label}
         }
     }
 }
@@ -231,10 +232,12 @@ fn NavButton(busy: Signal<bool>, label: String, onclick: EventHandler<MouseEvent
 #[component]
 fn BackButton(app: Signal<App>, busy: Signal<bool>) -> Element {
     rsx! {
-        NavButton {
-            busy,
-            label: app.read().text(Text::Back),
-            onclick: move |_| app.write().go_back(),
+        nav {
+            NavButton {
+                busy,
+                label: app.read().text(Text::Back),
+                onclick: move |_| app.write().go_back(),
+            }
         }
     }
 }
@@ -250,10 +253,17 @@ fn LibrariesScreen(
     // Nothing listed because the listing failed, not because there is nothing.
     let failed = libraries.is_empty() && matches!(notice, Some(Notice::Api(_)));
     rsx! {
-        NavButton {
-            busy,
-            label: text(Text::SettingsTitle),
-            onclick: move |_| app.write().open_settings(),
+        nav {
+            NavButton {
+                busy,
+                label: text(Text::GroupsTitle),
+                onclick: move |_| act(app, busy, async |app: &mut App| app.open_groups().await),
+            }
+            NavButton {
+                busy,
+                label: text(Text::SettingsTitle),
+                onclick: move |_| app.write().open_settings(),
+            }
         }
         h1 { {text(Text::LibrariesTitle)} }
         NoticeView { app, notice }
@@ -436,6 +446,57 @@ fn ItemScreen(app: Signal<App>, busy: Signal<bool>, item: Item, notice: Option<N
 }
 
 #[component]
+fn GroupsScreen(
+    app: Signal<App>,
+    busy: Signal<bool>,
+    groups: Vec<Group>,
+    notice: Option<Notice>,
+) -> Element {
+    let text = |text| app.read().text(text);
+    let language = app.read().language();
+    // Nothing listed because the listing failed, not because there is nothing.
+    let failed = groups.is_empty() && matches!(notice, Some(Notice::Api(_)));
+    rsx! {
+        nav {
+            NavButton {
+                busy,
+                label: text(Text::LibrariesTitle),
+                onclick: move |_| act(app, busy, async |app: &mut App| app.open_libraries().await),
+            }
+            NavButton {
+                busy,
+                label: text(if failed { Text::Retry } else { Text::GroupsRefresh }),
+                onclick: move |_| act(app, busy, async |app: &mut App| app.open_groups().await),
+            }
+        }
+        h1 { {text(Text::GroupsTitle)} }
+        NoticeView { app, notice }
+        if groups.is_empty() && !failed {
+            p { {text(Text::GroupsNone)} }
+        }
+        ul { class: "groups",
+            for group in groups {
+                li { key: "{group.id}",
+                    span { class: "title", "{group.name}" }
+                    span { class: "detail", {member_names(&group)} }
+                    span { class: "detail", {i18n::group_playback(language, &group)} }
+                }
+            }
+        }
+    }
+}
+
+/// A Group's members as its row lists them: "Kitchen, Bath".
+fn member_names(group: &Group) -> String {
+    let names: Vec<&str> = group
+        .members
+        .iter()
+        .map(|member| member.name.as_str())
+        .collect();
+    names.join(", ")
+}
+
+#[component]
 fn SettingsScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>) -> Element {
     let text = |text| app.read().text(text);
     let (library_server, username, bridge_url, choice) = {
@@ -451,10 +512,12 @@ fn SettingsScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>) 
         )
     };
     rsx! {
-        NavButton {
-            busy,
-            label: text(Text::LibrariesTitle),
-            onclick: move |_| act(app, busy, async |app: &mut App| app.open_libraries().await),
+        nav {
+            NavButton {
+                busy,
+                label: text(Text::LibrariesTitle),
+                onclick: move |_| act(app, busy, async |app: &mut App| app.open_libraries().await),
+            }
         }
         h1 { {text(Text::SettingsTitle)} }
         NoticeView { app, notice }

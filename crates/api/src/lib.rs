@@ -17,6 +17,8 @@
 //! filtered by the user's Progress, and [`item`] one Item with that Progress, its chapters and
 //! its audio files. Ids from the App name things on the Library Server; one that names nothing
 //! the user can see is [`ApiError::NotFound`].
+//!
+//! A session also sees the household's Sonos Groups with what each plays, [`groups`].
 
 use std::fmt;
 
@@ -246,6 +248,63 @@ impl EpisodeFilter {
     }
 }
 
+/// A Sonos Group exactly as set up in the Sonos app (the Bridge never changes grouping), with
+/// what it plays.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Group {
+    /// Its coordinator's UUID, such as `RINCON_48A6B8000001400`; always the coordinator's, also
+    /// when the coordinator is not a member (it is invisible in the Sonos app).
+    pub id: String,
+    /// The name set in the Sonos app for its coordinator (bonded speakers share it).
+    pub name: String,
+    /// The players the Sonos app shows in the Group, its coordinator first when it is one of
+    /// them; never empty. A single speaker is a Group of one. A bonded surround or sub, the
+    /// second speaker of a stereo pair and a Boost are not members.
+    pub members: Vec<GroupMember>,
+    /// What the Group's playback is doing; none if its coordinator was not found by the
+    /// Bridge's searches, didn't answer, or answered too late.
+    pub state: Option<TransportState>,
+    /// The track it has loaded, if any and if its coordinator said; none whenever `state` is
+    /// none.
+    pub now_playing: Option<NowPlaying>,
+}
+
+/// A Sonos player in a Group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupMember {
+    /// The player's UUID.
+    pub id: String,
+    /// The name set in the Sonos app for it.
+    pub name: String,
+}
+
+/// What a Group's playback is doing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportState {
+    Playing,
+    Paused,
+    Stopped,
+    /// Between states, such as while starting a track.
+    Transitioning,
+    /// The coordinator's answer had no state, or one the Bridge doesn't know; or (on the App's
+    /// side, when decoding) a state from a newer Bridge. Last, as serde wants its catch-all.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The track a Group has loaded. Times are seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NowPlaying {
+    /// From the track's metadata, if it has one.
+    pub title: Option<String>,
+    pub creator: Option<String>,
+    /// How far into the track playback is.
+    pub position: Option<f64>,
+    /// The track's length; none when unknown, as for a stream.
+    pub duration: Option<f64>,
+}
+
 /// An error code the App translates for the user.
 ///
 /// On the wire this is the `data` member of the error body, for example
@@ -291,6 +350,15 @@ pub enum ApiError {
     /// see.
     #[error("not_found")]
     NotFound,
+    /// The Bridge knows Sonos players, but none of them told it the Group topology within the
+    /// listing's time.
+    #[error("sonos_unreachable")]
+    SonosUnreachable,
+    /// The Bridge knows no Sonos player, and can't tell whether there are any: its last search
+    /// could not be sent (socket not bound, or datagram not sent), its searching stopped, or
+    /// its first search didn't end within the listing's time.
+    #[error("sonos_search_failed")]
+    SonosSearchFailed,
     /// A code this build of the App does not know yet, from a newer Bridge. Produced only on
     /// the App's side, when decoding; the Bridge never sends it.
     #[serde(other)]
@@ -323,9 +391,11 @@ impl AsStatusCode for ApiError {
         match self {
             Self::ApiKeyRejected | Self::SessionInvalid => StatusCode::UNAUTHORIZED,
             Self::LibraryServerNotConfigured | Self::NotFound => StatusCode::NOT_FOUND,
-            Self::BridgeUnreachable | Self::NotABridge | Self::LibraryServerUnreachable => {
-                StatusCode::BAD_GATEWAY
-            }
+            Self::BridgeUnreachable
+            | Self::NotABridge
+            | Self::LibraryServerUnreachable
+            | Self::SonosUnreachable
+            | Self::SonosSearchFailed => StatusCode::BAD_GATEWAY,
             Self::Internal | Self::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -419,6 +489,17 @@ pub async fn podcast(id: String, filter: Option<EpisodeFilter>) -> Result<Podcas
         .await
 }
 
+/// Every Sonos Group in the Bridge's household, exactly as grouped in the Sonos app, with
+/// what each plays; by name. None when the Bridge has found no Sonos player.
+#[get(
+    "/api/groups",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn groups() -> Result<Vec<Group>, ApiError> {
+    bridge.groups(server::session_token(&headers)?).await
+}
+
 /// The Bridge's side of the App API.
 #[cfg(feature = "server")]
 pub mod server {
@@ -432,7 +513,7 @@ pub mod server {
     use dioxus::server::{DioxusRouterExt, FullstackState};
 
     use crate::{
-        ApiError, ApiKey, CurrentUser, EpisodeFilter, Item, ItemId, Library, LibraryEntry,
+        ApiError, ApiKey, CurrentUser, EpisodeFilter, Group, Item, ItemId, Library, LibraryEntry,
         LibraryServer, Podcast, Session, SessionToken,
     };
 
@@ -478,6 +559,9 @@ pub mod server {
             podcast: String,
             filter: EpisodeFilter,
         ) -> BoxFuture<'_, Result<Podcast, ApiError>>;
+
+        /// See [`crate::groups`].
+        fn groups(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Group>, ApiError>>;
     }
 
     /// How server functions reach the [`Bridge`].
@@ -515,7 +599,7 @@ mod tests {
     use dioxus::fullstack::{AsStatusCode, StatusCode};
     use serde_json::json;
 
-    use super::{ApiError, ApiKey, SessionToken};
+    use super::{ApiError, ApiKey, SessionToken, TransportState};
 
     #[test]
     fn error_codes_travel_as_a_code_field() {
@@ -534,6 +618,18 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ApiError>(json!({"code": "group_busy"})).unwrap(),
             ApiError::Unknown
+        );
+    }
+
+    #[test]
+    fn a_transport_state_from_a_newer_bridge_decodes_as_unknown() {
+        assert_eq!(
+            serde_json::from_value::<TransportState>(json!("recording")).unwrap(),
+            TransportState::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<TransportState>(json!("paused")).unwrap(),
+            TransportState::Paused
         );
     }
 

@@ -14,15 +14,18 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use api::{
-    ApiError, ApiKey, EpisodeFilter, ItemId, Library, LibraryEntry, LibraryKind, LibraryServer,
-    Progress, Session,
+    ApiError, ApiKey, EpisodeFilter, Group, GroupMember, ItemId, Library, LibraryEntry,
+    LibraryKind, LibraryServer, NowPlaying, Progress, Session, TransportState,
 };
 use app::flow::{App, Notice, Screen};
 use app::i18n::{self, Language, LanguageChoice, Text};
 use app::storage::{DeviceStore, FileStore, LoadError, Stored};
+use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 use tempfile::TempDir;
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_PUBLISHED_AT};
-use test_support::bridge::{TestBridge, library_server_toml, named_library_server_toml};
+use test_support::bridge::{
+    TestBridge, home_with_sonos_toml, library_server_toml, named_library_server_toml,
+};
 use test_support::closed_port;
 
 /// The seeded audiobook Library.
@@ -172,6 +175,14 @@ fn bridge_with_abs() -> (TestBridge, Arc<Audiobookshelf>, String) {
     let unreachable = format!("http://{}", closed_port());
     let bridge = TestBridge::start(&home_config(&abs, &unreachable));
     (bridge, abs, unreachable)
+}
+
+/// A Bridge with the shared Audiobookshelf as its Library Server "Home", searching `household`
+/// for Sonos players.
+fn bridge_with_household(household: &Household) -> (TestBridge, Arc<Audiobookshelf>) {
+    let abs = Audiobookshelf::shared();
+    let config = home_with_sonos_toml(abs.base_url(), household.ssdp());
+    (TestBridge::start(&config), abs)
 }
 
 /// Restarts `bridge` on `config` and points `device` at it: it may listen on another port.
@@ -1502,5 +1513,238 @@ fn a_filter_that_fails_keeps_the_episodes_shown() {
             }
         );
         assert!(app.session().is_some());
+    });
+}
+
+#[test]
+fn the_groups_screen_shows_each_group_and_what_it_plays() {
+    let (household, clock) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let bath = household.add_player("Bath");
+    household.join(&bath, &kitchen);
+    let office = household.add_player("Office");
+    household.add_bonded(&office);
+    household.play(
+        &kitchen,
+        FakeTrack::new("Moby Dick", Duration::from_secs(600)).by("Herman Melville"),
+    );
+    clock.advance(Duration::from_secs(90));
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+
+        app.open_groups().await;
+        let member = |player: &PlayerId, name: &str| GroupMember {
+            id: player.uuid().to_owned(),
+            name: name.to_owned(),
+        };
+        let groups = vec![
+            Group {
+                id: kitchen.uuid().to_owned(),
+                name: "Kitchen".into(),
+                members: vec![member(&kitchen, "Kitchen"), member(&bath, "Bath")],
+                state: Some(TransportState::Playing),
+                now_playing: Some(NowPlaying {
+                    title: Some("Moby Dick".into()),
+                    creator: Some("Herman Melville".into()),
+                    position: Some(90.0),
+                    duration: Some(600.0),
+                }),
+            },
+            Group {
+                id: office.uuid().to_owned(),
+                name: "Office".into(),
+                members: vec![member(&office, "Office")],
+                state: Some(TransportState::Stopped),
+                now_playing: None,
+            },
+        ];
+        assert_eq!(
+            app.screen(),
+            &Screen::Groups {
+                groups: groups.clone(),
+                notice: None
+            }
+        );
+        assert!(!app.can_go_back());
+        let playback = |app: &App| {
+            groups
+                .iter()
+                .map(|group| i18n::group_playback(app.language(), group))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            texts_of(&mut app, playback),
+            (
+                vec![
+                    "Playing · Moby Dick · Herman Melville".to_owned(),
+                    "Stopped".to_owned()
+                ],
+                vec![
+                    "Spielt · Moby Dick · Herman Melville".to_owned(),
+                    "Gestoppt".to_owned()
+                ],
+            )
+        );
+
+        // Refreshing shows what changed in Sonos since.
+        household.pause(&kitchen);
+        household.leave(&bath);
+        app.open_groups().await;
+        let Screen::Groups {
+            groups,
+            notice: None,
+        } = app.screen()
+        else {
+            panic!("{:?}", app.screen());
+        };
+        let shown: Vec<_> = groups
+            .iter()
+            .map(|group| (group.name.as_str(), group.state))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("Bath", Some(TransportState::Stopped)),
+                ("Kitchen", Some(TransportState::Paused)),
+                ("Office", Some(TransportState::Stopped)),
+            ]
+        );
+
+        app.open_libraries().await;
+        assert_eq!(app.screen(), &libraries(&abs, None));
+    });
+}
+
+#[test]
+fn every_playback_state_reads_as_such_in_english_and_german() {
+    let (household, _) = Household::with_manual_clock();
+    let bath = household.add_player("Bath");
+    household.set_transport_state(&bath, "TRANSITIONING");
+    let den = household.add_player("Den");
+    household.set_fault(&den, Fault::Garbage);
+    let kitchen = household.add_player("Kitchen");
+    household.play(
+        &kitchen,
+        FakeTrack::new("Moby Dick", Duration::from_secs(600)),
+    );
+    household.pause(&kitchen);
+    let office = household.add_player("Office");
+    household.set_transport_state(&office, "RECORDING");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+
+        app.open_groups().await;
+        let playback = |app: &App| {
+            let Screen::Groups { groups, .. } = app.screen() else {
+                panic!("{:?}", app.screen());
+            };
+            groups
+                .iter()
+                .map(|group| i18n::group_playback(app.language(), group))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            texts_of(&mut app, playback),
+            (
+                vec![
+                    "Starting…".to_owned(),
+                    "Not answering".to_owned(),
+                    "Paused · Moby Dick".to_owned(),
+                    "Unknown state".to_owned(),
+                ],
+                vec![
+                    "Startet…".to_owned(),
+                    "Antwortet nicht".to_owned(),
+                    "Pausiert · Moby Dick".to_owned(),
+                    "Unbekannter Zustand".to_owned(),
+                ],
+            )
+        );
+    });
+}
+
+#[test]
+fn the_groups_screen_is_empty_without_sonos_players() {
+    let (household, _) = Household::with_manual_clock();
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+
+        app.open_groups().await;
+        assert_eq!(
+            app.screen(),
+            &Screen::Groups {
+                groups: Vec::new(),
+                notice: None
+            }
+        );
+    });
+}
+
+#[test]
+fn groups_that_cannot_be_listed_are_explained_and_listed_on_refresh() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    household.set_fault(&kitchen, Fault::Garbage);
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+
+        app.open_groups().await;
+        assert_eq!(
+            app.screen(),
+            &Screen::Groups {
+                groups: Vec::new(),
+                notice: Some(Notice::Api(ApiError::SonosUnreachable)),
+            }
+        );
+        assert_eq!(notice_texts(&mut app), both(Text::ErrorSonosUnreachable));
+        assert!(app.session().is_some());
+
+        household.set_fault(&kitchen, Fault::None);
+        app.open_groups().await;
+        assert!(
+            matches!(app.screen(), Screen::Groups { groups, notice: None } if groups.len() == 1),
+            "{:?}",
+            app.screen()
+        );
+    });
+}
+
+#[test]
+fn a_session_ended_elsewhere_leads_from_the_groups_to_login() {
+    let (household, _) = Household::with_manual_clock();
+    household.add_player("Kitchen");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        bridge.api().logout(&session(&app)).await;
+
+        app.open_groups().await;
+
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Login {
+                    notice: Some(Notice::Api(ApiError::SessionInvalid)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(app.session(), None);
     });
 }

@@ -7,6 +7,9 @@
 //! [[library_servers]]
 //! url = "https://abs.example.com"
 //! name = "Home"              # optional
+//!
+//! [sonos]                     # optional
+//! discovery_address = "239.255.255.250:1900"   # the default: SSDP multicast
 //! ```
 
 use std::fmt;
@@ -27,6 +30,7 @@ pub struct Config {
     pub database: PathBuf,
     /// In file order; no two share a [`LibraryServerUrl`].
     pub library_servers: Vec<LibraryServerConfig>,
+    pub sonos: SonosConfig,
 }
 
 /// One configured Library Server.
@@ -36,6 +40,14 @@ pub struct LibraryServerConfig {
     pub name: Option<String>,
 }
 
+/// How the Bridge reaches Sonos.
+#[derive(Debug)]
+pub struct SonosConfig {
+    /// Where the Bridge sends its SSDP searches for players: the SSDP multicast group
+    /// (`239.255.255.250:1900`) unless set, which tests point at `sonos-fake` on loopback.
+    pub discovery_address: SocketAddr,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -43,6 +55,8 @@ struct RawConfig {
     database: PathBuf,
     #[serde(default)]
     library_servers: Vec<RawLibraryServer>,
+    #[serde(default)]
+    sonos: RawSonos,
 }
 
 #[derive(Deserialize)]
@@ -50,6 +64,12 @@ struct RawConfig {
 struct RawLibraryServer {
     url: String,
     name: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSonos {
+    discovery_address: Option<SocketAddr>,
 }
 
 /// Why the configuration was rejected. URL errors name the offending entry, and its value only
@@ -132,6 +152,9 @@ impl std::str::FromStr for Config {
             listen: raw.listen,
             database: raw.database,
             library_servers,
+            sonos: SonosConfig {
+                discovery_address: raw.sonos.discovery_address.unwrap_or(sonos::MULTICAST),
+            },
         })
     }
 }
@@ -444,6 +467,24 @@ mod tests {
         .parse::<Config>()
         .unwrap();
         assert_eq!(config.library_servers.len(), 2);
+    }
+
+    #[test]
+    fn sonos_discovery_searches_the_ssdp_multicast_group_unless_set() {
+        let base = "listen = \"127.0.0.1:0\"\ndatabase = \"bridge.db\"\n";
+        let config = base.parse::<Config>().unwrap();
+        assert_eq!(
+            config.sonos.discovery_address,
+            "239.255.255.250:1900".parse().unwrap()
+        );
+
+        let config = format!("{base}[sonos]\ndiscovery_address = \"127.0.0.1:41900\"\n")
+            .parse::<Config>()
+            .unwrap();
+        assert_eq!(
+            config.sonos.discovery_address,
+            "127.0.0.1:41900".parse().unwrap()
+        );
     }
 
     #[test]

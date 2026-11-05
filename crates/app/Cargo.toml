@@ -25,6 +25,7 @@ url.workspace = true
 
 [dev-dependencies]
 fluent-syntax.workspace = true
+sonos-fake.workspace = true
 tempfile.workspace = true
 test-support.workspace = true
 
