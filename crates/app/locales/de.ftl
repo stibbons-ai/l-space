@@ -41,6 +41,8 @@ item-duration = Dauer
 item-published = Veröffentlicht
 item-progress = Fortschritt
 item-chapters = Kapitel
+item-mark-finished = Als beendet markieren
+item-mark-unfinished = Als nicht beendet markieren
 
 progress-finished = Beendet
 progress-not-started = Nicht begonnen

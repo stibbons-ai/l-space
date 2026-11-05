@@ -229,23 +229,90 @@ impl<S: Store> AppApi<S> {
     }
 
     async fn item(&self, token: SessionToken, id: ItemId) -> Result<Item, ApiError> {
+        Ok(self.found_item(token, id, "fetch an Item").await?.fetched)
+    }
+
+    /// The Item `id` from the session's Library Server as its user (the `operation` named in
+    /// log events), with what [`AppApi::browse`] fetched it for; not found unless the library
+    /// item the user can see holds it.
+    async fn found_item(
+        &self,
+        token: SessionToken,
+        id: ItemId,
+        operation: &'static str,
+    ) -> Result<Browsed<'_, Item>, ApiError> {
         let (library_item_id, episode) = (id.library_item.clone(), id.episode.clone());
         let request = Request {
-            operation: "fetch an Item",
+            operation,
             id: Some(&library_item_id),
         };
         let Browsed {
             library_server,
+            session,
             user,
             fetched: library_item,
-            ..
         } = self
             .browse(token, request, async |server, key| {
                 self.abs.library_item(server, key, &library_item_id).await
             })
             .await?;
-        browse::item(&user, library_item, id)
-            .map_err(|reason| missing(library_server, request, episode.as_deref(), reason))
+        let item = browse::item(&user, library_item, id)
+            .map_err(|reason| missing(library_server, request, episode.as_deref(), reason))?;
+        Ok(Browsed {
+            library_server,
+            session,
+            user,
+            fetched: item,
+        })
+    }
+
+    /// Marks Item `id` Finished or unfinished for the session's user with their key, once the
+    /// library item is found to hold it: Audiobookshelf itself checks neither that the user
+    /// may see the library item nor that the episode belongs to it. Answers with the Item and
+    /// the user's Progress read back from the Library Server.
+    async fn mark_finished(
+        &self,
+        token: SessionToken,
+        id: ItemId,
+        finished: bool,
+    ) -> Result<Item, ApiError> {
+        const OPERATION: &str = "mark an Item Finished or unfinished";
+        let Browsed {
+            library_server,
+            session,
+            user,
+            fetched: mut item,
+        } = self.found_item(token, id, OPERATION).await?;
+        let (library_item_id, episode) = (&item.id.library_item, item.id.episode.as_deref());
+        if let Err(error) = self
+            .abs
+            .set_finished(
+                library_server,
+                &session.api_key,
+                library_item_id,
+                episode,
+                finished,
+            )
+            .await
+        {
+            let request = Request {
+                operation: OPERATION,
+                id: Some(library_item_id),
+            };
+            return Err(self.failure(library_server, &session, request, error).await);
+        }
+        tracing::info!(
+            library_server,
+            user_id = user.id,
+            library_item = library_item_id,
+            episode,
+            finished,
+            "Item marked"
+        );
+        let user = self.abs.me(library_server, &session.api_key).await;
+        let user = self.verified(library_server, &session, user).await?;
+        item.progress = browse::item_progress(&user, &item.id);
+        Ok(item)
     }
 
     /// Every Sonos Group, for any valid session.
@@ -582,6 +649,15 @@ impl<S: Store> Bridge for AppApi<S> {
 
     fn item(&self, token: SessionToken, id: ItemId) -> BoxFuture<'_, Result<Item, ApiError>> {
         Box::pin(self.item(token, id))
+    }
+
+    fn mark_finished(
+        &self,
+        token: SessionToken,
+        item: ItemId,
+        finished: bool,
+    ) -> BoxFuture<'_, Result<Item, ApiError>> {
+        Box::pin(self.mark_finished(token, item, finished))
     }
 
     fn podcast(

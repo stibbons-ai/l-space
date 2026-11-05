@@ -15,13 +15,15 @@
 //! A session browses its Library Server as its user: [`libraries`] lists the Libraries,
 //! [`library_entries`] a Library's audiobooks or podcasts, [`podcast`] a podcast's episodes
 //! filtered by the user's Progress, and [`item`] one Item with that Progress, its chapters and
-//! its audio files. Ids from the App name things on the Library Server; one that names nothing
-//! the user can see is [`ApiError::NotFound`].
+//! its audio files; [`mark_finished`] marks an Item Finished or unfinished for the user. Ids
+//! from the App name things on the Library Server; one that names nothing the user can see is
+//! [`ApiError::NotFound`].
 //!
 //! A session also sees the household's Sonos Groups with what each plays, [`groups`], starts
 //! an Item on a Group, [`start_handoff`], and sees every active Handoff, [`handoffs`]. Any
 //! logged-in household member may start on any Group and sees every Handoff.
 
+use std::cmp::Reverse;
 use std::fmt;
 
 use dioxus::fullstack::{AsStatusCode, ServerFnError, StatusCode};
@@ -221,6 +223,14 @@ pub struct Episode {
     /// The session user's Progress; none if the Library Server holds no Progress of theirs
     /// for the episode.
     pub progress: Option<Progress>,
+}
+
+impl Episode {
+    /// Its place in its podcast's list, the smallest first: newest first, episodes without a
+    /// publish date last.
+    pub fn order(&self) -> Reverse<Option<i64>> {
+        Reverse(self.published_at)
+    }
 }
 
 /// Which of a podcast's episodes to list, by the session user's Progress. A filter this
@@ -503,6 +513,22 @@ pub async fn item(library_item: String, episode: Option<String>) -> Result<Item,
     bridge.item(server::session_token(&headers)?, id).await
 }
 
+/// Marks the Item `item` Finished (`finished`) or unfinished for the session user on the
+/// session's Library Server, which keeps Progress; answers with the Item as it is then. The
+/// Library Server gives an Item without the user's Progress some at 0 seconds, and sets the
+/// position of a Finished one marked unfinished back to 0. An Item the user can't see is
+/// [`ApiError::NotFound`], and nothing is written.
+#[post(
+    "/api/item/finished",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn mark_finished(item: ItemId, finished: bool) -> Result<Item, ApiError> {
+    bridge
+        .mark_finished(server::session_token(&headers)?, item, finished)
+        .await
+}
+
 /// The podcast `id` with the episodes `filter` picks by the session user's Progress (by
 /// default, and for a filter this Bridge doesn't know, the unfinished ones).
 #[get(
@@ -608,6 +634,14 @@ pub mod server {
 
         /// See [`crate::item`].
         fn item(&self, token: SessionToken, id: ItemId) -> BoxFuture<'_, Result<Item, ApiError>>;
+
+        /// See [`crate::mark_finished`].
+        fn mark_finished(
+            &self,
+            token: SessionToken,
+            item: ItemId,
+            finished: bool,
+        ) -> BoxFuture<'_, Result<Item, ApiError>>;
 
         /// See [`crate::podcast`].
         fn podcast(

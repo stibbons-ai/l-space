@@ -14,8 +14,8 @@ use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
 use api::{
-    ApiError, ApiKey, EpisodeFilter, Group, GroupMember, ItemId, Library, LibraryEntry,
-    LibraryKind, LibraryServer, NowPlaying, Progress, Session, TransportState,
+    ApiError, ApiKey, EpisodeFilter, Group, GroupMember, Item, ItemId, Library, LibraryEntry,
+    LibraryKind, LibraryServer, NowPlaying, Podcast, Progress, Session, TransportState,
 };
 use app::flow::{App, Notice, Screen};
 use app::i18n::{self, Language, LanguageChoice, Text};
@@ -1888,6 +1888,252 @@ fn a_filter_that_fails_keeps_the_episodes_shown() {
             }
         );
         assert!(app.session().is_some());
+    });
+}
+
+/// The Item on screen.
+fn shown_item(app: &App) -> &Item {
+    match app.screen() {
+        Screen::Item { item, .. } => item,
+        screen => panic!("{screen:?}"),
+    }
+}
+
+/// The podcast on screen, its episodes as listed.
+fn shown_podcast(app: &App) -> &Podcast {
+    match app.screen() {
+        Screen::Podcast { podcast, .. } => podcast,
+        screen => panic!("{screen:?}"),
+    }
+}
+
+/// The titles of the episodes on screen, as listed.
+fn shown_titles(app: &App) -> Vec<&str> {
+    shown_podcast(app)
+        .episodes
+        .iter()
+        .map(|episode| episode.title.as_str())
+        .collect()
+}
+
+/// The Progress the Item screen shows, as the person reads it.
+fn shown_progress(app: &App) -> String {
+    i18n::item_facts(app.language(), shown_item(app))[0]
+        .1
+        .clone()
+}
+
+/// Back on the podcast's episodes after marking episodes on their Item screens, the list is
+/// what the Bridge lists for that filter now, without a refresh; the Item screen shows the
+/// new Progress at once.
+#[test]
+fn marking_an_episode_shows_on_the_item_and_in_the_episodes_under_each_filter() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        abs.set_progress(
+            &user,
+            &seeded.podcast,
+            Some(&seeded.episodes[0]),
+            120.0,
+            false,
+        )
+        .await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        let session = session(&app);
+        let listed_now = async |filter| {
+            bridge
+                .api()
+                .podcast(&session, &seeded.podcast, filter)
+                .await
+        };
+        app.open_library(podcasts(&abs)).await;
+        app.open_podcast(&seeded.podcast).await;
+
+        // Unfinished: Episode 2 leaves the list once Finished.
+        app.open_episode(&seeded.episodes[1]).await;
+        app.mark_finished(true).await;
+        assert_eq!(
+            shown_item(&app).progress,
+            Some(Progress {
+                current_time: 0.0,
+                finished: true
+            })
+        );
+        assert_eq!(
+            texts_of(&mut app, shown_progress),
+            ("Finished".to_owned(), "Beendet".to_owned())
+        );
+        assert_eq!(
+            abs.progress(&user, &seeded.podcast, Some(&seeded.episodes[1]))
+                .await,
+            Some((0.0, true))
+        );
+        app.go_back();
+        assert_eq!(
+            shown_podcast(&app),
+            &listed_now(EpisodeFilter::Unfinished).await
+        );
+        assert_eq!(shown_titles(&app), ["Episode 3", "Episode 1"]);
+
+        // Finished: unfinished, it leaves the list.
+        app.filter_episodes(EpisodeFilter::Finished).await;
+        app.open_episode(&seeded.episodes[1]).await;
+        app.mark_finished(false).await;
+        app.go_back();
+        assert_eq!(
+            shown_podcast(&app),
+            &listed_now(EpisodeFilter::Finished).await
+        );
+        assert!(shown_podcast(&app).episodes.is_empty());
+
+        // All: the episode stays where it was, with its new Progress.
+        app.filter_episodes(EpisodeFilter::All).await;
+        app.open_episode(&seeded.episodes[0]).await;
+        app.mark_finished(true).await;
+        assert_eq!(
+            shown_item(&app).progress,
+            Some(Progress {
+                current_time: 120.0,
+                finished: true
+            })
+        );
+        app.go_back();
+        assert_eq!(shown_podcast(&app), &listed_now(EpisodeFilter::All).await);
+
+        // Finished again: the newest episode comes back first, before the older one.
+        abs.set_progress(&user, &seeded.podcast, Some(&seeded.episodes[2]), 0.0, true)
+            .await;
+        app.filter_episodes(EpisodeFilter::Finished).await;
+        app.open_episode(&seeded.episodes[2]).await;
+        app.mark_finished(false).await;
+        app.mark_finished(true).await;
+        app.go_back();
+        assert_eq!(
+            shown_podcast(&app),
+            &listed_now(EpisodeFilter::Finished).await
+        );
+        assert_eq!(shown_titles(&app), ["Episode 3", "Episode 1"]);
+    });
+}
+
+/// An audiobook marked Finished keeps its position; marked unfinished, Audiobookshelf sets it
+/// back to the start, which the Item screen shows.
+#[test]
+fn marking_an_audiobook_finished_and_unfinished_shows_on_its_item_screen() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        abs.set_progress(&user, &seeded.long_book, None, 600.0, false)
+            .await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.open_library(audiobooks(&abs)).await;
+        app.open_entry(&seeded.long_book).await;
+
+        app.mark_finished(true).await;
+        assert_eq!(app.screen().notice(), None);
+        assert_eq!(
+            texts_of(&mut app, shown_progress),
+            ("Finished".to_owned(), "Beendet".to_owned())
+        );
+        assert_eq!(
+            abs.progress(&user, &seeded.long_book, None).await,
+            Some((600.0, true))
+        );
+
+        app.mark_finished(false).await;
+        assert_eq!(
+            texts_of(&mut app, shown_progress),
+            ("Not started".to_owned(), "Nicht begonnen".to_owned())
+        );
+        assert_eq!(
+            abs.progress(&user, &seeded.long_book, None).await,
+            Some((0.0, false))
+        );
+
+        app.go_back();
+        app.go_back();
+        assert_eq!(app.screen(), &libraries(&abs, None));
+    });
+}
+
+/// A mark the Library Server doesn't take leaves the Item screen as it was, saying why, and
+/// nothing changes there; the episodes to go back to stay as listed.
+#[test]
+fn a_mark_that_fails_keeps_the_item_shown_and_says_why() {
+    let (bridge, abs, proxy, failing) = bridge_behind_proxy();
+    let device = Device::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        let mut app = logged_in_behind(&device, &bridge, &proxy, &user).await;
+        app.open_library(podcasts(&abs)).await;
+        app.open_entry(&seeded.podcast).await;
+        let podcast = shown_podcast(&app).clone();
+        app.open_episode(&seeded.episodes[0]).await;
+        let item = shown_item(&app).clone();
+
+        *failing.lock().unwrap() = Some("PATCH /api/me/progress/");
+        app.mark_finished(true).await;
+
+        assert_eq!(
+            app.screen(),
+            &Screen::Item {
+                item,
+                notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
+            }
+        );
+        assert_eq!(
+            notice_texts(&mut app),
+            both(Text::ErrorLibraryServerUnreachable)
+        );
+        assert_eq!(
+            abs.progress(&user, &seeded.podcast, Some(&seeded.episodes[0]))
+                .await,
+            None
+        );
+        app.go_back();
+        assert_eq!(
+            app.screen(),
+            &Screen::Podcast {
+                podcast,
+                notice: None
+            }
+        );
+    });
+}
+
+#[test]
+fn a_session_ended_elsewhere_leads_from_marking_to_login() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.open_library(audiobooks(&abs)).await;
+        app.open_entry(&seeded.long_book).await;
+        bridge.api().logout(&session(&app)).await;
+
+        app.mark_finished(true).await;
+
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Login {
+                    notice: Some(Notice::Api(ApiError::SessionInvalid)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(app.session(), None);
+        assert_eq!(abs.progress(&user, &seeded.long_book, None).await, None);
     });
 }
 

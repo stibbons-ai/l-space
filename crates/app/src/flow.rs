@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::{
-    ApiError, ApiKey, EpisodeFilter, Group, Item, ItemId, Library, LibraryEntry, LibraryKind,
-    LibraryServer, Podcast, Session, SessionToken,
+    ApiError, ApiKey, Episode, EpisodeFilter, Group, Item, ItemId, Library, LibraryEntry,
+    LibraryKind, LibraryServer, Podcast, Session, SessionToken,
 };
 use dioxus::fullstack::http::header::{AUTHORIZATION, HeaderValue};
 use dioxus::fullstack::{HeaderMap, get_server_url, set_request_headers, set_server_url};
@@ -478,6 +478,30 @@ impl App {
         matches!(&self.screen, Screen::Item { item, .. } if item.audio_files.len() == 1)
     }
 
+    /// On the Item screen, marks its Item Finished (`finished`) or unfinished on the Library
+    /// Server, and shows the Item as the Bridge then answers; the podcast screen to go back to
+    /// lists the episode by its new state. On failure the screen keeps what it showed and says
+    /// why.
+    pub async fn mark_finished(&mut self, finished: bool) {
+        let Screen::Item { item, .. } = &self.screen else {
+            return;
+        };
+        match self
+            .call(api::mark_finished(item.id.clone(), finished))
+            .await
+        {
+            Ok(item) => {
+                for screen in &mut self.back {
+                    if let Screen::Podcast { podcast, .. } = screen {
+                        relist_episode(podcast, &item);
+                    }
+                }
+                self.screen = Screen::Item { item, notice: None };
+            }
+            Err(error) => self.failed(error).await,
+        }
+    }
+
     /// From the Item screen, lists every Group to play the Item on.
     pub async fn open_play_on(&mut self) {
         let Screen::Item { item, .. } = &self.screen else {
@@ -808,6 +832,43 @@ impl App {
         if let Some(notice) = self.screen.notice_mut() {
             *notice = Some(new);
         }
+    }
+}
+
+/// Lists episode `item` on `podcast` (if it is one of its episodes) as the podcast's filter
+/// picks it by the Item's Progress: with that Progress where it was listed, at its place by date
+/// if it newly passes, or left out.
+fn relist_episode(podcast: &mut Podcast, item: &Item) {
+    let Some(episode_id) = &item.id.episode else {
+        return;
+    };
+    if podcast.id != item.id.library_item {
+        return;
+    }
+    let passes = podcast.filter.passes(item.progress.as_ref());
+    let listed = podcast
+        .episodes
+        .iter()
+        .position(|episode| &episode.id == episode_id);
+    match (listed, passes) {
+        (Some(at), true) => podcast.episodes[at].progress.clone_from(&item.progress),
+        (Some(at), false) => {
+            podcast.episodes.remove(at);
+        }
+        (None, true) => {
+            let episode = Episode {
+                id: episode_id.clone(),
+                title: item.title.clone(),
+                duration: item.duration,
+                published_at: item.published_at,
+                progress: item.progress.clone(),
+            };
+            let at = podcast
+                .episodes
+                .partition_point(|listed| listed.order() <= episode.order());
+            podcast.episodes.insert(at, episode);
+        }
+        (None, false) => {}
     }
 }
 

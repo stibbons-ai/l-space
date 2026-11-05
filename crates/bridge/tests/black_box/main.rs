@@ -5,6 +5,7 @@
 
 mod browse;
 mod encryption;
+mod finished;
 mod forwarder;
 mod groups;
 mod handoff;

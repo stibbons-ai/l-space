@@ -3,7 +3,8 @@
 //! It covers the "who am I" check (`GET /api/me`) that proves an API key (ADR 0011) and also
 //! brings the user's Progress, read-only browsing: the user's Libraries, a Library's
 //! audiobooks or podcasts, and one audiobook or podcast with its chapters, audio files and
-//! episodes; and an audio file's bytes, by byte range, for the Bridge's streams (ADR 0010).
+//! episodes; marking an audiobook or episode Finished or unfinished for the user; and an
+//! audio file's bytes, by byte range, for the Bridge's streams (ADR 0010).
 //! Every request authenticates with `Authorization: Bearer <api key>`.
 //!
 //! Ids a caller passes go into request paths only if they are plain Audiobookshelf ids (ASCII
@@ -16,9 +17,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::stream::{self, BoxStream};
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, HeaderValue, RANGE};
-use reqwest::{Method, StatusCode, redirect};
+use reqwest::{Method, RequestBuilder, Response, StatusCode, redirect};
 use serde::de::{DeserializeOwned, IgnoredAny};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// How long one request to a Library Server may take, connecting included, before it counts
 /// as unreachable. For an audio file, how long connecting may take, and then the answer and
@@ -458,6 +459,44 @@ impl Client {
         })
     }
 
+    /// Marks the audiobook `library_item_id`, or its episode `episode_id` (a podcast's),
+    /// Finished (`finished`) or unfinished for the user `api_key` acts for:
+    /// `PATCH /api/me/progress/<library item>[/<episode>]` with `{"isFinished": finished}`.
+    ///
+    /// As Audiobookshelf 2.37.2 does it (`User.createUpdateMediaProgressFromPayload`,
+    /// `MediaProgress.applyProgressUpdate`): the user gets Progress at 0 seconds if they had
+    /// none; marking a Finished one unfinished also sets its position back to 0. It checks
+    /// neither that the user may see the library item nor that the episode belongs to it: a
+    /// caller must, before. An unknown audiobook or episode is [`Error::NotFound`]; a library
+    /// item that is no audiobook (without an episode) is [`Error::Unavailable`] (HTTP 400).
+    pub async fn set_finished(
+        &self,
+        base_url: &str,
+        api_key: &ApiKey,
+        library_item_id: &str,
+        episode_id: Option<&str>,
+        finished: bool,
+    ) -> Result<(), Error> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Update {
+            is_finished: bool,
+        }
+        let library_item_id = id_segment(library_item_id)?;
+        let url = match episode_id {
+            Some(episode_id) => format!(
+                "{base_url}/api/me/progress/{library_item_id}/{}",
+                id_segment(episode_id)?
+            ),
+            None => format!("{base_url}/api/me/progress/{library_item_id}"),
+        };
+        let request = self.http.patch(url).json(&Update {
+            is_finished: finished,
+        });
+        self.send(request, api_key, Names::One).await?;
+        Ok(())
+    }
+
     /// GETs `path_and_query`, which `names` a Library or library item or not, and decodes the
     /// answer.
     async fn get<T: DeserializeOwned>(
@@ -467,12 +506,21 @@ impl Client {
         path_and_query: &str,
         names: Names,
     ) -> Result<T, Error> {
-        let authorization = authorization(api_key)?;
+        let request = self.http.get(format!("{base_url}{path_and_query}"));
+        let response = self.send(request, api_key, names).await?;
+        response.json().await.map_err(Error::unavailable)
+    }
 
-        let response = self
-            .http
-            .get(format!("{base_url}{path_and_query}"))
-            .header(AUTHORIZATION, authorization)
+    /// Sends `request`, which `names` a Library or library item or not, with `api_key`; the
+    /// answer if it is a success.
+    async fn send(
+        &self,
+        request: RequestBuilder,
+        api_key: &ApiKey,
+        names: Names,
+    ) -> Result<Response, Error> {
+        let response = request
+            .header(AUTHORIZATION, authorization(api_key)?)
             .send()
             .await
             .map_err(Error::unavailable)?;
@@ -481,7 +529,7 @@ impl Client {
             // Audiobookshelf answers 403 for a Library or item the user may not see.
             (StatusCode::FORBIDDEN, Names::One) => Err(Error::NotFound(NotFound::Forbidden)),
             (StatusCode::NOT_FOUND, Names::One) => Err(Error::NotFound(NotFound::Missing)),
-            (status, _) if status.is_success() => response.json().await.map_err(Error::unavailable),
+            (status, _) if status.is_success() => Ok(response),
             // Any other answer, for example a server error, a redirect, or a 403/404 on
             // `/api/me` or `/api/libraries`, which every Audiobookshelf answers, so something
             // in front of it did.
@@ -997,5 +1045,120 @@ mod tests {
             .collect();
         assert_eq!(titles, ["One"]);
         assert_eq!(chapters.dropped, 1);
+    }
+
+    /// Every request the stand-in got: method, path, `Authorization` and JSON body (null if
+    /// none).
+    type Requests =
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, serde_json::Value)>>>;
+
+    /// A stand-in that records every request and answers each with `status`.
+    async fn recording(status: StatusCode) -> (String, Requests) {
+        let requests = Requests::default();
+        let recorded = requests.clone();
+        let base_url = serve(Router::new().fallback(
+            move |method: axum::http::Method,
+                  uri: axum::http::Uri,
+                  headers: HeaderMap,
+                  body: String| async move {
+                let authorization = headers
+                    .get("authorization")
+                    .map(|value| value.to_str().unwrap().to_owned())
+                    .unwrap_or_default();
+                recorded.lock().unwrap().push((
+                    method.to_string(),
+                    uri.to_string(),
+                    authorization,
+                    serde_json::from_str(&body).unwrap_or_default(),
+                ));
+                status
+            },
+        ))
+        .await;
+        (base_url, requests)
+    }
+
+    #[tokio::test]
+    async fn marking_finished_patches_the_users_progress_in_the_item_or_episode() {
+        let (base_url, requests) = recording(StatusCode::OK).await;
+        let client = Client::new();
+        let key = ApiKey::new("s3cret");
+        client
+            .set_finished(&base_url, &key, "li-1", None, true)
+            .await
+            .unwrap();
+        client
+            .set_finished(&base_url, &key, "li-2", Some("ep-1"), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [
+                (
+                    "PATCH".to_owned(),
+                    "/api/me/progress/li-1".to_owned(),
+                    "Bearer s3cret".to_owned(),
+                    json!({"isFinished": true}),
+                ),
+                (
+                    "PATCH".to_owned(),
+                    "/api/me/progress/li-2/ep-1".to_owned(),
+                    "Bearer s3cret".to_owned(),
+                    json!({"isFinished": false}),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn marking_finished_fails_like_fetching_an_item() {
+        let cases = [
+            (StatusCode::UNAUTHORIZED, "Rejected"),
+            (StatusCode::FORBIDDEN, "NotFound(Forbidden)"),
+            (StatusCode::NOT_FOUND, "NotFound(Missing)"),
+            // Audiobookshelf's answer for a library item that is no audiobook.
+            (
+                StatusCode::BAD_REQUEST,
+                "Unavailable(\"HTTP 400 Bad Request\")",
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unavailable(\"HTTP 500 Internal Server Error\")",
+            ),
+        ];
+        for (status, expected) in cases {
+            let (base_url, _) = recording(status).await;
+            let error = Client::new()
+                .set_finished(&base_url, &ApiKey::new("key"), "li-1", Some("ep-1"), true)
+                .await
+                .unwrap_err();
+            assert_eq!(format!("{error:?}"), expected, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn marking_finished_with_an_id_that_is_not_an_audiobookshelf_id_sends_nothing() {
+        let (base_url, requests) = recording(StatusCode::OK).await;
+        let client = Client::new();
+        let key = ApiKey::new("key");
+        for (item, episode) in [
+            ("../me", None),
+            ("", None),
+            ("li-1", Some("../../li-2")),
+            ("li-1", Some("")),
+            ("li-1", Some("ep?x")),
+        ] {
+            assert!(
+                matches!(
+                    client
+                        .set_finished(&base_url, &key, item, episode, true)
+                        .await,
+                    Err(Error::NotFound(NotFound::InvalidId))
+                ),
+                "{item:?} {episode:?}"
+            );
+        }
+        assert!(requests.lock().unwrap().is_empty());
     }
 }

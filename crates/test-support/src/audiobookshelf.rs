@@ -187,6 +187,32 @@ impl Audiobookshelf {
         .await;
     }
 
+    /// `user`'s Progress in audiobook `library_item`, or in its episode `episode`, read
+    /// straight from Audiobookshelf with their key (`/api/me`): `(currentTime, isFinished)`,
+    /// none if they have none.
+    pub async fn progress(
+        &self,
+        user: &AbsUser,
+        library_item: &str,
+        episode: Option<&str>,
+    ) -> Option<(f64, bool)> {
+        let me = self.whose_key(&user.api_key).await;
+        me["mediaProgress"]
+            .as_array()
+            .expect("mediaProgress")
+            .iter()
+            .find(|entry| match episode {
+                Some(episode) => entry["episodeId"] == episode,
+                None => entry["libraryItemId"] == library_item && entry["episodeId"].is_null(),
+            })
+            .map(|entry| {
+                (
+                    entry["currentTime"].as_f64().expect("currentTime"),
+                    entry["isFinished"].as_bool().expect("isFinished"),
+                )
+            })
+    }
+
     /// Its `host:port`, for a forwarder in front of it.
     pub fn address(&self) -> &str {
         self.base_url.trim_start_matches("http://")

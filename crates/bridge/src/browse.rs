@@ -1,7 +1,6 @@
 //! What the App sees of a Library Server while browsing: Audiobookshelf's answers, shaped
 //! into the App API's types for the session's user.
 
-use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use api::{
@@ -58,8 +57,7 @@ pub fn podcast(
         })
         .filter(|episode| filter.passes(episode.progress.as_ref()))
         .collect();
-    // Newest first; `None` sorts below every date.
-    episodes.sort_by_key(|episode| Reverse(episode.published_at));
+    episodes.sort_by_key(Episode::order);
     Ok(Podcast {
         id: item.id,
         title: media.metadata.title,
@@ -72,7 +70,7 @@ pub fn podcast(
 /// The Item `id` in `library_item` (an audiobook, or the podcast holding the episode), with
 /// `user`'s Progress; or why `library_item` holds no such Item.
 pub fn item(user: &abs::User, library_item: abs::LibraryItem, id: ItemId) -> Result<Item, Missing> {
-    let progress_of = ProgressIndex::of(user);
+    let progress = item_progress(user, &id);
     Ok(match select(library_item.media, &id)? {
         Selected::Audiobook(book) => Item {
             title: book.metadata.title,
@@ -81,14 +79,14 @@ pub fn item(user: &abs::User, library_item: abs::LibraryItem, id: ItemId) -> Res
             description: non_empty(book.metadata.description),
             duration: book_duration(&book.tracks, book.duration),
             published_at: None,
-            progress: progress_of.audiobook(&library_item.id),
+            progress,
             chapters: book.chapters.entries.into_iter().map(chapter).collect(),
             audio_files: audio_files(book.tracks),
             id,
         },
         Selected::Episode { podcast, episode } => Item {
             duration: episode_duration(&episode),
-            progress: progress_of.episode(&episode.id),
+            progress,
             title: episode.title,
             author: None,
             podcast: Some(podcast.title),
@@ -99,6 +97,23 @@ pub fn item(user: &abs::User, library_item: abs::LibraryItem, id: ItemId) -> Res
             id,
         },
     })
+}
+
+/// `user`'s Progress in Item `id`; none if they have none. An episode is found by its own id
+/// alone: Audiobookshelf ids are unique, and it may record episode Progress without the
+/// podcast. Should it hold several entries for one Item, the first counts.
+pub fn item_progress(user: &abs::User, id: &ItemId) -> Option<Progress> {
+    user.media_progress
+        .entries
+        .iter()
+        .find(|entry| match &id.episode {
+            Some(episode) => entry.episode_id.as_ref() == Some(episode),
+            None => {
+                entry.episode_id.is_none()
+                    && entry.library_item_id.as_ref() == Some(&id.library_item)
+            }
+        })
+        .map(progress)
 }
 
 /// The audio file of Item `id` in `library_item`, if it has exactly one; or why not.
@@ -182,32 +197,21 @@ fn book_duration(tracks: &[abs::Track], duration: Option<f64>) -> Option<f64> {
     tracks.iter().map(|track| track.duration).sum()
 }
 
-/// A user's Progress by audiobook and by episode. An episode is found by its own id alone:
-/// Audiobookshelf ids are unique, and it may record episode Progress without the podcast.
-/// Should it hold several entries for one, the first counts.
+/// A user's Progress by episode, to look up many. An episode is found by its own id alone (see
+/// [`item_progress`]).
 struct ProgressIndex<'a> {
-    audiobooks: HashMap<&'a str, &'a abs::MediaProgress>,
     episodes: HashMap<&'a str, &'a abs::MediaProgress>,
 }
 
 impl<'a> ProgressIndex<'a> {
     fn of(user: &'a abs::User) -> Self {
-        let mut index = Self {
-            audiobooks: HashMap::new(),
-            episodes: HashMap::new(),
-        };
+        let mut episodes = HashMap::new();
         for entry in &user.media_progress.entries {
             if let Some(episode) = &entry.episode_id {
-                index.episodes.entry(episode).or_insert(entry);
-            } else if let Some(audiobook) = &entry.library_item_id {
-                index.audiobooks.entry(audiobook).or_insert(entry);
+                episodes.entry(episode.as_str()).or_insert(entry);
             }
         }
-        index
-    }
-
-    fn audiobook(&self, id: &str) -> Option<Progress> {
-        self.audiobooks.get(id).map(|entry| progress(entry))
+        Self { episodes }
     }
 
     fn episode(&self, id: &str) -> Option<Progress> {
