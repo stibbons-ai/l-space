@@ -346,6 +346,10 @@ const UNAVAILABLE: &[u8] =
 const NOT_FOUND: &[u8] =
     b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
+/// What Audiobookshelf answers for a key it doesn't accept.
+const UNAUTHORIZED: &[u8] =
+    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
 /// Sends `request` (which closes its connection) to `target` (`host:port`) and returns the
 /// whole response.
 fn forward(target: &str, request: &[u8]) -> Vec<u8> {
@@ -2162,7 +2166,7 @@ fn a_mark_that_fails_keeps_the_item_shown_and_says_why() {
 
 /// A Bridge whose Library Server "Home" is the shared Audiobookshelf behind a proxy that
 /// answers a request with `answer(request, patched)` if that is some, else passes it on;
-/// `patched` tells whether a `PATCH` (a mark) went through it before. The proxy's log too.
+/// `patched` tells whether a `PATCH` (a mark) reached it before. The proxy's log too.
 fn bridge_marking_through(
     answer: impl Fn(&[u8], bool) -> Option<&'static [u8]> + Send + Sync + 'static,
 ) -> (TestBridge, Arc<Audiobookshelf>, String, ProxyLog) {
@@ -2313,7 +2317,56 @@ fn a_mark_the_app_gives_up_on_keeps_the_item_shown_without_reading_again() {
                 notice: Some(Notice::Api(ApiError::BridgeUnreachable)),
             }
         );
+        // The Bridge goes on to write after the App gave up; once its PATCH reached the
+        // proxy, the mark's own fetch is the only one: nothing was read again.
+        within(Duration::from_secs(10), async {
+            while requests(&log, "PATCH ") == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert_eq!(requests(&log, "PATCH "), 1);
         assert_eq!(requests(&log, "GET /api/items/"), 1);
+    });
+}
+
+/// When reading again after a mark that couldn't be read back finds the key rejected, the
+/// session ends: Login says so, and nothing of it stays on the device.
+#[test]
+fn a_mark_whose_reading_again_ends_the_session_leads_to_login() {
+    // After the mark: the read-back fails, then the reading again finds the key rejected.
+    let read_back = AtomicBool::new(false);
+    let (bridge, abs, proxy, _) = bridge_marking_through(move |request, patched| {
+        if !patched || !request.starts_with(b"GET /api/me ") {
+            return None;
+        }
+        Some(if read_back.swap(true, Ordering::SeqCst) {
+            UNAUTHORIZED
+        } else {
+            UNAVAILABLE
+        })
+    });
+    let device = Device::new();
+    run(async || {
+        let (mut app, _) =
+            on_episode_2(&device, &bridge, &abs, &proxy, EpisodeFilter::Unfinished).await;
+
+        app.mark_finished(true).await;
+
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Login {
+                    notice: Some(Notice::Api(ApiError::ApiKeyRejected)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(app.session(), None);
+        assert!(!app.can_go_back());
+        assert_eq!(device.launch().await.session(), None);
     });
 }
 

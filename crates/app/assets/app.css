@@ -174,7 +174,7 @@ ol.chapters li {
   border-bottom: 1px solid #8884;
 }
 
-/* Buttons side by side, as the filters are. */
+/* Buttons side by side at their own width, with the filters' gap, wrapping when they don't fit. */
 .actions {
   display: flex;
   flex-wrap: wrap;

@@ -482,9 +482,10 @@ impl App {
     /// Server, and shows the Item as the Bridge then answers; the podcast screen to go back to
     /// lists the episode by its new state. When the Library Server can't be reached, the Bridge
     /// may have written before reading the Progress back failed: the Item and its podcast's
-    /// episodes are read again, as far as that works. On any other failure the screen stays as
-    /// shown. Either way it says why; a mark whose answer was lost (the App gave up waiting, for
-    /// example) may still land on the Library Server, which opening the Item again shows.
+    /// episodes are read again, as far as that works. On any other failure that keeps the
+    /// session the screen stays as shown. Either way it says why; a mark whose answer was lost
+    /// (the App gave up waiting, for example) may still land on the Library Server, which
+    /// opening the Item again shows.
     pub async fn mark_finished(&mut self, finished: bool) {
         let Screen::Item { item, .. } = &self.screen else {
             return;
