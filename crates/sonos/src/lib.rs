@@ -2,12 +2,13 @@
 //! Control API can replace the local UPnP implementation, [`Upnp`], later.
 //!
 //! It reads every Group as set up in the Sonos app, with its members and what its coordinator
-//! plays, and starts a stream the Bridge serves on a Group ([`Sonos::play`]). It never changes
-//! volume or grouping.
+//! plays, and starts a stream the Bridge serves on a Group ([`Sonos::play`]), if Sonos plays
+//! its format ([`media_type`]). It never changes volume or grouping.
 //!
 //! Every SSDP datagram and SOAP body sent or received is logged at DEBUG under the target
 //! [`RAW`], and only there; INFO and above summarise without raw bodies.
 
+mod media;
 mod soap;
 mod ssdp;
 mod upnp;
@@ -18,6 +19,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 
+pub use media::media_type;
 pub use soap::MAX_BODY;
 pub use ssdp::MULTICAST;
 pub use upnp::{EXPIRY, LISTING_TIMEOUT, PLAY_TIMEOUT, REFRESH, Upnp};
@@ -32,13 +34,8 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// no player has none.
     fn groups(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>>;
 
-    /// Group `group` (its id) plays `stream` from its start, replacing what it played. Returns
-    /// the URL the Group was given.
-    fn play<'a>(
-        &'a self,
-        group: &'a str,
-        stream: &'a Stream,
-    ) -> BoxFuture<'a, Result<String, Error>>;
+    /// Group `group` (its id) plays `stream` from its start, replacing what it played.
+    fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>>;
 }
 
 /// A stream the Bridge serves over plain HTTP, for a Group to play.

@@ -5,6 +5,7 @@
 //! stored only as its hash. Anything that doesn't name an active Handoff's file is `404`,
 //! alike for an unknown id and a known one with another file name.
 
+use std::fmt::Write;
 use std::sync::Arc;
 
 use axum::Router;
@@ -15,7 +16,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::StreamExt;
-use store::{Store, StreamId};
+use store::Store;
 
 use crate::app_api::AppApi;
 
@@ -31,25 +32,6 @@ pub fn path(id: &str, file_name: &str) -> String {
     format!("/stream/{id}/{}", path_segment(file_name))
 }
 
-/// The `Content-Type` Sonos accepts for an audio file named `file_name`, by its extension;
-/// none for a format Sonos doesn't play. Media types per Sonos's supported audio formats
-/// (`docs/research/sonos-media-types.md`).
-pub fn content_type(file_name: &str) -> Option<&'static str> {
-    let (_, extension) = file_name.rsplit_once('.')?;
-    Some(match extension.to_ascii_lowercase().as_str() {
-        "mp3" => "audio/mpeg",
-        "m4a" | "m4b" | "mp4" => "audio/mp4",
-        "aac" => "audio/aac",
-        "flac" => "audio/flac",
-        "ogg" | "oga" => "application/ogg",
-        "wma" | "asf" => "audio/x-ms-wma",
-        "wav" => "audio/wav",
-        "aif" | "aiff" => "audio/aiff",
-        // Ogg Opus among them: Sonos skips it silently (docs/research/sonos-smoke-2026-11-04.md).
-        _ => return None,
-    })
-}
-
 /// `text` as one URL path segment: ASCII letters, digits and `-._~` as they are, every other
 /// byte percent-encoded.
 fn path_segment(text: &str) -> String {
@@ -58,7 +40,7 @@ fn path_segment(text: &str) -> String {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             segment.push(char::from(byte));
         } else {
-            segment.push_str(&format!("%{byte:02X}"));
+            write!(segment, "%{byte:02X}").expect("writing to a String cannot fail");
         }
     }
     segment
@@ -82,32 +64,16 @@ async fn serve<S: Store>(
     method: Method,
     headers: HeaderMap,
 ) -> Response {
-    let handoff = match app.store.handoff(&StreamId::of(&id)).await {
-        Ok(Some(handoff)) => handoff,
-        Ok(None) => return not_found(),
-        Err(error) => {
-            tracing::error!(
-                operation = "look up a stream",
-                error = crate::error_chain(&error),
-                "storage failed"
-            );
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
-    let store::ActiveHandoff { handoff, api_key } = handoff;
-    if file != handoff.file.name {
-        return not_found();
-    }
-    // The operator may have removed the Library Server since the start.
-    let Some(library_server) = app.configured_base_url(&handoff.started_by.library_server) else {
-        tracing::info!(
-            group = handoff.group,
-            library_server = handoff.started_by.library_server,
-            "stream for a Library Server that is not configured"
-        );
-        return not_found();
-    };
-    let Some(content_type) = content_type(&handoff.file.name) else {
+    let (library_server, store::ActiveHandoff { handoff, api_key }) =
+        match app.active_handoff(&id, &file).await {
+            Ok(Some(active)) => active,
+            Ok(None) => return not_found(),
+            Err(error) => {
+                crate::app_api::log_storage_error("look up a stream", &error);
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+    let Some(content_type) = sonos::media_type(&handoff.file.name) else {
         return not_found();
     };
     let request = if method == Method::HEAD {
@@ -115,6 +81,7 @@ async fn serve<S: Store>(
     } else {
         abs::FileRequest::Get
     };
+    let range = range(&headers);
     let answer = app
         .abs
         .file(
@@ -123,7 +90,7 @@ async fn serve<S: Store>(
             &handoff.library_item,
             &handoff.file.ino,
             request,
-            range(&headers),
+            range,
         )
         .await;
     let file = match answer {
@@ -147,7 +114,7 @@ async fn serve<S: Store>(
     tracing::debug!(
         group = handoff.group,
         status = file.status,
-        range = range(&headers),
+        range,
         "streaming a Handoff's file"
     );
     let status = StatusCode::from_u16(file.status).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -185,28 +152,7 @@ fn not_found() -> Response {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::{content_type, path, range};
-
-    #[test]
-    fn audio_formats_sonos_plays_have_its_media_types_and_others_none() {
-        let cases = [
-            ("Episode 1.mp3", Some("audio/mpeg")),
-            ("book.M4B", Some("audio/mp4")),
-            ("talk.m4a", Some("audio/mp4")),
-            ("raw.aac", Some("audio/aac")),
-            ("lossless.flac", Some("audio/flac")),
-            ("vorbis.ogg", Some("application/ogg")),
-            ("silence.wav", Some("audio/wav")),
-            ("old.aiff", Some("audio/aiff")),
-            ("legacy.wma", Some("audio/x-ms-wma")),
-            ("speech.opus", None),
-            ("cover.jpg", None),
-            ("no-extension", None),
-        ];
-        for (name, expected) in cases {
-            assert_eq!(content_type(name), expected, "{name}");
-        }
-    }
+    use super::{path, range};
 
     #[test]
     fn a_file_name_is_one_percent_encoded_segment() {

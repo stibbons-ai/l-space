@@ -13,7 +13,7 @@ use api::{
     LibraryEntry, LibraryServer, NowPlaying, Podcast, Session, SessionToken, TransportState,
 };
 use sonos::Sonos;
-use store::{HandoffFile, LibraryUser, SessionId, Store, StreamId};
+use store::{ActiveHandoff, HandoffFile, LibraryUser, SessionId, Store, StreamId};
 
 use crate::browse::{self, NoSingleFile};
 use crate::config::{LibraryServerConfig, LibraryServerUrl};
@@ -25,7 +25,7 @@ use crate::stream;
 pub struct AppApi<S> {
     library_servers: Vec<LibraryServer>,
     pub(crate) abs: abs::Client,
-    pub(crate) store: S,
+    store: S,
     sonos: Arc<dyn Sonos>,
     /// Where the Bridge listens, port 0 resolved: where Groups fetch streams.
     listen: SocketAddr,
@@ -61,11 +61,37 @@ impl<S: Store> AppApi<S> {
     }
 
     /// `base_url` (already normalized), if it is a configured Library Server's.
-    pub(crate) fn configured_base_url(&self, base_url: &str) -> Option<&str> {
+    fn configured_base_url(&self, base_url: &str) -> Option<&str> {
         self.library_servers
             .iter()
             .map(|server| server.base_url.as_str())
             .find(|&configured| configured == base_url)
+    }
+
+    /// The active Handoff whose stream is `id`, if `file` is its file's name, with its
+    /// configured Library Server; none otherwise, alike for every reason.
+    pub(crate) async fn active_handoff(
+        &self,
+        id: &str,
+        file: &str,
+    ) -> Result<Option<(&str, ActiveHandoff)>, store::Error> {
+        let Some(active) = self.store.handoff(&StreamId::of(id)).await? else {
+            return Ok(None);
+        };
+        if file != active.handoff.file.name {
+            return Ok(None);
+        }
+        let started_by = &active.handoff.started_by;
+        // The operator may have removed the Library Server since the start.
+        let Some(library_server) = self.configured_base_url(&started_by.library_server) else {
+            tracing::info!(
+                group = active.handoff.group,
+                library_server = started_by.library_server,
+                "stream for a Library Server that is not configured"
+            );
+            return Ok(None);
+        };
+        Ok(Some((library_server, active)))
     }
 
     async fn login(
@@ -141,12 +167,13 @@ impl<S: Store> AppApi<S> {
             operation: "list the Libraries",
             id: None,
         };
-        let (library_server, _, _, libraries) = self
+        let browsed = self
             .browse(token, request, async |server, key| {
                 self.abs.libraries(server, key).await
             })
             .await?;
-        warn_dropped(library_server, None, "Libraries", libraries.dropped);
+        let libraries = browsed.fetched;
+        warn_dropped(browsed.library_server, None, "Libraries", libraries.dropped);
         Ok(libraries.entries.into_iter().map(browse::library).collect())
     }
 
@@ -159,11 +186,12 @@ impl<S: Store> AppApi<S> {
             operation: "list a Library",
             id: Some(&library),
         };
-        let (_, _, _, items) = self
+        let items = self
             .browse(token, request, async |server, key| {
                 self.abs.library_items(server, key, &library).await
             })
-            .await?;
+            .await?
+            .fetched;
         Ok(items
             .into_iter()
             .filter_map(browse::library_entry)
@@ -180,7 +208,12 @@ impl<S: Store> AppApi<S> {
             operation: "fetch a podcast",
             id: Some(&podcast),
         };
-        let (library_server, _, user, item) = self
+        let Browsed {
+            library_server,
+            user,
+            fetched: item,
+            ..
+        } = self
             .browse(token, request, async |server, key| {
                 self.abs.library_item(server, key, &podcast).await
             })
@@ -195,7 +228,12 @@ impl<S: Store> AppApi<S> {
             operation: "fetch an Item",
             id: Some(&library_item_id),
         };
-        let (library_server, _, user, library_item) = self
+        let Browsed {
+            library_server,
+            user,
+            fetched: library_item,
+            ..
+        } = self
             .browse(token, request, async |server, key| {
                 self.abs.library_item(server, key, &library_item_id).await
             })
@@ -230,7 +268,12 @@ impl<S: Store> AppApi<S> {
             operation: "start a Handoff",
             id: Some(&library_item_id),
         };
-        let (library_server, session, user, library_item) = self
+        let Browsed {
+            library_server,
+            session,
+            user,
+            fetched: library_item,
+        } = self
             .browse(token, request, async |server, key| {
                 self.abs.library_item(server, key, &library_item_id).await
             })
@@ -259,7 +302,7 @@ impl<S: Store> AppApi<S> {
         let name = file
             .metadata
             .map(|metadata| metadata.filename)
-            .filter(|name| stream::content_type(name).is_some())
+            .filter(|name| sonos::media_type(name).is_some())
             .ok_or_else(|| {
                 tracing::info!(
                     library_server,
@@ -277,13 +320,13 @@ impl<S: Store> AppApi<S> {
         let stream = StreamId::of(&stream_id);
         let handoff = store::Handoff {
             group,
-            library_item: id.library_item.clone(),
-            episode: id.episode.clone(),
+            library_item: library_item_id,
+            episode: id.episode,
             file: HandoffFile {
                 ino: file.ino,
                 name,
             },
-            started_by: session.user.clone(),
+            started_by: session.user,
             username: user.username,
             started_at: now_millis(),
         };
@@ -352,14 +395,12 @@ impl<S: Store> AppApi<S> {
 
     /// Fetches something with `fetch` (the `request`) from the session's Library Server as its
     /// user, and checks at the same time that the session's key still acts for that user.
-    /// Returns the Library Server, the session, the user with their Progress, and what was
-    /// fetched.
     async fn browse<T>(
         &self,
         token: SessionToken,
         request: Request<'_>,
         fetch: impl AsyncFnOnce(&str, &abs::ApiKey) -> Result<T, abs::Error>,
-    ) -> Result<(&str, store::Session, abs::User, T), ApiError> {
+    ) -> Result<Browsed<'_, T>, ApiError> {
         let (library_server, session) = self.session(&token).await?;
         let (user, fetched) = tokio::join!(
             self.abs.me(library_server, &session.api_key),
@@ -367,7 +408,12 @@ impl<S: Store> AppApi<S> {
         );
         let user = self.verified(library_server, &session, user).await?;
         match fetched {
-            Ok(fetched) => Ok((library_server, session, user, fetched)),
+            Ok(fetched) => Ok(Browsed {
+                library_server,
+                session,
+                user,
+                fetched,
+            }),
             Err(error) => Err(self.failure(library_server, &session, request, error).await),
         }
     }
@@ -546,8 +592,8 @@ fn api_handoff(handoff: store::Handoff) -> Handoff {
     }
 }
 
-/// Whether `group` can be a Group's id: a Sonos player UUID's characters (`RINCON_` and
-/// letters and digits), at most 64. Anything else names no Group and is never stored.
+/// Whether `group` can be a Group's id: the characters of a Sonos player UUID (ASCII letters,
+/// digits and `_`), at most 64. Anything else names no Group and is never stored.
 fn is_group_id(group: &str) -> bool {
     !group.is_empty()
         && group.len() <= 64
@@ -606,6 +652,16 @@ fn random_hex(what: &str) -> Result<String, ApiError> {
         write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
     }
     Ok(hex)
+}
+
+/// What [`AppApi::browse`] fetched from the session's Library Server, and for whom.
+struct Browsed<'a, T> {
+    /// The session's Library Server.
+    library_server: &'a str,
+    session: store::Session,
+    /// The session's user, with their Progress.
+    user: abs::User,
+    fetched: T,
 }
 
 /// What the Bridge asked a Library Server for, for its log events.
@@ -686,11 +742,16 @@ fn abs_error(library_server: &str, request: Request, error: abs::Error) -> ApiEr
 /// Logs a storage failure during `operation` and hides it from the App.
 fn storage_error(operation: &'static str) -> impl FnOnce(store::Error) -> ApiError {
     move |error| {
-        tracing::error!(
-            operation,
-            error = crate::error_chain(&error),
-            "storage failed"
-        );
+        log_storage_error(operation, &error);
         ApiError::Internal
     }
+}
+
+/// Logs a storage failure during `operation`.
+pub(crate) fn log_storage_error(operation: &'static str, error: &store::Error) {
+    tracing::error!(
+        operation,
+        error = crate::error_chain(error),
+        "storage failed"
+    );
 }

@@ -83,12 +83,7 @@ impl Setup {
     /// `item`'s audio file, straight from Audiobookshelf.
     async fn file(&self, item: &ItemId) -> Vec<u8> {
         let ino = self.ino(item).await;
-        let (status, _, body) = self
-            .abs
-            .file(&self.user, &item.library_item, &ino, None)
-            .await;
-        assert_eq!(status, StatusCode::OK);
-        body
+        self.abs.file(&self.user, &item.library_item, &ino).await
     }
 
     /// Starts `item` on `group`'s Group as the user, and returns the Handoff and the URL the

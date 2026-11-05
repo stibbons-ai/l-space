@@ -321,17 +321,14 @@ impl Client {
         // reqwest drops `Authorization` on a redirect to another host or port, but would send
         // the key along on a redirect to the same host and port, even over plain http; a
         // request to Audiobookshelf has no reason to move.
-        let http = reqwest::Client::builder()
-            .timeout(TIMEOUT)
-            .redirect(redirect::Policy::none())
-            .build()
-            .expect("the TLS backend and system configuration load");
-        let media = reqwest::Client::builder()
+        let builder = || reqwest::Client::builder().redirect(redirect::Policy::none());
+        let built = "the TLS backend and system configuration load";
+        let http = builder().timeout(TIMEOUT).build().expect(built);
+        let media = builder()
             .connect_timeout(TIMEOUT)
             .read_timeout(TIMEOUT)
-            .redirect(redirect::Policy::none())
             .build()
-            .expect("the TLS backend and system configuration load");
+            .expect(built);
         Self { http, media }
     }
 
@@ -440,14 +437,11 @@ impl Client {
             status => return Err(Error::Unavailable(format!("HTTP {status}"))),
         }
         let header = |name| {
-            response
-                .headers()
-                .get(name)
-                .and_then(|value: &HeaderValue| value.to_str().ok())
-                .map(str::to_owned)
+            let value: &HeaderValue = response.headers().get(name)?;
+            value.to_str().ok()
         };
         let content_length = header(CONTENT_LENGTH).and_then(|length| length.parse().ok());
-        let content_range = header(CONTENT_RANGE);
+        let content_range = header(CONTENT_RANGE).map(str::to_owned);
         let body = stream::unfold(Some(response), async |response| {
             let mut response = response?;
             match response.chunk().await {

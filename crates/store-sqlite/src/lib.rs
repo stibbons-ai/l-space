@@ -283,11 +283,20 @@ fn warn_unreadable(user: &LibraryUser) {
     );
 }
 
-/// The columns of `handoffs h` joined with `api_keys k` that [`handoff_row`] reads.
-const HANDOFF_COLUMNS: &str = "h.group_id, h.library_item, h.episode, h.file_ino, h.file_name, \
-     h.username, h.started_at, k.id, k.library_server, k.user_id, k.key_fingerprint, k.sealed_key";
+/// A query of Handoffs with their keys, ending in `$rest`: from `handoffs h` joined with
+/// `api_keys k`, the columns [`handoff_row`] reads.
+macro_rules! select_handoffs {
+    ($rest:literal) => {
+        concat!(
+            "SELECT h.group_id, h.library_item, h.episode, h.file_ino, h.file_name, h.username, \
+             h.started_at, k.id, k.library_server, k.user_id, k.key_fingerprint, k.sealed_key \
+             FROM handoffs h JOIN api_keys k ON k.id = h.api_key_id ",
+            $rest
+        )
+    };
+}
 
-/// A Handoff and its stored key, from a row of [`HANDOFF_COLUMNS`].
+/// A Handoff and its stored key, from a row of [`select_handoffs`].
 fn handoff_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Handoff, StoredKey)> {
     let key = StoredKey::read(row, 7)?;
     let handoff = Handoff {
@@ -445,11 +454,7 @@ impl Store for SqliteStore {
         let lookup = self
             .transaction(move |tx| {
                 let Some((handoff, key)) = tx
-                    .prepare_cached(&format!(
-                        "SELECT {HANDOFF_COLUMNS}
-                         FROM handoffs h JOIN api_keys k ON k.id = h.api_key_id
-                         WHERE h.stream_id = ?1"
-                    ))?
+                    .prepare_cached(select_handoffs!("WHERE h.stream_id = ?1"))?
                     .query_row(params![stream.as_bytes()], handoff_row)
                     .optional()?
                 else {
@@ -469,11 +474,7 @@ impl Store for SqliteStore {
         let (handoffs, unreadable) = self
             .transaction(move |tx| {
                 let rows = tx
-                    .prepare_cached(&format!(
-                        "SELECT {HANDOFF_COLUMNS}
-                         FROM handoffs h JOIN api_keys k ON k.id = h.api_key_id
-                         ORDER BY h.started_at, h.group_id"
-                    ))?
+                    .prepare_cached(select_handoffs!("ORDER BY h.started_at, h.group_id"))?
                     .query_map([], handoff_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 let mut handoffs = Vec::new();
@@ -488,12 +489,12 @@ impl Store for SqliteStore {
                         None => unreadable.push(key),
                     }
                 }
-                let unreadable: Vec<LibraryUser> =
-                    unreadable.into_iter().map(|key| key.user).collect();
                 Ok((handoffs, unreadable))
             })
             .await?;
-        unreadable.iter().for_each(warn_unreadable);
+        for key in &unreadable {
+            warn_unreadable(&key.user);
+        }
         Ok(handoffs)
     }
 

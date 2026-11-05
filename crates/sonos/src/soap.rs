@@ -3,6 +3,7 @@
 //! arguments of their own (AVTransport's instance id aside); the actions that start playback
 //! send theirs XML-escaped.
 
+use std::fmt::Write;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -113,7 +114,8 @@ async fn send(
     let urn = service.urn();
     let mut inputs = service.arguments().to_owned();
     for (name, value) in arguments {
-        inputs.push_str(&format!("<{name}>{}</{name}>", xml::escape(value)));
+        write!(inputs, "<{name}>{}</{name}>", xml::escape(value))
+            .expect("writing to a String cannot fail");
     }
     let body = format!(
         r#"<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:{action} xmlns:u="{urn}">{inputs}</u:{action}></s:Body></s:Envelope>"#

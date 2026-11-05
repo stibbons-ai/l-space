@@ -463,22 +463,16 @@ impl App {
         let Screen::PlayOn { item, groups, .. } = &self.screen else {
             return;
         };
-        let (item, name) = (
-            item.clone(),
-            groups.iter().find(|listed| listed.id == group),
-        );
-        let name = name.map_or_else(|| group.to_owned(), |listed| listed.name.clone());
-        match self
-            .call(api::start_handoff(item.id.clone(), group.to_owned()))
-            .await
-        {
+        let item = item.id.clone();
+        let name = groups
+            .iter()
+            .find(|listed| listed.id == group)
+            .map_or_else(|| group.to_owned(), |listed| listed.name.clone());
+        match self.call(api::start_handoff(item, group.to_owned())).await {
             Ok(_) => {
                 // Back to the Item screen the picker was opened from.
-                self.back.pop();
-                self.screen = Screen::Item {
-                    item,
-                    notice: Some(Notice::PlayingOn(name)),
-                };
+                self.go_back();
+                self.set_notice(Notice::PlayingOn(name));
             }
             Err(error) => self.failed(error).await,
         }

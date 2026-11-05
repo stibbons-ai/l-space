@@ -212,37 +212,21 @@ impl Audiobookshelf {
         self.call(&user.api_key.key, method, path, body).await
     }
 
-    /// The bytes of audio file `ino` of `library_item`, fetched straight from Audiobookshelf
-    /// as `user` (with the `Range` header `range`, if any): status, `Content-Type` and body.
-    pub async fn file(
-        &self,
-        user: &AbsUser,
-        library_item: &str,
-        ino: &str,
-        range: Option<&str>,
-    ) -> (reqwest::StatusCode, Option<String>, Vec<u8>) {
-        let mut request = self
-            .http
-            .get(format!(
-                "{}/api/items/{library_item}/file/{ino}",
-                self.base_url
-            ))
-            .bearer_auth(&user.api_key.key);
-        if let Some(range) = range {
-            request = request.header(reqwest::header::RANGE, range);
-        }
-        let response = request
+    /// Audio file `ino` of `library_item`, fetched whole and straight from Audiobookshelf as
+    /// `user`; panics unless that succeeds.
+    pub async fn file(&self, user: &AbsUser, library_item: &str, ino: &str) -> Vec<u8> {
+        let path = format!("/api/items/{library_item}/file/{ino}");
+        self.http
+            .get(format!("{}{path}", self.base_url))
+            .bearer_auth(&user.api_key.key)
             .send()
             .await
-            .unwrap_or_else(|error| panic!("GET file {ino}: {error}"));
-        let status = response.status();
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let body = response.bytes().await.expect("file body").to_vec();
-        (status, content_type, body)
+            .and_then(reqwest::Response::error_for_status)
+            .unwrap_or_else(|error| panic!("GET {path}: {error}"))
+            .bytes()
+            .await
+            .expect("file body")
+            .to_vec()
     }
 
     /// Creates a user with the settings in `extra`, and an API key for them.

@@ -41,7 +41,7 @@ use clock::{Clock, ManualClock};
 use tokio::runtime::Runtime;
 
 /// The `Range` a player asks for when it starts a URL: everything, from the start.
-pub const FETCH_RANGE: &str = "bytes=0-";
+const FETCH_RANGE: &str = "bytes=0-";
 
 /// The most bytes of a URL's body a player keeps, per fetch; it reads no further.
 pub const MAX_FETCHED: usize = 16 * 1024 * 1024;
@@ -96,8 +96,6 @@ impl FakeTrack {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fetch {
     pub uri: String,
-    /// The `Range` it asked for: [`FETCH_RANGE`].
-    pub range: String,
     /// The answer's status; none without an answer.
     pub status: Option<u16>,
     /// The answer's headers, names in lower case, in the order received.
@@ -204,9 +202,8 @@ impl Transport {
             .since
             .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
         let position = self.offset + moved;
-        match self.track.as_ref().and_then(|track| track.duration) {
-            Some(duration) => position.min(duration),
-            None if self.track.is_some() => position,
+        match &self.track {
+            Some(track) => track.duration.map_or(position, |end| position.min(end)),
             None => Duration::ZERO,
         }
     }
@@ -446,23 +443,19 @@ impl Household {
         state.coordinator(coordinator).transport.position(now)
     }
 
-    /// Every fetch `coordinator` has finished of the URLs its Group was told to play, in
-    /// order.
-    pub fn fetches(&self, coordinator: &PlayerId) -> Vec<Fetch> {
-        let state = self.shared.lock();
-        let fetches = state
-            .fetches
-            .iter()
-            .filter(|(uuid, _)| *uuid == coordinator.0);
-        fetches.map(|(_, fetch)| fetch.clone()).collect()
-    }
-
-    /// The first fetch `coordinator` finished of a URL its Group was told to play, waiting
-    /// for it up to twice a fetch's own time limit. Panics if there is none by then.
+    /// The first fetch `coordinator` finished of a URL its Group was told to play (with
+    /// `Range: bytes=0-`), waiting for it up to twice a fetch's own time limit. Panics if there
+    /// is none by then.
     pub async fn fetched(&self, coordinator: &PlayerId) -> Fetch {
         let deadline = Instant::now() + 2 * FETCH_TIMEOUT;
         loop {
-            if let Some(fetch) = self.fetches(coordinator).into_iter().next() {
+            let first = {
+                let state = self.shared.lock();
+                let mut fetches = state.fetches.iter();
+                let first = fetches.find(|(uuid, _)| *uuid == coordinator.0);
+                first.map(|(_, fetch)| fetch.clone())
+            };
+            if let Some(fetch) = first {
                 return fetch;
             }
             assert!(
@@ -637,7 +630,6 @@ fn input(request: &str, name: &str) -> Option<String> {
 async fn fetch(shared: Arc<Shared>, uuid: String, uri: String) {
     let mut fetch = Fetch {
         uri: uri.clone(),
-        range: FETCH_RANGE.to_owned(),
         status: None,
         headers: Vec::new(),
         body: Vec::new(),

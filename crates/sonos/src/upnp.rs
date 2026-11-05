@@ -4,7 +4,7 @@
 //! its coordinator (AVTransport `SetAVTransportURI`, then `Play`).
 
 use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -128,9 +128,9 @@ impl Upnp {
         self.shared.groups(deadline).await
     }
 
-    async fn play(&self, group: &str, stream: &Stream) -> Result<String, Error> {
+    async fn play(&self, group: &str, stream: &Stream) -> Result<(), Error> {
         let deadline = tokio::time::Instant::now() + PLAY_TIMEOUT;
-        self.shared.play(group, stream, deadline).await
+        self.shared.play(group, stream, deadline).await.map(drop)
     }
 }
 
@@ -145,11 +145,7 @@ impl Sonos for Upnp {
         Box::pin(self.groups())
     }
 
-    fn play<'a>(
-        &'a self,
-        group: &'a str,
-        stream: &'a Stream,
-    ) -> BoxFuture<'a, Result<String, Error>> {
+    fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>> {
         Box::pin(self.play(group, stream))
     }
 }
@@ -316,7 +312,11 @@ impl Shared {
             );
             return Err(Error::GroupFailed);
         };
-        let url = stream.url(route_to(coordinator.ip()).ok_or(Error::GroupFailed)?);
+        let Some(host) = route_to(coordinator.ip()) else {
+            tracing::warn!(group, "no route to a Group's coordinator");
+            return Err(Error::GroupFailed);
+        };
+        let url = stream.url(host);
         let call = async |action, arguments: &[(&str, &str)]| {
             let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
             soap::call_with(
@@ -435,17 +435,14 @@ impl Shared {
 /// route. Connecting a UDP socket sends nothing; it only picks the route.
 fn route_to(peer: IpAddr) -> Option<IpAddr> {
     let unspecified: IpAddr = match peer {
-        IpAddr::V4(_) => std::net::Ipv4Addr::UNSPECIFIED.into(),
-        IpAddr::V6(_) => std::net::Ipv6Addr::UNSPECIFIED.into(),
+        IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+        IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
     };
     let socket = UdpSocket::bind((unspecified, 0)).ok()?;
     // Any port: nothing is sent.
     socket.connect((peer, 9)).ok()?;
     let local = socket.local_addr().ok()?.ip();
-    (!local.is_unspecified()).then_some(local).or_else(|| {
-        tracing::warn!(%peer, "no route to a Group's coordinator");
-        None
-    })
+    Some(local).filter(|local| !local.is_unspecified())
 }
 
 /// The transport state in Group `group`'s `GetTransportInfo` answer: unknown, and logged with

@@ -1,6 +1,6 @@
 # Sonos media types for Handoff streams (research 2026-11-05)
 
-The Bridge's stream endpoint (ADR 0010) sets a `Content-Type` Sonos accepts, chosen by the audio file's extension (`crates/bridge/src/stream.rs`, `content_type`). An extension not listed is not playable on a Group (`item_not_playable`).
+The Bridge's stream endpoint (ADR 0010) sets a `Content-Type` Sonos accepts, chosen by the audio file's extension (`sonos::media_type`, `crates/sonos/src/media.rs`). An extension not listed is not playable on a Group (`item_not_playable`).
 
 ## Sources
 
