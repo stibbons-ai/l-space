@@ -78,8 +78,15 @@ fn NoticeView(app: Signal<App>, notice: Option<Notice>) -> Element {
     let Some(notice) = notice else {
         return rsx! {};
     };
+    let text = notice.text(app.read().language());
+    // Only "Playing on …" reports something done; every other notice is a problem.
+    if matches!(notice, Notice::PlayingOn(_)) {
+        return rsx! {
+            p { class: "notice done", role: "status", {text} }
+        };
+    }
     rsx! {
-        p { class: "notice", role: "alert", {notice.text(app.read().language())} }
+        p { class: "notice", role: "alert", {text} }
     }
 }
 

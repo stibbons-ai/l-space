@@ -75,6 +75,11 @@ button:disabled {
   margin: 0;
 }
 
+.notice.done {
+  color: #1a7f37;
+  background: #1a7f3718;
+}
+
 dl {
   margin: 16px 0;
 }
