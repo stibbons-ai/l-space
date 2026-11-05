@@ -240,9 +240,35 @@ pub(crate) fn duration(time: &str) -> Option<Duration> {
     Duration::from_secs(seconds).checked_add(Duration::from_secs_f64(fraction))
 }
 
+/// `text` escaped for an XML element's content or an attribute value.
+pub(crate) fn escape(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            character => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A URL's query and anything markup-like reach the player as the same text.
+    #[test]
+    fn escaped_text_reads_back_as_itself() {
+        let url = r#"http://192.168.1.5:8080/stream/ab/Ep "1" <&> it's.mp3?a=1&b=2"#;
+        let body = format!("<CurrentURI>{}</CurrentURI>", escape(url));
+        let document = parse(&body).unwrap();
+        assert_eq!(document.root_element().text(), Some(url));
+        assert!(!escape(url).contains(['<', '>', '"', '\'']));
+    }
 
     fn member(uuid: &str, name: &str, visible: bool) -> ZoneMember {
         ZoneMember {

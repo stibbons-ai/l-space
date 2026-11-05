@@ -1,10 +1,11 @@
 //! The Bridge binary: loads the operator's configuration and encryption key, searches for Sonos
-//! players, and serves the App API.
+//! players, and serves the App API and the media streams Groups play.
 
 mod app_api;
 mod browse;
 mod config;
 mod encryption_key;
+mod stream;
 mod telemetry;
 
 use std::io;
@@ -87,8 +88,13 @@ async fn main() -> ExitCode {
     let discovery_address = config.sonos.discovery_address;
     tracing::info!(%discovery_address, "searching for Sonos players");
     let sonos = sonos::Upnp::start(discovery_address, Arc::new(clock::SystemClock));
-    let app_api = AppApi::new(config.library_servers, store, Arc::new(sonos));
-    let router = api::server::router(Arc::new(app_api));
+    let app_api = Arc::new(AppApi::new(
+        config.library_servers,
+        store,
+        Arc::new(sonos),
+        addr,
+    ));
+    let router = api::server::router(app_api.clone()).merge(stream::router(app_api));
 
     tracing::info!(%addr, "listening");
     if let Err(error) = axum::serve(listener, router).await {

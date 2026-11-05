@@ -59,6 +59,8 @@ group-stopped = Stopped
 group-transitioning = Starting…
 group-not-answering = Not answering
 group-state-unknown = Unknown state
+play-on = Play on…
+playing-on = Playing on { $group }
 
 date = { $month ->
         [1] January
@@ -96,4 +98,7 @@ error-not-found = This isn't (or is no longer) available to you on your Library 
 error-session-invalid = Your session has ended. Please log in again.
 error-sonos-unreachable = Clacks found your Sonos speakers, but none of them answered just now. Please try again.
 error-sonos-search-failed = Clacks can't search your network for Sonos speakers right now. Ask whoever runs Clacks to check its network setup and its logs.
+error-group-not-found = This Group isn't there any more: it may have been regrouped in the Sonos app. Pick it again from the list.
+error-group-failed = The Group didn't start playing. Check that it is on and on your network, then try again.
+error-item-not-playable = Clacks can't play this on a Group yet: only episodes and audiobooks in a single file, in a format Sonos plays.
 error-unknown = Something unexpected went wrong. Updating Ook may help.

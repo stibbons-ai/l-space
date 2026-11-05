@@ -1,31 +1,43 @@
 //! The App API's view of this Bridge: configured Library Servers, logins and sessions,
-//! browsing a session's Library Server as its user, and the household's Sonos Groups.
+//! browsing a session's Library Server as its user, the household's Sonos Groups, and
+//! Handoffs.
 
 use std::fmt::Write;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::server::{BoxFuture, Bridge};
 use api::{
-    ApiError, CurrentUser, EpisodeFilter, Group, GroupMember, Item, ItemId, Library, LibraryEntry,
-    LibraryServer, NowPlaying, Podcast, Session, SessionToken, TransportState,
+    ApiError, CurrentUser, EpisodeFilter, Group, GroupMember, Handoff, Item, ItemId, Library,
+    LibraryEntry, LibraryServer, NowPlaying, Podcast, Session, SessionToken, TransportState,
 };
 use sonos::Sonos;
-use store::{LibraryUser, SessionId, Store};
+use store::{HandoffFile, LibraryUser, SessionId, Store, StreamId};
 
-use crate::browse;
+use crate::browse::{self, NoSingleFile};
 use crate::config::{LibraryServerConfig, LibraryServerUrl};
+use crate::stream;
 
-/// Serves the App API from the configured Library Servers, the [`Store`] and [`Sonos`].
+/// Serves the App API from the configured Library Servers, the [`Store`] and [`Sonos`]; and,
+/// for the same Handoffs, the media streams (`crate::stream`).
 #[derive(Debug)]
 pub struct AppApi<S> {
     library_servers: Vec<LibraryServer>,
-    abs: abs::Client,
-    store: S,
+    pub(crate) abs: abs::Client,
+    pub(crate) store: S,
     sonos: Arc<dyn Sonos>,
+    /// Where the Bridge listens, port 0 resolved: where Groups fetch streams.
+    listen: SocketAddr,
 }
 
 impl<S: Store> AppApi<S> {
-    pub fn new(library_servers: Vec<LibraryServerConfig>, store: S, sonos: Arc<dyn Sonos>) -> Self {
+    pub fn new(
+        library_servers: Vec<LibraryServerConfig>,
+        store: S,
+        sonos: Arc<dyn Sonos>,
+        listen: SocketAddr,
+    ) -> Self {
         let library_servers = library_servers
             .into_iter()
             .map(|server| LibraryServer {
@@ -38,6 +50,7 @@ impl<S: Store> AppApi<S> {
             abs: abs::Client::new(),
             store,
             sonos,
+            listen,
         }
     }
 
@@ -48,7 +61,7 @@ impl<S: Store> AppApi<S> {
     }
 
     /// `base_url` (already normalized), if it is a configured Library Server's.
-    fn configured_base_url(&self, base_url: &str) -> Option<&str> {
+    pub(crate) fn configured_base_url(&self, base_url: &str) -> Option<&str> {
         self.library_servers
             .iter()
             .map(|server| server.base_url.as_str())
@@ -70,7 +83,7 @@ impl<S: Store> AppApi<S> {
             .await
             .map_err(|error| abs_error(library_server, Request::ME, error))?;
 
-        let token = new_session_token()?;
+        let token = SessionToken::new(random_hex("a session token")?);
         let owner = LibraryUser {
             library_server: library_server.to_owned(),
             user_id: user.id,
@@ -128,7 +141,7 @@ impl<S: Store> AppApi<S> {
             operation: "list the Libraries",
             id: None,
         };
-        let (library_server, _, libraries) = self
+        let (library_server, _, _, libraries) = self
             .browse(token, request, async |server, key| {
                 self.abs.libraries(server, key).await
             })
@@ -146,7 +159,7 @@ impl<S: Store> AppApi<S> {
             operation: "list a Library",
             id: Some(&library),
         };
-        let (_, _, items) = self
+        let (_, _, _, items) = self
             .browse(token, request, async |server, key| {
                 self.abs.library_items(server, key, &library).await
             })
@@ -167,7 +180,7 @@ impl<S: Store> AppApi<S> {
             operation: "fetch a podcast",
             id: Some(&podcast),
         };
-        let (library_server, user, item) = self
+        let (library_server, _, user, item) = self
             .browse(token, request, async |server, key| {
                 self.abs.library_item(server, key, &podcast).await
             })
@@ -182,7 +195,7 @@ impl<S: Store> AppApi<S> {
             operation: "fetch an Item",
             id: Some(&library_item_id),
         };
-        let (library_server, user, library_item) = self
+        let (library_server, _, user, library_item) = self
             .browse(token, request, async |server, key| {
                 self.abs.library_item(server, key, &library_item_id).await
             })
@@ -198,12 +211,122 @@ impl<S: Store> AppApi<S> {
             Ok(groups) => Ok(groups.into_iter().map(group).collect()),
             Err(error) => {
                 tracing::warn!(%error, "cannot list the Sonos Groups");
-                Err(match error {
-                    sonos::Error::Unreachable => ApiError::SonosUnreachable,
-                    sonos::Error::SearchFailed => ApiError::SonosSearchFailed,
-                })
+                Err(sonos_error(error))
             }
         }
+    }
+
+    /// Starts Item `id` on Group `group` for the session's user: resolves the Item's audio
+    /// file with the session's key, stores the Handoff (replacing the Group's), then has the
+    /// Group play its stream. If the Group doesn't, the Handoff ends again.
+    async fn start_handoff(
+        &self,
+        token: SessionToken,
+        id: ItemId,
+        group: String,
+    ) -> Result<Handoff, ApiError> {
+        let library_item_id = id.library_item.clone();
+        let request = Request {
+            operation: "start a Handoff",
+            id: Some(&library_item_id),
+        };
+        let (library_server, session, user, library_item) = self
+            .browse(token, request, async |server, key| {
+                self.abs.library_item(server, key, &library_item_id).await
+            })
+            .await?;
+        let file = match browse::single_audio_file(library_item, &id) {
+            Ok(file) => file,
+            Err(NoSingleFile::Missing(reason)) => {
+                return Err(missing(
+                    library_server,
+                    request,
+                    id.episode.as_deref(),
+                    reason,
+                ));
+            }
+            Err(NoSingleFile::Files(files)) => {
+                tracing::info!(
+                    library_server,
+                    library_item = id.library_item,
+                    episode = id.episode,
+                    files,
+                    "an Item without exactly one audio file can't be played on a Group yet"
+                );
+                return Err(ApiError::ItemNotPlayable);
+            }
+        };
+        let name = file
+            .metadata
+            .map(|metadata| metadata.filename)
+            .filter(|name| stream::content_type(name).is_some())
+            .ok_or_else(|| {
+                tracing::info!(
+                    library_server,
+                    library_item = id.library_item,
+                    episode = id.episode,
+                    "an Item's audio file is in a format Sonos doesn't play, or unnamed"
+                );
+                ApiError::ItemNotPlayable
+            })?;
+        if !is_group_id(&group) {
+            return Err(ApiError::GroupNotFound);
+        }
+
+        let stream_id = random_hex("a stream id")?;
+        let stream = StreamId::of(&stream_id);
+        let handoff = store::Handoff {
+            group,
+            library_item: id.library_item.clone(),
+            episode: id.episode.clone(),
+            file: HandoffFile {
+                ino: file.ino,
+                name,
+            },
+            started_by: session.user.clone(),
+            username: user.username,
+            started_at: now_millis(),
+        };
+        self.store
+            .start_handoff(&stream, &handoff, &session.api_key)
+            .await
+            .map_err(storage_error("start a Handoff"))?;
+        let target = sonos::Stream {
+            listen: self.listen,
+            path: stream::path(&stream_id, &handoff.file.name),
+        };
+        if let Err(error) = self.sonos.play(&handoff.group, &target).await {
+            tracing::warn!(group = handoff.group, %error, "a Group did not start a Handoff");
+            if let Err(error) = self.store.end_handoff(&stream).await {
+                tracing::error!(
+                    operation = "end a Handoff that did not start",
+                    group = handoff.group,
+                    error = crate::error_chain(&error),
+                    "storage failed"
+                );
+            }
+            return Err(sonos_error(error));
+        }
+        tracing::info!(
+            group = handoff.group,
+            library_server,
+            user_id = handoff.started_by.user_id,
+            library_item = handoff.library_item,
+            episode = handoff.episode,
+            "Handoff started"
+        );
+        Ok(api_handoff(handoff))
+    }
+
+    /// Every active Handoff, for any valid session.
+    async fn handoffs(&self, token: SessionToken) -> Result<Vec<Handoff>, ApiError> {
+        self.session(&token).await?;
+        let handoffs = self
+            .store
+            .handoffs()
+            .await
+            .map_err(storage_error("list the Handoffs"))?;
+        Ok(handoffs.into_iter().map(api_handoff).collect())
     }
 
     /// The session `token` names, and the configured Library Server it belongs to.
@@ -229,13 +352,14 @@ impl<S: Store> AppApi<S> {
 
     /// Fetches something with `fetch` (the `request`) from the session's Library Server as its
     /// user, and checks at the same time that the session's key still acts for that user.
-    /// Returns the Library Server, the user with their Progress, and what was fetched.
+    /// Returns the Library Server, the session, the user with their Progress, and what was
+    /// fetched.
     async fn browse<T>(
         &self,
         token: SessionToken,
         request: Request<'_>,
         fetch: impl AsyncFnOnce(&str, &abs::ApiKey) -> Result<T, abs::Error>,
-    ) -> Result<(&str, abs::User, T), ApiError> {
+    ) -> Result<(&str, store::Session, abs::User, T), ApiError> {
         let (library_server, session) = self.session(&token).await?;
         let (user, fetched) = tokio::join!(
             self.abs.me(library_server, &session.api_key),
@@ -243,7 +367,7 @@ impl<S: Store> AppApi<S> {
         );
         let user = self.verified(library_server, &session, user).await?;
         match fetched {
-            Ok(fetched) => Ok((library_server, user, fetched)),
+            Ok(fetched) => Ok((library_server, session, user, fetched)),
             Err(error) => Err(self.failure(library_server, &session, request, error).await),
         }
     }
@@ -380,6 +504,64 @@ impl<S: Store> Bridge for AppApi<S> {
     fn groups(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Group>, ApiError>> {
         Box::pin(self.groups(token))
     }
+
+    fn start_handoff(
+        &self,
+        token: SessionToken,
+        item: ItemId,
+        group: String,
+    ) -> BoxFuture<'_, Result<Handoff, ApiError>> {
+        Box::pin(self.start_handoff(token, item, group))
+    }
+
+    fn handoffs(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Handoff>, ApiError>> {
+        Box::pin(self.handoffs(token))
+    }
+}
+
+/// The App API's answer to Sonos failing.
+fn sonos_error(error: sonos::Error) -> ApiError {
+    match error {
+        sonos::Error::Unreachable => ApiError::SonosUnreachable,
+        sonos::Error::SearchFailed => ApiError::SonosSearchFailed,
+        sonos::Error::UnknownGroup => ApiError::GroupNotFound,
+        sonos::Error::GroupFailed => ApiError::GroupFailed,
+    }
+}
+
+/// A Handoff as the App API describes it.
+fn api_handoff(handoff: store::Handoff) -> Handoff {
+    Handoff {
+        group: handoff.group,
+        item: ItemId {
+            library_item: handoff.library_item,
+            episode: handoff.episode,
+        },
+        started_by: CurrentUser {
+            library_server: handoff.started_by.library_server,
+            user_id: handoff.started_by.user_id,
+            username: handoff.username,
+        },
+        started_at: handoff.started_at,
+    }
+}
+
+/// Whether `group` can be a Group's id: a Sonos player UUID's characters (`RINCON_` and
+/// letters and digits), at most 64. Anything else names no Group and is never stored.
+fn is_group_id(group: &str) -> bool {
+    !group.is_empty()
+        && group.len() <= 64
+        && group
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Now, in milliseconds since the Unix epoch.
+fn now_millis() -> i64 {
+    let since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// A Group as the App API describes it.
@@ -411,18 +593,19 @@ fn group(group: sonos::Group) -> Group {
     }
 }
 
-/// 256 random bits from the operating system, hex-encoded.
-fn new_session_token() -> Result<SessionToken, ApiError> {
+/// 256 random bits from the operating system, hex-encoded, for `what` (a session token, a
+/// stream id).
+fn random_hex(what: &str) -> Result<String, ApiError> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|error| {
-        tracing::error!(%error, "no randomness for a session token");
+        tracing::error!(%error, what, "no randomness");
         ApiError::Internal
     })?;
-    let mut token = String::with_capacity(2 * bytes.len());
+    let mut hex = String::with_capacity(2 * bytes.len());
     for byte in bytes {
-        write!(token, "{byte:02x}").expect("writing to a String cannot fail");
+        write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
     }
-    Ok(SessionToken::new(token))
+    Ok(hex)
 }
 
 /// What the Bridge asked a Library Server for, for its log events.

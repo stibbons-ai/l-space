@@ -52,6 +52,13 @@ pub enum Screen {
     },
     /// One Item: its details, the person's Progress, and an audiobook's chapters.
     Item { item: Item, notice: Option<Notice> },
+    /// Picks the Group to play an Item on: every Group; none when the Bridge found no Sonos
+    /// player.
+    PlayOn {
+        item: Item,
+        groups: Vec<Group>,
+        notice: Option<Notice>,
+    },
     /// Logged in: every Sonos Group with its members and what it plays. Empty, with a notice,
     /// when they could not be listed.
     Groups {
@@ -81,6 +88,7 @@ impl Screen {
             | Self::Library { notice, .. }
             | Self::Podcast { notice, .. }
             | Self::Item { notice, .. }
+            | Self::PlayOn { notice, .. }
             | Self::Groups { notice, .. }
             | Self::Settings { notice } => notice.as_ref(),
         }
@@ -95,6 +103,7 @@ impl Screen {
             | Self::Library { notice, .. }
             | Self::Podcast { notice, .. }
             | Self::Item { notice, .. }
+            | Self::PlayOn { notice, .. }
             | Self::Groups { notice, .. }
             | Self::Settings { notice } => Some(notice),
         }
@@ -124,11 +133,14 @@ pub enum Notice {
     StorageSave,
     /// Logged out, but the device storage still holds the session.
     LogoutNotSaved,
+    /// The Item now plays on the Group with this name.
+    PlayingOn(String),
 }
 
 impl Notice {
-    pub fn text(&self) -> Text {
-        match self {
+    /// The notice as the person reads it in `language`.
+    pub fn text(&self, language: Language) -> String {
+        let text = match self {
             Self::Api(error) => error.into(),
             Self::BridgeUrlInvalid => Text::ErrorBridgeUrlInvalid,
             Self::BridgeUrlUnreachable => Text::ErrorBridgeUrlUnreachable,
@@ -137,7 +149,9 @@ impl Notice {
             Self::StorageStuck => Text::ErrorStorageStuck,
             Self::StorageSave => Text::ErrorStorageSave,
             Self::LogoutNotSaved => Text::ErrorLogoutNotSaved,
-        }
+            Self::PlayingOn(group) => return i18n::playing_on(language, group),
+        };
+        i18n::text(language, text)
     }
 }
 
@@ -427,6 +441,47 @@ impl App {
             Screen::Item { item, notice: None }
         })
         .await;
+    }
+
+    /// From the Item screen, lists every Group to play the Item on.
+    pub async fn open_play_on(&mut self) {
+        let Screen::Item { item, .. } = &self.screen else {
+            return;
+        };
+        let item = item.clone();
+        self.go(api::groups(), |groups| Screen::PlayOn {
+            item,
+            groups,
+            notice: None,
+        })
+        .await;
+    }
+
+    /// On the Group picker, starts the Item on Group `group` (its id), and goes back to the
+    /// Item, noting where it plays; or shows why it could not start.
+    pub async fn play_on(&mut self, group: &str) {
+        let Screen::PlayOn { item, groups, .. } = &self.screen else {
+            return;
+        };
+        let (item, name) = (
+            item.clone(),
+            groups.iter().find(|listed| listed.id == group),
+        );
+        let name = name.map_or_else(|| group.to_owned(), |listed| listed.name.clone());
+        match self
+            .call(api::start_handoff(item.id.clone(), group.to_owned()))
+            .await
+        {
+            Ok(_) => {
+                // Back to the Item screen the picker was opened from.
+                self.back.pop();
+                self.screen = Screen::Item {
+                    item,
+                    notice: Some(Notice::PlayingOn(name)),
+                };
+            }
+            Err(error) => self.failed(error).await,
+        }
     }
 
     /// Opens Settings, from any logged-in screen; the screens to go back to are dropped (the

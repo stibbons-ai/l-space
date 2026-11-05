@@ -11,7 +11,7 @@
 //! Setup goes through Audiobookshelf's REST API as its root user, the way an admin would,
 //! never through its database: users are created there, API keys created, moved and deleted,
 //! and metadata a scan can't find in silent audio files (descriptions, publish dates) set.
-//! The audio is generated silence, so the repository holds no binary.
+//! The audio is generated near-silence, so the repository holds no binary.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -210,6 +210,39 @@ impl Audiobookshelf {
         body: Option<Value>,
     ) -> Value {
         self.call(&user.api_key.key, method, path, body).await
+    }
+
+    /// The bytes of audio file `ino` of `library_item`, fetched straight from Audiobookshelf
+    /// as `user` (with the `Range` header `range`, if any): status, `Content-Type` and body.
+    pub async fn file(
+        &self,
+        user: &AbsUser,
+        library_item: &str,
+        ino: &str,
+        range: Option<&str>,
+    ) -> (reqwest::StatusCode, Option<String>, Vec<u8>) {
+        let mut request = self
+            .http
+            .get(format!(
+                "{}/api/items/{library_item}/file/{ino}",
+                self.base_url
+            ))
+            .bearer_auth(&user.api_key.key);
+        if let Some(range) = range {
+            request = request.header(reqwest::header::RANGE, range);
+        }
+        let response = request
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("GET file {ino}: {error}"));
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = response.bytes().await.expect("file body").to_vec();
+        (status, content_type, body)
     }
 
     /// Creates a user with the settings in `extra`, and an API key for them.
@@ -523,8 +556,10 @@ async fn root_token(http: &reqwest::Client, base_url: &str) -> String {
         .to_owned()
 }
 
-/// `seconds` of silence as a WAV file: 100 Hz, 8-bit mono, so an hour takes only 360 kB. Low
-/// as the rate is, Audiobookshelf scans it as audio of that length.
+/// `seconds` of near-silence as a WAV file: 100 Hz, 8-bit mono, so an hour takes only 360 kB.
+/// Low as the rate is, Audiobookshelf scans it as audio of that length. The samples are quiet
+/// noise rather than silence, so every byte depends on its offset and a byte range served
+/// from the wrong place shows.
 fn silence(seconds: u32) -> Vec<u8> {
     const RATE: u32 = 100;
     // Unsigned 8-bit samples: 0x80 is silence.
@@ -543,6 +578,13 @@ fn silence(seconds: u32) -> Vec<u8> {
     wav.extend_from_slice(&8u16.to_le_bytes()); // bits per sample
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_len.to_le_bytes());
-    wav.resize(44 + data_len as usize, SILENT);
+    // A xorshift generator's low four bits, around silence: ±8 of 255.
+    let mut state = 0x2545_F491_u32 ^ seconds;
+    wav.extend((0..data_len).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        SILENT - 8 + (state & 0x0F) as u8
+    }));
     wav
 }

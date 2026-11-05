@@ -1,7 +1,12 @@
 //! A fake Sonos household for tests (PRD "Testing Decisions"): players on loopback that answer
-//! SSDP M-SEARCH and serve their device description and the read-only UPnP subset the Bridge
-//! uses (ZoneGroupTopology `GetZoneGroupState`, AVTransport `GetTransportInfo` and
-//! `GetPositionInfo`), with Groups, playback and faults the test controls.
+//! SSDP M-SEARCH and serve their device description and the UPnP subset the Bridge uses
+//! (ZoneGroupTopology `GetZoneGroupState`; AVTransport `GetTransportInfo`, `GetPositionInfo`,
+//! `SetAVTransportURI` and `Play`), with Groups, playback and faults the test controls.
+//!
+//! A Group told to play a URL (`SetAVTransportURI`, then `Play`) plays it like a speaker: its
+//! transport is Playing, its position moves on the clock, `GetPositionInfo` reports the URL,
+//! and it fetches the URL over HTTP with a `Range` request, recording what it got
+//! ([`Household::fetched`]).
 //!
 //! The household runs on its own Tokio runtime, so it answers whatever the test's runtime is
 //! doing (also while a test blocks on starting a Bridge). Each player listens on its own
@@ -35,6 +40,15 @@ use axum::routing::{get, post};
 use clock::{Clock, ManualClock};
 use tokio::runtime::Runtime;
 
+/// The `Range` a player asks for when it starts a URL: everything, from the start.
+pub const FETCH_RANGE: &str = "bytes=0-";
+
+/// The most bytes of a URL's body a player keeps, per fetch; it reads no further.
+pub const MAX_FETCHED: usize = 16 * 1024 * 1024;
+
+/// How long a player's fetch may take in all.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
 const ZONE_PLAYER: &str = "urn:schemas-upnp-org:device:ZonePlayer:1";
 const TOPOLOGY: &str = "urn:schemas-upnp-org:service:ZoneGroupTopology:1";
 const AV_TRANSPORT: &str = "urn:schemas-upnp-org:service:AVTransport:1";
@@ -56,7 +70,9 @@ pub struct FakeTrack {
     pub title: Option<String>,
     pub creator: Option<String>,
     pub uri: String,
-    pub duration: Duration,
+    /// None for a URL the Group was given, whose length the fake doesn't learn: it reports
+    /// `0:00:00`, as for a stream, and the position moves on without end.
+    pub duration: Option<Duration>,
 }
 
 impl FakeTrack {
@@ -66,13 +82,39 @@ impl FakeTrack {
             title: Some(title.to_owned()),
             creator: None,
             uri: "http://127.0.0.1:1/track.mp3".to_owned(),
-            duration,
+            duration: Some(duration),
         }
     }
 
     pub fn by(mut self, creator: &str) -> Self {
         self.creator = Some(creator.to_owned());
         self
+    }
+}
+
+/// What a player got when it fetched the URL it was told to play.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fetch {
+    pub uri: String,
+    /// The `Range` it asked for: [`FETCH_RANGE`].
+    pub range: String,
+    /// The answer's status; none without an answer.
+    pub status: Option<u16>,
+    /// The answer's headers, names in lower case, in the order received.
+    pub headers: Vec<(String, String)>,
+    /// The body, up to [`MAX_FETCHED`] bytes.
+    pub body: Vec<u8>,
+    /// Why there was no answer, or the body broke off; none if all went well.
+    pub error: Option<String>,
+}
+
+impl Fetch {
+    /// The value of header `name` (lower case), if the answer had it.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.as_str())
     }
 }
 
@@ -96,6 +138,9 @@ pub enum Fault {
     NoTransportState,
     /// It answers `GetTransportInfo` with a SOAP fault, and everything else correctly.
     FailTransportInfo,
+    /// It answers `SetAVTransportURI` and `Play` with a SOAP fault (UPnP error 714, illegal
+    /// MIME type), and everything else correctly.
+    RefusePlayback,
 }
 
 /// A fake Sonos household; dropping it stops every player.
@@ -110,6 +155,8 @@ pub struct Household {
 struct Shared {
     clock: Arc<dyn Clock>,
     state: Mutex<HouseholdState>,
+    /// How players fetch the URLs they play.
+    http: reqwest::Client,
 }
 
 #[derive(Debug, Default)]
@@ -118,6 +165,9 @@ struct HouseholdState {
     players: Vec<Player>,
     /// Every SOAP action called, as the UUID of the player called and `Service#Action`.
     actions: Vec<(String, String)>,
+    /// Every fetch of a URL a Group played, done, as the UUID of the coordinator and what it
+    /// got.
+    fetches: Vec<(String, Fetch)>,
     /// How many M-SEARCHes for ZonePlayers were received.
     searches: usize,
     added: u32,
@@ -154,8 +204,9 @@ impl Transport {
             .since
             .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
         let position = self.offset + moved;
-        match &self.track {
-            Some(track) => position.min(track.duration),
+        match self.track.as_ref().and_then(|track| track.duration) {
+            Some(duration) => position.min(duration),
+            None if self.track.is_some() => position,
             None => Duration::ZERO,
         }
     }
@@ -172,9 +223,15 @@ impl Household {
         let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind SSDP");
         socket.set_nonblocking(true).expect("non-blocking SSDP");
         let ssdp = socket.local_addr().expect("SSDP address");
+        let http = reqwest::Client::builder()
+            .timeout(FETCH_TIMEOUT)
+            .no_proxy()
+            .build()
+            .expect("an HTTP client without TLS builds");
         let shared = Arc::new(Shared {
             clock,
             state: Mutex::default(),
+            http,
         });
         {
             let _runtime = runtime.enter();
@@ -369,6 +426,54 @@ impl Household {
         self.shared.lock().searches
     }
 
+    /// The URL `coordinator`'s Group has loaded, as `GetPositionInfo` reports it; none if
+    /// nothing is loaded.
+    pub fn uri(&self, coordinator: &PlayerId) -> Option<String> {
+        let state = self.shared.lock();
+        let track = state.coordinator(coordinator).transport.track.as_ref();
+        track.map(|track| track.uri.clone())
+    }
+
+    /// `coordinator`'s Group's `CurrentTransportState`, such as `PLAYING`.
+    pub fn transport_state(&self, coordinator: &PlayerId) -> &'static str {
+        self.shared.lock().coordinator(coordinator).transport.state
+    }
+
+    /// How far into its track `coordinator`'s Group is, on the household's clock.
+    pub fn position(&self, coordinator: &PlayerId) -> Duration {
+        let now = self.shared.clock.now();
+        let state = self.shared.lock();
+        state.coordinator(coordinator).transport.position(now)
+    }
+
+    /// Every fetch `coordinator` has finished of the URLs its Group was told to play, in
+    /// order.
+    pub fn fetches(&self, coordinator: &PlayerId) -> Vec<Fetch> {
+        let state = self.shared.lock();
+        let fetches = state
+            .fetches
+            .iter()
+            .filter(|(uuid, _)| *uuid == coordinator.0);
+        fetches.map(|(_, fetch)| fetch.clone()).collect()
+    }
+
+    /// The first fetch `coordinator` finished of a URL its Group was told to play, waiting
+    /// for it up to twice a fetch's own time limit. Panics if there is none by then.
+    pub async fn fetched(&self, coordinator: &PlayerId) -> Fetch {
+        let deadline = Instant::now() + 2 * FETCH_TIMEOUT;
+        loop {
+            if let Some(fetch) = self.fetches(coordinator).into_iter().next() {
+                return fetch;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} fetched nothing",
+                coordinator.0
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     fn runtime(&self) -> &Runtime {
         self.runtime.as_ref().expect("running until dropped")
     }
@@ -407,6 +512,12 @@ impl HouseholdState {
         player
     }
 
+    fn coordinator(&self, id: &PlayerId) -> &Player {
+        let player = self.player(id);
+        assert_eq!(player.group, id.0, "{} does not coordinate its Group", id.0);
+        player
+    }
+
     fn find(&self, uuid: &str) -> Option<&Player> {
         self.players.iter().find(|player| player.uuid == uuid)
     }
@@ -422,6 +533,46 @@ impl HouseholdState {
                 player.group = group.to_owned();
             }
         }
+    }
+
+    /// `SetAVTransportURI` (with the SOAP `request`) or `Play` on `served`'s player, which must
+    /// coordinate its Group, at `now`. `Play` starts fetching the URL. The UPnP error code on
+    /// failure: 701 (transition not available) on a player that doesn't coordinate or with
+    /// nothing loaded, 402 (invalid arguments) without a `CurrentURI`.
+    fn start(
+        &mut self,
+        served: &Served,
+        action: &str,
+        request: &str,
+        now: Instant,
+    ) -> Result<(), u16> {
+        let player = self.find_mut(&served.uuid).ok_or(701u16)?;
+        if player.group != served.uuid {
+            return Err(701);
+        }
+        let transport = &mut player.transport;
+        if action == "SetAVTransportURI" {
+            let uri = input(request, "CurrentURI").ok_or(402u16)?;
+            *transport = Transport {
+                state: "STOPPED",
+                track: Some(FakeTrack {
+                    title: None,
+                    creator: None,
+                    uri,
+                    duration: None,
+                }),
+                offset: Duration::ZERO,
+                since: None,
+            };
+            return Ok(());
+        }
+        let uri = transport.track.as_ref().ok_or(701u16)?.uri.clone();
+        if transport.since.is_none() {
+            transport.since = Some(now);
+        }
+        transport.state = "PLAYING";
+        tokio::spawn(fetch(Arc::clone(&served.shared), served.uuid.clone(), uri));
+        Ok(())
     }
 
     /// The household's `ZoneGroupState` document: every Group, its members in the order they
@@ -471,6 +622,63 @@ impl Player {
 
 fn location(addr: SocketAddr) -> String {
     format!("http://{addr}/xml/device_description.xml")
+}
+
+/// The text of input argument `name` in a SOAP `request`, if it has one.
+fn input(request: &str, name: &str) -> Option<String> {
+    let document = roxmltree::Document::parse(request).ok()?;
+    let argument = document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == name)?;
+    Some(argument.text().unwrap_or_default().to_owned())
+}
+
+/// Fetches `uri` as player `uuid` does when told to play it, and records what it got.
+async fn fetch(shared: Arc<Shared>, uuid: String, uri: String) {
+    let mut fetch = Fetch {
+        uri: uri.clone(),
+        range: FETCH_RANGE.to_owned(),
+        status: None,
+        headers: Vec::new(),
+        body: Vec::new(),
+        error: None,
+    };
+    match shared
+        .http
+        .get(&uri)
+        .header("range", FETCH_RANGE)
+        .send()
+        .await
+    {
+        Ok(mut response) => {
+            fetch.status = Some(response.status().as_u16());
+            fetch.headers = response
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    let value = String::from_utf8_lossy(value.as_bytes()).into_owned();
+                    (name.as_str().to_owned(), value)
+                })
+                .collect();
+            while fetch.body.len() < MAX_FETCHED {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        let room = MAX_FETCHED - fetch.body.len();
+                        fetch
+                            .body
+                            .extend_from_slice(&chunk[..chunk.len().min(room)]);
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        fetch.error = Some(error.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        Err(error) => fetch.error = Some(error.to_string()),
+    }
+    shared.lock().fetches.push((uuid, fetch));
 }
 
 /// Answers each M-SEARCH for ZonePlayers (or everything) with one answer per player.
@@ -529,7 +737,7 @@ async fn description(State(served): State<Served>) -> Response {
 }
 
 /// Answers a SOAP call on either service by its `SOAPACTION` header.
-async fn control(State(served): State<Served>, headers: HeaderMap) -> Response {
+async fn control(State(served): State<Served>, headers: HeaderMap, request: String) -> Response {
     let soap_action = headers
         .get("soapaction")
         .and_then(|value| value.to_str().ok())
@@ -551,18 +759,22 @@ async fn control(State(served): State<Served>, headers: HeaderMap) -> Response {
             tokio::time::sleep(delay).await;
         }
         Some(Fault::FailTransportInfo) if action == "GetTransportInfo" => return invalid_action(),
+        Some(Fault::RefusePlayback) if matches!(action, "SetAVTransportURI" | "Play") => {
+            return upnp_fault(714);
+        }
         Some(
             Fault::None
             | Fault::Padded(_)
             | Fault::SlowPosition(_)
             | Fault::NoTransportState
-            | Fault::FailTransportInfo,
+            | Fault::FailTransportInfo
+            | Fault::RefusePlayback,
         ) => {}
         // Removed from the household: as good as unplugged.
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
     let now = served.shared.clock.now();
-    let state = served.shared.lock();
+    let mut state = served.shared.lock();
     let arguments: Vec<(&str, String)> = match (urn, action) {
         (TOPOLOGY, "GetZoneGroupState") => {
             vec![("ZoneGroupState", state.zone_group_state())]
@@ -586,6 +798,12 @@ async fn control(State(served): State<Served>, headers: HeaderMap) -> Response {
                 arguments
             } else {
                 position_info(transport, now)
+            }
+        }
+        (AV_TRANSPORT, "SetAVTransportURI" | "Play") => {
+            match state.start(&served, action, &request, now) {
+                Ok(()) => Vec::new(),
+                Err(code) => return upnp_fault(code),
             }
         }
         _ => return invalid_action(),
@@ -621,7 +839,8 @@ fn position_info(transport: &Transport, now: Instant) -> Vec<(&'static str, Stri
             didl.push_str(
                 "<upnp:class>object.item.audioItem.musicTrack</upnp:class></item></DIDL-Lite>",
             );
-            ("1", upnp_time(track.duration), didl, track.uri.clone())
+            let duration = upnp_time(track.duration.unwrap_or_default());
+            ("1", duration, didl, track.uri.clone())
         }
         None => ("0", upnp_time(Duration::ZERO), String::new(), String::new()),
     };
@@ -650,9 +869,16 @@ fn upnp_time(duration: Duration) -> String {
 
 /// The answer to an action the fake doesn't serve: UPnP's 401, Invalid Action.
 fn invalid_action() -> Response {
+    upnp_fault(401)
+}
+
+/// A SOAP fault carrying UPnP error `code`.
+fn upnp_fault(code: u16) -> Response {
     xml(
         StatusCode::INTERNAL_SERVER_ERROR,
-        r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>401</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#.to_owned(),
+        format!(
+            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>{code}</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#
+        ),
     )
 }
 
