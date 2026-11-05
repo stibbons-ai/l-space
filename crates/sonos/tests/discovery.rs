@@ -48,7 +48,8 @@ async fn players_are_searched_for_on_the_clocks_refresh_and_expire() {
 }
 
 /// Waits until search number `count` reached `household` and is over: once it has recorded
-/// what it found, the search loop creates its next sleep on `clock`, the only sleep on it.
+/// what it found, the search loop creates its next sleep on `clock`. Assumes the search loop
+/// is the only thing sleeping on `clock`, so that sleep is the only one.
 async fn parked(household: &Household, clock: &ManualClock, count: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while household.searches() < count || clock.sleepers() != 1 {

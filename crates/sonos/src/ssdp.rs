@@ -87,7 +87,7 @@ pub(crate) async fn search(target: SocketAddr) -> io::Result<Vec<Found>> {
 }
 
 /// The player in an M-SEARCH answer from `from`: a `200` for [`ZONE_PLAYER`] with a
-/// `uuid:` USN holding a Sonos player UUID (`RINCON_…`, at most 64 characters) and an `http`
+/// `uuid:` USN holding a Sonos player UUID (see [`xml::is_player_uuid`]) and an `http`
 /// LOCATION at the IP address the answer came from. A LOCATION elsewhere is refused, so an
 /// answer can't point the Bridge at another host.
 fn answer(datagram: &str, from: SocketAddr) -> Option<Found> {

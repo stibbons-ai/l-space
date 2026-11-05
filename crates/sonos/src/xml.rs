@@ -193,7 +193,7 @@ pub(crate) fn transport_state(state: &str) -> TransportState {
 
 /// Whether `uuid` looks like a Sonos player's, such as `RINCON_48A6B8000001400`: `RINCON_`
 /// and ASCII letters and digits, at most 64 bytes in all. Anything else is not one, and is
-/// never logged.
+/// never logged above DEBUG.
 pub(crate) fn is_player_uuid(uuid: &str) -> bool {
     uuid.len() <= 64
         && uuid

@@ -683,6 +683,52 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_listing_waiting_for_the_first_search_ends_when_searching_stops() {
+        let shared = Shared::new(Arc::new(ManualClock::new()));
+        let start = tokio::time::Instant::now();
+        let (listed, ()) = tokio::join!(shared.groups(soon(LISTING_TIMEOUT)), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            shared.stopped();
+        });
+        assert_eq!(listed, Err(Error::SearchFailed));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    fn found(uuid: String) -> ssdp::Found {
+        ssdp::Found {
+            uuid,
+            addr: "127.0.0.1:1".parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn players_past_the_most_kept_are_refused_until_others_expire() {
+        let clock = ManualClock::new();
+        let shared = Shared::new(Arc::new(clock.clone()));
+        let known = |shared: &Shared| shared.known().players.len();
+        let many: Vec<_> = (0..ssdp::MAX_PLAYERS)
+            .map(|n| found(format!("RINCON_A{n}")))
+            .collect();
+        shared.saw(Ok(many));
+        assert_eq!(known(&shared), ssdp::MAX_PLAYERS);
+
+        // One more is refused while the others are fresh...
+        shared.saw(Ok(vec![found("RINCON_B".into())]));
+        assert_eq!(known(&shared), ssdp::MAX_PLAYERS);
+        assert!(!shared.known().players.contains_key("RINCON_B"));
+
+        // ...and kept once they have expired, which the same search finds out first.
+        clock.advance(EXPIRY);
+        shared.saw(Ok(vec![found("RINCON_C".into())]));
+        let players: Vec<String> = shared.known().players.keys().cloned().collect();
+        assert_eq!(players, ["RINCON_C"]);
+    }
+
     #[test]
     fn a_transport_answer_without_a_known_state_is_an_unknown_state() {
         let without: Vec<(String, String)> = vec![("CurrentTransportStatus".into(), "OK".into())];
@@ -723,16 +769,17 @@ mod tests {
         }
         let shared = knowing(&household, &clock).await;
 
-        // Asking each in turn would take 2.5 s of stagger and 2 s for the last to time out.
+        // Without the deadline it would take about 4 s: the sixth player is asked at about 2 s,
+        // when the first one times out, and times out itself 2 s later.
         let start = tokio::time::Instant::now();
         assert_eq!(
             shared.groups(soon(Duration::from_secs(1))).await,
             Err(Error::Unreachable)
         );
+        let elapsed = start.elapsed();
         assert!(
-            start.elapsed() < Duration::from_millis(1300),
-            "{:?}",
-            start.elapsed()
+            elapsed >= Duration::from_millis(950) && elapsed < Duration::from_millis(1300),
+            "{elapsed:?}"
         );
     }
 
