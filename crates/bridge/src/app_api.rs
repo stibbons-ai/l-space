@@ -1,11 +1,16 @@
-//! The App API's view of this Bridge: configured Library Servers, logins and sessions.
+//! The App API's view of this Bridge: configured Library Servers, logins and sessions, and
+//! browsing a session's Library Server as its user.
 
 use std::fmt::Write;
 
 use api::server::{BoxFuture, Bridge};
-use api::{ApiError, CurrentUser, LibraryServer, Session, SessionToken};
+use api::{
+    ApiError, CurrentUser, EpisodeFilter, Item, ItemId, Library, LibraryEntry, LibraryServer,
+    Podcast, Session, SessionToken,
+};
 use store::{LibraryUser, SessionId, Store};
 
+use crate::browse;
 use crate::config::{LibraryServerConfig, LibraryServerUrl};
 
 /// Serves the App API from the configured Library Servers and the [`Store`].
@@ -59,7 +64,7 @@ impl<S: Store> AppApi<S> {
             .abs
             .me(library_server, &api_key)
             .await
-            .map_err(|error| abs_error(library_server, error))?;
+            .map_err(|error| abs_error(library_server, Request::ME, error))?;
 
         let token = new_session_token()?;
         let owner = LibraryUser {
@@ -102,10 +107,88 @@ impl<S: Store> AppApi<S> {
         }
     }
 
-    /// Asks the session's Library Server who its key belongs to. A key the Library Server
-    /// rejects, or that now belongs to another user, is revoked, ending this user's sessions
-    /// opened with it.
+    /// Asks the session's Library Server who its key belongs to.
     async fn current_user(&self, token: SessionToken) -> Result<CurrentUser, ApiError> {
+        let (library_server, session) = self.session(&token).await?;
+        let user = self.abs.me(library_server, &session.api_key).await;
+        let user = self.verified(library_server, &session, user).await?;
+        Ok(CurrentUser {
+            library_server: library_server.to_owned(),
+            user_id: user.id,
+            username: user.username,
+        })
+    }
+
+    async fn libraries(&self, token: SessionToken) -> Result<Vec<Library>, ApiError> {
+        let request = Request {
+            operation: "list the Libraries",
+            id: None,
+        };
+        let (library_server, _, libraries) = self
+            .browse(token, request, async |server, key| {
+                self.abs.libraries(server, key).await
+            })
+            .await?;
+        warn_dropped(library_server, None, "Libraries", libraries.dropped);
+        Ok(libraries.entries.into_iter().map(browse::library).collect())
+    }
+
+    async fn library_entries(
+        &self,
+        token: SessionToken,
+        library: String,
+    ) -> Result<Vec<LibraryEntry>, ApiError> {
+        let request = Request {
+            operation: "list a Library",
+            id: Some(&library),
+        };
+        let (_, _, items) = self
+            .browse(token, request, async |server, key| {
+                self.abs.library_items(server, key, &library).await
+            })
+            .await?;
+        Ok(items
+            .into_iter()
+            .filter_map(browse::library_entry)
+            .collect())
+    }
+
+    async fn podcast(
+        &self,
+        token: SessionToken,
+        podcast: String,
+        filter: EpisodeFilter,
+    ) -> Result<Podcast, ApiError> {
+        let request = Request {
+            operation: "fetch a podcast",
+            id: Some(&podcast),
+        };
+        let (library_server, user, item) = self
+            .browse(token, request, async |server, key| {
+                self.abs.library_item(server, key, &podcast).await
+            })
+            .await?;
+        browse::podcast(&user, item, filter)
+            .map_err(|reason| missing(library_server, request, None, reason))
+    }
+
+    async fn item(&self, token: SessionToken, id: ItemId) -> Result<Item, ApiError> {
+        let (library_item_id, episode) = (id.library_item.clone(), id.episode.clone());
+        let request = Request {
+            operation: "fetch an Item",
+            id: Some(&library_item_id),
+        };
+        let (library_server, user, library_item) = self
+            .browse(token, request, async |server, key| {
+                self.abs.library_item(server, key, &library_item_id).await
+            })
+            .await?;
+        browse::item(&user, library_item, id)
+            .map_err(|reason| missing(library_server, request, episode.as_deref(), reason))
+    }
+
+    /// The session `token` names, and the configured Library Server it belongs to.
+    async fn session(&self, token: &SessionToken) -> Result<(&str, store::Session), ApiError> {
         let session = self
             .store
             .session(&SessionId::of_token(token.expose()))
@@ -122,20 +205,74 @@ impl<S: Store> AppApi<S> {
                 );
                 ApiError::SessionInvalid
             })?;
-        match self.abs.me(library_server, &session.api_key).await {
-            Ok(user) if user.id == session.user.user_id => Ok(CurrentUser {
-                library_server: library_server.to_owned(),
-                user_id: user.id,
-                username: user.username,
-            }),
+        Ok((library_server, session))
+    }
+
+    /// Fetches something with `fetch` (the `request`) from the session's Library Server as its
+    /// user, and checks at the same time that the session's key still acts for that user.
+    /// Returns the Library Server, the user with their Progress, and what was fetched.
+    async fn browse<T>(
+        &self,
+        token: SessionToken,
+        request: Request<'_>,
+        fetch: impl AsyncFnOnce(&str, &abs::ApiKey) -> Result<T, abs::Error>,
+    ) -> Result<(&str, abs::User, T), ApiError> {
+        let (library_server, session) = self.session(&token).await?;
+        let (user, fetched) = tokio::join!(
+            self.abs.me(library_server, &session.api_key),
+            fetch(library_server, &session.api_key),
+        );
+        let user = self.verified(library_server, &session, user).await?;
+        match fetched {
+            Ok(fetched) => Ok((library_server, user, fetched)),
+            Err(error) => Err(self.failure(library_server, &session, request, error).await),
+        }
+    }
+
+    /// The session's user as the Library Server described them (`me`), if its key still acts
+    /// for them. A key the Library Server rejects, or that now belongs to another user, is
+    /// revoked, ending this user's sessions opened with it.
+    async fn verified(
+        &self,
+        library_server: &str,
+        session: &store::Session,
+        me: Result<abs::User, abs::Error>,
+    ) -> Result<abs::User, ApiError> {
+        match me {
+            Ok(user) if user.id == session.user.user_id => {
+                warn_dropped(
+                    library_server,
+                    Some(&user.id),
+                    "Progress entries",
+                    user.media_progress.dropped,
+                );
+                Ok(user)
+            }
             // An admin can move a key to another user; the session must not follow it.
             Ok(_) => Err(self
-                .revoke(&session, "the API key now acts for another user")
+                .revoke(session, "the API key now acts for another user")
                 .await),
-            Err(abs::Error::Rejected) => Err(self
-                .revoke(&session, "the Library Server rejected the API key")
+            Err(error) => Err(self
+                .failure(library_server, session, Request::ME, error)
                 .await),
-            Err(error) => Err(abs_error(library_server, error)),
+        }
+    }
+
+    /// The error a session call answers with when its Library Server failed `request` with
+    /// `error`. A rejected key is revoked.
+    async fn failure(
+        &self,
+        library_server: &str,
+        session: &store::Session,
+        request: Request<'_>,
+        error: abs::Error,
+    ) -> ApiError {
+        match error {
+            abs::Error::Rejected => {
+                self.revoke(session, "the Library Server rejected the API key")
+                    .await
+            }
+            error => abs_error(library_server, request, error),
         }
     }
 
@@ -195,6 +332,31 @@ impl<S: Store> Bridge for AppApi<S> {
     fn current_user(&self, token: SessionToken) -> BoxFuture<'_, Result<CurrentUser, ApiError>> {
         Box::pin(self.current_user(token))
     }
+
+    fn libraries(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Library>, ApiError>> {
+        Box::pin(self.libraries(token))
+    }
+
+    fn library_entries(
+        &self,
+        token: SessionToken,
+        library: String,
+    ) -> BoxFuture<'_, Result<Vec<LibraryEntry>, ApiError>> {
+        Box::pin(self.library_entries(token, library))
+    }
+
+    fn item(&self, token: SessionToken, id: ItemId) -> BoxFuture<'_, Result<Item, ApiError>> {
+        Box::pin(self.item(token, id))
+    }
+
+    fn podcast(
+        &self,
+        token: SessionToken,
+        podcast: String,
+        filter: EpisodeFilter,
+    ) -> BoxFuture<'_, Result<Podcast, ApiError>> {
+        Box::pin(self.podcast(token, podcast, filter))
+    }
 }
 
 /// 256 random bits from the operating system, hex-encoded.
@@ -211,11 +373,76 @@ fn new_session_token() -> Result<SessionToken, ApiError> {
     Ok(SessionToken::new(token))
 }
 
-fn abs_error(library_server: &str, error: abs::Error) -> ApiError {
+/// What the Bridge asked a Library Server for, for its log events.
+#[derive(Debug, Clone, Copy)]
+struct Request<'a> {
+    operation: &'static str,
+    /// The Library or library item asked for, if any.
+    id: Option<&'a str>,
+}
+
+impl Request<'_> {
+    /// The "who am I" check that proves an API key.
+    const ME: Request<'static> = Request {
+        operation: "check who the API key acts for",
+        id: None,
+    };
+}
+
+/// Logs that `dropped` of the `what` a Library Server sent (for user `user_id`, if any) were
+/// left out because the Bridge doesn't know their shape.
+fn warn_dropped(library_server: &str, user_id: Option<&str>, what: &'static str, dropped: usize) {
+    if dropped > 0 {
+        tracing::warn!(
+            library_server,
+            user_id,
+            what,
+            dropped,
+            "entries in a shape the Bridge doesn't know were left out"
+        );
+    }
+}
+
+/// The `not_found` a call answers with when the library item it fetched (`request`) holds
+/// nothing it asked for, logged with the `reason` (and the `episode` asked for, if any).
+fn missing(
+    library_server: &str,
+    request: Request,
+    episode: Option<&str>,
+    reason: browse::Missing,
+) -> ApiError {
+    tracing::info!(
+        library_server,
+        operation = request.operation,
+        library_item = request.id,
+        episode,
+        reason = ?reason,
+        "the library item holds nothing asked for"
+    );
+    ApiError::NotFound
+}
+
+fn abs_error(library_server: &str, request: Request, error: abs::Error) -> ApiError {
     match error {
         abs::Error::Rejected => ApiError::ApiKeyRejected,
+        abs::Error::NotFound(cause) => {
+            tracing::info!(
+                library_server,
+                operation = request.operation,
+                id = request.id,
+                cause = ?cause,
+                "not found on the Library Server"
+            );
+            ApiError::NotFound
+        }
         abs::Error::Unavailable(_) => {
-            tracing::warn!(library_server, %error, "Library Server unavailable");
+            tracing::warn!(
+                library_server,
+                operation = request.operation,
+                id = request.id,
+                %error,
+                "Library Server unavailable"
+            );
             ApiError::LibraryServerUnreachable
         }
     }

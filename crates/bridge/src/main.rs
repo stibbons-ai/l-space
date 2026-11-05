@@ -2,6 +2,7 @@
 //! API.
 
 mod app_api;
+mod browse;
 mod config;
 mod encryption_key;
 mod telemetry;

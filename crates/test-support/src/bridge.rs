@@ -42,7 +42,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use api::{ApiError, CurrentUser, Session};
+use api::{ApiError, CurrentUser, EpisodeFilter, Item, Library, LibraryEntry, Podcast, Session};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -284,6 +284,13 @@ pub fn named_library_server_toml(url: &str, name: &str) -> String {
 pub const SESSION_INVALID: (StatusCode, ApiError) =
     (StatusCode::UNAUTHORIZED, ApiError::SessionInvalid);
 
+/// The rejection of a session call whose API key the Library Server rejects.
+pub const KEY_REJECTED: (StatusCode, ApiError) =
+    (StatusCode::UNAUTHORIZED, ApiError::ApiKeyRejected);
+
+/// The rejection of an id that names nothing on the Library Server.
+pub const NOT_FOUND: (StatusCode, ApiError) = (StatusCode::NOT_FOUND, ApiError::NotFound);
+
 /// Who a session of `user` on `abs` acts as.
 pub fn acting_as(abs: &Audiobookshelf, user: &AbsUser) -> CurrentUser {
     acting_on(abs.base_url(), user)
@@ -327,15 +334,12 @@ impl AppApi {
     }
 
     pub async fn current_user(&self, session: &Session) -> CurrentUser {
-        let response = self
-            .send(Method::GET, "/api/me", Some(&bearer(session)), None)
-            .await;
-        decode(response).await
+        self.get_as(session, "/api/me", &[]).await
     }
 
     /// Asks who `session` acts for, expecting a rejection.
     pub async fn current_user_error(&self, session: &Session) -> (StatusCode, ApiError) {
-        self.get_error("/api/me", Some(&bearer(session))).await
+        self.get_as_error(session, "/api/me", &[]).await
     }
 
     pub async fn logout(&self, session: &Session) {
@@ -351,9 +355,60 @@ impl AppApi {
             .await
     }
 
+    /// The Libraries `session` sees.
+    pub async fn libraries(&self, session: &Session) -> Vec<Library> {
+        self.get_as(session, "/api/libraries", &[]).await
+    }
+
+    /// The audiobooks or podcasts in Library `library`, as `session` sees them.
+    pub async fn library_entries(&self, session: &Session, library: &str) -> Vec<LibraryEntry> {
+        self.get_as(session, "/api/library-entries", &[("library", library)])
+            .await
+    }
+
+    /// The audiobook `library_item`, or its episode `episode`, as `session` sees it.
+    pub async fn item(&self, session: &Session, library_item: &str, episode: Option<&str>) -> Item {
+        self.get_as(session, "/api/item", &item_query(library_item, episode))
+            .await
+    }
+
+    /// Podcast `id` with the episodes `filter` picks, as `session` sees it.
+    pub async fn podcast(&self, session: &Session, id: &str, filter: EpisodeFilter) -> Podcast {
+        self.get_as(
+            session,
+            "/api/podcast",
+            &[("id", id), ("filter", &filter_name(filter))],
+        )
+        .await
+    }
+
+    /// GETs `path` with `query` as `session` and decodes the successful response body, typed
+    /// or as raw JSON.
+    pub async fn get_as<T: serde::de::DeserializeOwned>(
+        &self,
+        session: &Session,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> T {
+        let response = self
+            .send(Method::GET, path, query, Some(&bearer(session)), None)
+            .await;
+        decode(response).await
+    }
+
+    /// GETs `path` with `query` as `session`, expecting a rejection.
+    pub async fn get_as_error(
+        &self,
+        session: &Session,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> (StatusCode, ApiError) {
+        self.get_error(path, query, Some(&bearer(session))).await
+    }
+
     /// GETs `path` and decodes the successful response body, typed or as raw JSON.
     pub async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> T {
-        decode(self.send(Method::GET, path, None, None).await).await
+        decode(self.send(Method::GET, path, &[], None, None).await).await
     }
 
     /// POSTs `body` to `path` with the given `Authorization` header, if any.
@@ -363,17 +418,23 @@ impl AppApi {
         authorization: Option<&str>,
         body: Value,
     ) -> reqwest::Response {
-        self.send(Method::POST, path, authorization, Some(body))
+        self.send(Method::POST, path, &[], authorization, Some(body))
             .await
     }
 
-    /// GETs `path` with the given `Authorization` header, if any, expecting a rejection.
+    /// GETs `path` with `query` and the given `Authorization` header, if any, expecting a
+    /// rejection.
     pub async fn get_error(
         &self,
         path: &str,
+        query: &[(&str, &str)],
         authorization: Option<&str>,
     ) -> (StatusCode, ApiError) {
-        api_error(self.send(Method::GET, path, authorization, None).await).await
+        api_error(
+            self.send(Method::GET, path, query, authorization, None)
+                .await,
+        )
+        .await
     }
 
     /// POSTs `body` to `path` with the given `Authorization` header, if any, expecting a
@@ -391,12 +452,14 @@ impl AppApi {
         &self,
         method: Method,
         path: &str,
+        query: &[(&str, &str)],
         authorization: Option<&str>,
         body: Option<Value>,
     ) -> reqwest::Response {
         let mut request = self
             .http
-            .request(method.clone(), format!("{}{path}", self.base_url));
+            .request(method.clone(), format!("{}{path}", self.base_url))
+            .query(query);
         if let Some(authorization) = authorization {
             request = request.header(reqwest::header::AUTHORIZATION, authorization);
         }
@@ -407,6 +470,21 @@ impl AppApi {
             .send()
             .await
             .unwrap_or_else(|error| panic!("{method} {path}: {error}"))
+    }
+}
+
+/// The query naming an Item.
+pub fn item_query<'a>(library_item: &'a str, episode: Option<&'a str>) -> Vec<(&'a str, &'a str)> {
+    let mut query = vec![("library_item", library_item)];
+    query.extend(episode.map(|episode| ("episode", episode)));
+    query
+}
+
+/// How an [`EpisodeFilter`] travels in a query: as it serializes.
+pub fn filter_name(filter: EpisodeFilter) -> String {
+    match serde_json::to_value(filter) {
+        Ok(Value::String(name)) => name,
+        other => panic!("{filter:?} serializes as {other:?}"),
     }
 }
 

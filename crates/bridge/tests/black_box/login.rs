@@ -9,7 +9,7 @@ use serde_json::json;
 
 use test_support::audiobookshelf::Audiobookshelf;
 use test_support::bridge::{
-    SESSION_INVALID, TestBridge, acting_as, acting_on, library_server_toml,
+    KEY_REJECTED, SESSION_INVALID, TestBridge, acting_as, acting_on, library_server_toml,
     named_library_server_toml, output_contains,
 };
 use test_support::closed_port;
@@ -27,8 +27,6 @@ fn bridge_with_abs() -> (TestBridge, Arc<Audiobookshelf>) {
     let bridge = TestBridge::start(&abs_config(&abs));
     (bridge, abs)
 }
-
-const KEY_REJECTED: (StatusCode, ApiError) = (StatusCode::UNAUTHORIZED, ApiError::ApiKeyRejected);
 
 #[tokio::test]
 async fn a_valid_key_opens_a_session_that_acts_as_its_user() {
@@ -392,7 +390,7 @@ async fn calls_without_a_valid_session_are_rejected() {
         Some("Bearer"),
     ] {
         assert_eq!(
-            bridge.api().get_error("/api/me", authorization).await,
+            bridge.api().get_error("/api/me", &[], authorization).await,
             SESSION_INVALID,
             "GET /api/me with {authorization:?}"
         );

@@ -13,14 +13,43 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::Duration;
 
-use api::{ApiError, ApiKey, LibraryServer, Session};
+use api::{
+    ApiError, ApiKey, EpisodeFilter, ItemId, Library, LibraryEntry, LibraryKind, LibraryServer,
+    Progress, Session,
+};
 use app::flow::{App, Notice, Screen};
 use app::i18n::{self, Language, LanguageChoice, Text};
 use app::storage::{DeviceStore, FileStore, LoadError, Stored};
 use tempfile::TempDir;
-use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
+use test_support::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_PUBLISHED_AT};
 use test_support::bridge::{TestBridge, library_server_toml, named_library_server_toml};
 use test_support::closed_port;
+
+/// The seeded audiobook Library.
+fn audiobooks(abs: &Audiobookshelf) -> Library {
+    Library {
+        id: abs.seeded().audiobook_library.clone(),
+        name: "Audiobooks".into(),
+        kind: LibraryKind::Audiobooks,
+    }
+}
+
+/// The seeded podcast Library.
+fn podcasts(abs: &Audiobookshelf) -> Library {
+    Library {
+        id: abs.seeded().podcast_library.clone(),
+        name: "Podcasts".into(),
+        kind: LibraryKind::Podcasts,
+    }
+}
+
+/// The screen listing every seeded Library, with `notice`: where a login lands.
+fn libraries(abs: &Audiobookshelf, notice: Option<Notice>) -> Screen {
+    Screen::Libraries {
+        libraries: vec![audiobooks(abs), podcasts(abs)],
+        notice,
+    }
+}
 
 /// One runtime for every test, as the App has one: the client's connection pool belongs to it.
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -158,11 +187,23 @@ async fn logged_in(
     abs: &Audiobookshelf,
     user: &AbsUser,
 ) -> App {
+    let app = logged_in_behind(device, bridge, abs.base_url(), user).await;
+    assert_eq!(app.screen(), &libraries(abs, None));
+    app
+}
+
+/// Launches the App on `device`, enters `bridge`'s URL and logs in as `user` on the Library
+/// Server at `library_server`, whatever the login shows.
+async fn logged_in_behind(
+    device: &Device,
+    bridge: &TestBridge,
+    library_server: &str,
+    user: &AbsUser,
+) -> App {
     let mut app = device.launch().await;
     app.submit_bridge_url(bridge.url()).await;
-    app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
+    app.log_in(library_server, ApiKey::new(&user.api_key.key))
         .await;
-    assert_eq!(app.screen(), &Screen::Settings { notice: None });
     app
 }
 
@@ -181,15 +222,20 @@ fn notice_text(app: &App) -> String {
     app.text(notice.text())
 }
 
-/// The notice on screen in English and in German.
-fn notice_texts(app: &mut App) -> (String, String) {
+/// The screen's text in English and in German, by `read` from the App.
+fn texts_of<T>(app: &mut App, read: impl Fn(&App) -> T) -> (T, T) {
     let choice = app.language_choice();
     app.set_language(LanguageChoice::English);
-    let english = notice_text(app);
+    let english = read(app);
     app.set_language(LanguageChoice::German);
-    let german = notice_text(app);
+    let german = read(app);
     app.set_language(choice);
     (english, german)
+}
+
+/// The notice on screen in English and in German.
+fn notice_texts(app: &mut App) -> (String, String) {
+    texts_of(app, notice_text)
 }
 
 fn both(text: Text) -> (String, String) {
@@ -236,8 +282,8 @@ fn html_page_server() -> String {
     web_server("200 OK", "text/html", "<html><body>Welcome</body></html>")
 }
 
-/// What went through a [`bridge_then_gone`] proxy: each request line, and after the first the
-/// status line the Bridge answered it with.
+/// What went through a [`proxy`]: each request line, and for each one passed on the status
+/// line of the answer.
 type ProxyLog = Arc<Mutex<Vec<String>>>;
 
 /// A loopback proxy that passes the first request on to `bridge` and answers every later one
@@ -245,39 +291,8 @@ type ProxyLog = Arc<Mutex<Vec<String>>>;
 fn bridge_then_gone(bridge: &str) -> (String, ProxyLog) {
     let target = bridge
         .strip_prefix("http://")
-        .expect("an http:// Bridge URL")
-        .to_owned();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let log = ProxyLog::default();
-    let written = Arc::clone(&log);
-    std::thread::spawn(move || {
-        for (index, mut stream) in listener.incoming().flatten().enumerate() {
-            let request = read_request(&stream);
-            let record = |bytes: &[u8]| {
-                let line = String::from_utf8_lossy(bytes)
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .to_owned();
-                written.lock().unwrap().push(line);
-            };
-            record(&request);
-            let response = if index == 0 {
-                let mut bridge = TcpStream::connect(&target).unwrap();
-                bridge.write_all(&request).unwrap();
-                let mut response = Vec::new();
-                bridge.read_to_end(&mut response).unwrap();
-                record(&response);
-                response
-            } else {
-                b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                    .to_vec()
-            };
-            let _ = stream.write_all(&response);
-        }
-    });
-    (format!("http://{addr}"), log)
+        .expect("an http:// Bridge URL");
+    proxy(target, |index, _| index > 0)
 }
 
 /// One HTTP/1.1 request from `stream`, rewritten to close the connection after the response,
@@ -306,6 +321,87 @@ fn read_request(stream: &TcpStream) -> Vec<u8> {
     reader.read_exact(&mut body).unwrap();
     request.extend(body);
     request
+}
+
+/// What a reverse proxy answers when what is behind it is gone.
+const UNAVAILABLE: &[u8] =
+    b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+/// Sends `request` (which closes its connection) to `target` (`host:port`) and returns the
+/// whole response.
+fn forward(target: &str, request: &[u8]) -> Vec<u8> {
+    let mut server = TcpStream::connect(target).unwrap();
+    server.write_all(request).unwrap();
+    let mut response = Vec::new();
+    server.read_to_end(&mut response).unwrap();
+    response
+}
+
+/// Which requests an [`abs_proxy`] fails: those whose request line starts with this.
+type Failing = Arc<Mutex<Option<&'static str>>>;
+
+/// A loopback proxy in front of Audiobookshelf at `abs` (`host:port`) that answers the
+/// requests `failing` names with `503 Service Unavailable` and passes every other one on.
+fn abs_proxy(abs: &str) -> (String, Failing) {
+    let failing = Failing::default();
+    let fails = Arc::clone(&failing);
+    let (url, _) = proxy(abs, move |_, request| {
+        fails
+            .lock()
+            .unwrap()
+            .is_some_and(|prefix| request.starts_with(prefix.as_bytes()))
+    });
+    (url, failing)
+}
+
+/// A loopback proxy in front of `target` (`host:port`): answers the `index`th request with
+/// `503 Service Unavailable` when `fails(index, request)`, else passes it on. Logs each
+/// request line and, for those passed on, the status line of the answer.
+fn proxy(
+    target: &str,
+    fails: impl Fn(usize, &[u8]) -> bool + Send + Sync + 'static,
+) -> (String, ProxyLog) {
+    let target = target.to_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log = ProxyLog::default();
+    let written = Arc::clone(&log);
+    let fails = Arc::new(fails);
+    std::thread::spawn(move || {
+        for (index, mut stream) in listener.incoming().flatten().enumerate() {
+            let (target, written, fails) =
+                (target.clone(), Arc::clone(&written), Arc::clone(&fails));
+            std::thread::spawn(move || {
+                let request = read_request(&stream);
+                let record = |bytes: &[u8]| {
+                    let line = String::from_utf8_lossy(bytes)
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_owned();
+                    written.lock().unwrap().push(line);
+                };
+                record(&request);
+                let response = if fails(index, &request) {
+                    UNAVAILABLE.to_vec()
+                } else {
+                    let response = forward(&target, &request);
+                    record(&response);
+                    response
+                };
+                let _ = stream.write_all(&response);
+            });
+        }
+    });
+    (format!("http://{addr}"), log)
+}
+
+/// A Bridge whose Library Server "Home" is the shared Audiobookshelf behind an [`abs_proxy`].
+fn bridge_behind_proxy() -> (TestBridge, Arc<Audiobookshelf>, String, Failing) {
+    let abs = Audiobookshelf::shared();
+    let (proxy, failing) = abs_proxy(abs.address());
+    let bridge = TestBridge::start(&named_library_server_toml(&proxy, "Home"));
+    (bridge, abs, proxy, failing)
 }
 
 /// Fails the test instead of hanging when `action` outlives `limit`.
@@ -408,7 +504,7 @@ fn an_address_that_is_not_a_bridge_is_named_as_such_and_not_remembered() {
 }
 
 #[test]
-fn login_with_an_api_key_opens_a_session_that_settings_shows() {
+fn login_with_an_api_key_opens_a_session_and_lists_the_libraries() {
     let (bridge, abs, _) = bridge_with_abs();
     let device = Device::new();
     run(async || {
@@ -421,7 +517,7 @@ fn login_with_an_api_key_opens_a_session_that_settings_shows() {
             ApiKey::new(format!(" {}\n", user.api_key.key)),
         )
         .await;
-        assert_eq!(app.screen(), &Screen::Settings { notice: None });
+        assert_eq!(app.screen(), &libraries(&abs, None));
 
         let stored = app.session().expect("logged in");
         assert_eq!(
@@ -489,7 +585,7 @@ fn a_session_lasts_across_launches_until_logout() {
         drop(app);
 
         let mut app = device.launch().await;
-        assert_eq!(app.screen(), &Screen::Settings { notice: None });
+        assert_eq!(app.screen(), &libraries(&abs, None));
         assert_eq!(session(&app), before);
 
         app.log_out().await;
@@ -600,7 +696,7 @@ fn a_session_whose_library_server_is_unconfigured_for_a_while_stays() {
         // Back in the configuration: the session kept on the device works again.
         restart_bridge(&mut bridge, &device, &home_config(&abs, &unreachable));
         let app = device.launch().await;
-        assert_eq!(app.screen(), &Screen::Settings { notice: None });
+        assert_eq!(app.screen(), &libraries(&abs, None));
         assert_eq!(session(&app), before);
         assert_eq!(bridge.api().current_user(&before).await, before.user);
     });
@@ -752,7 +848,7 @@ fn the_account_is_refreshed_at_launch() {
         abs.rename_user(&user.id, &renamed).await;
 
         let app = device.launch().await;
-        assert_eq!(app.screen(), &Screen::Settings { notice: None });
+        assert_eq!(app.screen(), &libraries(&abs, None));
         assert_eq!(app.session().unwrap().user.username, renamed);
 
         // Remembered: shown even when the Bridge can't confirm it.
@@ -810,12 +906,7 @@ fn failed_saves_are_reported_until_a_save_succeeds() {
         device.fail_saves.store(true, Ordering::SeqCst);
         app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
             .await;
-        assert_eq!(
-            app.screen(),
-            &Screen::Settings {
-                notice: Some(Notice::StorageSave)
-            }
-        );
+        assert_eq!(app.screen(), &libraries(&abs, Some(Notice::StorageSave)));
         assert_eq!(app.text(Text::ErrorStorageSave), notice_text(&app));
 
         // Picking a language: a working save clears the notice; a failing one, from a clean
@@ -969,12 +1060,7 @@ fn an_unreadable_device_file_that_cannot_be_set_aside_is_left_alone() {
         // claim the device still holds a session.
         app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
             .await;
-        assert_eq!(
-            app.screen(),
-            &Screen::Settings {
-                notice: Some(Notice::StorageStuck)
-            }
-        );
+        assert_eq!(app.screen(), &libraries(&abs, Some(Notice::StorageStuck)));
         app.log_out().await;
         assert_eq!(app.screen().notice(), Some(&Notice::StorageStuck));
         assert_eq!(notice_texts(&mut app), both(Text::ErrorStorageStuck));
@@ -995,7 +1081,7 @@ fn an_unknown_language_or_a_session_without_a_bridge_starts_cleanly() {
         // A language from a newer App: the session and address stay.
         device.edit(|json| json["language"] = "klingon".into());
         let app = device.launch().await;
-        assert_eq!(app.screen(), &Screen::Settings { notice: None });
+        assert_eq!(app.screen(), &libraries(&abs, None));
         assert_eq!(app.language_choice(), LanguageChoice::System);
         assert_eq!(app.session().map(|stored| &stored.user), Some(&before.user));
 
@@ -1033,5 +1119,388 @@ fn the_language_follows_the_device_unless_settings_overrides_it() {
 
         app.set_language(LanguageChoice::System);
         assert_eq!(german.launch().await.language(), Language::German);
+    });
+}
+
+#[test]
+fn a_podcasts_episodes_are_filtered_by_the_persons_progress() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        abs.set_progress(&user, &seeded.podcast, Some(&seeded.episodes[0]), 0.0, true)
+            .await;
+        abs.set_progress(
+            &user,
+            &seeded.podcast,
+            Some(&seeded.episodes[1]),
+            300.0,
+            false,
+        )
+        .await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        assert!(!app.can_go_back());
+
+        app.open_library(podcasts(&abs)).await;
+        let library = Screen::Library {
+            library: podcasts(&abs),
+            entries: vec![LibraryEntry {
+                id: seeded.podcast.clone(),
+                title: "The Clacks Hour".into(),
+                author: Some("Ankh-Morpork Radio".into()),
+            }],
+            notice: None,
+        };
+        assert_eq!(app.screen(), &library);
+
+        let episodes = |app: &App| match app.screen() {
+            // The filter the Bridge says it applied.
+            Screen::Podcast { podcast, .. } => (
+                podcast.filter,
+                podcast
+                    .episodes
+                    .iter()
+                    .map(|episode| episode.title.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            screen => panic!("{screen:?}"),
+        };
+        app.open_entry(&seeded.podcast).await;
+        assert_eq!(
+            episodes(&app),
+            (
+                EpisodeFilter::Unfinished,
+                vec!["Episode 3".into(), "Episode 2".into()]
+            )
+        );
+        app.filter_episodes(EpisodeFilter::Finished).await;
+        assert_eq!(
+            episodes(&app),
+            (EpisodeFilter::Finished, vec!["Episode 1".into()])
+        );
+        app.filter_episodes(EpisodeFilter::All).await;
+        assert_eq!(
+            episodes(&app),
+            (
+                EpisodeFilter::All,
+                vec!["Episode 3".into(), "Episode 2".into(), "Episode 1".into()]
+            )
+        );
+        // What each episode's row says, in both languages.
+        let rows = |app: &App| match app.screen() {
+            Screen::Podcast { podcast, .. } => podcast
+                .episodes
+                .iter()
+                .map(|episode| i18n::episode_summary(app.language(), episode))
+                .collect::<Vec<_>>(),
+            screen => panic!("{screen:?}"),
+        };
+        assert_eq!(
+            texts_of(&mut app, rows),
+            (
+                vec![
+                    "March 31, 2026 · Not started".to_owned(),
+                    "February 15, 2026 · 10 min left".to_owned(),
+                    "January 1, 2026 · Finished".to_owned(),
+                ],
+                vec![
+                    "31. März 2026 · Nicht begonnen".to_owned(),
+                    "15. Februar 2026 · noch 10 Min.".to_owned(),
+                    "1. Januar 2026 · Beendet".to_owned(),
+                ],
+            )
+        );
+
+        // Back the way it came.
+        app.go_back();
+        assert_eq!(app.screen(), &library);
+        app.go_back();
+        assert_eq!(app.screen(), &libraries(&abs, None));
+        assert!(!app.can_go_back());
+    });
+}
+
+#[test]
+fn an_audiobook_shows_its_details_progress_and_chapters_in_english_and_german() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        abs.set_progress(&user, &seeded.long_book, None, 600.0, false)
+            .await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+
+        app.open_library(audiobooks(&abs)).await;
+        let Screen::Library { entries, .. } = app.screen() else {
+            panic!("{:?}", app.screen());
+        };
+        let titles: Vec<_> = entries.iter().map(|entry| entry.title.as_str()).collect();
+        assert_eq!(titles, ["Silence", "The Long Book"]);
+
+        app.open_entry(&seeded.long_book).await;
+        let Screen::Item { item, notice: None } = app.screen() else {
+            panic!("{:?}", app.screen());
+        };
+        assert_eq!(
+            (
+                item.title.as_str(),
+                item.author.as_deref(),
+                item.description.as_deref()
+            ),
+            (
+                "The Long Book",
+                Some("Pratchett"),
+                Some("A book that goes on.")
+            )
+        );
+        assert_eq!(
+            item.progress,
+            Some(Progress {
+                current_time: 600.0,
+                finished: false
+            })
+        );
+        assert_eq!(
+            i18n::chapter_rows(item),
+            [
+                ("01 - Part One", "0:00".to_owned()),
+                ("02 - Part Two", "40:00".to_owned()),
+                ("03 - Part Three", "1:10:00".to_owned()),
+            ]
+        );
+        let item = item.clone();
+        let facts = |app: &App| i18n::item_facts(app.language(), &item);
+        assert_eq!(
+            texts_of(&mut app, facts),
+            (
+                vec![
+                    (Text::ItemProgress, "1 h 2 min left".to_owned()),
+                    (Text::ItemDuration, "1 h 12 min".to_owned()),
+                ],
+                vec![
+                    (Text::ItemProgress, "noch 1 Std. 2 Min.".to_owned()),
+                    (Text::ItemDuration, "1 Std. 12 Min.".to_owned()),
+                ],
+            )
+        );
+
+        app.go_back();
+        app.go_back();
+        assert_eq!(app.screen(), &libraries(&abs, None));
+    });
+}
+
+#[test]
+fn an_episode_shows_its_podcast_publish_date_and_progress() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::with_locale("de-DE");
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.open_library(podcasts(&abs)).await;
+        app.open_podcast(&seeded.podcast).await;
+
+        app.open_episode(&seeded.episodes[2]).await;
+        let Screen::Item { item, notice: None } = app.screen() else {
+            panic!("{:?}", app.screen());
+        };
+        assert_eq!(
+            (
+                item.title.as_str(),
+                item.podcast.as_deref(),
+                item.published_at
+            ),
+            (
+                "Episode 3",
+                Some("The Clacks Hour"),
+                Some(EPISODE_PUBLISHED_AT[2])
+            )
+        );
+        assert!(item.chapters.is_empty());
+        let item = item.clone();
+        let facts = |app: &App| i18n::item_facts(app.language(), &item);
+        assert_eq!(
+            texts_of(&mut app, facts),
+            (
+                vec![
+                    (Text::ItemProgress, "Not started".to_owned()),
+                    (Text::ItemDuration, "1 h 6 min".to_owned()),
+                    (Text::ItemPublished, "March 31, 2026".to_owned()),
+                ],
+                vec![
+                    (Text::ItemProgress, "Nicht begonnen".to_owned()),
+                    (Text::ItemDuration, "1 Std. 6 Min.".to_owned()),
+                    (Text::ItemPublished, "31. März 2026".to_owned()),
+                ],
+            )
+        );
+
+        // Back to the episodes, as they were.
+        app.go_back();
+        assert!(
+            matches!(app.screen(), Screen::Podcast { podcast, .. } if podcast.filter == EpisodeFilter::Unfinished && podcast.episodes.len() == 3),
+            "{:?}",
+            app.screen()
+        );
+    });
+}
+
+#[test]
+fn settings_stay_reachable_from_the_libraries() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+
+        app.open_settings();
+        assert_eq!(app.screen(), &Screen::Settings { notice: None });
+        assert!(!app.can_go_back());
+
+        app.open_libraries().await;
+        assert_eq!(app.screen(), &libraries(&abs, None));
+    });
+}
+
+#[test]
+fn something_no_longer_on_the_library_server_is_named_on_the_screen_shown() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+
+        app.open_item(ItemId {
+            library_item: "00000000-0000-0000-0000-000000000000".into(),
+            episode: None,
+        })
+        .await;
+        assert_eq!(
+            app.screen(),
+            &libraries(&abs, Some(Notice::Api(ApiError::NotFound)))
+        );
+        assert_eq!(notice_texts(&mut app), both(Text::ErrorNotFound));
+        assert!(app.session().is_some());
+    });
+}
+
+#[test]
+fn a_key_revoked_while_browsing_ends_the_session() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        abs.delete_api_key(&user.api_key).await;
+
+        app.open_library(audiobooks(&abs)).await;
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Login {
+                    notice: Some(Notice::Api(ApiError::ApiKeyRejected)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(app.session(), None);
+        assert!(!app.can_go_back());
+        assert_eq!(device.launch().await.session(), None);
+    });
+}
+
+#[test]
+fn libraries_that_cannot_be_listed_are_explained_and_listed_on_retry() {
+    let (bridge, abs, proxy, failing) = bridge_behind_proxy();
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        *failing.lock().unwrap() = Some("GET /api/libraries ");
+        let failed = Screen::Libraries {
+            libraries: Vec::new(),
+            notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
+        };
+
+        // After login...
+        let mut app = logged_in_behind(&device, &bridge, &proxy, &user).await;
+        assert_eq!(app.screen(), &failed);
+        assert_eq!(
+            notice_texts(&mut app),
+            both(Text::ErrorLibraryServerUnreachable)
+        );
+        assert!(app.session().is_some());
+
+        // ...and at launch, the session staying.
+        let mut app = device.launch().await;
+        assert_eq!(app.screen(), &failed);
+
+        *failing.lock().unwrap() = None;
+        app.open_libraries().await;
+        assert_eq!(app.screen(), &libraries(&abs, None));
+    });
+}
+
+#[test]
+fn a_session_ended_elsewhere_while_browsing_leads_to_login() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.open_library(podcasts(&abs)).await;
+        app.open_entry(&seeded.podcast).await;
+        assert!(matches!(app.screen(), Screen::Podcast { .. }));
+        // Logged out on the Bridge, as from another device holding the session.
+        bridge.api().logout(&session(&app)).await;
+
+        app.filter_episodes(EpisodeFilter::All).await;
+
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Login {
+                    notice: Some(Notice::Api(ApiError::SessionInvalid)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(app.session(), None);
+        assert!(!app.can_go_back());
+    });
+}
+
+#[test]
+fn a_filter_that_fails_keeps_the_episodes_shown() {
+    let (bridge, abs, proxy, failing) = bridge_behind_proxy();
+    let device = Device::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        let mut app = logged_in_behind(&device, &bridge, &proxy, &user).await;
+        app.open_library(podcasts(&abs)).await;
+        app.open_entry(&seeded.podcast).await;
+        let Screen::Podcast { podcast, .. } = app.screen().clone() else {
+            panic!("{:?}", app.screen());
+        };
+
+        *failing.lock().unwrap() = Some("GET /api/items/");
+        app.filter_episodes(EpisodeFilter::Finished).await;
+
+        assert_eq!(
+            app.screen(),
+            &Screen::Podcast {
+                podcast,
+                notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
+            }
+        );
+        assert!(app.session().is_some());
     });
 }

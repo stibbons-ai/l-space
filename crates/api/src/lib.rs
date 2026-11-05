@@ -11,6 +11,12 @@
 //! A person logs in with [`login`] and gets a [`Session`]. Every call that acts for them sends
 //! its token as `Authorization: Bearer <token>`; on the App's side, set it for every server
 //! function with `dioxus::fullstack::set_request_headers`.
+//!
+//! A session browses its Library Server as its user: [`libraries`] lists the Libraries,
+//! [`library_entries`] a Library's audiobooks or podcasts, [`podcast`] a podcast's episodes
+//! filtered by the user's Progress, and [`item`] one Item with that Progress, its chapters and
+//! its audio files. Ids from the App name things on the Library Server; one that names nothing
+//! the user can see is [`ApiError::NotFound`].
 
 use std::fmt;
 
@@ -94,6 +100,152 @@ pub struct CurrentUser {
     pub username: String,
 }
 
+/// A Library on the session's Library Server: audiobooks or podcasts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Library {
+    /// Audiobookshelf's id for the Library.
+    pub id: String,
+    pub name: String,
+    pub kind: LibraryKind,
+}
+
+/// What a Library holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LibraryKind {
+    Audiobooks,
+    Podcasts,
+}
+
+/// An audiobook or a podcast, as a Library lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryEntry {
+    /// Audiobookshelf's id for the audiobook or podcast (its library item).
+    pub id: String,
+    pub title: String,
+    pub author: Option<String>,
+}
+
+/// Names an Item: an audiobook, or one episode of a podcast.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemId {
+    /// The audiobook, or the podcast the episode belongs to.
+    pub library_item: String,
+    /// The episode, for a podcast's.
+    pub episode: Option<String>,
+}
+
+/// An Item with its details, the session user's Progress and its audio files. Times are
+/// seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Item {
+    pub id: ItemId,
+    pub title: String,
+    /// An audiobook's author.
+    pub author: Option<String>,
+    /// An episode's podcast, by title.
+    pub podcast: Option<String>,
+    pub description: Option<String>,
+    /// Unknown if the Library Server doesn't know it, for an audiobook or an episode alike.
+    pub duration: Option<f64>,
+    /// When an episode was published, in milliseconds since the Unix epoch.
+    pub published_at: Option<i64>,
+    /// The session user's Progress; none if the Library Server holds no Progress of theirs
+    /// for the Item.
+    pub progress: Option<Progress>,
+    /// An audiobook's chapters, in the order the Library Server keeps them; an episode has
+    /// none.
+    pub chapters: Vec<Chapter>,
+    /// The audio files in playing order.
+    pub audio_files: Vec<AudioFile>,
+}
+
+/// How far a user is into an Item.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Progress {
+    /// Seconds into the Item.
+    pub current_time: f64,
+    pub finished: bool,
+}
+
+/// A chapter of an audiobook; seconds into the whole audiobook.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Chapter {
+    pub title: String,
+    pub start: f64,
+    pub end: f64,
+}
+
+/// One audio file of an Item.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioFile {
+    /// Audiobookshelf's id for the file within its audiobook or podcast.
+    pub id: String,
+    /// Seconds into the whole Item where this file starts; unknown once a file before it has
+    /// an unknown duration, or when the Library Server doesn't say.
+    pub start_offset: Option<f64>,
+    /// Unknown if the Library Server could not tell.
+    pub duration: Option<f64>,
+}
+
+/// A podcast with those of its episodes a filter picked.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Podcast {
+    /// Audiobookshelf's id for the podcast (its library item).
+    pub id: String,
+    pub title: String,
+    pub author: Option<String>,
+    /// The filter that picked the episodes: the one asked for, or the one the Bridge applied
+    /// instead of a filter it doesn't know.
+    pub filter: EpisodeFilter,
+    /// Newest first; episodes without a publish date last.
+    pub episodes: Vec<Episode>,
+}
+
+/// An episode as its podcast lists it. Times are seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Episode {
+    /// Audiobookshelf's id for the episode.
+    pub id: String,
+    pub title: String,
+    /// Unknown if the Library Server doesn't know it.
+    pub duration: Option<f64>,
+    /// Milliseconds since the Unix epoch.
+    pub published_at: Option<i64>,
+    /// The session user's Progress; none if the Library Server holds no Progress of theirs
+    /// for the episode.
+    pub progress: Option<Progress>,
+}
+
+/// Which of a podcast's episodes to list, by the session user's Progress. A filter this
+/// Bridge doesn't know (from a newer App) counts as [`EpisodeFilter::Unfinished`], as does
+/// none at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EpisodeFilter {
+    Finished,
+    All,
+    /// Not Finished, started or not. Last, as serde wants its catch-all.
+    #[default]
+    #[serde(other)]
+    Unfinished,
+}
+
+impl EpisodeFilter {
+    /// Every filter, in the order the App offers them.
+    pub const CHOICES: [EpisodeFilter; 3] = [Self::Unfinished, Self::Finished, Self::All];
+
+    /// Whether an episode with `progress` passes.
+    pub fn passes(self, progress: Option<&Progress>) -> bool {
+        let finished = progress.is_some_and(|progress| progress.finished);
+        match self {
+            Self::Unfinished => !finished,
+            Self::Finished => finished,
+            Self::All => true,
+        }
+    }
+}
+
 /// An error code the App translates for the user.
 ///
 /// On the wire this is the `data` member of the error body, for example
@@ -135,6 +287,10 @@ pub enum ApiError {
     /// the configuration: it ends the session either way.
     #[error("session_invalid")]
     SessionInvalid,
+    /// The session's Library Server has no Library or Item with this id that its user can
+    /// see.
+    #[error("not_found")]
+    NotFound,
     /// A code this build of the App does not know yet, from a newer Bridge. Produced only on
     /// the App's side, when decoding; the Bridge never sends it.
     #[serde(other)]
@@ -166,7 +322,7 @@ impl AsStatusCode for ApiError {
     fn as_status_code(&self) -> StatusCode {
         match self {
             Self::ApiKeyRejected | Self::SessionInvalid => StatusCode::UNAUTHORIZED,
-            Self::LibraryServerNotConfigured => StatusCode::NOT_FOUND,
+            Self::LibraryServerNotConfigured | Self::NotFound => StatusCode::NOT_FOUND,
             Self::BridgeUnreachable | Self::NotABridge | Self::LibraryServerUnreachable => {
                 StatusCode::BAD_GATEWAY
             }
@@ -208,6 +364,61 @@ pub async fn current_user() -> Result<CurrentUser, ApiError> {
     bridge.current_user(server::session_token(&headers)?).await
 }
 
+/// Every Library of the session's Library Server that its user can see, audiobooks and
+/// podcasts, in the Library Server's order.
+#[get(
+    "/api/libraries",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn libraries() -> Result<Vec<Library>, ApiError> {
+    bridge.libraries(server::session_token(&headers)?).await
+}
+
+/// Every audiobook or podcast in Library `library`, by title.
+#[get(
+    "/api/library-entries?library",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn library_entries(library: String) -> Result<Vec<LibraryEntry>, ApiError> {
+    bridge
+        .library_entries(server::session_token(&headers)?, library)
+        .await
+}
+
+/// The Item `library_item` (an audiobook), or its episode `episode` (a podcast's), with the
+/// session user's Progress.
+#[get(
+    "/api/item?library_item&episode",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn item(library_item: String, episode: Option<String>) -> Result<Item, ApiError> {
+    let id = ItemId {
+        library_item,
+        episode,
+    };
+    bridge.item(server::session_token(&headers)?, id).await
+}
+
+/// The podcast `id` with the episodes `filter` picks by the session user's Progress (by
+/// default, and for a filter this Bridge doesn't know, the unfinished ones).
+#[get(
+    "/api/podcast?id&filter",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn podcast(id: String, filter: Option<EpisodeFilter>) -> Result<Podcast, ApiError> {
+    bridge
+        .podcast(
+            server::session_token(&headers)?,
+            id,
+            filter.unwrap_or_default(),
+        )
+        .await
+}
+
 /// The Bridge's side of the App API.
 #[cfg(feature = "server")]
 pub mod server {
@@ -220,7 +431,10 @@ pub mod server {
     use dioxus::fullstack::headers::authorization::{Authorization, Bearer};
     use dioxus::server::{DioxusRouterExt, FullstackState};
 
-    use crate::{ApiError, ApiKey, CurrentUser, LibraryServer, Session, SessionToken};
+    use crate::{
+        ApiError, ApiKey, CurrentUser, EpisodeFilter, Item, ItemId, Library, LibraryEntry,
+        LibraryServer, Podcast, Session, SessionToken,
+    };
 
     /// A boxed future, so [`Bridge`] stays object-safe.
     pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -243,6 +457,27 @@ pub mod server {
         /// See [`crate::current_user`].
         fn current_user(&self, token: SessionToken)
         -> BoxFuture<'_, Result<CurrentUser, ApiError>>;
+
+        /// See [`crate::libraries`].
+        fn libraries(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Library>, ApiError>>;
+
+        /// See [`crate::library_entries`].
+        fn library_entries(
+            &self,
+            token: SessionToken,
+            library: String,
+        ) -> BoxFuture<'_, Result<Vec<LibraryEntry>, ApiError>>;
+
+        /// See [`crate::item`].
+        fn item(&self, token: SessionToken, id: ItemId) -> BoxFuture<'_, Result<Item, ApiError>>;
+
+        /// See [`crate::podcast`].
+        fn podcast(
+            &self,
+            token: SessionToken,
+            podcast: String,
+            filter: EpisodeFilter,
+        ) -> BoxFuture<'_, Result<Podcast, ApiError>>;
     }
 
     /// How server functions reach the [`Bridge`].

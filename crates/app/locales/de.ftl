@@ -2,6 +2,7 @@ app-name = Ook
 starting = Verbinde…
 busy = Einen Moment…
 bridge = Clacks
+retry = Erneut versuchen
 
 bridge-url-title = Mit Clacks verbinden
 bridge-url-intro = Gib die Adresse von Clacks ein, zum Beispiel http://192.168.1.10:8080. Das ist nur einmal nötig.
@@ -14,7 +15,6 @@ login-api-key = Audiobookshelf-API-Schlüssel
 login-api-key-hint = API-Schlüssel legt ein Audiobookshelf-Admin unter Einstellungen → API-Schlüssel an.
 login-submit = Anmelden
 login-no-library-servers = Clacks hat noch keine Library Server. Bitte wende dich an die Person, die Clacks betreibt, damit sie einen hinzufügt.
-login-retry = Erneut versuchen
 login-change-bridge = Clacks ändern
 
 settings-title = Einstellungen
@@ -22,6 +22,48 @@ settings-library-server = Library Server
 settings-account = Konto
 settings-language = Sprache
 settings-logout = Abmelden
+
+libraries-title = Bibliotheken
+libraries-none = Auf deinem Library Server siehst du noch keine Bibliotheken.
+library-kind-audiobooks = Hörbücher
+library-kind-podcasts = Podcasts
+library-empty = In dieser Bibliothek gibt es noch nichts zum Anhören.
+back = Zurück
+
+episodes-unfinished = Nicht beendet
+episodes-finished = Beendet
+episodes-all = Alle
+episodes-none = Hier gibt es keine Folgen.
+
+item-duration = Dauer
+item-published = Veröffentlicht
+item-progress = Fortschritt
+item-chapters = Kapitel
+
+progress-finished = Beendet
+progress-not-started = Nicht begonnen
+progress-started = Begonnen
+progress-left = noch { $duration }
+
+duration-hours-minutes = { $hours } Std. { $minutes } Min.
+duration-hours = { $hours } Std.
+duration-minutes = { $minutes } Min.
+duration-under-minute = unter 1 Min.
+
+date = { $day }. { $month ->
+        [1] Januar
+        [2] Februar
+        [3] März
+        [4] April
+        [5] Mai
+        [6] Juni
+        [7] Juli
+        [8] August
+        [9] September
+        [10] Oktober
+        [11] November
+       *[12] Dezember
+    } { $year }
 
 language-system = System
 language-english = English
@@ -40,5 +82,6 @@ error-internal = Bei Clacks ist etwas schiefgegangen. Bitte versuche es später 
 error-api-key-rejected = Audiobookshelf hat diesen API-Schlüssel abgelehnt: Er ist falsch, wurde widerrufen oder ist abgelaufen. Bitte deinen Audiobookshelf-Admin um einen neuen.
 error-library-server-not-configured = Dieser Library Server ist auf Clacks nicht mehr eingerichtet. Wähle einen anderen oder wende dich an die Person, die Clacks betreibt.
 error-library-server-unreachable = Clacks erreicht diesen Library Server gerade nicht. Bitte versuche es später noch einmal.
+error-not-found = Das ist auf deinem Library Server nicht (mehr) für dich verfügbar.
 error-session-invalid = Deine Sitzung ist beendet. Bitte melde dich erneut an.
 error-unknown = Etwas Unerwartetes ist schiefgegangen. Ein Update von Ook kann helfen.
