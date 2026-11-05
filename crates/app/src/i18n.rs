@@ -9,11 +9,12 @@
 //! What the screens say about Items is composed here too, with the words and word order from
 //! the same Fluent resources: [`duration`], [`progress`], [`date`], an episode's row
 //! ([`episode_summary`]), an Item's facts ([`item_facts`]) and its chapters with their start
-//! times ([`chapter_rows`], [`clock`]).
+//! times ([`chapter_rows`], [`clock`]). So is what the Groups screen says about a Group's
+//! playback ([`group_playback`]).
 
 use std::sync::LazyLock;
 
-use api::{Episode, EpisodeFilter, Item, LibraryKind, Progress};
+use api::{Episode, EpisodeFilter, Group, Item, LibraryKind, Progress, TransportState};
 use fluent_bundle::concurrent::FluentBundle;
 use fluent_bundle::{FluentArgs, FluentResource};
 use serde::{Deserialize, Serialize};
@@ -152,6 +153,14 @@ texts! {
     ProgressNotStarted => "progress-not-started",
     ProgressStarted => "progress-started",
     DurationUnderMinute => "duration-under-minute",
+    GroupsTitle => "groups-title",
+    GroupsNone => "groups-none",
+    GroupsRefresh => "groups-refresh",
+    GroupPlaying => "group-playing",
+    GroupPaused => "group-paused",
+    GroupStopped => "group-stopped",
+    GroupTransitioning => "group-transitioning",
+    GroupStateUnknown => "group-state-unknown",
     SettingsTitle => "settings-title",
     SettingsLibraryServer => "settings-library-server",
     SettingsAccount => "settings-account",
@@ -175,6 +184,7 @@ texts! {
     ErrorLibraryServerUnreachable => "error-library-server-unreachable",
     ErrorSessionInvalid => "error-session-invalid",
     ErrorNotFound => "error-not-found",
+    ErrorSonosUnreachable => "error-sonos-unreachable",
     ErrorUnknown => "error-unknown",
 }
 
@@ -231,6 +241,7 @@ impl From<&api::ApiError> for Text {
             ApiError::LibraryServerUnreachable => Self::ErrorLibraryServerUnreachable,
             ApiError::SessionInvalid => Self::ErrorSessionInvalid,
             ApiError::NotFound => Self::ErrorNotFound,
+            ApiError::SonosUnreachable => Self::ErrorSonosUnreachable,
             ApiError::Unknown => Self::ErrorUnknown,
         }
     }
@@ -253,6 +264,18 @@ impl From<EpisodeFilter> for Text {
             EpisodeFilter::Unfinished => Self::EpisodesUnfinished,
             EpisodeFilter::Finished => Self::EpisodesFinished,
             EpisodeFilter::All => Self::EpisodesAll,
+        }
+    }
+}
+
+/// How a Group's transport state is named.
+impl From<TransportState> for Text {
+    fn from(state: TransportState) -> Self {
+        match state {
+            TransportState::Playing => Self::GroupPlaying,
+            TransportState::Paused => Self::GroupPaused,
+            TransportState::Stopped => Self::GroupStopped,
+            TransportState::Transitioning => Self::GroupTransitioning,
         }
     }
 }
@@ -359,6 +382,17 @@ pub fn item_facts(language: Language, item: &Item) -> Vec<(Text, String)> {
         facts.push((Text::ItemPublished, date(language, published_at)));
     }
     facts
+}
+
+/// What a Group's row says about its playback: its state, then its track's title and creator
+/// where known, such as "Playing · Moby Dick · Herman Melville".
+pub fn group_playback(language: Language, group: &Group) -> String {
+    let state = group.state.map_or(Text::GroupStateUnknown, Text::from);
+    let mut parts = vec![text(language, state)];
+    if let Some(track) = &group.now_playing {
+        parts.extend(track.title.iter().chain(&track.creator).cloned());
+    }
+    parts.join(" · ")
 }
 
 /// An Item's chapters as the Item screen lists them: each title with its start time.
@@ -675,8 +709,8 @@ mod tests {
         for (text, error) in &messages {
             assert_eq!(Text::from(error), *text, "{error:?}");
         }
-        // One message per code (ApiError has 9), each different in every language.
-        assert_eq!(messages.len(), 9, "{messages:?}");
+        // One message per code (ApiError has 10), each different in every language.
+        assert_eq!(messages.len(), 10, "{messages:?}");
         for language in Language::ALL {
             let distinct: BTreeSet<_> = messages
                 .iter()

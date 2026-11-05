@@ -1,0 +1,16 @@
+[package]
+name = "sonos-fake"
+description = "Test only: an in-process fake Sonos household on loopback, speaking the UPnP subset the Bridge uses"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+axum.workspace = true
+clock.workspace = true
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time"] }
+
+[lints]
+workspace = true

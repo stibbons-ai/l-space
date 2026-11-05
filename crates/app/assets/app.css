@@ -184,3 +184,26 @@ ol.chapters li {
   background: #0a63d8;
   color: white;
 }
+
+ul.groups {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+ul.groups li {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 12px 0;
+  border-bottom: 1px solid #8884;
+}
+
+.groups .title {
+  font-weight: 600;
+}
+
+.groups .detail {
+  color: #888;
+  font-size: 15px;
+}

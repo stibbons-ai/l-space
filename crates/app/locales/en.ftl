@@ -50,6 +50,15 @@ duration-hours = { $hours } h
 duration-minutes = { $minutes } min
 duration-under-minute = under 1 min
 
+groups-title = Groups
+groups-none = Clacks hasn't found any Sonos speakers on your network.
+groups-refresh = Refresh
+group-playing = Playing
+group-paused = Paused
+group-stopped = Stopped
+group-transitioning = Starting…
+group-state-unknown = Not answering
+
 date = { $month ->
         [1] January
         [2] February
@@ -84,4 +93,5 @@ error-library-server-not-configured = This Library Server is no longer set up on
 error-library-server-unreachable = Clacks can't reach this Library Server right now. Please try again later.
 error-not-found = This isn't (or is no longer) available to you on your Library Server.
 error-session-invalid = Your session has ended. Please log in again.
+error-sonos-unreachable = Clacks found your Sonos speakers, but none of them answered just now. Please try again.
 error-unknown = Something unexpected went wrong. Updating Ook may help.

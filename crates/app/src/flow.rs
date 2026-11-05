@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::{
-    ApiError, ApiKey, EpisodeFilter, Item, ItemId, Library, LibraryEntry, LibraryKind,
+    ApiError, ApiKey, EpisodeFilter, Group, Item, ItemId, Library, LibraryEntry, LibraryKind,
     LibraryServer, Podcast, Session, SessionToken,
 };
 use dioxus::fullstack::http::header::{AUTHORIZATION, HeaderValue};
@@ -52,6 +52,12 @@ pub enum Screen {
     },
     /// One Item: its details, the person's Progress, and an audiobook's chapters.
     Item { item: Item, notice: Option<Notice> },
+    /// Logged in: every Sonos Group with its members and what it plays. Empty, with a notice,
+    /// when they could not be listed.
+    Groups {
+        groups: Vec<Group>,
+        notice: Option<Notice>,
+    },
     /// Logged in: the Library Server, the account, the language, and logout.
     Settings { notice: Option<Notice> },
 }
@@ -75,6 +81,7 @@ impl Screen {
             | Self::Library { notice, .. }
             | Self::Podcast { notice, .. }
             | Self::Item { notice, .. }
+            | Self::Groups { notice, .. }
             | Self::Settings { notice } => notice.as_ref(),
         }
     }
@@ -88,6 +95,7 @@ impl Screen {
             | Self::Library { notice, .. }
             | Self::Podcast { notice, .. }
             | Self::Item { notice, .. }
+            | Self::Groups { notice, .. }
             | Self::Settings { notice } => Some(notice),
         }
     }
@@ -427,6 +435,32 @@ impl App {
         if self.stored.session.is_some() {
             self.back.clear();
             self.screen = Screen::Settings { notice: None };
+        }
+    }
+
+    /// Lists every Sonos Group with what it plays, afresh: from any logged-in screen (the UI
+    /// offers it on the Libraries screen), or to refresh the list. The screens to go back to
+    /// are dropped.
+    pub async fn open_groups(&mut self) {
+        if self.stored.session.is_none() {
+            return;
+        }
+        self.back.clear();
+        match self.call(api::groups()).await {
+            Ok(groups) => {
+                self.screen = Screen::Groups {
+                    groups,
+                    notice: None,
+                }
+            }
+            Err(error) => {
+                if let Some(error) = self.session_call_failed(error).await {
+                    self.screen = Screen::Groups {
+                        groups: Vec::new(),
+                        notice: Some(Notice::Api(error)),
+                    };
+                }
+            }
         }
     }
 

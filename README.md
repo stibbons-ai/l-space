@@ -16,7 +16,7 @@ Toolchain and tasks come from [mise](https://mise.jdx.dev). In a fresh clone run
 
 The black-box Bridge tests start a real Audiobookshelf in a container ([testcontainers](https://crates.io/crates/testcontainers)), so `mise run test` needs a running Docker; the first run pulls the Audiobookshelf image. The App's flow tests (`crates/app/tests`) drive the App's state and actions, without rendering, against a real Bridge and Audiobookshelf; they start the `bridge` binary from the same target directory, so run them through `mise run test` (or `cargo build -p bridge` before `cargo test -p app`). They run apart from the rest of the workspace: built together with the Bridge, `api` gets its `server` feature, and the App's server function calls would run in-process instead of over HTTP.
 
-Crates live in `crates/`: `api` (the App API contract), `bridge` (the Bridge binary), `app` (the App), `abs` (the Audiobookshelf client), `store` (the storage traits and their contract test suite), `store-sqlite` (their SQLite implementation) and `test-support` (the test harness the Bridge's and the App's tests share).
+Crates live in `crates/`: `api` (the App API contract), `bridge` (the Bridge binary), `app` (the App), `abs` (the Audiobookshelf client), `sonos` (Sonos control behind one trait, over local UPnP), `clock` (the time the Bridge and `sonos-fake` share, which tests advance by hand), `store` (the storage traits and their contract test suite), `store-sqlite` (their SQLite implementation), `test-support` (the test harness the Bridge's and the App's tests share) and `sonos-fake` (a fake Sonos household on loopback for those tests).
 
 ## Build and run the App
 
@@ -35,6 +35,8 @@ For a phone, set it up as in `spikes/ios-audio/README.md` ("One-time device setu
 The bundle identifier is `ai.stibbons.ook`. On first launch the App asks for the Bridge's address, for example `http://192.168.1.10:8080` (the Simulator reaches a Bridge on the same Mac at `http://127.0.0.1:8080`); the Bridge answers with its Library Servers, and the App remembers the address. Then a person picks a Library Server and enters their Audiobookshelf API key (see [Log in](#log-in)). The App keeps the address, the session and the language choice in `Application Support/ai.stibbons.ook/app.json` inside its sandbox, readable by its owner only; the API key is not kept. A file the App can't read is moved aside (to the first free `app.json.bad`, `app.json.bad.2`, …), and the App starts afresh and says so; if it can't even move the file, it leaves it untouched, saves nothing during that launch, and says that instead. The session lasts across launches until logout, or until the Bridge answers `api_key_rejected` at launch, or `session_invalid` while it still lists the session's Library Server; then the App forgets it and shows Login with the reason. A session whose Library Server the operator removed from the configuration stays, and the App says so: it may work again once the operator re-adds the Library Server (a session that also ended in the meantime is forgotten at the next launch after that). Any other failure at launch (the Bridge or the Library Server unreachable, also for the listing after `session_invalid`, a call taking longer than 15 seconds, a proxy or captive portal answering instead of the Bridge) keeps the session. Logout also forgets the session when the Bridge can't be reached; if the App can't save that, it says so.
 
 Logged in (after login, and on a launch whose session the Bridge confirms), the App lists every Library the user can see on the Library Server, audiobooks and podcasts alike; Settings is one tap away. A Library lists its audiobooks or podcasts by title. Left out: a book Audiobookshelf counts no audio files for (an ebook alone), and a Library in a shape the Bridge doesn't know (another kind, for example). A podcast lists its episodes newest first, filtered by the person's Progress: unfinished (the default), Finished, or all. An Item (an audiobook or an episode) shows its title, author or podcast, description, duration, publish date for an episode, the person's Progress ("1 h 12 min left", "Finished", "Not started", or "Started" when the duration is unknown) and an audiobook's chapters with their start times; Back returns to where it was opened from. Progress and Finished are always the logged-in user's own, as their Library Server records them; the Bridge only reads from Audiobookshelf while browsing. Durations and dates follow the App's language (dates as the UTC calendar day).
+
+The Groups screen, one tap from the Libraries like Settings, lists every Sonos Group exactly as grouped in the Sonos app, by name: its members (a single speaker is a Group of one; bonded surrounds, subs and Boosts are not shown) and what it is playing, as Playing, Paused or Stopped with the track's title and creator when Sonos has them. Refresh lists them afresh. There are no controls yet.
 
 Every string inside the App comes from Fluent (`crates/app/locales/en.ftl`, `de.ftl`, embedded in the binary). The Info.plist strings (display name, local network usage text) are the exception and stay English, since dx doesn't generate `InfoPlist.strings`. The App shows German on a German device and English otherwise, unless Settings picks a language.
 
@@ -61,7 +63,18 @@ A configuration that can't be read or parsed, or a bad Library Server URL, stops
 
 The database holds the Bridge's state: App sessions and the Audiobookshelf API keys users logged in with. Each key is encrypted (XChaCha20-Poly1305, bound to its Library Server and user) and is looked up by an HMAC keyed by the encryption key, never by a plain hash; session tokens are stored only as their SHA-256. On Unix the Bridge also makes the database readable by its owner only, also when it already existed. Logout ends only the session: the key stays stored, and so do keys and sessions of Library Servers removed from the configuration. A database written by a newer Bridge is refused. Upgrading a database from a Bridge that stored keys in plain text deletes those keys and their sessions, so their users log in again. Before that, the Bridge rebuilds the file (`VACUUM`), so that keys the earlier Bridge had deleted don't linger in free pages; if the rebuild fails, nothing is upgraded and the next start tries again. The upgrade's own deletes are overwritten in the file. During the upgrade SQLite's rollback journal briefly holds copies of the old pages; it is deleted, not overwritten, afterwards, and a crash mid-upgrade leaves it in place until the next start rolls it back.
 
-Logs are JSON on stdout, one event per line. `RUST_LOG` adds to the default level `info`: `RUST_LOG=hyper=debug` raises one target and leaves the rest at `info`, and `RUST_LOG=warn` lowers the default.
+Logs are JSON on stdout, one event per line. `RUST_LOG` adds to the default level `info`: `RUST_LOG=hyper=debug` raises one target and leaves the rest at `info`, and `RUST_LOG=warn` lowers the default. `RUST_LOG=sonos::raw=debug` logs every SSDP datagram and SOAP request and response body the Bridge exchanges with Sonos players; nothing else logs them, at any level.
+
+### Sonos discovery
+
+At startup and then every minute the Bridge searches for Sonos players with SSDP: an M-SEARCH to the multicast group `239.255.255.250:1900`, answered by every player on the LAN within a second. A player that hasn't answered for three minutes is forgotten. An answer only counts if its device description is plain `http` at the address the answer came from. The App's Groups list then asks any found player for the household's Group topology and each Group's coordinator for what it plays; that takes at most 8 seconds, and the Groups list answers `sonos_unreachable` if no player told the topology by then. The Bridge only reads (ZoneGroupTopology `GetZoneGroupState`, AVTransport `GetTransportInfo` and `GetPositionInfo`); it never changes playback, volume or grouping.
+
+`discovery_address` in `[sonos]` changes where the search goes. Leave it unset in production; the tests set it to a fake Sonos household (`crates/sonos-fake`) on loopback:
+
+```toml
+[sonos]
+discovery_address = "127.0.0.1:41900"   # default "239.255.255.250:1900", SSDP multicast
+```
 
 ### Encryption key
 
@@ -124,7 +137,7 @@ Each URL in `[[library_servers]]` must be reachable from the host; with host net
 
 ### Why host networking
 
-The container shares the host's network, so the Bridge listens on the host's addresses and needs no `ports:`. Sonos control isn't implemented yet; once it is, the Bridge finds Groups with SSDP multicast and receives GENA event callbacks from the speakers on its own port ([ADR 0005](docs/adr/0005-local-upnp-sonos-control.md)), which needs the host's LAN interface rather than a Docker bridge network. Keep the `listen` port fixed for the same reason.
+The container shares the host's network, so the Bridge listens on the host's addresses and needs no `ports:`. The Bridge finds Sonos players with SSDP multicast (see [Sonos discovery](#sonos-discovery)), and once playback control lands it also receives GENA event callbacks from the players on its own port ([ADR 0005](docs/adr/0005-local-upnp-sonos-control.md)); both need the host's LAN interface rather than a Docker bridge network. Keep the `listen` port fixed for the same reason.
 
 ### HTTPS through Traefik
 
@@ -159,7 +172,7 @@ After setup, make one request from a tailnet device and check the client address
 
 ### Sonos: keep UPnP enabled
 
-L-Space will control Sonos over its local UPnP interface once Sonos control lands ([ADR 0005](docs/adr/0005-local-upnp-sonos-control.md)), and Sonos lets you turn that interface off. Keep the UPnP setting in the Sonos app enabled: Account → Privacy & Security → Connection Security → UPnP. It is on by default ([Sonos: Adjust Connection Security settings](https://support.sonos.com/en-us/article/adjust-connection-security-settings)). Leave Authentication on the same screen at its default, off: turned on, it requires third-party integrations that use Sonos's LAN APIs to authenticate.
+L-Space controls Sonos over its local UPnP interface ([ADR 0005](docs/adr/0005-local-upnp-sonos-control.md)); so far the Bridge only reads which Groups there are and what they play. Sonos lets you turn that interface off. Keep the UPnP setting in the Sonos app enabled: Account → Privacy & Security → Connection Security → UPnP. It is on by default ([Sonos: Adjust Connection Security settings](https://support.sonos.com/en-us/article/adjust-connection-security-settings)). Leave Authentication on the same screen at its default, off: turned on, it requires third-party integrations that use Sonos's LAN APIs to authenticate.
 
 ### Releases
 

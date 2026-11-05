@@ -18,10 +18,11 @@
 //! ```
 //!
 //! - [`TestBridge::start`] writes the configuration to a temporary directory, adding [`LISTEN`]
-//!   (loopback, port 0, so tests can run in parallel without port clashes) and [`DATABASE`] (a
-//!   file in that directory, the Bridge's working directory), and passes the encryption key
-//!   [`KEY`] in `BRIDGE_ENCRYPTION_KEY`. [`TestBridge::start_with_key`] passes other
-//!   [`KeyEnv`] variables: none, a key file (written to that directory), or both.
+//!   (loopback, port 0, so tests can run in parallel without port clashes), [`DATABASE`] (a
+//!   file in that directory, the Bridge's working directory) and, unless the test configures
+//!   `[sonos]` (see [`sonos_toml`]), [`NO_SONOS`], and passes the encryption key [`KEY`] in
+//!   `BRIDGE_ENCRYPTION_KEY`. [`TestBridge::start_with_key`] passes other [`KeyEnv`]
+//!   variables: none, a key file (written to that directory), or both.
 //! - Readiness comes from the Bridge itself: it logs a `listening` event with the address it
 //!   bound, and `start` waits for that event. No sleeps.
 //! - [`TestBridge::restart`] stops the Bridge and starts it again on the same configuration,
@@ -42,7 +43,9 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use api::{ApiError, CurrentUser, EpisodeFilter, Item, Library, LibraryEntry, Podcast, Session};
+use api::{
+    ApiError, CurrentUser, EpisodeFilter, Group, Item, Library, LibraryEntry, Podcast, Session,
+};
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -57,6 +60,10 @@ pub const LISTEN: &str = "listen = \"127.0.0.1:0\"\n";
 
 /// A database file in the Bridge's working directory.
 pub const DATABASE: &str = "database = \"bridge.db\"\n";
+
+/// Points the Bridge's Sonos discovery at a loopback port nothing answers on, so a test's Bridge
+/// never searches the LAN it runs on.
+pub const NO_SONOS: &str = "[sonos]\ndiscovery_address = \"127.0.0.1:9\"\n";
 
 /// The `RUST_LOG` the harness sets unless a test asks for another, so the developer's own
 /// setting cannot hide the events the harness waits for.
@@ -144,7 +151,7 @@ impl TestBridge {
     }
 
     fn new(config: &str, rust_log: &str, key: KeyEnv) -> Self {
-        let (dir, config) = config_file(&format!("{LISTEN}{DATABASE}{config}"));
+        let (dir, config) = config_file(&complete(config));
         Self {
             running: launch(&config, rust_log, &key),
             config,
@@ -164,7 +171,7 @@ impl TestBridge {
     /// [`TestBridge::restart`] with `config` (TOML, as for [`TestBridge::start`]) replacing
     /// the configuration; the database stays.
     pub fn restart_with(&mut self, config: &str) {
-        std::fs::write(&self.config, format!("{LISTEN}{DATABASE}{config}")).expect("write config");
+        std::fs::write(&self.config, complete(config)).expect("write config");
         self.restart();
     }
 
@@ -213,6 +220,17 @@ impl TestBridge {
     pub fn startup_output(&self) -> &[Value] {
         &self.running.startup
     }
+}
+
+/// The configuration file for `config`: [`LISTEN`], [`DATABASE`], `config`, and [`NO_SONOS`]
+/// unless `config` has a `[sonos]` section.
+fn complete(config: &str) -> String {
+    let sonos = if config.contains("[sonos]") {
+        ""
+    } else {
+        NO_SONOS
+    };
+    format!("{LISTEN}{DATABASE}{config}{sonos}")
 }
 
 impl Drop for TestBridge {
@@ -278,6 +296,12 @@ pub fn library_server_toml(url: &str) -> String {
 /// The configuration entry for a Library Server at `url` named `name`.
 pub fn named_library_server_toml(url: &str, name: &str) -> String {
     format!("{}name = \"{name}\"\n", library_server_toml(url))
+}
+
+/// The configuration section pointing the Bridge's Sonos discovery at `ssdp`, such as a
+/// `sonos_fake::Household`'s address.
+pub fn sonos_toml(ssdp: std::net::SocketAddr) -> String {
+    format!("[sonos]\ndiscovery_address = \"{ssdp}\"\n")
 }
 
 /// The rejection of a call without a usable session.
@@ -380,6 +404,11 @@ impl AppApi {
             &[("id", id), ("filter", &filter_name(filter))],
         )
         .await
+    }
+
+    /// The Sonos Groups `session` sees.
+    pub async fn groups(&self, session: &Session) -> Vec<Group> {
+        self.get_as(session, "/api/groups", &[]).await
     }
 
     /// GETs `path` with `query` as `session` and decodes the successful response body, typed

@@ -1,0 +1,25 @@
+[package]
+name = "sonos"
+description = "Sonos control behind one trait; the implementation speaks local UPnP (SSDP and SOAP)"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clock.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+roxmltree.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+sonos-fake.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

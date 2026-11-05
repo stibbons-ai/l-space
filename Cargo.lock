@@ -139,12 +139,14 @@ name = "app"
 version = "0.1.0"
 dependencies = [
  "api",
+ "clock",
  "dioxus",
  "dirs",
  "fluent-bundle",
  "fluent-syntax",
  "serde",
  "serde_json",
+ "sonos-fake",
  "sys-locale",
  "tempfile",
  "test-support",
@@ -583,11 +585,14 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "clap",
+ "clock",
  "getrandom 0.4.3",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "sonos",
+ "sonos-fake",
  "store",
  "store-sqlite",
  "tempfile",
@@ -852,6 +857,13 @@ name = "clap_lex"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
+
+[[package]]
+name = "clock"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+]
 
 [[package]]
 name = "cmov"
@@ -5386,6 +5398,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "roxmltree"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "rsqlite-vfs"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5964,6 +5985,30 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sonos"
+version = "0.1.0"
+dependencies = [
+ "clock",
+ "futures",
+ "reqwest 0.12.28",
+ "roxmltree",
+ "sonos-fake",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "sonos-fake"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clock",
+ "tokio",
 ]
 
 [[package]]

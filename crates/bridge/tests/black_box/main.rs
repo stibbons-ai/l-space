@@ -6,6 +6,7 @@
 mod browse;
 mod encryption;
 mod forwarder;
+mod groups;
 mod library_servers;
 mod logging;
 mod login;
