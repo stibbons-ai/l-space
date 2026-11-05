@@ -1,8 +1,11 @@
 //! Calling a player's UPnP services: a SOAP request to a fixed control path, the answer read up
-//! to [`MAX_BODY`] bytes and parsed for the action's output arguments. Only argument-less
-//! read actions (plus AVTransport's instance id) are sent.
+//! to [`MAX_BODY`] bytes and parsed for the action's output arguments. Read actions send no
+//! arguments of their own (AVTransport's instance id aside); the actions that start playback
+//! send theirs XML-escaped.
 
+use std::fmt::Write;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use reqwest::Client;
 use reqwest::header::CONTENT_TYPE;
@@ -36,7 +39,7 @@ impl Service {
         }
     }
 
-    /// The input arguments of every action this crate calls on the service.
+    /// The input arguments every action this crate calls on the service starts with.
     fn arguments(self) -> &'static str {
         match self {
             Self::ZoneGroupTopology => "",
@@ -76,25 +79,57 @@ impl From<reqwest::Error> for CallError {
 }
 
 /// Calls `action` on `service` of the player at `player` and returns its output arguments.
+/// It may take as long as `http` allows.
 pub(crate) async fn call(
     http: &Client,
     player: SocketAddr,
     service: Service,
     action: &str,
 ) -> Result<Vec<(String, String)>, CallError> {
+    send(http, player, service, action, &[], None).await
+}
+
+/// [`call`] with the input `arguments` (name, unescaped value) after the service's own, taking
+/// at most `timeout` instead of what `http` allows.
+pub(crate) async fn call_with(
+    http: &Client,
+    player: SocketAddr,
+    service: Service,
+    action: &str,
+    arguments: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<Vec<(String, String)>, CallError> {
+    send(http, player, service, action, arguments, Some(timeout)).await
+}
+
+async fn send(
+    http: &Client,
+    player: SocketAddr,
+    service: Service,
+    action: &str,
+    arguments: &[(&str, &str)],
+    timeout: Option<Duration>,
+) -> Result<Vec<(String, String)>, CallError> {
     let url = format!("http://{player}{}", service.path());
-    let (urn, arguments) = (service.urn(), service.arguments());
+    let urn = service.urn();
+    let mut inputs = service.arguments().to_owned();
+    for (name, value) in arguments {
+        write!(inputs, "<{name}>{}</{name}>", xml::escape(value))
+            .expect("writing to a String cannot fail");
+    }
     let body = format!(
-        r#"<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:{action} xmlns:u="{urn}">{arguments}</u:{action}></s:Body></s:Envelope>"#
+        r#"<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:{action} xmlns:u="{urn}">{inputs}</u:{action}></s:Body></s:Envelope>"#
     );
     tracing::debug!(target: RAW, peer = url, action, body, "SOAP request");
-    let mut response = http
+    let mut request = http
         .post(&url)
         .header(CONTENT_TYPE, r#"text/xml; charset="utf-8""#)
         .header("SOAPACTION", format!("\"{urn}#{action}\""))
-        .body(body)
-        .send()
-        .await?;
+        .body(body);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let mut response = request.send().await?;
     let status = response.status();
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {

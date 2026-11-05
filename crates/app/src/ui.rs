@@ -48,6 +48,9 @@ pub fn root() -> Element {
                 Screen::Item { item, notice } => rsx! {
                     ItemScreen { app, busy, item, notice }
                 },
+                Screen::PlayOn { item, groups, notice } => rsx! {
+                    PlayOnScreen { app, busy, item, groups, notice }
+                },
                 Screen::Groups { groups, notice } => rsx! {
                     GroupsScreen { app, busy, groups, notice }
                 },
@@ -75,8 +78,14 @@ fn NoticeView(app: Signal<App>, notice: Option<Notice>) -> Element {
     let Some(notice) = notice else {
         return rsx! {};
     };
+    let text = notice.text(app.read().language());
+    if notice.is_success() {
+        return rsx! {
+            p { class: "notice done", role: "status", {text} }
+        };
+    }
     rsx! {
-        p { class: "notice", role: "alert", {app.read().text(notice.text())} }
+        p { class: "notice", role: "alert", {text} }
     }
 }
 
@@ -422,6 +431,14 @@ fn ItemScreen(app: Signal<App>, busy: Signal<bool>, item: Item, notice: Option<N
             p { class: "byline", "{by}" }
         }
         NoticeView { app, notice }
+        if app.read().can_play_on() {
+            button {
+                r#type: "button",
+                disabled: busy(),
+                onclick: move |_| act(app, busy, async |app: &mut App| app.open_play_on().await),
+                {text(Text::PlayOn)}
+            }
+        }
         dl {
             for (label, value) in i18n::item_facts(language, &item) {
                 dt { {text(label)} }
@@ -439,6 +456,44 @@ fn ItemScreen(app: Signal<App>, busy: Signal<bool>, item: Item, notice: Option<N
                         span { class: "title", "{title}" }
                         span { class: "detail", "{start}" }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// Picks the Group to play an Item on.
+#[component]
+fn PlayOnScreen(
+    app: Signal<App>,
+    busy: Signal<bool>,
+    item: Item,
+    groups: Vec<Group>,
+    notice: Option<Notice>,
+) -> Element {
+    let text = |text| app.read().text(text);
+    rsx! {
+        BackButton { app, busy }
+        h1 { {text(Text::PlayOn)} }
+        p { class: "byline", "{item.title}" }
+        NoticeView { app, notice }
+        if groups.is_empty() {
+            p { {text(Text::GroupsNone)} }
+        }
+        ul { class: "entries",
+            for group in groups {
+                EntryButton {
+                    key: "{group.id}",
+                    busy,
+                    title: group.name.clone(),
+                    detail: member_names(&group),
+                    onclick: {
+                        let id = group.id.clone();
+                        move |_| {
+                            let id = id.clone();
+                            act(app, busy, async move |app: &mut App| app.play_on(&id).await);
+                        }
+                    },
                 }
             }
         }

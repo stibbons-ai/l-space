@@ -52,6 +52,13 @@ pub enum Screen {
     },
     /// One Item: its details, the person's Progress, and an audiobook's chapters.
     Item { item: Item, notice: Option<Notice> },
+    /// Picks the Group to play an Item on: every Group; none when the Bridge found no Sonos
+    /// player.
+    PlayOn {
+        item: Item,
+        groups: Vec<Group>,
+        notice: Option<Notice>,
+    },
     /// Logged in: every Sonos Group with its members and what it plays. Empty, with a notice,
     /// when they could not be listed.
     Groups {
@@ -81,6 +88,7 @@ impl Screen {
             | Self::Library { notice, .. }
             | Self::Podcast { notice, .. }
             | Self::Item { notice, .. }
+            | Self::PlayOn { notice, .. }
             | Self::Groups { notice, .. }
             | Self::Settings { notice } => notice.as_ref(),
         }
@@ -95,6 +103,7 @@ impl Screen {
             | Self::Library { notice, .. }
             | Self::Podcast { notice, .. }
             | Self::Item { notice, .. }
+            | Self::PlayOn { notice, .. }
             | Self::Groups { notice, .. }
             | Self::Settings { notice } => Some(notice),
         }
@@ -124,11 +133,19 @@ pub enum Notice {
     StorageSave,
     /// Logged out, but the device storage still holds the session.
     LogoutNotSaved,
+    /// The Item now plays on the Group with this name.
+    PlayingOn(String),
 }
 
 impl Notice {
-    pub fn text(&self) -> Text {
-        match self {
+    /// Whether it reports something done, rather than a problem.
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::PlayingOn(_))
+    }
+
+    /// The notice as the person reads it in `language`.
+    pub fn text(&self, language: Language) -> String {
+        let text = match self {
             Self::Api(error) => error.into(),
             Self::BridgeUrlInvalid => Text::ErrorBridgeUrlInvalid,
             Self::BridgeUrlUnreachable => Text::ErrorBridgeUrlUnreachable,
@@ -137,7 +154,9 @@ impl Notice {
             Self::StorageStuck => Text::ErrorStorageStuck,
             Self::StorageSave => Text::ErrorStorageSave,
             Self::LogoutNotSaved => Text::ErrorLogoutNotSaved,
-        }
+            Self::PlayingOn(group) => return i18n::playing_on(language, group),
+        };
+        i18n::text(language, text)
     }
 }
 
@@ -427,6 +446,60 @@ impl App {
             Screen::Item { item, notice: None }
         })
         .await;
+    }
+
+    /// Whether the Item screen offers to play its Item on a Group: only an Item in one audio
+    /// file plays there so far.
+    pub fn can_play_on(&self) -> bool {
+        matches!(&self.screen, Screen::Item { item, .. } if item.audio_files.len() == 1)
+    }
+
+    /// From the Item screen, lists every Group to play the Item on.
+    pub async fn open_play_on(&mut self) {
+        let Screen::Item { item, .. } = &self.screen else {
+            return;
+        };
+        let item = item.clone();
+        self.go(api::groups(), |groups| Screen::PlayOn {
+            item,
+            groups,
+            notice: None,
+        })
+        .await;
+    }
+
+    /// On the Group picker, starts the Item on Group `group` (its id), and goes back to the
+    /// Item, noting where it plays; or shows why it could not start. A Group that is gone
+    /// (`group_not_found`) has the picker list the Groups afresh, with that notice; if they
+    /// can't be listed, the picker keeps its list and shows why instead (an ended session
+    /// leads to Login).
+    pub async fn play_on(&mut self, group: &str) {
+        let Screen::PlayOn { item, groups, .. } = &self.screen else {
+            return;
+        };
+        let id = item.id.clone();
+        let name = groups
+            .iter()
+            .find(|listed| listed.id == group)
+            .map_or_else(|| group.to_owned(), |listed| listed.name.clone());
+        match self.call(api::start_handoff(id, group.to_owned())).await {
+            Ok(_) => {
+                // Back to the Item screen the picker was opened from.
+                self.go_back();
+                self.set_notice(Notice::PlayingOn(name));
+            }
+            Err(ApiError::GroupNotFound) => match self.call(api::groups()).await {
+                Ok(listed) => {
+                    if let Screen::PlayOn { groups, .. } = &mut self.screen {
+                        *groups = listed;
+                    }
+                    self.set_notice(Notice::Api(ApiError::GroupNotFound));
+                }
+                // Why the Groups could not be listed afresh matters more now.
+                Err(error) => self.failed(error).await,
+            },
+            Err(error) => self.failed(error).await,
+        }
     }
 
     /// Opens Settings, from any logged-in screen; the screens to go back to are dropped (the

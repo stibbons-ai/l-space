@@ -11,7 +11,7 @@
 //! Setup goes through Audiobookshelf's REST API as its root user, the way an admin would,
 //! never through its database: users are created there, API keys created, moved and deleted,
 //! and metadata a scan can't find in silent audio files (descriptions, publish dates) set.
-//! The audio is generated silence, so the repository holds no binary.
+//! The audio is generated near-silence, so the repository holds no binary.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -31,9 +31,13 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 /// How long the seeded audiobooks and podcast may take to appear after a scan.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The seeded audio files: path in the container, length in seconds.
+/// The seeded audio files: path in the container, length in seconds. Silence's one file has a
+/// name with spaces, non-ASCII and URL-reserved characters.
 const AUDIO_FILES: [(&str, u32); 7] = [
-    ("/audiobooks/L-Space/Silence/silence.wav", 1),
+    (
+        "/audiobooks/L-Space/Silence/Folge 3 – Über & Co #1 (50%).wav",
+        1,
+    ),
     (
         "/audiobooks/Pratchett/The Long Book/01 - Part One.wav",
         2400,
@@ -65,8 +69,8 @@ pub const EPISODE_PUBLISHED_AT: [i64; 3] =
 /// What the shared Audiobookshelf holds, by Audiobookshelf id.
 #[derive(Debug, Clone, Default)]
 pub struct Seeded {
-    /// The audiobook Library "Audiobooks": [`Seeded::long_book`], "Silence" (one second, by
-    /// L-Space) and the ebook [`Seeded::ebook_only`].
+    /// The audiobook Library "Audiobooks": [`Seeded::long_book`], [`Seeded::silence`] and the
+    /// ebook [`Seeded::ebook_only`].
     pub audiobook_library: String,
     /// The podcast Library "Podcasts": [`Seeded::podcast`].
     pub podcast_library: String,
@@ -74,6 +78,9 @@ pub struct Seeded {
     /// 40, 30 and 2 minutes, one chapter each ("01 - Part One", "02 - Part Two",
     /// "03 - Part Three"), 72 minutes in all.
     pub long_book: String,
+    /// "Silence" by L-Space: one audio file of one second, named
+    /// `Folge 3 – Über & Co #1 (50%).wav`.
+    pub silence: String,
     /// "Only Words" by Rincewind: an ebook (a PDF) without audio, so not an audiobook.
     pub ebook_only: String,
     /// "The Clacks Hour" by Ankh-Morpork Radio.
@@ -210,6 +217,23 @@ impl Audiobookshelf {
         body: Option<Value>,
     ) -> Value {
         self.call(&user.api_key.key, method, path, body).await
+    }
+
+    /// Audio file `ino` of `library_item`, fetched whole and straight from Audiobookshelf as
+    /// `user`; panics unless that succeeds.
+    pub async fn file(&self, user: &AbsUser, library_item: &str, ino: &str) -> Vec<u8> {
+        let path = format!("/api/items/{library_item}/file/{ino}");
+        self.http
+            .get(format!("{}{path}", self.base_url))
+            .bearer_auth(&user.api_key.key)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .unwrap_or_else(|error| panic!("GET {path}: {error}"))
+            .bytes()
+            .await
+            .expect("file body")
+            .to_vec()
     }
 
     /// Creates a user with the settings in `extra`, and an API key for them.
@@ -391,6 +415,11 @@ impl Audiobookshelf {
             .find(|book| book["media"]["metadata"]["title"] == "The Long Book")
             .map(id)
             .expect("The Long Book");
+        let silence = books
+            .iter()
+            .find(|book| book["media"]["metadata"]["title"] == "Silence")
+            .map(id)
+            .expect("Silence");
         let ebook_only = books
             .iter()
             .find(|book| book["media"]["metadata"]["title"] == "Only Words")
@@ -444,6 +473,7 @@ impl Audiobookshelf {
             audiobook_library,
             podcast_library,
             long_book,
+            silence,
             ebook_only,
             podcast,
             episodes,
@@ -523,8 +553,10 @@ async fn root_token(http: &reqwest::Client, base_url: &str) -> String {
         .to_owned()
 }
 
-/// `seconds` of silence as a WAV file: 100 Hz, 8-bit mono, so an hour takes only 360 kB. Low
-/// as the rate is, Audiobookshelf scans it as audio of that length.
+/// `seconds` of near-silence as a WAV file: 100 Hz, 8-bit mono, so an hour takes only 360 kB.
+/// Low as the rate is, Audiobookshelf scans it as audio of that length. The samples are quiet
+/// noise rather than silence, so every byte depends on its offset and a byte range served
+/// from the wrong place shows.
 fn silence(seconds: u32) -> Vec<u8> {
     const RATE: u32 = 100;
     // Unsigned 8-bit samples: 0x80 is silence.
@@ -543,6 +575,13 @@ fn silence(seconds: u32) -> Vec<u8> {
     wav.extend_from_slice(&8u16.to_le_bytes()); // bits per sample
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_len.to_le_bytes());
-    wav.resize(44 + data_len as usize, SILENT);
+    // A xorshift generator's low four bits, around silence: -8 to +7 of 255.
+    let mut state = 0x2545_F491_u32 ^ seconds;
+    wav.extend((0..data_len).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        SILENT - 8 + (state & 0x0F) as u8
+    }));
     wav
 }

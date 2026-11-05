@@ -6,9 +6,10 @@
 //! API keys are stored encrypted under the operator's [`EncryptionKey`], each bound to its row,
 //! and compared and looked up only by a fingerprint keyed by it (see `sealing`). A key that no
 //! longer decrypts (the Bridge runs with another encryption key, or the row was tampered with)
-//! is removed with its sessions when one of them is looked up: the session is gone, and its
-//! user logs in again. On open, the store removes keys sealed under another encryption key
-//! that no session uses, and warns if any such keys still have sessions.
+//! is removed with its sessions and Handoffs when one of them is looked up: the session is
+//! gone, and its user logs in again; the Handoff is gone, and its stream answers no more. On
+//! open, the store removes keys sealed under another encryption key that no session or Handoff
+//! uses, and warns if any such keys are still used.
 
 mod sealing;
 
@@ -18,7 +19,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use abs::ApiKey;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use store::{Error, LibraryUser, Session, SessionId, Store};
+use store::{
+    ActiveHandoff, Error, Handoff, HandoffFile, LibraryUser, Session, SessionId, Store, StreamId,
+};
 
 pub use crate::sealing::EncryptionKey;
 use crate::sealing::{Fingerprint, Row, Sealing};
@@ -28,6 +31,7 @@ use crate::sealing::{Fingerprint, Row, Sealing};
 const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_sessions.sql"),
     include_str!("migrations/0002_encrypted_api_keys.sql"),
+    include_str!("migrations/0003_handoffs.sql"),
 ];
 
 /// A [`Store`] in one SQLite database file.
@@ -167,9 +171,11 @@ fn migrate(connection: &mut Connection) -> Result<(), Box<dyn std::error::Error 
     Ok(())
 }
 
-/// Removes keys sealed under another encryption key than `sealing`'s that no session uses
-/// (nothing would ever look them up again), and warns once if others remain: their sessions
-/// end at their next call.
+/// Removes keys sealed under another encryption key than `sealing`'s that no session or
+/// Handoff uses (nothing would ever look them up again), and warns once each if others remain:
+/// keys with sessions (those end at their next call, and their users log in again), and keys
+/// Handoffs use (those Handoffs end when their streams are next asked for, or listed). A key
+/// both use is counted in both.
 fn forget_keys_sealed_under_another_key(
     connection: &Connection,
     sealing: &Sealing,
@@ -177,37 +183,170 @@ fn forget_keys_sealed_under_another_key(
     let removed = connection.execute(
         "DELETE FROM api_keys
          WHERE key_id <> ?1
-           AND NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.api_key_id = api_keys.id)",
+           AND NOT EXISTS (SELECT 1 FROM sessions WHERE sessions.api_key_id = api_keys.id)
+           AND NOT EXISTS (SELECT 1 FROM handoffs WHERE handoffs.api_key_id = api_keys.id)",
         params![sealing.key_id()],
     )?;
     if removed > 0 {
         tracing::info!(
             removed,
             "removed stored API keys that were encrypted with another encryption key and that \
-             no session used"
+             no session or Handoff used"
         );
     }
-    let keys: i64 = connection.query_row(
-        "SELECT count(*) FROM api_keys WHERE key_id <> ?1",
+    let (with_sessions, with_handoffs): (i64, i64) = connection.query_row(
+        "SELECT
+             count(*) FILTER (WHERE EXISTS
+                 (SELECT 1 FROM sessions WHERE sessions.api_key_id = api_keys.id)),
+             count(*) FILTER (WHERE EXISTS
+                 (SELECT 1 FROM handoffs WHERE handoffs.api_key_id = api_keys.id))
+         FROM api_keys WHERE key_id <> ?1",
         params![sealing.key_id()],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if keys > 0 {
+    if with_sessions > 0 {
         tracing::warn!(
-            keys,
+            keys = with_sessions,
             "stored API keys were encrypted with another encryption key; their sessions end \
              at their next call, and their users must log in again"
+        );
+    }
+    if with_handoffs > 0 {
+        tracing::warn!(
+            keys = with_handoffs,
+            "stored API keys Handoffs use were encrypted with another encryption key; those \
+             Handoffs end"
         );
     }
     Ok(())
 }
 
-/// A session looked up in the database.
-enum Lookup {
-    Open(Session),
-    /// The session's key does not open: it and its sessions were removed.
+/// Stores `api_key` (`sealed`, with its `fingerprint`, under the encryption key `key_id`) for
+/// `user` unless it already is, and returns its row's id. A key already stored for the user
+/// keeps its row and is sealed anew.
+fn store_key(
+    tx: &Transaction<'_>,
+    user: &LibraryUser,
+    fingerprint: &Fingerprint,
+    sealed: &[u8],
+    key_id: &[u8; 16],
+) -> rusqlite::Result<i64> {
+    tx.prepare_cached(
+        "INSERT INTO api_keys (library_server, user_id, key_fingerprint, sealed_key, key_id)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (library_server, user_id, key_fingerprint)
+         DO UPDATE SET sealed_key = excluded.sealed_key
+         RETURNING id",
+    )?
+    .query_row(
+        params![
+            user.library_server,
+            user.user_id,
+            fingerprint,
+            sealed,
+            key_id
+        ],
+        |row| row.get(0),
+    )
+}
+
+/// A stored key as read with what uses it: its row's id, user and fingerprint, and the sealed
+/// key.
+struct StoredKey {
+    id: i64,
+    user: LibraryUser,
+    fingerprint: Fingerprint,
+    sealed: Vec<u8>,
+}
+
+impl StoredKey {
+    /// Reads the key from `row`, from column `first` on: `api_keys`' `id`, `library_server`,
+    /// `user_id`, `key_fingerprint` and `sealed_key`.
+    fn read(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(first)?,
+            user: LibraryUser {
+                library_server: row.get(first + 1)?,
+                user_id: row.get(first + 2)?,
+            },
+            fingerprint: row.get(first + 3)?,
+            sealed: row.get(first + 4)?,
+        })
+    }
+
+    /// The key, if it opens with `sealing`; otherwise it is removed in `tx`, with its sessions
+    /// and Handoffs, and none.
+    fn open(&self, tx: &Transaction<'_>, sealing: &Sealing) -> rusqlite::Result<Option<ApiKey>> {
+        if let Some(api_key) = sealing.open(&Row::of(&self.user, &self.fingerprint), &self.sealed) {
+            return Ok(Some(api_key));
+        }
+        tx.prepare_cached("DELETE FROM api_keys WHERE id = ?1")?
+            .execute(params![self.id])?;
+        Ok(None)
+    }
+}
+
+/// Logs that the key of `user`, which did not open, was removed with what used it.
+fn warn_unreadable(user: &LibraryUser) {
+    tracing::warn!(
+        library_server = user.library_server,
+        user_id = user.user_id,
+        "a stored API key does not decrypt with the current encryption key (or was tampered \
+         with); it was removed, and the sessions and Handoffs using it ended"
+    );
+}
+
+/// A query of Handoffs with their keys, ending in `$rest`: from `handoffs h` joined with
+/// `api_keys k`, the columns [`handoff_row`] reads.
+macro_rules! select_handoffs {
+    ($rest:literal) => {
+        concat!(
+            "SELECT h.group_id, h.library_item, h.episode, h.file_ino, h.file_name, h.username, \
+             h.started_at, k.id, k.library_server, k.user_id, k.key_fingerprint, k.sealed_key \
+             FROM handoffs h JOIN api_keys k ON k.id = h.api_key_id ",
+            $rest
+        )
+    };
+}
+
+/// A Handoff and its stored key, from a row of [`select_handoffs`].
+fn handoff_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Handoff, StoredKey)> {
+    let key = StoredKey::read(row, 7)?;
+    let handoff = Handoff {
+        group: row.get(0)?,
+        library_item: row.get(1)?,
+        episode: row.get(2)?,
+        file: HandoffFile {
+            ino: row.get(3)?,
+            name: row.get(4)?,
+        },
+        started_by: key.user.clone(),
+        username: row.get(5)?,
+        started_at: row.get(6)?,
+    };
+    Ok((handoff, key))
+}
+
+/// A session or Handoff looked up in the database.
+enum Lookup<T> {
+    Open(T),
+    /// Its key does not open: it was removed, with what used it.
     Unreadable(LibraryUser),
     Unknown,
+}
+
+impl<T> Lookup<T> {
+    /// What was found, if its key opened; an unreadable key is logged.
+    fn found(self) -> Option<T> {
+        match self {
+            Self::Open(found) => Some(found),
+            Self::Unreadable(user) => {
+                warn_unreadable(&user);
+                None
+            }
+            Self::Unknown => None,
+        }
+    }
 }
 
 impl Store for SqliteStore {
@@ -225,26 +364,7 @@ impl Store for SqliteStore {
             .map_err(Error::new)?;
         let key_id = *self.sealing.key_id();
         self.transaction(move |tx| {
-            // A key already stored for the user keeps its row; logging in re-seals it.
-            let api_key_id: i64 = tx
-                .prepare_cached(
-                    "INSERT INTO api_keys
-                         (library_server, user_id, key_fingerprint, sealed_key, key_id)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT (library_server, user_id, key_fingerprint)
-                     DO UPDATE SET sealed_key = excluded.sealed_key
-                     RETURNING id",
-                )?
-                .query_row(
-                    params![
-                        user.library_server,
-                        user.user_id,
-                        fingerprint,
-                        sealed,
-                        key_id
-                    ],
-                    |row| row.get(0),
-                )?;
+            let api_key_id = store_key(tx, &user, &fingerprint, &sealed, &key_id)?;
             tx.prepare_cached("INSERT INTO sessions (id, api_key_id) VALUES (?1, ?2)")?
                 .execute(params![id.as_bytes(), api_key_id])?;
             Ok(())
@@ -256,49 +376,27 @@ impl Store for SqliteStore {
         let (id, sealing) = (*id, Arc::clone(&self.sealing));
         let lookup = self
             .transaction(move |tx| {
-                let Some((api_key_id, user, fingerprint, sealed)) = tx
+                let Some(key) = tx
                     .prepare_cached(
                         "SELECT k.id, k.library_server, k.user_id, k.key_fingerprint, k.sealed_key
                          FROM sessions s JOIN api_keys k ON k.id = s.api_key_id
                          WHERE s.id = ?1",
                     )?
-                    .query_row(params![id.as_bytes()], |row| {
-                        let user = LibraryUser {
-                            library_server: row.get(1)?,
-                            user_id: row.get(2)?,
-                        };
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            user,
-                            row.get::<_, Fingerprint>(3)?,
-                            row.get::<_, Vec<u8>>(4)?,
-                        ))
-                    })
+                    .query_row(params![id.as_bytes()], |row| StoredKey::read(row, 0))
                     .optional()?
                 else {
                     return Ok(Lookup::Unknown);
                 };
-                if let Some(api_key) = sealing.open(&Row::of(&user, &fingerprint), &sealed) {
-                    return Ok(Lookup::Open(Session { user, api_key }));
-                }
-                tx.prepare_cached("DELETE FROM api_keys WHERE id = ?1")?
-                    .execute(params![api_key_id])?;
-                Ok(Lookup::Unreadable(user))
+                Ok(match key.open(tx, &sealing)? {
+                    Some(api_key) => Lookup::Open(Session {
+                        user: key.user,
+                        api_key,
+                    }),
+                    None => Lookup::Unreadable(key.user),
+                })
             })
             .await?;
-        Ok(match lookup {
-            Lookup::Open(session) => Some(session),
-            Lookup::Unreadable(user) => {
-                tracing::warn!(
-                    library_server = user.library_server,
-                    user_id = user.user_id,
-                    "a stored API key does not decrypt with the current encryption key (or was \
-                     tampered with); it was removed and the sessions opened with it ended"
-                );
-                None
-            }
-            Lookup::Unknown => None,
-        })
+        Ok(lookup.found())
     }
 
     async fn close_session(&self, id: &SessionId) -> Result<bool, Error> {
@@ -325,6 +423,104 @@ impl Store for SqliteStore {
         })
         .await
     }
+
+    async fn start_handoff(
+        &self,
+        stream: &StreamId,
+        handoff: &Handoff,
+        api_key: &ApiKey,
+    ) -> Result<(), Error> {
+        let (stream, handoff) = (*stream, handoff.clone());
+        let fingerprint = self.sealing.fingerprint(api_key);
+        let sealed = self
+            .sealing
+            .seal(&Row::of(&handoff.started_by, &fingerprint), api_key)
+            .map_err(Error::new)?;
+        let key_id = *self.sealing.key_id();
+        self.transaction(move |tx| {
+            let api_key_id = store_key(tx, &handoff.started_by, &fingerprint, &sealed, &key_id)?;
+            tx.prepare_cached("DELETE FROM handoffs WHERE group_id = ?1")?
+                .execute(params![handoff.group])?;
+            tx.prepare_cached(
+                "INSERT INTO handoffs (group_id, stream_id, library_item, episode, file_ino,
+                     file_name, username, api_key_id, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?
+            .execute(params![
+                handoff.group,
+                stream.as_bytes(),
+                handoff.library_item,
+                handoff.episode,
+                handoff.file.ino,
+                handoff.file.name,
+                handoff.username,
+                api_key_id,
+                handoff.started_at,
+            ])?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn handoff(&self, stream: &StreamId) -> Result<Option<ActiveHandoff>, Error> {
+        let (stream, sealing) = (*stream, Arc::clone(&self.sealing));
+        let lookup = self
+            .transaction(move |tx| {
+                let Some((handoff, key)) = tx
+                    .prepare_cached(select_handoffs!("WHERE h.stream_id = ?1"))?
+                    .query_row(params![stream.as_bytes()], handoff_row)
+                    .optional()?
+                else {
+                    return Ok(Lookup::Unknown);
+                };
+                Ok(match key.open(tx, &sealing)? {
+                    Some(api_key) => Lookup::Open(ActiveHandoff { handoff, api_key }),
+                    None => Lookup::Unreadable(key.user),
+                })
+            })
+            .await?;
+        Ok(lookup.found())
+    }
+
+    async fn handoffs(&self) -> Result<Vec<Handoff>, Error> {
+        let sealing = Arc::clone(&self.sealing);
+        let (handoffs, unreadable) = self
+            .transaction(move |tx| {
+                let rows = tx
+                    .prepare_cached(select_handoffs!("ORDER BY h.started_at, h.group_id"))?
+                    .query_map([], handoff_row)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut handoffs = Vec::new();
+                let mut unreadable: Vec<StoredKey> = Vec::new();
+                for (handoff, key) in rows {
+                    // Handoffs may share a key; once it was removed, the others went with it.
+                    if unreadable.iter().any(|removed| removed.id == key.id) {
+                        continue;
+                    }
+                    match key.open(tx, &sealing)? {
+                        Some(_) => handoffs.push(handoff),
+                        None => unreadable.push(key),
+                    }
+                }
+                Ok((handoffs, unreadable))
+            })
+            .await?;
+        for key in &unreadable {
+            warn_unreadable(&key.user);
+        }
+        Ok(handoffs)
+    }
+
+    async fn end_handoff(&self, stream: &StreamId) -> Result<bool, Error> {
+        let stream = *stream;
+        self.transaction(move |tx| {
+            let deleted = tx
+                .prepare_cached("DELETE FROM handoffs WHERE stream_id = ?1")?
+                .execute(params![stream.as_bytes()])?;
+            Ok(deleted > 0)
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -334,7 +530,7 @@ mod tests {
     use abs::ApiKey;
     use rusqlite::params;
     use store::contract::Backend;
-    use store::{LibraryUser, SessionId, Store};
+    use store::{Handoff, HandoffFile, LibraryUser, SessionId, Store, StreamId};
     use tempfile::TempDir;
 
     use super::{EncryptionKey, MIGRATIONS, SqliteStore};
@@ -538,6 +734,129 @@ mod tests {
 
         drop(database.open_with(2));
         assert_eq!((keys_of("alice-id"), keys_of("bob-id")), (1, 0));
+    }
+
+    fn kitchen_handoff(user: &LibraryUser) -> Handoff {
+        Handoff {
+            group: "RINCON_K".into(),
+            library_item: "podcast-id".into(),
+            episode: Some("episode-id".into()),
+            file: HandoffFile {
+                ino: "42".into(),
+                name: "Episode 1.mp3".into(),
+            },
+            started_by: user.clone(),
+            username: "alice".into(),
+            started_at: 1_000,
+        }
+    }
+
+    async fn start_kitchen(store: &SqliteStore, stream: &str, user: &LibraryUser, key: &str) {
+        store
+            .start_handoff(
+                &StreamId::of(stream),
+                &kitchen_handoff(user),
+                &ApiKey::new(key),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A Handoff whose key no longer decrypts is gone, listed or looked up, and stays gone:
+    /// its key was removed, not just hidden.
+    #[tokio::test]
+    async fn another_encryption_key_ends_the_handoffs() {
+        let database = TempDatabase::new();
+        start_kitchen(&database.open_with(1), "stream-1", &alice(), "alice-key").await;
+        {
+            // A key only a Handoff uses stays on open, until the Handoff is looked at.
+            let other = database.open_with(2);
+            assert_eq!(other.handoffs().await.unwrap(), []);
+        }
+        let store = database.open_with(1);
+        assert_eq!(
+            store.handoff(&StreamId::of("stream-1")).await.unwrap(),
+            None
+        );
+        assert_eq!(store.handoffs().await.unwrap(), []);
+
+        start_kitchen(&database.open_with(1), "stream-2", &alice(), "alice-key").await;
+        let other = database.open_with(2);
+        assert_eq!(
+            other.handoff(&StreamId::of("stream-2")).await.unwrap(),
+            None
+        );
+        assert_eq!(database.open_with(1).handoffs().await.unwrap(), []);
+    }
+
+    /// Opening with another encryption key keeps a key only a Handoff uses (it is not unused),
+    /// so going back to the right encryption key finds the Handoff still active.
+    #[tokio::test]
+    async fn a_key_only_a_handoff_uses_survives_opening_with_another_encryption_key() {
+        let database = TempDatabase::new();
+        start_kitchen(&database.open_with(1), "stream-1", &alice(), "alice-key").await;
+
+        drop(database.open_with(2));
+
+        let store = database.open_with(1);
+        let active = store.handoff(&StreamId::of("stream-1")).await.unwrap();
+        assert_eq!(
+            active.map(|active| active.api_key),
+            Some(ApiKey::new("alice-key"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tampered_key_ends_the_handoffs_using_it_only() {
+        let database = TempDatabase::new();
+        let store = database.open_with(1);
+        start_kitchen(&store, "stream-1", &alice(), "alice-key").await;
+        let office = Handoff {
+            group: "RINCON_O".into(),
+            ..kitchen_handoff(&bob())
+        };
+        store
+            .start_handoff(&StreamId::of("stream-2"), &office, &ApiKey::new("bob-key"))
+            .await
+            .unwrap();
+        let mut sealed = database.sealed_key("alice-id");
+        sealed[30] ^= 1;
+        database.set_sealed_key("alice-id", &sealed);
+
+        assert_eq!(store.handoffs().await.unwrap(), [office]);
+        assert_eq!(
+            store.handoff(&StreamId::of("stream-1")).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_file_holds_no_stream_id_and_no_plain_key() {
+        let database = TempDatabase::new();
+        let store = database.open_with(1);
+        start_kitchen(&store, "stream-secret-id", &alice(), "alice-secret-key").await;
+        drop(store);
+
+        let bytes = file_bytes(&database.path);
+        assert!(!contains(&bytes, b"stream-secret-id"));
+        assert!(!contains(&bytes, b"alice-secret-key"));
+    }
+
+    /// A database from before Handoffs (schema version 2) keeps its sessions.
+    #[tokio::test]
+    async fn sessions_from_before_handoffs_stay() {
+        let database = TempDatabase::new();
+        login(&database.open_with(1), 1, &alice(), "alice-key").await;
+        // Back to how a Bridge of schema version 2 left it.
+        database
+            .raw()
+            .execute_batch("DROP TABLE handoffs; PRAGMA user_version = 2;")
+            .unwrap();
+
+        let store = database.open_with(1);
+        assert_eq!(schema_version(&database), MIGRATIONS.len() as i64);
+        assert_eq!(api_key(&store, 1).await, Some(ApiKey::new("alice-key")));
+        assert_eq!(store.handoffs().await.unwrap(), []);
     }
 
     /// Writes a database as the Bridge before encryption (schema version 1) left it: plain-text

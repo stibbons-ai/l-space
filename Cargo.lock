@@ -7,6 +7,8 @@ name = "abs"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
+ "futures",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -585,6 +587,7 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "clock",
+ "futures",
  "getrandom 0.4.3",
  "reqwest 0.12.28",
  "serde",
@@ -6007,6 +6010,8 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clock",
+ "reqwest 0.12.28",
+ "roxmltree",
  "tokio",
 ]
 

@@ -10,6 +10,9 @@ publish.workspace = true
 [dependencies]
 axum.workspace = true
 clock.workspace = true
+# Players fetch the URLs they are told to play, as speakers do.
+reqwest.workspace = true
+roxmltree.workspace = true
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync", "time"] }
 
 [lints]

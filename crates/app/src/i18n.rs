@@ -10,7 +10,8 @@
 //! the same Fluent resources: [`duration`], [`progress`], [`date`], an episode's row
 //! ([`episode_summary`]), an Item's facts ([`item_facts`]) and its chapters with their start
 //! times ([`chapter_rows`], [`clock`]). So is what the Groups screen says about a Group's
-//! playback ([`group_playback`]).
+//! playback ([`group_playback`]), and the notice that an Item now plays on a Group
+//! ([`playing_on`]).
 
 use std::sync::LazyLock;
 
@@ -162,6 +163,7 @@ texts! {
     GroupTransitioning => "group-transitioning",
     GroupNotAnswering => "group-not-answering",
     GroupStateUnknown => "group-state-unknown",
+    PlayOn => "play-on",
     SettingsTitle => "settings-title",
     SettingsLibraryServer => "settings-library-server",
     SettingsAccount => "settings-account",
@@ -187,6 +189,9 @@ texts! {
     ErrorNotFound => "error-not-found",
     ErrorSonosUnreachable => "error-sonos-unreachable",
     ErrorSonosSearchFailed => "error-sonos-search-failed",
+    ErrorGroupNotFound => "error-group-not-found",
+    ErrorGroupFailed => "error-group-failed",
+    ErrorItemNotPlayable => "error-item-not-playable",
     ErrorUnknown => "error-unknown",
 }
 
@@ -225,6 +230,7 @@ macro_rules! phrases {
 
 phrases! {
     ProgressLeft => "progress-left" ("duration"),
+    PlayingOn => "playing-on" ("group"),
     DurationHoursMinutes => "duration-hours-minutes" ("hours", "minutes"),
     DurationHours => "duration-hours" ("hours"),
     DurationMinutes => "duration-minutes" ("minutes"),
@@ -245,6 +251,9 @@ impl From<&api::ApiError> for Text {
             ApiError::NotFound => Self::ErrorNotFound,
             ApiError::SonosUnreachable => Self::ErrorSonosUnreachable,
             ApiError::SonosSearchFailed => Self::ErrorSonosSearchFailed,
+            ApiError::GroupNotFound => Self::ErrorGroupNotFound,
+            ApiError::GroupFailed => Self::ErrorGroupFailed,
+            ApiError::ItemNotPlayable => Self::ErrorItemNotPlayable,
             ApiError::Unknown => Self::ErrorUnknown,
         }
     }
@@ -386,6 +395,13 @@ pub fn item_facts(language: Language, item: &Item) -> Vec<(Text, String)> {
         facts.push((Text::ItemPublished, date(language, published_at)));
     }
     facts
+}
+
+/// That an Item now plays on the Group named `group`: "Playing on Kitchen".
+pub fn playing_on(language: Language, group: &str) -> String {
+    let mut args = FluentArgs::new();
+    args.set("group", group);
+    phrase(language, Phrase::PlayingOn, &args)
 }
 
 /// What a Group's row says about its playback: its state, then its track's title and creator
@@ -716,8 +732,8 @@ mod tests {
         for (text, error) in &messages {
             assert_eq!(Text::from(error), *text, "{error:?}");
         }
-        // One message per code (ApiError has 11), each different in every language.
-        assert_eq!(messages.len(), 11, "{messages:?}");
+        // One message per code (ApiError has 14), each different in every language.
+        assert_eq!(messages.len(), 14, "{messages:?}");
         for language in Language::ALL {
             let distinct: BTreeSet<_> = messages
                 .iter()

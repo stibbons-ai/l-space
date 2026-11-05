@@ -73,9 +73,8 @@ pub fn podcast(
 /// `user`'s Progress; or why `library_item` holds no such Item.
 pub fn item(user: &abs::User, library_item: abs::LibraryItem, id: ItemId) -> Result<Item, Missing> {
     let progress_of = ProgressIndex::of(user);
-    match (library_item.media, &id.episode) {
-        (abs::Media::Book(book), None) if !is_audiobook(&book) => Err(Missing::EbookAlone),
-        (abs::Media::Book(book), None) => Ok(Item {
+    Ok(match select(library_item.media, &id)? {
+        Selected::Audiobook(book) => Item {
             title: book.metadata.title,
             author: non_empty(book.metadata.author_name),
             podcast: None,
@@ -86,7 +85,61 @@ pub fn item(user: &abs::User, library_item: abs::LibraryItem, id: ItemId) -> Res
             chapters: book.chapters.entries.into_iter().map(chapter).collect(),
             audio_files: audio_files(book.tracks),
             id,
-        }),
+        },
+        Selected::Episode { podcast, episode } => Item {
+            duration: episode_duration(&episode),
+            progress: progress_of.episode(&episode.id),
+            title: episode.title,
+            author: None,
+            podcast: Some(podcast.title),
+            description: non_empty(episode.description),
+            published_at: episode.published_at,
+            chapters: Vec::new(),
+            audio_files: audio_files(episode.audio_track),
+            id,
+        },
+    })
+}
+
+/// The audio file of Item `id` in `library_item`, if it has exactly one; or why not.
+pub fn single_audio_file(
+    library_item: abs::LibraryItem,
+    id: &ItemId,
+) -> Result<abs::Track, NoSingleFile> {
+    let mut tracks = match select(library_item.media, id).map_err(NoSingleFile::Missing)? {
+        Selected::Audiobook(book) => book.tracks,
+        Selected::Episode { episode, .. } => episode.audio_track.into_iter().collect(),
+    };
+    match tracks.len() {
+        1 => Ok(tracks.remove(0)),
+        files => Err(NoSingleFile::Files(files)),
+    }
+}
+
+/// Why an Item has no single audio file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoSingleFile {
+    /// The library item holds no such Item.
+    Missing(Missing),
+    /// It has this many audio files.
+    Files(usize),
+}
+
+/// What an Item is in its library item.
+enum Selected {
+    Audiobook(abs::Book),
+    Episode {
+        podcast: abs::PodcastMetadata,
+        episode: abs::Episode,
+    },
+}
+
+/// The Item `id` in `media` (an audiobook, or the podcast holding the episode); or why
+/// `media` holds no such Item.
+fn select(media: abs::Media, id: &ItemId) -> Result<Selected, Missing> {
+    match (media, &id.episode) {
+        (abs::Media::Book(book), None) if !is_audiobook(&book) => Err(Missing::EbookAlone),
+        (abs::Media::Book(book), None) => Ok(Selected::Audiobook(book)),
         (abs::Media::Book(_), Some(_)) => Err(Missing::EpisodeOfAudiobook),
         (abs::Media::Podcast(_), None) => Err(Missing::PodcastWithoutEpisode),
         (abs::Media::Podcast(podcast), Some(episode_id)) => {
@@ -95,17 +148,9 @@ pub fn item(user: &abs::User, library_item: abs::LibraryItem, id: ItemId) -> Res
                 .into_iter()
                 .find(|episode| &episode.id == episode_id)
                 .ok_or(Missing::NoSuchEpisode)?;
-            Ok(Item {
-                duration: episode_duration(&episode),
-                progress: progress_of.episode(&episode.id),
-                title: episode.title,
-                author: None,
-                podcast: Some(podcast.metadata.title),
-                description: non_empty(episode.description),
-                published_at: episode.published_at,
-                chapters: Vec::new(),
-                audio_files: audio_files(episode.audio_track),
-                id,
+            Ok(Selected::Episode {
+                podcast: podcast.metadata,
+                episode,
             })
         }
     }
@@ -292,6 +337,7 @@ mod tests {
             ino: "1".into(),
             start_offset: Some(0.0),
             duration: Some(60.0),
+            metadata: None,
         });
         let mut own = episode("own", Some(3), Some(30.0));
         own.audio_track = from_file.audio_track.clone();

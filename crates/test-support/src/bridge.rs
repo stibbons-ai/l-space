@@ -45,7 +45,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use api::{
-    ApiError, CurrentUser, EpisodeFilter, Group, Item, Library, LibraryEntry, Podcast, Session,
+    ApiError, CurrentUser, EpisodeFilter, Group, Handoff, Item, ItemId, Library, LibraryEntry,
+    Podcast, Session,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -440,6 +441,58 @@ impl AppApi {
         self.get_as(session, "/api/groups", &[]).await
     }
 
+    /// Starts Item `item` on Group `group` as `session`, panicking unless that succeeds.
+    pub async fn start_handoff(&self, session: &Session, item: &ItemId, group: &str) -> Handoff {
+        let response = self
+            .post(
+                "/api/handoffs/start",
+                Some(&bearer(session)),
+                handoff_body(item, group),
+            )
+            .await;
+        decode(response).await
+    }
+
+    /// Starts Item `item` on Group `group` as `session`, expecting a rejection.
+    pub async fn start_handoff_error(
+        &self,
+        session: &Session,
+        item: &ItemId,
+        group: &str,
+    ) -> (StatusCode, ApiError) {
+        self.post_error(
+            "/api/handoffs/start",
+            Some(&bearer(session)),
+            handoff_body(item, group),
+        )
+        .await
+    }
+
+    /// The active Handoffs `session` sees.
+    pub async fn handoffs(&self, session: &Session) -> Vec<Handoff> {
+        self.get_as(session, "/api/handoffs", &[]).await
+    }
+
+    /// `GET`s (or with `method`, `HEAD`s) `path` on the Bridge without authenticating, with
+    /// the `Range` header `range`, if any, as a Group fetches a stream.
+    pub async fn fetch(
+        &self,
+        method: Method,
+        path: &str,
+        range: Option<&str>,
+    ) -> reqwest::Response {
+        let mut request = self
+            .http
+            .request(method.clone(), format!("{}{path}", self.base_url));
+        if let Some(range) = range {
+            request = request.header(reqwest::header::RANGE, range);
+        }
+        request
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("{method} {path}: {error}"))
+    }
+
     /// GETs `path` with `query` as `session` and decodes the successful response body, typed
     /// or as raw JSON.
     pub async fn get_as<T: serde::de::DeserializeOwned>(
@@ -544,6 +597,10 @@ pub fn filter_name(filter: EpisodeFilter) -> String {
         Ok(Value::String(name)) => name,
         other => panic!("{filter:?} serializes as {other:?}"),
     }
+}
+
+fn handoff_body(item: &ItemId, group: &str) -> Value {
+    json!({"item": item, "group": group})
 }
 
 fn login_body(library_server: &str, api_key: &str) -> Value {

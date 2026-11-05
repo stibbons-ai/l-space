@@ -18,7 +18,9 @@
 //! its audio files. Ids from the App name things on the Library Server; one that names nothing
 //! the user can see is [`ApiError::NotFound`].
 //!
-//! A session also sees the household's Sonos Groups with what each plays, [`groups`].
+//! A session also sees the household's Sonos Groups with what each plays, [`groups`], starts
+//! an Item on a Group, [`start_handoff`], and sees every active Handoff, [`handoffs`]. Any
+//! logged-in household member may start on any Group and sees every Handoff.
 
 use std::fmt;
 
@@ -92,7 +94,9 @@ impl fmt::Debug for ApiKey {
     }
 }
 
-/// The Audiobookshelf user a session acts for.
+/// The Audiobookshelf user a session acts for. It also names who started a Handoff
+/// ([`Handoff::started_by`]), which every logged-in household member sees: whatever is added
+/// here goes out to all of them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CurrentUser {
     /// The normalized base URL of the user's Library Server.
@@ -305,6 +309,19 @@ pub struct NowPlaying {
     pub duration: Option<f64>,
 }
 
+/// A Handoff: an Item playing on a Group from the Bridge, which keeps it going without the
+/// App.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Handoff {
+    /// The Group's id, as [`Group::id`].
+    pub group: String,
+    pub item: ItemId,
+    /// Who started it: their Library Server, Audiobookshelf user id, and username then.
+    pub started_by: CurrentUser,
+    /// When it started, in milliseconds since the Unix epoch.
+    pub started_at: i64,
+}
+
 /// An error code the App translates for the user.
 ///
 /// On the wire this is the `data` member of the error body, for example
@@ -350,15 +367,25 @@ pub enum ApiError {
     /// see.
     #[error("not_found")]
     NotFound,
-    /// The Bridge knows Sonos players, but none of them told it the Group topology within the
-    /// listing's time.
+    /// The Bridge knows Sonos players, but none of them told it the Group topology in time.
     #[error("sonos_unreachable")]
     SonosUnreachable,
     /// The Bridge knows no Sonos player, and can't tell whether there are any: its last search
     /// could not be sent (socket not bound, or datagram not sent), its searching stopped, or
-    /// its first search didn't end within the listing's time.
+    /// its first search didn't end in time.
     #[error("sonos_search_failed")]
     SonosSearchFailed,
+    /// The household has no Group with this id (any more): it was regrouped, or its
+    /// coordinator unplugged.
+    #[error("group_not_found")]
+    GroupNotFound,
+    /// The Group did not start playing: its coordinator didn't answer in time, or refused.
+    #[error("group_failed")]
+    GroupFailed,
+    /// The Item can't be played on a Group by this Bridge yet: it has more than one audio
+    /// file, none, or one in a format Sonos doesn't play.
+    #[error("item_not_playable")]
+    ItemNotPlayable,
     /// A code this build of the App does not know yet, from a newer Bridge. Produced only on
     /// the App's side, when decoding; the Bridge never sends it.
     #[serde(other)]
@@ -390,12 +417,16 @@ impl AsStatusCode for ApiError {
     fn as_status_code(&self) -> StatusCode {
         match self {
             Self::ApiKeyRejected | Self::SessionInvalid => StatusCode::UNAUTHORIZED,
-            Self::LibraryServerNotConfigured | Self::NotFound => StatusCode::NOT_FOUND,
+            Self::LibraryServerNotConfigured | Self::NotFound | Self::GroupNotFound => {
+                StatusCode::NOT_FOUND
+            }
+            Self::ItemNotPlayable => StatusCode::UNPROCESSABLE_ENTITY,
             Self::BridgeUnreachable
             | Self::NotABridge
             | Self::LibraryServerUnreachable
             | Self::SonosUnreachable
-            | Self::SonosSearchFailed => StatusCode::BAD_GATEWAY,
+            | Self::SonosSearchFailed
+            | Self::GroupFailed => StatusCode::BAD_GATEWAY,
             Self::Internal | Self::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -500,6 +531,32 @@ pub async fn groups() -> Result<Vec<Group>, ApiError> {
     bridge.groups(server::session_token(&headers)?).await
 }
 
+/// Starts the Item `item` on Group `group` from its beginning, replacing what the Group
+/// played and the Handoff it had, if any. The Bridge streams the Item to the Group, which
+/// keeps playing without the App. Only an Item with exactly one audio file plays so far. Once
+/// the Item is found playable, the Group's Handoff is replaced before the Group is told to
+/// play: if it then doesn't start (a Sonos error), the Group is left with no Handoff.
+#[post(
+    "/api/handoffs/start",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn start_handoff(item: ItemId, group: String) -> Result<Handoff, ApiError> {
+    bridge
+        .start_handoff(server::session_token(&headers)?, item, group)
+        .await
+}
+
+/// Every active Handoff in the household, whoever started it; the earliest started first.
+#[get(
+    "/api/handoffs",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn handoffs() -> Result<Vec<Handoff>, ApiError> {
+    bridge.handoffs(server::session_token(&headers)?).await
+}
+
 /// The Bridge's side of the App API.
 #[cfg(feature = "server")]
 pub mod server {
@@ -513,8 +570,8 @@ pub mod server {
     use dioxus::server::{DioxusRouterExt, FullstackState};
 
     use crate::{
-        ApiError, ApiKey, CurrentUser, EpisodeFilter, Group, Item, ItemId, Library, LibraryEntry,
-        LibraryServer, Podcast, Session, SessionToken,
+        ApiError, ApiKey, CurrentUser, EpisodeFilter, Group, Handoff, Item, ItemId, Library,
+        LibraryEntry, LibraryServer, Podcast, Session, SessionToken,
     };
 
     /// A boxed future, so [`Bridge`] stays object-safe.
@@ -562,6 +619,17 @@ pub mod server {
 
         /// See [`crate::groups`].
         fn groups(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Group>, ApiError>>;
+
+        /// See [`crate::start_handoff`].
+        fn start_handoff(
+            &self,
+            token: SessionToken,
+            item: ItemId,
+            group: String,
+        ) -> BoxFuture<'_, Result<Handoff, ApiError>>;
+
+        /// See [`crate::handoffs`].
+        fn handoffs(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Handoff>, ApiError>>;
     }
 
     /// How server functions reach the [`Bridge`].

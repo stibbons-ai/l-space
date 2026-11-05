@@ -230,7 +230,7 @@ fn session(app: &App) -> Session {
 /// The notice on screen, as the person reads it.
 fn notice_text(app: &App) -> String {
     let notice = app.screen().notice().expect("a notice on screen");
-    app.text(notice.text())
+    notice.text(app.language())
 }
 
 /// The screen's text in English and in German, by `read` from the App.
@@ -1746,5 +1746,223 @@ fn a_session_ended_elsewhere_leads_from_the_groups_to_login() {
             app.screen()
         );
         assert_eq!(app.session(), None);
+    });
+}
+
+/// Opens episode `n` (0-based) of the seeded podcast from the Libraries screen, which offers
+/// "Play on…": an episode is one audio file.
+async fn open_episode(app: &mut App, abs: &Audiobookshelf, n: usize) {
+    let seeded = abs.seeded();
+    app.open_library(podcasts(abs)).await;
+    app.open_podcast(&seeded.podcast).await;
+    app.open_episode(&seeded.episodes[n]).await;
+    assert!(
+        matches!(app.screen(), Screen::Item { notice: None, .. }),
+        "{:?}",
+        app.screen()
+    );
+    assert!(app.can_play_on());
+}
+
+/// The names of the Groups the picker lists.
+fn picker_names(app: &App) -> Vec<String> {
+    let Screen::PlayOn { groups, .. } = app.screen() else {
+        panic!("{:?}", app.screen());
+    };
+    groups.iter().map(|group| group.name.clone()).collect()
+}
+
+#[test]
+fn play_on_lists_every_group_and_plays_the_episode_on_the_one_chosen() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let bath = household.add_player("Bath");
+    household.join(&bath, &kitchen);
+    let office = household.add_player("Office");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        open_episode(&mut app, &abs, 0).await;
+        let Screen::Item { item, .. } = app.screen().clone() else {
+            unreachable!()
+        };
+
+        app.open_play_on().await;
+        assert_eq!(picker_names(&app), ["Kitchen", "Office"]);
+
+        app.play_on(office.uuid()).await;
+        assert_eq!(
+            app.screen(),
+            &Screen::Item {
+                item: item.clone(),
+                notice: Some(Notice::PlayingOn("Office".into())),
+            }
+        );
+        assert_eq!(
+            notice_texts(&mut app),
+            (
+                "Playing on Office".to_owned(),
+                "Spielt auf Office".to_owned()
+            )
+        );
+
+        // Office plays the episode from the Bridge; Kitchen's Group is untouched.
+        assert_eq!(household.transport_state(&office), "PLAYING");
+        let url = household.uri(&office).expect("Office was given a URL");
+        assert!(
+            url.starts_with(&format!("{}/stream/", bridge.url())),
+            "{url}"
+        );
+        assert_eq!(household.fetched(&office).await.status, Some(206));
+        assert_eq!(household.uri(&kitchen), None);
+        let handoffs = bridge.api().handoffs(&session(&app)).await;
+        assert_eq!(handoffs.len(), 1);
+        assert_eq!(
+            (handoffs[0].group.as_str(), &handoffs[0].item),
+            (office.uuid(), &item.id)
+        );
+
+        // Back leads to where the Item was opened from, not to the picker.
+        app.go_back();
+        assert!(
+            matches!(app.screen(), Screen::Podcast { .. }),
+            "{:?}",
+            app.screen()
+        );
+    });
+}
+
+#[test]
+fn a_start_that_fails_is_explained_on_the_picker() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    household.set_fault(&kitchen, Fault::RefusePlayback);
+    let office = household.add_player("Office");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        open_episode(&mut app, &abs, 1).await;
+        app.open_play_on().await;
+
+        app.play_on(kitchen.uuid()).await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::GroupFailed))
+        );
+        assert_eq!(notice_texts(&mut app), both(Text::ErrorGroupFailed));
+
+        // A Group unplugged since the list was shown is gone; the picker lists the Groups
+        // afresh, keeping the notice.
+        household.remove(&office);
+        app.play_on(office.uuid()).await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::GroupNotFound))
+        );
+        assert_eq!(notice_texts(&mut app), both(Text::ErrorGroupNotFound));
+        assert_eq!(picker_names(&app), ["Kitchen"]);
+        assert_eq!(bridge.api().handoffs(&session(&app)).await, []);
+    });
+}
+
+#[test]
+fn an_item_in_several_files_is_not_offered_and_cannot_play_on_a_group() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.open_library(audiobooks(&abs)).await;
+        app.open_entry(&abs.seeded().long_book).await;
+        let Screen::Item { item, .. } = app.screen() else {
+            panic!("{:?}", app.screen());
+        };
+        assert_eq!(item.audio_files.len(), 3);
+        // The Item screen doesn't offer "Play on…".
+        assert!(!app.can_play_on());
+
+        // Asked anyway, the Bridge refuses.
+        app.open_play_on().await;
+        app.play_on(kitchen.uuid()).await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::ItemNotPlayable))
+        );
+        assert_eq!(notice_texts(&mut app), both(Text::ErrorItemNotPlayable));
+        assert_eq!(household.uri(&kitchen), None);
+    });
+}
+
+#[test]
+fn a_session_ended_elsewhere_leads_from_play_on_to_login() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        open_episode(&mut app, &abs, 0).await;
+        app.open_play_on().await;
+        bridge.api().logout(&session(&app)).await;
+
+        app.play_on(kitchen.uuid()).await;
+
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Login {
+                    notice: Some(Notice::Api(ApiError::SessionInvalid)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(app.session(), None);
+        assert_eq!(household.uri(&kitchen), None);
+    });
+}
+
+#[test]
+fn a_group_gone_whose_groups_cant_be_listed_afresh_says_why() {
+    let (household, _) = Household::with_manual_clock();
+    household.add_player("Kitchen");
+    let office = household.add_player("Office");
+    let (bridge, abs) = bridge_with_household(&household);
+    // In front of the Bridge: the first Groups listing (the picker's) passes, later ones get
+    // 503, as from a reverse proxy whose Bridge just went away.
+    let listings = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let target = bridge.url().strip_prefix("http://").unwrap().to_owned();
+    let (proxy, _) = proxy(&target, move |_, request| {
+        request.starts_with(b"GET /api/groups") && listings.fetch_add(1, Ordering::SeqCst) > 0
+    });
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = device.launch().await;
+        app.submit_bridge_url(&proxy).await;
+        app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
+            .await;
+        open_episode(&mut app, &abs, 0).await;
+        app.open_play_on().await;
+        assert_eq!(picker_names(&app), ["Kitchen", "Office"]);
+
+        household.remove(&office);
+        app.play_on(office.uuid()).await;
+
+        // Why the Groups couldn't be listed, on the picker as it was.
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::BridgeUnreachable))
+        );
+        assert_eq!(picker_names(&app), ["Kitchen", "Office"]);
+        assert!(app.session().is_some());
     });
 }

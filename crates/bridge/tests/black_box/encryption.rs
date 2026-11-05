@@ -200,8 +200,8 @@ async fn another_encryption_key_ends_sessions_until_a_fresh_login() {
 }
 
 const KEY_REMOVED: &str = "a stored API key does not decrypt with the current encryption key \
-                           (or was tampered with); it was removed and the sessions opened with \
-                           it ended";
+                           (or was tampered with); it was removed, and the sessions and Handoffs \
+                           using it ended";
 
 /// A key whose sessions all ended (here by logout) is useless once the encryption key
 /// changed: it is removed at the next start, with no warning about it then or later.
@@ -237,4 +237,4 @@ async fn a_logged_out_key_under_another_encryption_key_is_forgotten_quietly() {
 }
 
 const UNUSED_KEYS_REMOVED: &str = "removed stored API keys that were encrypted with another \
-                                   encryption key and that no session used";
+                                   encryption key and that no session or Handoff used";

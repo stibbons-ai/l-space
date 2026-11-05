@@ -1,9 +1,10 @@
 //! [`Sonos`] over local UPnP: players found with SSDP, the Group topology read from any of
-//! them (ZoneGroupTopology `GetZoneGroupState`), and each Group's playback from its coordinator
-//! (AVTransport `GetTransportInfo` and `GetPositionInfo`).
+//! them (ZoneGroupTopology `GetZoneGroupState`), each Group's playback from its coordinator
+//! (AVTransport `GetTransportInfo` and `GetPositionInfo`), and a stream started on a Group by
+//! its coordinator (AVTransport `SetAVTransportURI`, then `Play`).
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,7 @@ use tokio::task::AbortHandle;
 
 use crate::soap::{self, CallError, Service, argument};
 use crate::xml::{self, ZoneGroup};
-use crate::{Error, Group, Member, Sonos, Track, TransportState, ssdp};
+use crate::{Error, Group, Member, Sonos, Stream, Track, TransportState, ssdp};
 
 /// How long after one search the next one starts, on the [`Clock`].
 pub const REFRESH: Duration = Duration::from_secs(60);
@@ -29,6 +30,11 @@ pub const EXPIRY: Duration = Duration::from_secs(3 * 60);
 /// How long [`Upnp::groups`] may take in all, waiting for the first search included; shorter
 /// than the App's limit for a call to the Bridge.
 pub const LISTING_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How long [`Upnp::play`] may take in all, waiting for the first search included. With the
+/// Library Server's 10 seconds for resolving an Item, a start stays within the App's limit for
+/// a call to the Bridge.
+pub const PLAY_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// How long one SOAP call may take, connecting included.
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -121,6 +127,11 @@ impl Upnp {
         let deadline = tokio::time::Instant::now() + LISTING_TIMEOUT;
         self.shared.groups(deadline).await
     }
+
+    async fn play(&self, group: &str, stream: &Stream) -> Result<(), Error> {
+        let deadline = tokio::time::Instant::now() + PLAY_TIMEOUT;
+        self.shared.play(group, stream, deadline).await.map(drop)
+    }
 }
 
 impl Drop for Upnp {
@@ -132,6 +143,10 @@ impl Drop for Upnp {
 impl Sonos for Upnp {
     fn groups(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>> {
         Box::pin(self.groups())
+    }
+
+    fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(self.play(group, stream))
     }
 }
 
@@ -217,6 +232,23 @@ impl Shared {
     /// Every Group, if the topology could be read by `deadline`. A Group whose coordinator
     /// didn't tell its playback by then is listed without what it didn't tell.
     async fn groups(&self, deadline: tokio::time::Instant) -> Result<Vec<Group>, Error> {
+        let (players, topology) = self.topology_by(deadline).await?;
+        let mut groups = join_all(topology.iter().filter_map(visible).map(|group| {
+            // Only an address a player announced for itself: the topology's could point anywhere.
+            let coordinator = players.get(&group.id).copied();
+            self.with_playback(group, coordinator, deadline)
+        }))
+        .await;
+        groups.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        Ok(groups)
+    }
+
+    /// The players known now (by UUID) and the Group topology, read by `deadline`; no
+    /// topology when a working search found no player.
+    async fn topology_by(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(BTreeMap<String, SocketAddr>, Vec<ZoneGroup>), Error> {
         // Without a first search, an empty list would only mean "not searched yet".
         let mut searched = self.searched.subscribe();
         if tokio::time::timeout_at(deadline, searched.wait_for(|searched| *searched))
@@ -240,7 +272,7 @@ impl Shared {
                 return if known.search_failed {
                     Err(Error::SearchFailed)
                 } else {
-                    Ok(Vec::new())
+                    Ok((players, Vec::new()))
                 };
             }
             let candidates = candidates(&players, &known.ranks);
@@ -248,22 +280,70 @@ impl Shared {
         };
         let Ok(topology) = tokio::time::timeout_at(deadline, self.topology(&candidates)).await
         else {
-            tracing::warn!(
-                timeout = ?LISTING_TIMEOUT,
-                "no Sonos player told the Group topology within the listing's time"
-            );
+            tracing::warn!("no Sonos player told the Group topology in time");
             return Err(Error::Unreachable);
         };
         let (from, topology) = topology?;
         self.known().ranks = ranks(&from, &topology);
-        let mut groups = join_all(topology.iter().filter_map(visible).map(|group| {
-            // Only an address a player announced for itself: the topology's could point anywhere.
-            let coordinator = players.get(&group.id).copied();
-            self.with_playback(group, coordinator, deadline)
-        }))
-        .await;
-        groups.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-        Ok(groups)
+        Ok((players, topology))
+    }
+
+    /// Has Group `group` play `stream` from its start, by `deadline`: its coordinator, as the
+    /// topology read now names it, is given the stream's URL (`SetAVTransportURI`, without
+    /// metadata) and told to play. Returns the URL.
+    async fn play(
+        &self,
+        group: &str,
+        stream: &Stream,
+        deadline: tokio::time::Instant,
+    ) -> Result<String, Error> {
+        let (players, topology) = self.topology_by(deadline).await?;
+        let known = topology
+            .iter()
+            .any(|zone| zone.coordinator == group && visible(zone).is_some());
+        if !known {
+            return Err(Error::UnknownGroup);
+        }
+        // Only an address a player announced for itself: the topology's could point anywhere.
+        let Some(&coordinator) = players.get(group) else {
+            tracing::warn!(
+                group,
+                "a Group's coordinator did not answer the last searches"
+            );
+            return Err(Error::GroupFailed);
+        };
+        let host = match route_to(coordinator.ip()) {
+            Ok(host) => host,
+            Err(error) => {
+                let peer = coordinator.ip();
+                tracing::warn!(group, %peer, %error, "no route to a Group's coordinator");
+                return Err(Error::GroupFailed);
+            }
+        };
+        let url = stream.url(host);
+        let call = async |action, arguments: &[(&str, &str)]| {
+            let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+            soap::call_with(
+                &self.http,
+                coordinator,
+                Service::AvTransport,
+                action,
+                arguments,
+                timeout,
+            )
+            .await
+            .map_err(|error| {
+                tracing::warn!(group, action, %error, "a Group's coordinator did not start playing");
+                Error::GroupFailed
+            })
+        };
+        call(
+            "SetAVTransportURI",
+            &[("CurrentURI", &url), ("CurrentURIMetaData", "")],
+        )
+        .await?;
+        call("Play", &[("Speed", "1")]).await?;
+        Ok(url)
     }
 
     /// The Group topology and the UUID of the player that told it, asking `candidates` (UUID,
@@ -353,6 +433,23 @@ impl Shared {
         }
         group
     }
+}
+
+/// This host's address on the route to `peer`: where `peer` reaches it. Connecting a UDP
+/// socket sends nothing; it only picks the route.
+fn route_to(peer: IpAddr) -> std::io::Result<IpAddr> {
+    let unspecified: IpAddr = match peer {
+        IpAddr::V4(_) => Ipv4Addr::UNSPECIFIED.into(),
+        IpAddr::V6(_) => Ipv6Addr::UNSPECIFIED.into(),
+    };
+    let socket = UdpSocket::bind((unspecified, 0))?;
+    // Any port: nothing is sent.
+    socket.connect((peer, 9))?;
+    let local = socket.local_addr()?.ip();
+    if local.is_unspecified() {
+        return Err(std::io::Error::other("the route has no local address"));
+    }
+    Ok(local)
 }
 
 /// The transport state in Group `group`'s `GetTransportInfo` answer: unknown, and logged with
@@ -460,6 +557,10 @@ mod tests {
 
     use super::*;
     use crate::xml::ZoneMember;
+
+    /// The SOAP actions that give a Group a URL and have it play, as `sonos-fake` records them.
+    const SET_URI: &str = "AVTransport#SetAVTransportURI";
+    const PLAY: &str = "AVTransport#Play";
 
     fn member(uuid: &str, name: &str, visible: bool) -> ZoneMember {
         ZoneMember {
@@ -796,5 +897,123 @@ mod tests {
             shared.groups(soon(LISTING_TIMEOUT)).await,
             Err(Error::SearchFailed)
         );
+    }
+
+    fn stream(listen: &str) -> Stream {
+        Stream {
+            listen: listen.parse().unwrap(),
+            path: "/stream/abc/Episode%201.mp3".into(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_group_plays_the_stream_on_the_address_its_coordinator_reaches() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let bath = household.add_player("Bath");
+        household.join(&bath, &kitchen);
+        let office = household.add_player("Office");
+        let shared = knowing(&household, &clock).await;
+
+        // Listening on every address, the coordinator gets the one on its route: loopback.
+        let url = shared
+            .play(kitchen.uuid(), &stream("0.0.0.0:9"), soon(PLAY_TIMEOUT))
+            .await
+            .unwrap();
+        assert_eq!(url, "http://127.0.0.1:9/stream/abc/Episode%201.mp3");
+        assert_eq!(household.uri(&kitchen).as_deref(), Some(url.as_str()));
+        assert_eq!(household.transport_state(&kitchen), "PLAYING");
+        let started = [SET_URI, PLAY];
+        let calls = household.actions_of(&kitchen);
+        assert!(calls.ends_with(&started.map(String::from)), "{calls:?}");
+        assert!(
+            !household
+                .actions_of(&bath)
+                .iter()
+                .any(|a| a.contains("Play"))
+        );
+        assert!(
+            !household
+                .actions_of(&office)
+                .iter()
+                .any(|a| a.contains("Play"))
+        );
+        assert_eq!(household.uri(&office), None);
+
+        // Listening on one address, that one.
+        let url = shared
+            .play(office.uuid(), &stream("127.0.0.2:9"), soon(PLAY_TIMEOUT))
+            .await
+            .unwrap();
+        assert_eq!(url, "http://127.0.0.2:9/stream/abc/Episode%201.mp3");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_group_in_the_topology_plays() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let bath = household.add_player("Bath");
+        household.join(&bath, &kitchen);
+        let beam = household.add_player("TV");
+        let surround = household.add_bonded(&beam);
+        let shared = knowing(&household, &clock).await;
+
+        // A member that doesn't coordinate, a bonded speaker, and no player at all.
+        for group in [bath.uuid(), surround.uuid(), "RINCON_NOSUCH01400"] {
+            assert_eq!(
+                shared
+                    .play(group, &stream("0.0.0.0:9"), soon(PLAY_TIMEOUT))
+                    .await,
+                Err(Error::UnknownGroup),
+                "{group}"
+            );
+        }
+        assert!(
+            !household
+                .actions()
+                .iter()
+                .any(|a| a.contains("SetAVTransportURI"))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_coordinator_that_refuses_or_hangs_fails_in_time() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        household.set_fault(&kitchen, Fault::RefusePlayback);
+        let office = household.add_player("Office");
+        household.set_fault(&office, Fault::Hang);
+        let shared = knowing(&household, &clock).await;
+
+        assert_eq!(
+            shared
+                .play(kitchen.uuid(), &stream("0.0.0.0:9"), soon(PLAY_TIMEOUT))
+                .await,
+            Err(Error::GroupFailed)
+        );
+        assert_eq!(household.transport_state(&kitchen), "STOPPED");
+        // It failed at the coordinator's refusal, not before.
+        let set_uri = SET_URI.to_owned();
+        assert!(household.actions_of(&kitchen).contains(&set_uri));
+
+        // The topology comes from Kitchen; Office never answers its own calls.
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            shared
+                .play(
+                    office.uuid(),
+                    &stream("0.0.0.0:9"),
+                    soon(Duration::from_secs(1))
+                )
+                .await,
+            Err(Error::GroupFailed)
+        );
+        let elapsed = start.elapsed();
+        // It waited for Office up to the deadline, then gave up.
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+        assert!(household.actions_of(&office).contains(&set_uri));
     }
 }

@@ -11,7 +11,9 @@
 
 use abs::ApiKey;
 
-use crate::{LibraryUser, Session, SessionId, Store};
+use crate::{
+    ActiveHandoff, Handoff, HandoffFile, LibraryUser, Session, SessionId, Store, StreamId,
+};
 
 /// Empty storage that a store can be opened on, any number of times in turn: what one opened
 /// store wrote, the next one opened must see.
@@ -41,6 +43,16 @@ macro_rules! store_contract_tests {
             revoked_keys_stay_revoked_after_reopening,
             revoking_a_key_for_one_user_keeps_it_for_another,
             users_are_distinct_per_library_server,
+            a_started_handoff_streams_with_its_starters_key,
+            an_unknown_stream_is_no_handoff,
+            a_new_handoff_on_a_group_replaces_its_old_one,
+            handoffs_on_other_groups_stay_apart,
+            handoffs_survive_reopening,
+            a_handoff_outlives_the_session_that_started_it,
+            starting_a_handoff_keeps_the_starters_sessions,
+            ending_a_handoff_ends_only_it,
+            revoking_a_key_ends_the_handoffs_acting_with_it,
+            ending_a_replaced_stream_leaves_its_replacement,
         );
     };
     (@tests $backend:expr; $($test:ident),* $(,)?) => {
@@ -339,4 +351,207 @@ pub async fn users_are_distinct_per_library_server(backend: &impl Backend) {
         session(&store, session_id(2)).await,
         acting_as(&office, "office-key")
     );
+}
+
+fn stream(n: u8) -> StreamId {
+    StreamId::of(&format!("stream-{n}"))
+}
+
+/// A Handoff of episode `episode` on Group `group`, started by `user` at `started_at`.
+fn handoff(group: &str, episode: &str, user: &LibraryUser, started_at: i64) -> Handoff {
+    Handoff {
+        group: group.into(),
+        library_item: "podcast-id".into(),
+        episode: Some(episode.into()),
+        file: HandoffFile {
+            ino: format!("{episode}-ino"),
+            name: format!("{episode}.mp3"),
+        },
+        started_by: user.clone(),
+        username: format!("{}-name", user.user_id),
+        started_at,
+    }
+}
+
+async fn start(store: &impl Store, stream: StreamId, handoff: &Handoff, api_key: &str) {
+    store
+        .start_handoff(&stream, handoff, &key(api_key))
+        .await
+        .expect("start handoff");
+}
+
+async fn active(store: &impl Store, stream: StreamId) -> Option<ActiveHandoff> {
+    store.handoff(&stream).await.expect("look up handoff")
+}
+
+async fn listed(store: &impl Store) -> Vec<Handoff> {
+    store.handoffs().await.expect("list handoffs")
+}
+
+fn acting_with(handoff: &Handoff, api_key: &str) -> Option<ActiveHandoff> {
+    Some(ActiveHandoff {
+        handoff: handoff.clone(),
+        api_key: key(api_key),
+    })
+}
+
+pub async fn a_started_handoff_streams_with_its_starters_key(backend: &impl Backend) {
+    let store = backend.open().await;
+    let kitchen = handoff("RINCON_K", "ep-1", &alice(), 1_000);
+    start(&store, stream(1), &kitchen, "alice-key").await;
+
+    assert_eq!(
+        active(&store, stream(1)).await,
+        acting_with(&kitchen, "alice-key")
+    );
+    assert_eq!(listed(&store).await, [kitchen]);
+}
+
+pub async fn an_unknown_stream_is_no_handoff(backend: &impl Backend) {
+    let store = backend.open().await;
+    assert_eq!(active(&store, stream(1)).await, None);
+    assert_eq!(listed(&store).await, []);
+
+    start(
+        &store,
+        stream(1),
+        &handoff("RINCON_K", "ep-1", &alice(), 1_000),
+        "alice-key",
+    )
+    .await;
+    assert_eq!(active(&store, stream(2)).await, None);
+}
+
+pub async fn a_new_handoff_on_a_group_replaces_its_old_one(backend: &impl Backend) {
+    let store = backend.open().await;
+    let first = handoff("RINCON_K", "ep-1", &alice(), 1_000);
+    start(&store, stream(1), &first, "alice-key").await;
+    let second = handoff("RINCON_K", "ep-2", &bob(), 2_000);
+    start(&store, stream(2), &second, "bob-key").await;
+
+    assert_eq!(active(&store, stream(1)).await, None);
+    assert_eq!(
+        active(&store, stream(2)).await,
+        acting_with(&second, "bob-key")
+    );
+    assert_eq!(listed(&store).await, [second]);
+}
+
+pub async fn handoffs_on_other_groups_stay_apart(backend: &impl Backend) {
+    let store = backend.open().await;
+    let office = handoff("RINCON_O", "ep-2", &bob(), 2_000);
+    let kitchen = handoff("RINCON_K", "ep-1", &alice(), 1_000);
+    start(&store, stream(2), &office, "bob-key").await;
+    start(&store, stream(1), &kitchen, "alice-key").await;
+
+    assert_eq!(
+        active(&store, stream(1)).await,
+        acting_with(&kitchen, "alice-key")
+    );
+    assert_eq!(
+        active(&store, stream(2)).await,
+        acting_with(&office, "bob-key")
+    );
+    // The earliest started first.
+    assert_eq!(listed(&store).await, [kitchen, office]);
+}
+
+pub async fn handoffs_survive_reopening(backend: &impl Backend) {
+    let kitchen = handoff("RINCON_K", "ep-1", &alice(), 1_000);
+    {
+        let store = backend.open().await;
+        start(&store, stream(1), &kitchen, "alice-key").await;
+    }
+
+    let store = backend.open().await;
+    assert_eq!(
+        active(&store, stream(1)).await,
+        acting_with(&kitchen, "alice-key")
+    );
+    assert_eq!(listed(&store).await, [kitchen]);
+}
+
+pub async fn a_handoff_outlives_the_session_that_started_it(backend: &impl Backend) {
+    let store = backend.open().await;
+    open(&store, session_id(1), &alice(), "alice-key").await;
+    let kitchen = handoff("RINCON_K", "ep-1", &alice(), 1_000);
+    start(&store, stream(1), &kitchen, "alice-key").await;
+
+    assert!(store.close_session(&session_id(1)).await.expect("close"));
+
+    assert_eq!(
+        active(&store, stream(1)).await,
+        acting_with(&kitchen, "alice-key")
+    );
+}
+
+/// The Handoff and the session share the stored key; each keeps it.
+pub async fn starting_a_handoff_keeps_the_starters_sessions(backend: &impl Backend) {
+    let store = backend.open().await;
+    open(&store, session_id(1), &alice(), "alice-key").await;
+    start(
+        &store,
+        stream(1),
+        &handoff("RINCON_K", "ep-1", &alice(), 1_000),
+        "alice-key",
+    )
+    .await;
+
+    assert_eq!(
+        session(&store, session_id(1)).await,
+        acting_as(&alice(), "alice-key")
+    );
+}
+
+pub async fn ending_a_handoff_ends_only_it(backend: &impl Backend) {
+    let store = backend.open().await;
+    let kitchen = handoff("RINCON_K", "ep-1", &alice(), 1_000);
+    let office = handoff("RINCON_O", "ep-2", &alice(), 2_000);
+    start(&store, stream(1), &kitchen, "alice-key").await;
+    start(&store, stream(2), &office, "alice-key").await;
+
+    assert!(store.end_handoff(&stream(1)).await.expect("end"));
+    assert!(!store.end_handoff(&stream(1)).await.expect("end again"));
+
+    assert_eq!(active(&store, stream(1)).await, None);
+    assert_eq!(listed(&store).await, [office]);
+}
+
+pub async fn ending_a_replaced_stream_leaves_its_replacement(backend: &impl Backend) {
+    let store = backend.open().await;
+    let first = handoff("RINCON_K", "ep-1", &alice(), 1_000);
+    start(&store, stream(1), &first, "alice-key").await;
+    let second = handoff("RINCON_K", "ep-2", &bob(), 2_000);
+    start(&store, stream(2), &second, "bob-key").await;
+
+    assert!(!store.end_handoff(&stream(1)).await.expect("end replaced"));
+
+    assert_eq!(
+        active(&store, stream(2)).await,
+        acting_with(&second, "bob-key")
+    );
+    assert_eq!(listed(&store).await, [second]);
+}
+
+pub async fn revoking_a_key_ends_the_handoffs_acting_with_it(backend: &impl Backend) {
+    let store = backend.open().await;
+    start(
+        &store,
+        stream(1),
+        &handoff("RINCON_K", "ep-1", &alice(), 1_000),
+        "alice-key",
+    )
+    .await;
+    let office = handoff("RINCON_O", "ep-2", &bob(), 2_000);
+    start(&store, stream(2), &office, "bob-key").await;
+
+    assert!(
+        store
+            .revoke_api_key(&alice(), &key("alice-key"))
+            .await
+            .expect("revoke")
+    );
+
+    assert_eq!(active(&store, stream(1)).await, None);
+    assert_eq!(listed(&store).await, [office]);
 }

@@ -1,9 +1,10 @@
 //! The Audiobookshelf client: the Bridge's only way to talk to a Library Server.
 //!
 //! It covers the "who am I" check (`GET /api/me`) that proves an API key (ADR 0011) and also
-//! brings the user's Progress, and read-only browsing: the user's Libraries, a Library's
+//! brings the user's Progress, read-only browsing: the user's Libraries, a Library's
 //! audiobooks or podcasts, and one audiobook or podcast with its chapters, audio files and
-//! episodes. Every request authenticates with `Authorization: Bearer <api key>`.
+//! episodes; and an audio file's bytes, by byte range, for the Bridge's streams (ADR 0010).
+//! Every request authenticates with `Authorization: Bearer <api key>`.
 //!
 //! Ids a caller passes go into request paths only if they are plain Audiobookshelf ids (ASCII
 //! letters, digits, `-` and `_`); any other id names nothing ([`Error::NotFound`]) and is
@@ -12,13 +13,16 @@
 use std::fmt;
 use std::time::Duration;
 
-use reqwest::header::{AUTHORIZATION, HeaderValue};
-use reqwest::{StatusCode, redirect};
+use bytes::Bytes;
+use futures::stream::{self, BoxStream};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, HeaderValue, RANGE};
+use reqwest::{Method, StatusCode, redirect};
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Deserializer};
 
 /// How long one request to a Library Server may take, connecting included, before it counts
-/// as unreachable.
+/// as unreachable. For an audio file, how long connecting may take, and then the answer and
+/// each next part of its body: the body itself may take as long as a speaker takes to read it.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 /// An Audiobookshelf API key. It never shows in `Debug` output, so it cannot leak into logs.
@@ -231,6 +235,17 @@ pub struct Track {
     /// Seconds; none when Audiobookshelf could not probe the file.
     #[serde(default, deserialize_with = "known_seconds")]
     pub duration: Option<f64>,
+    /// The file itself, as Audiobookshelf found it; none if it doesn't say.
+    #[serde(default)]
+    pub metadata: Option<FileMetadata>,
+}
+
+/// What Audiobookshelf found out about an audio file on disk.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct FileMetadata {
+    /// Its name, with its extension, without its directory.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub filename: String,
 }
 
 /// A duration in seconds, unless Audiobookshelf doesn't know it: it then sends 0 (or null).
@@ -291,6 +306,8 @@ impl Error {
 #[derive(Debug)]
 pub struct Client {
     http: reqwest::Client,
+    /// For audio files, whose bodies have no time limit in all.
+    media: reqwest::Client,
 }
 
 impl Default for Client {
@@ -301,15 +318,18 @@ impl Default for Client {
 
 impl Client {
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(TIMEOUT)
-            // reqwest drops `Authorization` on a redirect to another host or port, but would
-            // send the key along on a redirect to the same host and port, even over plain
-            // http; an API call has no reason to move.
-            .redirect(redirect::Policy::none())
+        // reqwest drops `Authorization` on a redirect to another host or port, but would send
+        // the key along on a redirect to the same host and port, even over plain http; a
+        // request to Audiobookshelf has no reason to move.
+        let builder = || reqwest::Client::builder().redirect(redirect::Policy::none());
+        let built = "the TLS backend and system configuration load";
+        let http = builder().timeout(TIMEOUT).build().expect(built);
+        let media = builder()
+            .connect_timeout(TIMEOUT)
+            .read_timeout(TIMEOUT)
             .build()
-            .expect("the TLS backend and system configuration load");
-        Self { http }
+            .expect(built);
+        Self { http, media }
     }
 
     /// The user `api_key` acts for on the Library Server at `base_url` (a normalized base URL
@@ -377,6 +397,67 @@ impl Client {
         self.get(base_url, api_key, &path, Names::One).await
     }
 
+    /// Audio file `ino` of the audiobook or podcast `library_item_id`, as the Library Server
+    /// serves it (`/api/items/<id>/file/<ino>`): `request` is `GET` or `HEAD`, and `range`
+    /// the `Range` header to send, if any. The answer's body streams; a failure while reading
+    /// it ends it with an error.
+    pub async fn file(
+        &self,
+        base_url: &str,
+        api_key: &ApiKey,
+        library_item_id: &str,
+        ino: &str,
+        request: FileRequest,
+        range: Option<&str>,
+    ) -> Result<File, Error> {
+        let (library_item_id, ino) = (id_segment(library_item_id)?, id_segment(ino)?);
+        let method = match request {
+            FileRequest::Get => Method::GET,
+            FileRequest::Head => Method::HEAD,
+        };
+        let mut request = self
+            .media
+            .request(
+                method,
+                format!("{base_url}/api/items/{library_item_id}/file/{ino}"),
+            )
+            .header(AUTHORIZATION, authorization(api_key)?);
+        if let Some(range) = range {
+            let range = HeaderValue::from_str(range)
+                .map_err(|_| Error::Unavailable("a Range that is no header value".to_owned()))?;
+            request = request.header(RANGE, range);
+        }
+        let response = request.send().await.map_err(Error::unavailable)?;
+        let status = response.status();
+        match status {
+            StatusCode::UNAUTHORIZED => return Err(Error::Rejected),
+            StatusCode::FORBIDDEN => return Err(Error::NotFound(NotFound::Forbidden)),
+            StatusCode::NOT_FOUND => return Err(Error::NotFound(NotFound::Missing)),
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT | StatusCode::RANGE_NOT_SATISFIABLE => {}
+            status => return Err(Error::Unavailable(format!("HTTP {status}"))),
+        }
+        let header = |name| {
+            let value: &HeaderValue = response.headers().get(name)?;
+            value.to_str().ok()
+        };
+        let content_length = header(CONTENT_LENGTH).and_then(|length| length.parse().ok());
+        let content_range = header(CONTENT_RANGE).map(str::to_owned);
+        let body = stream::unfold(Some(response), async |response| {
+            let mut response = response?;
+            match response.chunk().await {
+                Ok(Some(chunk)) => Some((Ok(chunk), Some(response))),
+                Ok(None) => None,
+                Err(error) => Some((Err(Error::unavailable(error)), None)),
+            }
+        });
+        Ok(File {
+            status: status.as_u16(),
+            content_length,
+            content_range,
+            body: Box::pin(body),
+        })
+    }
+
     /// GETs `path_and_query`, which `names` a Library or library item or not, and decodes the
     /// answer.
     async fn get<T: DeserializeOwned>(
@@ -386,10 +467,7 @@ impl Client {
         path_and_query: &str,
         names: Names,
     ) -> Result<T, Error> {
-        // A key that cannot be sent as a header value cannot be a valid key.
-        let mut authorization = HeaderValue::try_from(format!("Bearer {}", api_key.expose()))
-            .map_err(|_| Error::Rejected)?;
-        authorization.set_sensitive(true);
+        let authorization = authorization(api_key)?;
 
         let response = self
             .http
@@ -410,6 +488,46 @@ impl Client {
             (status, _) => Err(Error::Unavailable(format!("HTTP {status}"))),
         }
     }
+}
+
+/// How to ask for an audio file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileRequest {
+    Get,
+    /// The headers alone.
+    Head,
+}
+
+/// An audio file, or the part of it asked for, as the Library Server answered.
+pub struct File {
+    /// 200 (the whole file), 206 (the range asked for) or 416 (a range the file doesn't
+    /// have).
+    pub status: u16,
+    /// The body's length, as the Library Server said.
+    pub content_length: Option<u64>,
+    /// Which bytes of the file the body holds (206), or how long the file is (416).
+    pub content_range: Option<String>,
+    /// The bytes; empty for `HEAD`.
+    pub body: BoxStream<'static, Result<Bytes, Error>>,
+}
+
+impl fmt::Debug for File {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("File")
+            .field("status", &self.status)
+            .field("content_length", &self.content_length)
+            .field("content_range", &self.content_range)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The `Authorization` header for `api_key`, marked sensitive. A key that cannot be sent as a
+/// header value cannot be a valid key.
+fn authorization(api_key: &ApiKey) -> Result<HeaderValue, Error> {
+    let mut authorization = HeaderValue::try_from(format!("Bearer {}", api_key.expose()))
+        .map_err(|_| Error::Rejected)?;
+    authorization.set_sensitive(true);
+    Ok(authorization)
 }
 
 /// Whether a request names one Library or library item, which then may not exist for the user.

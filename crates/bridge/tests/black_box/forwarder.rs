@@ -1,12 +1,13 @@
 //! A TCP forwarder on loopback in front of another server, that a test can take down and
 //! bring back: a Library Server outage, or a second Library Server URL for the same
-//! Audiobookshelf.
+//! Audiobookshelf. It can also cut answers short (a Library Server failing mid-body), stall
+//! them (one hanging mid-body), and record what clients send.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::io::copy_bidirectional;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, copy, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio::task::{JoinHandle, JoinSet};
@@ -15,7 +16,8 @@ use tokio::task::{JoinHandle, JoinSet};
 /// (out of file descriptors) doesn't spin.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(50);
 
-/// Forwards connections on its own port to `target`; stops forwarding when dropped.
+/// Forwards connections on its own port to `target`; stops forwarding, and closes every
+/// connection through it, when dropped.
 #[derive(Debug)]
 pub struct Forwarder {
     port: u16,
@@ -23,11 +25,28 @@ pub struct Forwarder {
     serving: JoinHandle<()>,
 }
 
+/// How much of what `target` answers a connection passes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answers {
+    Whole,
+    /// This many bytes, then the connection closes.
+    CutAfter(u64),
+    /// This many bytes (none for 0), then nothing more; the connection stays open.
+    StallAfter(u64),
+}
+
 #[derive(Debug)]
 struct State {
     target: String,
     /// While false, connections are accepted and dropped at once.
     forwarding: AtomicBool,
+    /// For connections opened since it was set.
+    answers: std::sync::Mutex<Answers>,
+    /// While true, a connection opened since records what the client sends in `requests`.
+    recording: AtomicBool,
+    /// Shared with the connections, which hold nothing else of the state: dropping the
+    /// forwarder drops `connections`, aborting them.
+    requests: Arc<std::sync::Mutex<Vec<u8>>>,
     connections: Mutex<JoinSet<()>>,
 }
 
@@ -41,6 +60,9 @@ impl Forwarder {
         let state = Arc::new(State {
             target: target.to_owned(),
             forwarding: AtomicBool::new(true),
+            answers: std::sync::Mutex::new(Answers::Whole),
+            recording: AtomicBool::new(false),
+            requests: Arc::default(),
             connections: Mutex::new(JoinSet::new()),
         });
         let serving = tokio::spawn(serve(listener, Arc::clone(&state)));
@@ -60,14 +82,48 @@ impl Forwarder {
     /// open, until [`Forwarder::resume`].
     pub async fn stop(&self) {
         self.state.forwarding.store(false, Ordering::SeqCst);
-        let mut connections = self.state.connections.lock().await;
-        connections.abort_all();
-        while connections.join_next().await.is_some() {}
+        self.close_all().await;
     }
 
     /// Forwards again.
     pub fn resume(&self) {
         self.state.forwarding.store(true, Ordering::SeqCst);
+    }
+
+    /// Closes every connection through the forwarder; from now on each new one passes back
+    /// at most `bytes` of what `target` answers, then closes.
+    pub async fn cut_after(&self, bytes: u64) {
+        self.answer(Answers::CutAfter(bytes)).await;
+    }
+
+    /// Closes every connection through the forwarder; from now on each new one passes back
+    /// at most `bytes` of what `target` answers (none for 0), then nothing more, staying open.
+    pub async fn stall_after(&self, bytes: u64) {
+        self.answer(Answers::StallAfter(bytes)).await;
+    }
+
+    async fn answer(&self, answers: Answers) {
+        *self.state.answers.lock().unwrap() = answers;
+        self.close_all().await;
+    }
+
+    /// Closes every connection through the forwarder; from now on it records every byte
+    /// clients send through new ones, from none.
+    pub async fn record_requests(&self) {
+        self.state.requests.lock().unwrap().clear();
+        self.state.recording.store(true, Ordering::SeqCst);
+        self.close_all().await;
+    }
+
+    /// What clients sent since [`Forwarder::record_requests`], as text.
+    pub fn requests(&self) -> String {
+        String::from_utf8_lossy(&self.state.requests.lock().unwrap()).into_owned()
+    }
+
+    async fn close_all(&self) {
+        let mut connections = self.state.connections.lock().await;
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
     }
 }
 
@@ -77,8 +133,9 @@ impl Drop for Forwarder {
     }
 }
 
-/// Accepts until aborted. Open connections live in `state.connections`: `stop` aborts them,
-/// and so does dropping the set once the forwarder and this task are both gone.
+/// Accepts until aborted. Open connections live in `state.connections`: `stop` and the other
+/// mode changes abort them, and so does dropping the set with the state, once the forwarder
+/// and this task (aborted when the forwarder drops) are both gone.
 async fn serve(listener: TcpListener, state: Arc<State>) {
     loop {
         let mut inbound = match listener.accept().await {
@@ -98,13 +155,51 @@ async fn serve(listener: TcpListener, state: Arc<State>) {
         // Reap connections that have ended, so the set holds only open ones.
         while connections.try_join_next().is_some() {}
         let target = state.target.clone();
+        let answers = *state.answers.lock().unwrap();
+        let recording = state.recording.load(Ordering::SeqCst);
+        let requests = Arc::clone(&state.requests);
         connections.spawn(async move {
-            match TcpStream::connect(&target).await {
-                Ok(mut outbound) => {
-                    let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+            let mut outbound = match TcpStream::connect(&target).await {
+                Ok(outbound) => outbound,
+                Err(error) => {
+                    eprintln!("[forwarder] connect to {target} failed: {error}");
+                    return;
                 }
-                Err(error) => eprintln!("[forwarder] connect to {target} failed: {error}"),
+            };
+            if answers == Answers::Whole && !recording {
+                let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                return;
             }
+            let (mut from_client, mut to_client) = inbound.split();
+            let (from_server, mut to_server) = outbound.split();
+            let (limit, stall) = match answers {
+                Answers::Whole => (u64::MAX, false),
+                Answers::CutAfter(bytes) => (bytes, false),
+                Answers::StallAfter(bytes) => (bytes, true),
+            };
+            let mut limited = from_server.take(limit);
+            let sending = async {
+                let mut buffer = [0; 8192];
+                while let Ok(read @ 1..) = from_client.read(&mut buffer).await {
+                    if recording {
+                        requests.lock().unwrap().extend_from_slice(&buffer[..read]);
+                    }
+                    if to_server.write_all(&buffer[..read]).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            // Whichever ends first ends the connection.
+            tokio::select! {
+                () = sending => {}
+                () = async {
+                    let _ = copy(&mut limited, &mut to_client).await;
+                    if stall {
+                        std::future::pending::<()>().await;
+                    }
+                } => {}
+            }
+            let _ = to_client.shutdown().await;
         });
     }
 }
