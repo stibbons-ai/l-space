@@ -84,7 +84,9 @@ fn BridgeUrlScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>)
             label {
                 {text(Text::BridgeUrlLabel)}
                 input {
-                    r#type: "url",
+                    // Not `url`: native validation would reject bare addresses such as
+                    // `192.168.1.10:8080` before the flow can add `http://`.
+                    r#type: "text",
                     inputmode: "url",
                     autocapitalize: "none",
                     autocomplete: "off",
