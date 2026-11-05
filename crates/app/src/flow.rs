@@ -66,7 +66,7 @@ pub enum Notice {
     /// likeliest cause.
     BridgeUrlUnreachable,
     /// The session's Library Server is not configured on the Bridge (any more); the session
-    /// stays, as it works again once the operator re-adds it.
+    /// stays, as it may work again once the operator re-adds it.
     SessionLibraryServerNotConfigured,
     /// What the App saved on the device could not be read; it was moved aside and the App
     /// started afresh.

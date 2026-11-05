@@ -236,23 +236,39 @@ fn html_page_server() -> String {
     web_server("200 OK", "text/html", "<html><body>Welcome</body></html>")
 }
 
+/// What went through a [`bridge_then_gone`] proxy: each request line, and after the first the
+/// status line the Bridge answered it with.
+type ProxyLog = Arc<Mutex<Vec<String>>>;
+
 /// A loopback proxy that passes the first request on to `bridge` and answers every later one
 /// with `503 Service Unavailable`, as a reverse proxy does once the Bridge behind it is gone.
-fn bridge_then_gone(bridge: &str) -> String {
+fn bridge_then_gone(bridge: &str) -> (String, ProxyLog) {
     let target = bridge
         .strip_prefix("http://")
         .expect("an http:// Bridge URL")
         .to_owned();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    let log = ProxyLog::default();
+    let written = Arc::clone(&log);
     std::thread::spawn(move || {
         for (index, mut stream) in listener.incoming().flatten().enumerate() {
             let request = read_request(&stream);
+            let record = |bytes: &[u8]| {
+                let line = String::from_utf8_lossy(bytes)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_owned();
+                written.lock().unwrap().push(line);
+            };
+            record(&request);
             let response = if index == 0 {
                 let mut bridge = TcpStream::connect(&target).unwrap();
                 bridge.write_all(&request).unwrap();
                 let mut response = Vec::new();
                 bridge.read_to_end(&mut response).unwrap();
+                record(&response);
                 response
             } else {
                 b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
@@ -261,7 +277,7 @@ fn bridge_then_gone(bridge: &str) -> String {
             let _ = stream.write_all(&response);
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), log)
 }
 
 /// One HTTP/1.1 request from `stream`, rewritten to close the connection after the response,
@@ -540,7 +556,12 @@ fn a_session_the_bridge_ended_is_forgotten_at_the_next_launch() {
             app.screen().notice(),
             Some(&Notice::Api(ApiError::SessionInvalid))
         );
-        assert!(matches!(app.screen(), Screen::Login { .. }));
+        // Login with the list the App fetched to tell this apart from an unconfigured server.
+        assert!(
+            matches!(app.screen(), Screen::Login { library_servers, .. } if library_servers.len() == 2),
+            "{:?}",
+            app.screen()
+        );
         assert_eq!(app.session(), None);
         assert_eq!(notice_texts(&mut app), both(Text::ErrorSessionInvalid));
 
@@ -595,7 +616,7 @@ fn a_failed_library_server_listing_after_session_invalid_keeps_the_session() {
         bridge.api().logout(&before).await;
         // The Bridge answers `session_invalid`, then can't be reached for the listing that
         // would tell an ended session from an unconfigured Library Server.
-        let proxy = bridge_then_gone(bridge.url());
+        let (proxy, log) = bridge_then_gone(bridge.url());
         device.edit(|json| json["bridge_url"] = proxy.clone().into());
 
         let app = device.launch().await;
@@ -606,6 +627,16 @@ fn a_failed_library_server_listing_after_session_invalid_keeps_the_session() {
             }
         );
         assert_eq!(session(&app), before);
+        // The Bridge itself answered `session_invalid` (401), and the App then asked for the
+        // list: not a failed first call that keeps the session anyway.
+        let seen = log.lock().unwrap().clone();
+        assert!(
+            matches!(&seen[..], [current_user, answer, listing]
+                if current_user.starts_with("GET /api/me ")
+                    && answer.starts_with("HTTP/1.1 401 ")
+                    && listing.starts_with("GET /api/library-servers ")),
+            "{seen:?}"
+        );
         // Kept on the device: the next launch, with the Bridge gone, still holds it.
         assert_eq!(session(&device.launch().await), before);
     });
