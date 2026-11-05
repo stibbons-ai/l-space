@@ -101,9 +101,9 @@ pub fn item_progress(user: &abs::User, id: &ItemId) -> Option<Progress> {
     progress_in(user, &id.library_item, id.episode.as_deref())
 }
 
-/// `user`'s Progress in audiobook `library_item`, or in its episode `episode`. An episode is
-/// found by its own id alone: Audiobookshelf ids are unique, and it may record episode Progress
-/// without the podcast. Should it hold several entries for one, the first counts.
+/// `user`'s Progress in the audiobook `library_item`, or in the episode `episode` (found by its
+/// id alone: Audiobookshelf ids are unique, and it may record episode Progress without the
+/// podcast). Should it hold several entries for one, the first counts.
 fn progress_in(user: &abs::User, library_item: &str, episode: Option<&str>) -> Option<Progress> {
     user.media_progress
         .entries

@@ -488,19 +488,21 @@ fn ItemScreen(app: Signal<App>, busy: Signal<bool>, item: Item, notice: Option<N
             p { class: "byline", "{by}" }
         }
         NoticeView { app, notice }
-        if app.read().can_play_on() {
+        div { class: "actions",
+            if app.read().can_play_on() {
+                button {
+                    r#type: "button",
+                    disabled: busy(),
+                    onclick: move |_| act(app, busy, async |app: &mut App| app.open_play_on().await),
+                    {text(Text::PlayOn)}
+                }
+            }
             button {
                 r#type: "button",
                 disabled: busy(),
-                onclick: move |_| act(app, busy, async |app: &mut App| app.open_play_on().await),
-                {text(Text::PlayOn)}
+                onclick: move |_| act(app, busy, async move |app: &mut App| app.mark_finished(!finished).await),
+                {text(if finished { Text::ItemMarkUnfinished } else { Text::ItemMarkFinished })}
             }
-        }
-        button {
-            r#type: "button",
-            disabled: busy(),
-            onclick: move |_| act(app, busy, async move |app: &mut App| app.mark_finished(!finished).await),
-            {text(if finished { Text::ItemMarkUnfinished } else { Text::ItemMarkFinished })}
         }
         dl {
             for (label, value) in i18n::item_facts(language, &item) {

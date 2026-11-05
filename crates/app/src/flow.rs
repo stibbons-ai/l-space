@@ -480,10 +480,11 @@ impl App {
 
     /// On the Item screen, marks its Item Finished (`finished`) or unfinished on the Library
     /// Server, and shows the Item as the Bridge then answers; the podcast screen to go back to
-    /// lists the episode by its new state. On a failure that leaves the session, the write may
-    /// still have happened (the answer was lost, or reading it back failed): the Item and its
-    /// podcast's episodes are read afresh from the Library Server, and the screen says why;
-    /// what can't be read again stays as shown.
+    /// lists the episode by its new state. When the Library Server can't be reached, the Bridge
+    /// may have written before reading the Progress back failed: the Item and its podcast's
+    /// episodes are read again, as far as that works. On any other failure the screen stays as
+    /// shown. Either way it says why; a mark whose answer was lost (the App gave up waiting, for
+    /// example) may still land on the Library Server, which opening the Item again shows.
     pub async fn mark_finished(&mut self, finished: bool) {
         let Screen::Item { item, .. } = &self.screen else {
             return;
@@ -498,27 +499,29 @@ impl App {
                 }
                 self.screen = Screen::Item { item, notice: None };
             }
-            Err(error) => {
-                if let Some(error) = self.session_call_failed(error).await {
-                    self.reread(&id).await;
+            Err(error @ ApiError::LibraryServerUnreachable) => {
+                if self.reread(&id).await {
                     self.set_notice(Notice::Api(error));
                 }
             }
+            Err(error) => self.failed(error).await,
         }
     }
 
-    /// Shows Item `id` (on its screen) and its podcast's episodes (on the screens to go back
-    /// to) as the Library Server holds them now; any that can't be read again stay as shown.
-    async fn reread(&mut self, id: &ItemId) {
-        if let Ok(item) = self
+    /// Shows Item `id` on its screen as the Library Server holds it now, then (once that
+    /// worked) its podcast's episodes on the screens to go back to; whatever can't be read
+    /// again stays as shown. Returns whether the session goes on: if not, the screen shown
+    /// says why.
+    async fn reread(&mut self, id: &ItemId) -> bool {
+        match self
             .call(api::item(id.library_item.clone(), id.episode.clone()))
             .await
-            && matches!(&self.screen, Screen::Item { item: shown, .. } if shown.id == item.id)
         {
-            self.screen = Screen::Item { item, notice: None };
+            Ok(item) => self.screen = Screen::Item { item, notice: None },
+            Err(error) => return self.reread_failed(error).await,
         }
         if id.episode.is_none() {
-            return;
+            return true;
         }
         for at in 0..self.back.len() {
             let Screen::Podcast { podcast, .. } = &self.back[at] else {
@@ -527,12 +530,31 @@ impl App {
             if podcast.id != id.library_item {
                 continue;
             }
-            let call = api::podcast(podcast.id.clone(), Some(podcast.filter));
-            if let Ok(listed) = self.call(call).await
-                && let Screen::Podcast { podcast, .. } = &mut self.back[at]
+            match self
+                .call(api::podcast(podcast.id.clone(), Some(podcast.filter)))
+                .await
             {
-                *podcast = listed;
+                Ok(listed) => {
+                    if let Screen::Podcast { podcast, .. } = &mut self.back[at] {
+                        *podcast = listed;
+                    }
+                }
+                Err(error) => return self.reread_failed(error).await,
             }
+        }
+        true
+    }
+
+    /// Handles a failure to read again after a failed mark: one that concerns the session goes
+    /// to [`App::session_call_failed`]; any other is only logged. Returns whether the session
+    /// goes on.
+    async fn reread_failed(&mut self, error: ApiError) -> bool {
+        match self.session_call_failed(error).await {
+            Some(error) => {
+                tracing::debug!(%error, "cannot read again after a failed mark");
+                true
+            }
+            None => false,
         }
     }
 

@@ -342,6 +342,10 @@ fn read_request(stream: &TcpStream) -> Vec<u8> {
 const UNAVAILABLE: &[u8] =
     b"HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
+/// What Audiobookshelf answers for something that isn't there.
+const NOT_FOUND: &[u8] =
+    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
 /// Sends `request` (which closes its connection) to `target` (`host:port`) and returns the
 /// whole response.
 fn forward(target: &str, request: &[u8]) -> Vec<u8> {
@@ -376,16 +380,29 @@ fn proxy(
     target: &str,
     fails: impl Fn(usize, &[u8]) -> bool + Send + Sync + 'static,
 ) -> (String, ProxyLog) {
+    proxy_answering(target, move |index, request| {
+        fails(index, request).then_some(UNAVAILABLE)
+    })
+}
+
+/// A loopback proxy in front of `target` (`host:port`): answers the `index`th request with
+/// `answer(index, request)` if that is some, else passes it on. Logs each request line and,
+/// for those passed on, the status line of the answer. `answer` may take its time: the request
+/// waits for it.
+fn proxy_answering(
+    target: &str,
+    answer: impl Fn(usize, &[u8]) -> Option<&'static [u8]> + Send + Sync + 'static,
+) -> (String, ProxyLog) {
     let target = target.to_owned();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let log = ProxyLog::default();
     let written = Arc::clone(&log);
-    let fails = Arc::new(fails);
+    let answer = Arc::new(answer);
     std::thread::spawn(move || {
         for (index, mut stream) in listener.incoming().flatten().enumerate() {
-            let (target, written, fails) =
-                (target.clone(), Arc::clone(&written), Arc::clone(&fails));
+            let (target, written, answer) =
+                (target.clone(), Arc::clone(&written), Arc::clone(&answer));
             std::thread::spawn(move || {
                 let request = read_request(&stream);
                 let record = |bytes: &[u8]| {
@@ -397,18 +414,28 @@ fn proxy(
                     written.lock().unwrap().push(line);
                 };
                 record(&request);
-                let response = if fails(index, &request) {
-                    UNAVAILABLE.to_vec()
-                } else {
-                    let response = forward(&target, &request);
-                    record(&response);
-                    response
+                let response = match answer(index, &request) {
+                    Some(answer) => answer.to_vec(),
+                    None => {
+                        let response = forward(&target, &request);
+                        record(&response);
+                        response
+                    }
                 };
                 let _ = stream.write_all(&response);
             });
         }
     });
     (format!("http://{addr}"), log)
+}
+
+/// How many requests in `log` start with `prefix`.
+fn requests(log: &ProxyLog, prefix: &str) -> usize {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|line| line.starts_with(prefix))
+        .count()
 }
 
 /// A Bridge whose Library Server "Home" is the shared Audiobookshelf behind an [`abs_proxy`].
@@ -2133,39 +2160,65 @@ fn a_mark_that_fails_keeps_the_item_shown_and_says_why() {
     });
 }
 
-/// A mark the Library Server takes, whose answer is then lost (reading the Progress back
-/// fails): the screen says why, and shows the Item and the podcast's episodes as the Library
-/// Server now holds them, the write included.
-#[test]
-fn a_mark_that_lands_but_fails_to_answer_shows_what_the_library_server_holds() {
+/// A Bridge whose Library Server "Home" is the shared Audiobookshelf behind a proxy that
+/// answers a request with `answer(request, patched)` if that is some, else passes it on;
+/// `patched` tells whether a `PATCH` (a mark) went through it before. The proxy's log too.
+fn bridge_marking_through(
+    answer: impl Fn(&[u8], bool) -> Option<&'static [u8]> + Send + Sync + 'static,
+) -> (TestBridge, Arc<Audiobookshelf>, String, ProxyLog) {
     let abs = Audiobookshelf::shared();
-    // Fails the first `GET /api/me` once a `PATCH` has gone through: the Bridge's readback.
-    let (patched, read_back) = (
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-    );
-    let (proxy, _) = proxy(abs.address(), {
-        let (patched, read_back) = (Arc::clone(&patched), Arc::clone(&read_back));
-        move |_, request| {
-            if request.starts_with(b"PATCH /api/me/progress/") {
-                patched.store(true, Ordering::SeqCst);
-                return false;
-            }
-            request.starts_with(b"GET /api/me ")
-                && patched.load(Ordering::SeqCst)
-                && !read_back.swap(true, Ordering::SeqCst)
+    let patched = AtomicBool::new(false);
+    let (proxy, log) = proxy_answering(abs.address(), move |_, request| {
+        let answered = answer(request, patched.load(Ordering::SeqCst));
+        if request.starts_with(b"PATCH ") {
+            patched.store(true, Ordering::SeqCst);
         }
+        answered
     });
     let bridge = TestBridge::start(&named_library_server_toml(&proxy, "Home"));
+    (bridge, abs, proxy, log)
+}
+
+/// Logs in as a new user on `bridge`'s Library Server `proxy` and opens Episode 2 from the
+/// podcast's episodes under `filter`.
+async fn on_episode_2(
+    device: &Device,
+    bridge: &TestBridge,
+    abs: &Audiobookshelf,
+    proxy: &str,
+    filter: EpisodeFilter,
+) -> (App, AbsUser) {
+    let user = abs.new_user().await;
+    let mut app = logged_in_behind(device, bridge, proxy, &user).await;
+    app.open_library(podcasts(abs)).await;
+    app.open_entry(&abs.seeded().podcast).await;
+    app.filter_episodes(filter).await;
+    app.open_episode(&abs.seeded().episodes[1]).await;
+    (app, user)
+}
+
+/// A mark the Library Server takes, whose Progress the Bridge then can't read back: the
+/// screen says why, and shows the Item and the podcast's episodes (under the filter they were
+/// listed by) as the Library Server now holds them, the write included.
+#[test]
+fn a_mark_that_lands_but_cant_be_read_back_shows_what_the_library_server_holds() {
+    // Fails the first `GET /api/me` after the mark: the Bridge's readback.
+    let read_back = Arc::new(AtomicBool::new(false));
+    let (bridge, abs, proxy, _) = bridge_marking_through({
+        let read_back = Arc::clone(&read_back);
+        move |request, patched| {
+            (patched
+                && request.starts_with(b"GET /api/me ")
+                && !read_back.swap(true, Ordering::SeqCst))
+            .then_some(UNAVAILABLE)
+        }
+    });
     let device = Device::new();
     run(async || {
         let seeded = abs.seeded();
-        let user = abs.new_user().await;
-        let mut app = logged_in_behind(&device, &bridge, &proxy, &user).await;
+        let (mut app, user) =
+            on_episode_2(&device, &bridge, &abs, &proxy, EpisodeFilter::Finished).await;
         let session = session(&app);
-        app.open_library(podcasts(&abs)).await;
-        app.open_entry(&seeded.podcast).await;
-        app.open_episode(&seeded.episodes[1]).await;
 
         app.mark_finished(true).await;
 
@@ -2194,11 +2247,112 @@ fn a_mark_that_lands_but_fails_to_answer_shows_what_the_library_server_holds() {
             shown_podcast(&app),
             &bridge
                 .api()
-                .podcast(&session, &seeded.podcast, EpisodeFilter::Unfinished)
+                .podcast(&session, &seeded.podcast, EpisodeFilter::Finished)
                 .await
         );
-        assert_eq!(shown_titles(&app), ["Episode 3", "Episode 1"]);
+        assert_eq!(shown_titles(&app), ["Episode 2"]);
         assert!(app.session().is_some());
+    });
+}
+
+/// When reading again after such a mark fails too, the screens stay as shown, the podcast's
+/// episodes aren't asked for, and the screen says why.
+#[test]
+fn a_mark_whose_reading_again_fails_keeps_the_screens_shown() {
+    let (bridge, abs, proxy, log) = bridge_marking_through(|request, patched| {
+        (patched && request.starts_with(b"GET /api/me ")).then_some(UNAVAILABLE)
+    });
+    let device = Device::new();
+    run(async || {
+        let (mut app, _) =
+            on_episode_2(&device, &bridge, &abs, &proxy, EpisodeFilter::Unfinished).await;
+        let item = shown_item(&app).clone();
+        log.lock().unwrap().clear();
+
+        app.mark_finished(true).await;
+
+        assert_eq!(
+            app.screen(),
+            &Screen::Item {
+                item,
+                notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
+            }
+        );
+        // The mark's own fetch, and the Item's once again; not the podcast's.
+        assert_eq!(requests(&log, "GET /api/items/"), 2);
+        app.go_back();
+        assert_eq!(shown_titles(&app), ["Episode 3", "Episode 2", "Episode 1"]);
+        assert!(app.session().is_some());
+    });
+}
+
+/// A mark the App gives up waiting for is not followed by reading again, and the controls are
+/// free again once the call timeout is over; the screen stays as shown and says why.
+#[test]
+fn a_mark_the_app_gives_up_on_keeps_the_item_shown_without_reading_again() {
+    let (bridge, abs, proxy, log) = bridge_marking_through(|request, _| {
+        if request.starts_with(b"PATCH ") {
+            std::thread::sleep(Duration::from_secs(3));
+        }
+        None
+    });
+    let device = Device::new();
+    run(async || {
+        let (app, _) =
+            on_episode_2(&device, &bridge, &abs, &proxy, EpisodeFilter::Unfinished).await;
+        let mut app = app.with_call_timeout(SHORT_CALL_TIMEOUT);
+        let item = shown_item(&app).clone();
+        log.lock().unwrap().clear();
+
+        within(Duration::from_secs(2), app.mark_finished(true)).await;
+
+        assert_eq!(
+            app.screen(),
+            &Screen::Item {
+                item,
+                notice: Some(Notice::Api(ApiError::BridgeUnreachable)),
+            }
+        );
+        assert_eq!(requests(&log, "GET /api/items/"), 1);
+    });
+}
+
+/// A mark the Bridge answers `not_found` (nothing written) is not followed by reading again.
+#[test]
+fn a_mark_not_found_keeps_the_item_shown_without_reading_again() {
+    let armed = Arc::new(AtomicBool::new(false));
+    let (bridge, abs, proxy, log) = bridge_marking_through({
+        let armed = Arc::clone(&armed);
+        move |request, _| {
+            (armed.load(Ordering::SeqCst) && request.starts_with(b"GET /api/items/"))
+                .then_some(NOT_FOUND)
+        }
+    });
+    let device = Device::new();
+    run(async || {
+        let (mut app, user) =
+            on_episode_2(&device, &bridge, &abs, &proxy, EpisodeFilter::Unfinished).await;
+        let item = shown_item(&app).clone();
+        log.lock().unwrap().clear();
+        armed.store(true, Ordering::SeqCst);
+
+        app.mark_finished(true).await;
+
+        assert_eq!(
+            app.screen(),
+            &Screen::Item {
+                item,
+                notice: Some(Notice::Api(ApiError::NotFound)),
+            }
+        );
+        assert_eq!(requests(&log, "GET /api/items/"), 1);
+        assert_eq!(requests(&log, "PATCH "), 0);
+        let seeded = abs.seeded();
+        assert_eq!(
+            abs.progress(&user, &seeded.podcast, Some(&seeded.episodes[1]))
+                .await,
+            None
+        );
     });
 }
 

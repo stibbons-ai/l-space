@@ -472,8 +472,8 @@ impl Client {
     ///
     /// Callers must check first that the user may see the Item: Audiobookshelf checks neither
     /// that the user may see the library item nor that the episode belongs to it (it finds an
-    /// episode by its id alone), and the ids `batch` and `update` reach its batch route
-    /// (`/api/me/progress/batch/update`) instead.
+    /// episode by its id alone), and the library item `batch` with the episode `update` reaches
+    /// its batch route (`/api/me/progress/batch/update`) instead.
     pub async fn set_finished(
         &self,
         base_url: &str,

@@ -528,9 +528,9 @@ pub async fn item(library_item: String, episode: Option<String>) -> Result<Item,
 /// session's Library Server, which keeps Progress; answers with the Item as it is then. The
 /// Library Server gives an Item without the user's Progress some at 0 seconds, and sets the
 /// position of a Finished one marked unfinished back to 0. An Item the user can't see is
-/// [`ApiError::NotFound`], and nothing is written. On another failure the write may still have
-/// happened (the Library Server took it, but reading it back failed, or the answer was lost):
-/// [`item`] tells.
+/// [`ApiError::NotFound`], and nothing is written. On `library_server_unreachable` the write
+/// may still have happened (the Library Server took it, but reading it back failed); so may a
+/// mark whose answer was lost.
 #[post(
     "/api/item/finished",
     headers: dioxus_fullstack::HeaderMap,

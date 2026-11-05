@@ -229,24 +229,23 @@ impl<S: Store> AppApi<S> {
     }
 
     async fn item(&self, token: SessionToken, id: ItemId) -> Result<Item, ApiError> {
-        let library_item_id = id.library_item.clone();
-        let request = Request {
-            operation: "fetch an Item",
-            id: Some(&library_item_id),
-        };
-        Ok(self.found_item(token, id, request).await?.fetched)
+        let (_, found) = self.found_item(token, &id, "fetch an Item").await?;
+        Ok(found.fetched)
     }
 
     /// The Item `id` on the session's Library Server, with the session's user and their
-    /// Progress in it, for `request` (`id` names the library item); not found unless a library
-    /// item the user can see holds it.
-    async fn found_item(
+    /// Progress in it; not found unless a library item the user can see holds it. Also the
+    /// `operation`'s [`Request`] (for the library item) for further log events.
+    async fn found_item<'r>(
         &self,
         token: SessionToken,
-        id: ItemId,
-        request: Request<'_>,
-    ) -> Result<Browsed<'_, Item>, ApiError> {
-        let episode = id.episode.clone();
+        id: &'r ItemId,
+        operation: &'static str,
+    ) -> Result<(Request<'r>, Browsed<'_, Item>), ApiError> {
+        let request = Request {
+            operation,
+            id: Some(&id.library_item),
+        };
         let Browsed {
             library_server,
             session,
@@ -257,14 +256,15 @@ impl<S: Store> AppApi<S> {
                 self.abs.library_item(server, key, &id.library_item).await
             })
             .await?;
-        let item = browse::item(&user, library_item, id)
-            .map_err(|reason| missing(library_server, request, episode.as_deref(), reason))?;
-        Ok(Browsed {
+        let item = browse::item(&user, library_item, id.clone())
+            .map_err(|reason| missing(library_server, request, id.episode.as_deref(), reason))?;
+        let found = Browsed {
             library_server,
             session,
             user,
             fetched: item,
-        })
+        };
+        Ok((request, found))
     }
 
     /// Marks Item `id` Finished or unfinished for the session's user with their key, once the
@@ -277,24 +277,22 @@ impl<S: Store> AppApi<S> {
         id: ItemId,
         finished: bool,
     ) -> Result<Item, ApiError> {
-        let (library_item_id, episode) = (id.library_item.clone(), id.episode.clone());
-        let episode = episode.as_deref();
-        let request = Request {
-            operation: "mark an Item Finished or unfinished",
-            id: Some(&library_item_id),
-        };
+        let (library_item_id, episode) = (&id.library_item, id.episode.as_deref());
+        let (request, found) = self
+            .found_item(token, &id, "mark an Item Finished or unfinished")
+            .await?;
         let Browsed {
             library_server,
             session,
             user,
             fetched: mut item,
-        } = self.found_item(token, id, request).await?;
+        } = found;
         if let Err(error) = self
             .abs
             .set_finished(
                 library_server,
                 &session.api_key,
-                &library_item_id,
+                library_item_id,
                 episode,
                 finished,
             )
