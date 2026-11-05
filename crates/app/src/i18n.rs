@@ -169,6 +169,8 @@ texts! {
     SettingsAccount => "settings-account",
     SettingsLanguage => "settings-language",
     SettingsLogout => "settings-logout",
+    SettingsLogInElsewhere => "settings-log-in-elsewhere",
+    SwitchLibraryServer => "switch-library-server",
     LanguageSystem => "language-system",
     LanguageEnglish => "language-english",
     LanguageGerman => "language-german",

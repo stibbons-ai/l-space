@@ -146,13 +146,21 @@ fn LoginScreen(
         .map(|server| server.base_url.clone());
     // `None` until the person picks one: the first listed.
     let mut picked = use_signal(|| None::<String>);
-    // Only in this screen's state: it goes when a login moves on to Settings.
+    // Only in this screen's state: it goes when the person leaves Login.
     let mut api_key = use_signal(String::new);
     let key_empty = use_memo(move || api_key.read().trim().is_empty());
     let text = |text| app.read().text(text);
     let bridge_url = app.read().bridge_url().unwrap_or_default().to_owned();
     let has_servers = !library_servers.is_empty();
+    let (can_go_back, can_change_bridge_url) = {
+        let app = app.read();
+        (app.can_go_back(), app.can_change_bridge_url())
+    };
     rsx! {
+        // Opened from Settings, to log in to another Library Server.
+        if can_go_back {
+            BackButton { app, busy }
+        }
         h1 { {text(Text::LoginTitle)} }
         form {
             onsubmit: move |event| {
@@ -172,7 +180,7 @@ fn LoginScreen(
                             option {
                                 key: "{server.base_url}",
                                 value: "{server.base_url}",
-                                {server.name.as_deref().unwrap_or(&server.base_url)}
+                                {server_label(&server)}
                             }
                         }
                     }
@@ -207,17 +215,62 @@ fn LoginScreen(
                 }
             }
         }
+        SwitchList { app, busy }
         footer {
             dl {
                 dt { {text(Text::Bridge)} }
                 dd { "{bridge_url}" }
             }
-            button {
-                r#type: "button",
-                class: "secondary",
-                disabled: busy(),
-                onclick: move |_| app.write().change_bridge_url(),
-                {text(Text::LoginChangeBridge)}
+            if can_change_bridge_url {
+                button {
+                    r#type: "button",
+                    class: "secondary",
+                    disabled: busy(),
+                    onclick: move |_| app.write().change_bridge_url(),
+                    {text(Text::LoginChangeBridge)}
+                }
+            }
+        }
+    }
+}
+
+/// How a Library Server is named: its display name, or its base URL without one.
+fn server_label(server: &LibraryServer) -> &str {
+    server.name.as_deref().unwrap_or(&server.base_url)
+}
+
+/// The Library Servers the person has a session on besides the selected one, each to switch
+/// to without a login; nothing without any.
+#[component]
+fn SwitchList(app: Signal<App>, busy: Signal<bool>) -> Element {
+    let sessions: Vec<_> = app
+        .read()
+        .other_sessions()
+        .map(|session| {
+            (
+                session.library_server_url().to_owned(),
+                server_label(&session.library_server).to_owned(),
+                session.user.username.clone(),
+            )
+        })
+        .collect();
+    if sessions.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        h2 { {app.read().text(Text::SwitchLibraryServer)} }
+        ul { class: "entries",
+            for (url, title, username) in sessions {
+                EntryButton {
+                    key: "{url}",
+                    busy,
+                    title,
+                    detail: username,
+                    onclick: move |_| {
+                        let url = url.clone();
+                        act(app, busy, async move |app: &mut App| app.switch_to(&url).await);
+                    },
+                }
             }
         }
     }
@@ -588,6 +641,14 @@ fn SettingsScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>) 
             dd { "{username}" }
             dt { {text(Text::Bridge)} }
             dd { "{bridge_url}" }
+        }
+        SwitchList { app, busy }
+        button {
+            r#type: "button",
+            class: "secondary",
+            disabled: busy(),
+            onclick: move |_| act(app, busy, async |app: &mut App| app.open_login().await),
+            {text(Text::SettingsLogInElsewhere)}
         }
         label {
             {text(Text::SettingsLanguage)}

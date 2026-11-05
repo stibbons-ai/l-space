@@ -22,6 +22,8 @@ settings-library-server = Library Server
 settings-account = Account
 settings-language = Language
 settings-logout = Log out
+settings-log-in-elsewhere = Log in to another Library Server
+switch-library-server = Switch Library Server
 
 libraries-title = Libraries
 libraries-none = You can't see any Libraries on your Library Server yet.

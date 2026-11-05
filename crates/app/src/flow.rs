@@ -5,8 +5,9 @@
 //! a real Bridge.
 //!
 //! Server functions reach the Bridge at a process-wide base URL and send a process-wide
-//! `Authorization` header (Dioxus fullstack's client); [`App`] sets both, so one process runs
-//! one [`App`] at a time.
+//! `Authorization` header (Dioxus fullstack's client); [`App`] sets both, the header to the
+//! selected session's token (except while ending another session, see `App::end_session`), so
+//! one process runs one [`App`] at a time.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +29,8 @@ pub enum Screen {
     Starting,
     /// Asks for the Bridge's address.
     BridgeUrl { notice: Option<Notice> },
-    /// Picks a Library Server and takes an API key.
+    /// Picks a Library Server and takes an API key; also offers the Library Servers with a
+    /// session to switch to, and Back when opened from Settings.
     Login {
         library_servers: Vec<LibraryServer>,
         notice: Option<Notice>,
@@ -65,7 +67,8 @@ pub enum Screen {
         groups: Vec<Group>,
         notice: Option<Notice>,
     },
-    /// Logged in: the Library Server, the account, the language, and logout.
+    /// Logged in: the Library Server, the account, the language, logout, the other Library
+    /// Servers with a session to switch to, and logging in to another Library Server.
     Settings { notice: Option<Notice> },
 }
 
@@ -199,12 +202,12 @@ impl App {
         };
         // A session belongs to its Bridge; without one it can't be used.
         if stored.bridge_url.is_none() {
-            stored.session = None;
+            stored.forget_all();
         }
         if let Some(url) = &stored.bridge_url {
             point_at(url);
         }
-        authorize(stored.session.as_ref().map(|session| &session.token));
+        authorize_selected(&stored);
         Self {
             store,
             stored,
@@ -223,28 +226,25 @@ impl App {
         self
     }
 
-    /// Picks the first screen: the Bridge address if there is none, Login if there is no
-    /// session, else every Library once the Bridge confirmed the session. A session whose key
-    /// the Library Server rejected (`api_key_rejected`) is forgotten; so is one the Bridge
-    /// reports as `session_invalid` while its Library Server is still configured. On any other
-    /// failure (the Bridge or Library Server unreachable, the Library Server not configured for
-    /// now, for example) it stays, and Settings shows why.
+    /// Picks the first screen: the Bridge address if there is none, Login if no session is
+    /// selected, else every Library once the Bridge confirmed the selected session (only that
+    /// one is checked). A session whose key the Library Server rejected (`api_key_rejected`) is
+    /// forgotten; so is one the Bridge reports as `session_invalid` while its Library Server is
+    /// still configured. On any other failure (the Bridge or Library Server unreachable, the
+    /// Library Server not configured for now, for example) it stays, and Settings shows why.
     pub async fn start(&mut self) {
         let mut notice = self.load_notice.take();
         if self.stored.bridge_url.is_none() {
             self.screen = Screen::BridgeUrl { notice };
             return;
         }
-        if self.stored.session.is_none() {
+        if self.stored.session().is_none() {
             self.show_login(notice).await;
             return;
         }
         match self.call(api::current_user()).await {
             Ok(user) => {
-                if let Some(session) = &mut self.stored.session
-                    && session.user != user
-                {
-                    session.user = user;
+                if self.stored.update_user(user) {
                     notice = notice.or(self.save());
                 }
                 self.show_libraries(notice).await;
@@ -260,9 +260,9 @@ impl App {
     }
 
     /// Connects to the Bridge at `input` and remembers it if it answers with its Library
-    /// Servers. Only while logged out: a session belongs to its Bridge.
+    /// Servers. Only while no session is stored: a session belongs to its Bridge.
     pub async fn submit_bridge_url(&mut self, input: &str) {
-        if self.stored.session.is_some() {
+        if !self.can_change_bridge_url() {
             return;
         }
         let Some(url) = bridge_url(input) else {
@@ -295,22 +295,24 @@ impl App {
         }
     }
 
-    /// Back to the Bridge address, to enter another one. Only while logged out.
+    /// Back to the Bridge address, to enter another one. Only while no session is stored.
     pub fn change_bridge_url(&mut self) {
-        if self.stored.session.is_none() {
+        if self.can_change_bridge_url() {
             self.screen = Screen::BridgeUrl { notice: None };
         }
     }
 
     /// Asks the Bridge for its Library Servers again, for Login.
     pub async fn reload_library_servers(&mut self) {
-        if self.stored.session.is_none() && self.stored.bridge_url.is_some() {
+        if matches!(self.screen, Screen::Login { .. }) && self.stored.bridge_url.is_some() {
             self.show_login(None).await;
         }
     }
 
-    /// Logs in to the Library Server with base URL `library_server`. The key is sent to the
-    /// Bridge and not kept.
+    /// Logs in to the Library Server with base URL `library_server`, adding its session and
+    /// selecting it; the other sessions stay. A session already on that Library Server is
+    /// replaced, and once that is saved, ended on the Bridge as far as it can. The key is sent
+    /// to the Bridge and not kept.
     pub async fn log_in(&mut self, library_server: &str, api_key: ApiKey) {
         if !matches!(self.screen, Screen::Login { .. }) {
             return;
@@ -322,7 +324,6 @@ impl App {
             .await
         {
             Ok(Session { token, user }) => {
-                authorize(Some(&token));
                 let listed = match &self.screen {
                     Screen::Login {
                         library_servers, ..
@@ -336,33 +337,34 @@ impl App {
                     base_url: user.library_server.clone(),
                     name: None,
                 });
-                self.stored.session = Some(StoredSession {
+                let replaced = self.stored.add(StoredSession {
                     token,
                     library_server,
                     user,
                 });
+                authorize_selected(&self.stored);
                 let notice = self.save();
+                // Only once the device no longer holds it: a failed save keeps the replaced
+                // session in the file, which must stay usable then. Read-only, the file holds
+                // none of this launch's sessions, so there is nothing to keep.
+                if let Some(replaced) = replaced
+                    && (notice.is_none() || self.read_only)
+                {
+                    self.end_session(&replaced.token).await;
+                }
                 self.show_libraries(notice).await;
             }
             Err(error) => self.set_notice(Notice::Api(error)),
         }
     }
 
-    /// Ends the session on the Bridge and forgets it on the device, also when the Bridge can't
-    /// be reached.
+    /// Ends the selected session on the Bridge and forgets it on the device, also when the
+    /// Bridge can't be reached. The other sessions stay; Login offers them.
     pub async fn log_out(&mut self) {
-        if self.stored.session.is_none() {
+        let Some(session) = self.stored.session() else {
             return;
-        }
-        match self.call(api::logout()).await {
-            Ok(()) => {}
-            Err(error @ (ApiError::BridgeUnreachable | ApiError::SessionInvalid)) => {
-                tracing::info!(%error, "the Bridge did not end the session; forgetting it anyway");
-            }
-            Err(error) => {
-                tracing::warn!(%error, "the Bridge did not end the session; forgetting it anyway");
-            }
-        }
+        };
+        self.end_session(&session.token).await;
         let not_saved = self.forget_session();
         self.show_login(None).await;
         match not_saved {
@@ -375,9 +377,31 @@ impl App {
 
     /// Every Library, listed afresh: from Settings, or to try again after a failure.
     pub async fn open_libraries(&mut self) {
-        if self.stored.session.is_some() {
+        if self.stored.session().is_some() {
             self.show_libraries(None).await;
         }
+    }
+
+    /// Selects the session on the Library Server with base URL `library_server`, without a
+    /// login, and lists its Libraries afresh: from Settings or Login. Every later call acts on
+    /// that session; once saved, the next launch starts with it.
+    pub async fn switch_to(&mut self, library_server: &str) {
+        if !self.stored.select(library_server) {
+            return;
+        }
+        authorize_selected(&self.stored);
+        let notice = self.save();
+        self.show_libraries(notice).await;
+    }
+
+    /// From Settings, Login with the Bridge's Library Servers, to log in to another one; Back
+    /// returns to Settings.
+    pub async fn open_login(&mut self) {
+        self.go(api::library_servers(), |library_servers| Screen::Login {
+            library_servers,
+            notice: None,
+        })
+        .await;
     }
 
     /// Opens `library`, listing its audiobooks or podcasts.
@@ -505,7 +529,7 @@ impl App {
     /// Opens Settings, from any logged-in screen; the screens to go back to are dropped (the
     /// UI offers it on the Libraries screen).
     pub fn open_settings(&mut self) {
-        if self.stored.session.is_some() {
+        if self.stored.session().is_some() {
             self.back.clear();
             self.screen = Screen::Settings { notice: None };
         }
@@ -515,7 +539,7 @@ impl App {
     /// offers it on the Libraries screen), or to refresh the list. The screens to go back to
     /// are dropped.
     pub async fn open_groups(&mut self) {
-        if self.stored.session.is_none() {
+        if self.stored.session().is_none() {
             return;
         }
         self.back.clear();
@@ -594,7 +618,7 @@ impl App {
         call: impl Future<Output = Result<T, ApiError>>,
         opened: impl FnOnce(T) -> Screen,
     ) {
-        if self.stored.session.is_none() {
+        if self.stored.session().is_none() {
             return;
         }
         match self.call(call).await {
@@ -640,9 +664,20 @@ impl App {
         self.stored.bridge_url.as_deref()
     }
 
-    /// The logged-in session: its Library Server and account.
+    /// Whether the Bridge address may change: only while no session is stored, as a session
+    /// belongs to its Bridge.
+    pub fn can_change_bridge_url(&self) -> bool {
+        !self.stored.has_sessions()
+    }
+
+    /// The selected session: its Library Server and account.
     pub fn session(&self) -> Option<&StoredSession> {
-        self.stored.session.as_ref()
+        self.stored.session()
+    }
+
+    /// The sessions other than the selected one, to switch to.
+    pub fn other_sessions(&self) -> impl Iterator<Item = &StoredSession> {
+        self.stored.other_sessions()
     }
 
     pub fn language_choice(&self) -> LanguageChoice {
@@ -694,21 +729,41 @@ impl App {
         };
     }
 
-    /// Whether `library_servers` includes the session's Library Server.
+    /// Whether `library_servers` includes the selected session's Library Server.
     fn lists_session_library_server(&self, library_servers: &[LibraryServer]) -> bool {
-        self.stored.session.as_ref().is_some_and(|session| {
+        self.stored.session().is_some_and(|session| {
             library_servers
                 .iter()
-                .any(|listed| listed.base_url == session.user.library_server)
+                .any(|listed| listed.base_url == session.library_server_url())
         })
     }
 
-    /// Forgets the session on the device. Returns a notice if that could not be saved.
+    /// Forgets the selected session on the device; the others stay. Returns a notice if that
+    /// could not be saved.
     fn forget_session(&mut self) -> Option<Notice> {
-        self.stored.session = None;
+        self.stored.forget_selected();
         self.back.clear();
-        authorize(None);
+        authorize_selected(&self.stored);
         self.save()
+    }
+
+    /// Ends the session with `token` on the Bridge, as far as it can; callers forget it on the
+    /// device either way. Later calls send the selected session's token again.
+    async fn end_session(&self, token: &SessionToken) {
+        // The process-wide header carries `token` until the restore below. No guard restores
+        // it if this future is dropped midway: safe while `act` runs every action to its end
+        // on the root component, which lives as long as the App.
+        authorize(Some(token));
+        match self.call(api::logout()).await {
+            Ok(()) => {}
+            Err(error @ (ApiError::BridgeUnreachable | ApiError::SessionInvalid)) => {
+                tracing::info!(%error, "the Bridge did not end the session; forgetting it anyway");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the Bridge did not end the session; forgetting it anyway");
+            }
+        }
+        authorize_selected(&self.stored);
     }
 
     /// Saves what the App remembers. Returns a notice if that failed.
@@ -781,6 +836,12 @@ fn point_at(url: &str) {
     // The client keeps a `&'static str`. The App points at a new Bridge only when the person
     // enters one, so the leaked strings stay few and small.
     set_server_url(url.to_owned().leak());
+}
+
+/// Authenticates every server function call with the selected session's token, or with
+/// nothing when none is selected.
+fn authorize_selected(stored: &Stored) {
+    authorize(stored.session().map(|session| &session.token));
 }
 
 /// Authenticates every server function call with `token`, or with nothing.
