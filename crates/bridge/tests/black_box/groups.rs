@@ -1,6 +1,8 @@
 //! The household's Sonos Groups, read from `sonos-fake` players on loopback: every Group
-//! exactly as grouped in Sonos with what it plays, regrouping, positions moving on the shared
-//! clock, misbehaving players, and the raw UPnP traffic in the logs.
+//! exactly as grouped in Sonos with what it plays, regrouping, positions moving on the fake's
+//! clock, misbehaving players, failed searches, and the raw UPnP traffic in the logs. The
+//! Bridge runs on the system clock; that its search timing follows the injected clock is
+//! `crates/sonos/tests/discovery.rs`'s.
 
 use std::time::{Duration, Instant};
 
@@ -10,18 +12,14 @@ use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 
 use test_support::audiobookshelf::Audiobookshelf;
 use test_support::bridge::{
-    RUST_LOG, SESSION_INVALID, SONOS_UNREACHABLE, TestBridge, named_library_server_toml,
-    output_contains, sonos_toml,
+    RUST_LOG, SESSION_INVALID, SONOS_SEARCH_FAILED, SONOS_UNREACHABLE, TestBridge,
+    home_with_sonos_toml, output_contains,
 };
 
 /// A Bridge searching `household` for players, logging with `rust_log`, and a session on it.
 async fn logged_in_logging(household: &Household, rust_log: &str) -> (TestBridge, Session) {
     let abs = Audiobookshelf::shared();
-    let config = format!(
-        "{}{}",
-        named_library_server_toml(abs.base_url(), "Home"),
-        sonos_toml(household.ssdp())
-    );
+    let config = home_with_sonos_toml(abs.base_url(), household.ssdp());
     let bridge = TestBridge::start_logging(&config, rust_log);
     let user = abs.new_user().await;
     let session = bridge.api().login(abs.base_url(), &user.api_key.key).await;
@@ -192,7 +190,22 @@ async fn regrouping_in_sonos_shows_in_the_next_listing() {
 }
 
 #[tokio::test]
-async fn a_playing_groups_position_moves_with_the_clock_it_shares_with_the_fake() {
+async fn the_coordinator_is_listed_first_whatever_the_topology_order() {
+    let (household, _) = Household::with_manual_clock();
+    // The fake lists members in the order they were added: Bath before its coordinator.
+    let bath = household.add_player("Bath");
+    let kitchen = household.add_player("Kitchen");
+    household.join(&bath, &kitchen);
+    let (bridge, session) = logged_in(&household).await;
+
+    assert_eq!(
+        names(&bridge.api().groups(&session).await),
+        named(&[("Kitchen", &["Kitchen", "Bath"])])
+    );
+}
+
+#[tokio::test]
+async fn a_playing_groups_position_moves_with_the_fakes_clock() {
     let (household, clock) = Household::with_manual_clock();
     let kitchen = household.add_player("Kitchen");
     household.play(&kitchen, FakeTrack::new("Moby Dick", TEN_MINUTES));
@@ -249,7 +262,7 @@ async fn groups_need_a_session() {
 #[tokio::test]
 async fn a_player_answering_garbage_is_passed_over_for_the_topology_and_has_no_playback() {
     let (household, _) = Household::with_manual_clock();
-    // Asked first for the topology: players are tried in UUID order.
+    // Asked first for the topology: at first, players are asked in UUID order.
     let kitchen = household.add_player("Kitchen");
     let bath = household.add_player("Bath");
     household.play(&bath, FakeTrack::new("Moby Dick", TEN_MINUTES));
@@ -266,8 +279,8 @@ async fn a_player_answering_garbage_is_passed_over_for_the_topology_and_has_no_p
 }
 
 #[tokio::test]
-async fn players_that_answer_garbage_or_never_answer_are_reported_in_bounded_time() {
-    for fault in [Fault::Garbage, Fault::Hang] {
+async fn players_that_misbehave_are_reported_in_bounded_time() {
+    for fault in [Fault::Garbage, Fault::Hang, Fault::Oversize] {
         let (household, _) = Household::with_manual_clock();
         let kitchen = household.add_player("Kitchen");
         household.set_fault(&kitchen, fault);
@@ -289,6 +302,82 @@ async fn players_that_answer_garbage_or_never_answer_are_reported_in_bounded_tim
 }
 
 #[tokio::test]
+async fn players_that_never_answer_hold_up_the_listing_only_so_long() {
+    let (household, _) = Household::with_manual_clock();
+    // Added first, so asked first for the topology.
+    for n in 0..5 {
+        let silent = household.add_player(&format!("Silent {n}"));
+        household.set_fault(&silent, Fault::Hang);
+    }
+    let kitchen = household.add_player("Kitchen");
+    let (bridge, session) = logged_in(&household).await;
+    let api = bridge.api();
+
+    let start = Instant::now();
+    let groups = api.groups(&session).await;
+    assert!(
+        start.elapsed() < Duration::from_secs(9),
+        "{:?}",
+        start.elapsed()
+    );
+    // Every Group is listed; those whose coordinator never answers without playback.
+    assert_eq!(groups.len(), 6);
+    for group in &groups {
+        let answered = group.name == "Kitchen";
+        assert_eq!(group.state.is_some(), answered, "{group:?}");
+    }
+
+    // With only silent players, the listing gives up within its bound.
+    household.set_fault(&kitchen, Fault::Hang);
+    let start = Instant::now();
+    assert_eq!(
+        api.get_as_error(&session, "/api/groups", &[]).await,
+        SONOS_UNREACHABLE
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(9),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(api.library_servers().await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_coordinator_no_search_found_is_never_asked_for_its_playback() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let (bridge, session) = logged_in(&household).await;
+    // The first search is over (a listing waits for it), and no other runs on the fake's clock.
+    assert_eq!(bridge.api().groups(&session).await.len(), 1);
+    let bath = household.add_player("Bath");
+    household.play(&bath, FakeTrack::new("Moby Dick", TEN_MINUTES));
+    household.join(&kitchen, &bath);
+
+    let groups = bridge.api().groups(&session).await;
+    assert_eq!(names(&groups), named(&[("Bath", &["Bath", "Kitchen"])]));
+    assert_eq!((groups[0].state, &groups[0].now_playing), (None, &None));
+    assert_eq!(household.actions_of(&bath), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_failed_search_is_reported_rather_than_an_empty_household() {
+    let abs = Audiobookshelf::shared();
+    // Sending to the broadcast address without permission to broadcast fails at once.
+    let unsendable = "255.255.255.255:1900".parse().unwrap();
+    let bridge = TestBridge::start(&home_with_sonos_toml(abs.base_url(), unsendable));
+    let user = abs.new_user().await;
+    let session = bridge.api().login(abs.base_url(), &user.api_key.key).await;
+
+    assert_eq!(
+        bridge
+            .api()
+            .get_as_error(&session, "/api/groups", &[])
+            .await,
+        SONOS_SEARCH_FAILED
+    );
+}
+
+#[tokio::test]
 async fn raw_upnp_traffic_is_logged_at_debug_only() {
     let raw = [
         "M-SEARCH",
@@ -297,7 +386,7 @@ async fn raw_upnp_traffic_is_logged_at_debug_only() {
         "GetZoneGroupStateResponse",
     ];
 
-    // At the default level, none of it shows, at any level.
+    // At the default level, none of it shows in any event.
     let (household, _) = Household::with_manual_clock();
     household.add_player("Kitchen");
     let (bridge, session) = logged_in(&household).await;
@@ -313,6 +402,15 @@ async fn raw_upnp_traffic_is_logged_at_debug_only() {
     let (bridge, session) = logged_in_logging(&household, "sonos::raw=debug").await;
     assert_eq!(bridge.api().groups(&session).await.len(), 1);
     let output = bridge.stop();
+    // The request the Bridge sent, on its own.
+    assert!(
+        output.iter().any(|event| event["target"] == sonos::RAW
+            && event["message"] == "SOAP request"
+            && event["body"]
+                .as_str()
+                .is_some_and(|body| body.contains("<u:GetZoneGroupState "))),
+        "{output:#?}"
+    );
     let traffic: Vec<&Value> = output
         .iter()
         .filter(|event| event["target"] == sonos::RAW)

@@ -224,12 +224,22 @@ impl TestBridge {
 }
 
 /// The configuration file for `config`: [`LISTEN`], [`DATABASE`], `config`, and [`NO_SONOS`]
-/// unless `config` has a `[sonos]` section.
+/// unless `config` sets `discovery_address` in `[sonos]`. A `[sonos]` without it would search
+/// the LAN, so it panics. Configuration that isn't TOML is passed on as it is, for the Bridge to
+/// reject.
 fn complete(config: &str) -> String {
-    let sonos = if config.contains("[sonos]") {
-        String::new()
-    } else {
-        sonos_toml(NO_SONOS)
+    let sonos = match config.parse::<toml::Table>() {
+        Ok(table) => match table.get("sonos") {
+            Some(sonos) => {
+                assert!(
+                    sonos.get("discovery_address").is_some(),
+                    "a test's [sonos] must set discovery_address: {config}"
+                );
+                String::new()
+            }
+            None => sonos_toml(NO_SONOS),
+        },
+        Err(_) => String::new(),
     };
     format!("{LISTEN}{DATABASE}{config}{sonos}")
 }
@@ -305,6 +315,16 @@ pub fn sonos_toml(ssdp: SocketAddr) -> String {
     format!("[sonos]\ndiscovery_address = \"{ssdp}\"\n")
 }
 
+/// The configuration naming the Library Server at `url` "Home" and pointing Sonos discovery at
+/// `ssdp`.
+pub fn home_with_sonos_toml(url: &str, ssdp: SocketAddr) -> String {
+    format!(
+        "{}{}",
+        named_library_server_toml(url, "Home"),
+        sonos_toml(ssdp)
+    )
+}
+
 /// The rejection of a call without a usable session.
 pub const SESSION_INVALID: (StatusCode, ApiError) =
     (StatusCode::UNAUTHORIZED, ApiError::SessionInvalid);
@@ -312,6 +332,10 @@ pub const SESSION_INVALID: (StatusCode, ApiError) =
 /// The rejection of a Groups listing no Sonos player answered.
 pub const SONOS_UNREACHABLE: (StatusCode, ApiError) =
     (StatusCode::BAD_GATEWAY, ApiError::SonosUnreachable);
+
+/// The rejection of a Groups listing when the Bridge could not search for Sonos players.
+pub const SONOS_SEARCH_FAILED: (StatusCode, ApiError) =
+    (StatusCode::BAD_GATEWAY, ApiError::SonosSearchFailed);
 
 /// The rejection of a session call whose API key the Library Server rejects.
 pub const KEY_REJECTED: (StatusCode, ApiError) =

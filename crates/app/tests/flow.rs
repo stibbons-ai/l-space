@@ -24,7 +24,7 @@ use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 use tempfile::TempDir;
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_PUBLISHED_AT};
 use test_support::bridge::{
-    TestBridge, library_server_toml, named_library_server_toml, sonos_toml,
+    TestBridge, home_with_sonos_toml, library_server_toml, named_library_server_toml,
 };
 use test_support::closed_port;
 
@@ -181,11 +181,7 @@ fn bridge_with_abs() -> (TestBridge, Arc<Audiobookshelf>, String) {
 /// for Sonos players.
 fn bridge_with_household(household: &Household) -> (TestBridge, Arc<Audiobookshelf>) {
     let abs = Audiobookshelf::shared();
-    let config = format!(
-        "{}{}",
-        named_library_server_toml(abs.base_url(), "Home"),
-        sonos_toml(household.ssdp())
-    );
+    let config = home_with_sonos_toml(abs.base_url(), household.ssdp());
     (TestBridge::start(&config), abs)
 }
 
@@ -1619,6 +1615,57 @@ fn the_groups_screen_shows_each_group_and_what_it_plays() {
 
         app.open_libraries().await;
         assert_eq!(app.screen(), &libraries(&abs, None));
+    });
+}
+
+#[test]
+fn every_playback_state_reads_as_such_in_english_and_german() {
+    let (household, _) = Household::with_manual_clock();
+    let bath = household.add_player("Bath");
+    household.set_transport_state(&bath, "TRANSITIONING");
+    let den = household.add_player("Den");
+    household.set_fault(&den, Fault::Garbage);
+    let kitchen = household.add_player("Kitchen");
+    household.play(
+        &kitchen,
+        FakeTrack::new("Moby Dick", Duration::from_secs(600)),
+    );
+    household.pause(&kitchen);
+    let office = household.add_player("Office");
+    household.set_transport_state(&office, "RECORDING");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+
+        app.open_groups().await;
+        let playback = |app: &App| {
+            let Screen::Groups { groups, .. } = app.screen() else {
+                panic!("{:?}", app.screen());
+            };
+            groups
+                .iter()
+                .map(|group| i18n::group_playback(app.language(), group))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            texts_of(&mut app, playback),
+            (
+                vec![
+                    "Starting…".to_owned(),
+                    "Not answering".to_owned(),
+                    "Paused · Moby Dick".to_owned(),
+                    "Unknown state".to_owned(),
+                ],
+                vec![
+                    "Startet…".to_owned(),
+                    "Antwortet nicht".to_owned(),
+                    "Pausiert · Moby Dick".to_owned(),
+                    "Unbekannter Zustand".to_owned(),
+                ],
+            )
+        );
     });
 }
 

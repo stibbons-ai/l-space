@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use roxmltree::{Document, Node, ParsingOptions};
 
-use crate::TransportState;
+use crate::{RAW, TransportState};
 
 /// More than a household of dozens of players needs.
 const MAX_NODES: u32 = 100_000;
@@ -15,11 +15,16 @@ const MAX_NODES: u32 = 100_000;
 /// Dublin Core, which DIDL-Lite uses for an item's title and creator.
 const DC: &str = "http://purl.org/dc/elements/1.1/";
 
-/// Why a player's answer could not be read.
+/// Why a player's answer could not be read. It names no part of the answer, which is
+/// untrusted; the parser's own message goes to [`crate::RAW`] at DEBUG.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Malformed {
-    #[error("not XML: {0}")]
-    Xml(String),
+    #[error("not XML ({reason} at line {line}, column {column})")]
+    Xml {
+        reason: &'static str,
+        line: u32,
+        column: u32,
+    },
     #[error("no {0} element")]
     Missing(&'static str),
 }
@@ -29,7 +34,19 @@ fn parse(text: &str) -> Result<Document<'_>, Malformed> {
         nodes_limit: MAX_NODES,
         ..ParsingOptions::default()
     };
-    Document::parse_with_options(text, options).map_err(|error| Malformed::Xml(error.to_string()))
+    Document::parse_with_options(text, options).map_err(|error| {
+        tracing::debug!(target: RAW, %error, "XML not readable");
+        let position = error.pos();
+        Malformed::Xml {
+            reason: match error {
+                roxmltree::Error::DtdDetected => "a DTD",
+                roxmltree::Error::NodesLimitReached => "too many nodes",
+                _ => "malformed",
+            },
+            line: position.row,
+            column: position.col,
+        }
+    })
 }
 
 /// The output arguments of a SOAP action's answer, `<u:{action}Response>`'s children, by name
@@ -50,6 +67,15 @@ pub(crate) fn soap_response(body: &str, action: &str) -> Result<Vec<(String, Str
             (argument.tag_name().name().to_owned(), text)
         })
         .collect())
+}
+
+/// The UPnP `errorCode` of a SOAP fault, if the body has a numeric one.
+pub(crate) fn upnp_error_code(body: &str) -> Option<u32> {
+    let document = parse(body).ok()?;
+    let code = document
+        .descendants()
+        .find(|node| node.tag_name().name() == "errorCode")?;
+    code.text()?.trim().parse().ok()
 }
 
 /// One Group as ZoneGroupTopology describes it.
@@ -82,22 +108,38 @@ pub(crate) fn zone_groups(state: &str) -> Result<Vec<ZoneGroup>, Malformed> {
         .descendants()
         .find(|node| node.has_tag_name("ZoneGroups"))
         .ok_or(Malformed::Missing("ZoneGroups"))?;
-    Ok(groups_root
+    let (mut groups, mut skipped_groups, mut skipped_members) = (Vec::new(), 0, 0);
+    for group in groups_root
         .children()
         .filter(|node| node.has_tag_name("ZoneGroup"))
-        .filter_map(|group| {
-            let coordinator = non_empty(group.attribute("Coordinator"))?;
-            let members = group
-                .children()
-                .filter(|node| node.has_tag_name("ZoneGroupMember"))
-                .filter_map(zone_member)
-                .collect();
-            Some(ZoneGroup {
-                coordinator,
-                members,
-            })
-        })
-        .collect())
+    {
+        let Some(coordinator) = non_empty(group.attribute("Coordinator")) else {
+            skipped_groups += 1;
+            continue;
+        };
+        let mut members = Vec::new();
+        for member in group
+            .children()
+            .filter(|node| node.has_tag_name("ZoneGroupMember"))
+        {
+            match zone_member(member) {
+                Some(member) => members.push(member),
+                None => skipped_members += 1,
+            }
+        }
+        groups.push(ZoneGroup {
+            coordinator,
+            members,
+        });
+    }
+    if skipped_groups > 0 || skipped_members > 0 {
+        tracing::debug!(
+            skipped_groups,
+            skipped_members,
+            "left out Groups without a coordinator and members without a UUID"
+        );
+    }
+    Ok(groups)
 }
 
 fn zone_member(member: Node) -> Option<ZoneMember> {
@@ -120,15 +162,19 @@ fn non_empty(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// AVTransport's `CurrentTransportState`. `NO_MEDIA_PRESENT` counts as stopped; a state UPnP
-/// doesn't define is unknown.
-pub(crate) fn transport_state(state: &str) -> Option<TransportState> {
+/// AVTransport's `CurrentTransportState`. `NO_MEDIA_PRESENT` counts as stopped; any other
+/// state is unknown, and logged (its first 32 characters) so it can be added.
+pub(crate) fn transport_state(state: &str) -> TransportState {
     match state.trim() {
-        "PLAYING" => Some(TransportState::Playing),
-        "PAUSED_PLAYBACK" | "PAUSED_RECORDING" => Some(TransportState::Paused),
-        "STOPPED" | "NO_MEDIA_PRESENT" => Some(TransportState::Stopped),
-        "TRANSITIONING" => Some(TransportState::Transitioning),
-        _ => None,
+        "PLAYING" => TransportState::Playing,
+        "PAUSED_PLAYBACK" | "PAUSED_RECORDING" => TransportState::Paused,
+        "STOPPED" | "NO_MEDIA_PRESENT" => TransportState::Stopped,
+        "TRANSITIONING" => TransportState::Transitioning,
+        state => {
+            let state: String = state.chars().take(32).collect();
+            tracing::warn!(state, "unknown Sonos transport state");
+            TransportState::Unknown
+        }
     }
 }
 
@@ -167,7 +213,8 @@ pub(crate) fn duration(time: &str) -> Option<Duration> {
     let hours: u64 = hours.parse().ok()?;
     let seconds = hours.checked_mul(3600)?.checked_add(minutes * 60 + whole)?;
     let fraction: f64 = format!("0.{fraction}").parse().ok()?;
-    Some(Duration::from_secs(seconds) + Duration::from_secs_f64(fraction))
+    // A long fraction can round up to a whole second, past the largest `Duration`.
+    Duration::from_secs(seconds).checked_add(Duration::from_secs_f64(fraction))
 }
 
 #[cfg(test)]
@@ -286,18 +333,24 @@ mod tests {
             Err(Malformed::Missing("action response"))
         );
         assert!(soap_response("garbage", "GetTransportInfo").is_err());
+        assert_eq!(upnp_error_code(fault), None);
+        let coded = fault.replace(
+            "</s:Fault>",
+            r#"<detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>401</errorCode></UPnPError></detail></s:Fault>"#,
+        );
+        assert_eq!(upnp_error_code(&coded), Some(401));
     }
 
     #[test]
-    fn transport_states_map_to_four_states() {
+    fn transport_states_map_to_four_states_or_unknown() {
         for (state, expected) in [
-            ("PLAYING", Some(TransportState::Playing)),
-            ("PAUSED_PLAYBACK", Some(TransportState::Paused)),
-            ("STOPPED", Some(TransportState::Stopped)),
-            ("NO_MEDIA_PRESENT", Some(TransportState::Stopped)),
-            ("TRANSITIONING", Some(TransportState::Transitioning)),
-            ("RECORDING", None),
-            ("", None),
+            ("PLAYING", TransportState::Playing),
+            ("PAUSED_PLAYBACK", TransportState::Paused),
+            ("STOPPED", TransportState::Stopped),
+            ("NO_MEDIA_PRESENT", TransportState::Stopped),
+            ("TRANSITIONING", TransportState::Transitioning),
+            ("RECORDING", TransportState::Unknown),
+            ("", TransportState::Unknown),
         ] {
             assert_eq!(transport_state(state), expected, "{state:?}");
         }
@@ -342,6 +395,8 @@ mod tests {
             ("0:00:0x", None),
             ("1:00:00:00", None),
             ("99999999999999999999:00:00", None),
+            // Exactly the largest `Duration` in whole seconds, plus a fraction rounding to 1 s.
+            ("5124095576030431:00:15.9999999999999", None),
         ] {
             assert_eq!(duration(time), expected, "{time:?}");
         }

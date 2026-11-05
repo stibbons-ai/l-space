@@ -25,8 +25,8 @@ pub const RAW: &str = "sonos::raw";
 
 /// Sonos, as the Bridge uses it.
 pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
-    /// Every Group as the Sonos app shows it, by name. A household where no player was found
-    /// has none.
+    /// Every Group as the Sonos app shows it, by name. A household where a working search found
+    /// no player has none.
     fn groups(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>>;
 }
 
@@ -34,21 +34,29 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     /// Players were found, but none of them told the Group topology in time.
-    #[error("no Sonos player answered")]
+    #[error("no Sonos player told the Group topology")]
     Unreachable,
+    /// No player is known and the last search could not be sent or received, so whether there
+    /// are players is unknown.
+    #[error("cannot search for Sonos players")]
+    SearchFailed,
 }
 
 /// One or more players playing in sync, as grouped in the Sonos app.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Group {
-    /// The coordinator's UUID, such as `RINCON_48A6B8000001400`.
+    /// The coordinator's UUID, such as `RINCON_48A6B8000001400`, always, also when the
+    /// coordinator is not a member (it is invisible in the Sonos app).
     pub id: String,
-    /// The coordinator's room name.
+    /// The name set in the Sonos app for the coordinator (bonded speakers share it), or for the
+    /// first member if the coordinator has none.
     pub name: String,
-    /// The players the Sonos app shows in the Group, the coordinator first; never empty. A
-    /// bonded surround or sub, the second speaker of a stereo pair and a Boost are not members.
+    /// The players the Sonos app shows in the Group, the coordinator first when it is one of
+    /// them; never empty. A bonded surround or sub, the second speaker of a stereo pair and a
+    /// Boost are not members.
     pub members: Vec<Member>,
-    /// What the Group's transport is doing; none if its coordinator didn't say.
+    /// What the Group's transport is doing; none if its coordinator was not found by the
+    /// searches, didn't answer, or answered too late.
     pub state: Option<TransportState>,
     /// The current track, if one is loaded and the coordinator said so.
     pub track: Option<Track>,
@@ -59,7 +67,7 @@ pub struct Group {
 pub struct Member {
     /// Its UUID.
     pub id: String,
-    /// Its room name.
+    /// The name set in the Sonos app for it.
     pub name: String,
 }
 
@@ -70,6 +78,8 @@ pub enum TransportState {
     Paused,
     Stopped,
     Transitioning,
+    /// The coordinator answered with a state UPnP doesn't define.
+    Unknown,
 }
 
 /// The track a Group has loaded.

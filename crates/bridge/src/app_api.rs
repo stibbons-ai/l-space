@@ -198,7 +198,10 @@ impl<S: Store> AppApi<S> {
             Ok(groups) => Ok(groups.into_iter().map(group).collect()),
             Err(error) => {
                 tracing::warn!(%error, "cannot list the Sonos Groups");
-                Err(ApiError::SonosUnreachable)
+                Err(match error {
+                    sonos::Error::Unreachable => ApiError::SonosUnreachable,
+                    sonos::Error::SearchFailed => ApiError::SonosSearchFailed,
+                })
             }
         }
     }
@@ -397,6 +400,7 @@ fn group(group: sonos::Group) -> Group {
             sonos::TransportState::Paused => TransportState::Paused,
             sonos::TransportState::Stopped => TransportState::Stopped,
             sonos::TransportState::Transitioning => TransportState::Transitioning,
+            sonos::TransportState::Unknown => TransportState::Unknown,
         }),
         now_playing: group.track.map(|track| NowPlaying {
             title: track.title,

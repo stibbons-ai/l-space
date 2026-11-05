@@ -161,6 +161,7 @@ texts! {
     GroupStopped => "group-stopped",
     GroupTransitioning => "group-transitioning",
     GroupStateUnknown => "group-state-unknown",
+    GroupUnknown => "group-unknown",
     SettingsTitle => "settings-title",
     SettingsLibraryServer => "settings-library-server",
     SettingsAccount => "settings-account",
@@ -185,6 +186,7 @@ texts! {
     ErrorSessionInvalid => "error-session-invalid",
     ErrorNotFound => "error-not-found",
     ErrorSonosUnreachable => "error-sonos-unreachable",
+    ErrorSonosSearchFailed => "error-sonos-search-failed",
     ErrorUnknown => "error-unknown",
 }
 
@@ -242,6 +244,7 @@ impl From<&api::ApiError> for Text {
             ApiError::SessionInvalid => Self::ErrorSessionInvalid,
             ApiError::NotFound => Self::ErrorNotFound,
             ApiError::SonosUnreachable => Self::ErrorSonosUnreachable,
+            ApiError::SonosSearchFailed => Self::ErrorSonosSearchFailed,
             ApiError::Unknown => Self::ErrorUnknown,
         }
     }
@@ -276,6 +279,7 @@ impl From<TransportState> for Text {
             TransportState::Paused => Self::GroupPaused,
             TransportState::Stopped => Self::GroupStopped,
             TransportState::Transitioning => Self::GroupTransitioning,
+            TransportState::Unknown => Self::GroupUnknown,
         }
     }
 }
@@ -712,8 +716,8 @@ mod tests {
         for (text, error) in &messages {
             assert_eq!(Text::from(error), *text, "{error:?}");
         }
-        // One message per code (ApiError has 10), each different in every language.
-        assert_eq!(messages.len(), 10, "{messages:?}");
+        // One message per code (ApiError has 11), each different in every language.
+        assert_eq!(messages.len(), 11, "{messages:?}");
         for language in Language::ALL {
             let distinct: BTreeSet<_> = messages
                 .iter()

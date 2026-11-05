@@ -21,6 +21,16 @@ const ZONE_PLAYER: &str = "urn:schemas-upnp-org:device:ZonePlayer:1";
 /// The longest answer read; a Sonos answer is a few hundred bytes.
 const MAX_DATAGRAM: usize = 2048;
 
+/// The most players kept from a search, or known at once: far more than a household has, few
+/// enough that a flood of made-up answers can't grow without bound.
+pub(crate) const MAX_PLAYERS: usize = 64;
+
+/// How long a player may wait before answering a search (`MX`).
+const MX: Duration = Duration::from_secs(1);
+
+/// How long a search waits for answers: `MX`, plus a second for the network.
+const SEARCH_WINDOW: Duration = Duration::from_secs(MX.as_secs() + 1);
+
 /// A player that answered a search.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Found {
@@ -29,27 +39,35 @@ pub(crate) struct Found {
     pub addr: SocketAddr,
 }
 
-/// Sends one M-SEARCH to `target` and collects the players that answer within `window`,
-/// once each.
-pub(crate) async fn search(target: SocketAddr, window: Duration) -> io::Result<Vec<Found>> {
+/// Sends one M-SEARCH to `target` and collects the players that answer within the search
+/// window, once each and at most [`MAX_PLAYERS`]. A failure to receive ends the search with
+/// what was found so far; only a failure to search at all is an error.
+pub(crate) async fn search(target: SocketAddr) -> io::Result<Vec<Found>> {
     let any = match target {
         SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
         SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
     let socket = UdpSocket::bind((any, 0)).await?;
-    // MX: players answer within a second, so the window can stay short.
     let request = format!(
-        "M-SEARCH * HTTP/1.1\r\nHOST: {target}\r\nMAN: \"ssdp:discover\"\r\nMX: 1\r\nST: {ZONE_PLAYER}\r\n\r\n"
+        "M-SEARCH * HTTP/1.1\r\nHOST: {target}\r\nMAN: \"ssdp:discover\"\r\nMX: {}\r\nST: {ZONE_PLAYER}\r\n\r\n",
+        MX.as_secs()
     );
     tracing::debug!(target: RAW, peer = %target, datagram = request, "SSDP datagram sent");
     socket.send_to(request.as_bytes(), target).await?;
 
-    let deadline = tokio::time::Instant::now() + window;
+    let deadline = tokio::time::Instant::now() + SEARCH_WINDOW;
     let mut found: Vec<Found> = Vec::new();
     let mut buffer = [0; MAX_DATAGRAM];
-    while let Ok(received) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buffer)).await
+    while found.len() < MAX_PLAYERS
+        && let Ok(received) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buffer)).await
     {
-        let (length, from) = received?;
+        let (length, from) = match received {
+            Ok(received) => received,
+            Err(error) => {
+                tracing::warn!(%target, %error, "SSDP search ended early");
+                break;
+            }
+        };
         let datagram = String::from_utf8_lossy(&buffer[..length]);
         tracing::debug!(target: RAW, peer = %from, datagram = %datagram, "SSDP datagram received");
         match answer(&datagram, from) {
@@ -92,7 +110,8 @@ fn answer(datagram: &str, from: SocketAddr) -> Option<Found> {
         return None;
     }
     let uuid = usn?.strip_prefix("uuid:")?.split("::").next()?.trim();
-    if uuid.is_empty() {
+    // Every Sonos player's UUID looks like `RINCON_48A6B8000001400`.
+    if !uuid.starts_with("RINCON_") || uuid.len() > 64 {
         return None;
     }
     let addr = services_at(location?)?;
@@ -172,6 +191,12 @@ mod tests {
             datagram("urn:schemas-upnp-org:device:MediaRenderer:1", usn, here),
             datagram(ZONE_PLAYER, "RINCON_A", here),
             datagram(ZONE_PLAYER, "uuid:::x", here),
+            datagram(ZONE_PLAYER, "uuid:not-a-sonos-uuid::x", here),
+            datagram(
+                ZONE_PLAYER,
+                &format!("uuid:RINCON_{}", "0".repeat(64)),
+                here,
+            ),
             datagram(ZONE_PLAYER, usn, "not a url"),
             datagram(ZONE_PLAYER, usn, "https://192.168.1.23:1443/x.xml"),
             datagram(ZONE_PLAYER, usn, "http://192.168.1.99:1400/x.xml"),

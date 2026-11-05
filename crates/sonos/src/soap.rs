@@ -49,8 +49,12 @@ impl Service {
 pub(crate) enum CallError {
     #[error("{0}")]
     Http(String),
-    #[error("HTTP status {0}")]
-    Status(u16),
+    /// The HTTP status, and the UPnP `errorCode` of a SOAP fault if it has a numeric one.
+    #[error("HTTP status {status}{}", upnp_error.map_or_else(String::new, |code| format!(", UPnP error {code}")))]
+    Status {
+        status: u16,
+        upnp_error: Option<u32>,
+    },
     #[error("answer longer than {MAX_BODY} bytes")]
     TooLong,
     #[error(transparent)]
@@ -102,7 +106,10 @@ pub(crate) async fn call(
     let body = String::from_utf8_lossy(&bytes);
     tracing::debug!(target: RAW, peer = url, action, status = status.as_u16(), body = %body, "SOAP response");
     if !status.is_success() {
-        return Err(CallError::Status(status.as_u16()));
+        return Err(CallError::Status {
+            status: status.as_u16(),
+            upnp_error: xml::upnp_error_code(&body),
+        });
     }
     Ok(xml::soap_response(&body, action)?)
 }

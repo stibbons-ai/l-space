@@ -84,9 +84,14 @@ pub enum Fault {
     None,
     /// It answers every SOAP call with `200 OK` and a body that isn't XML.
     Garbage,
-    /// It accepts connections and never answers.
+    /// It accepts SOAP calls and never answers them (its device description still answers).
     Hang,
+    /// It answers every SOAP call with `200 OK` and a body longer than 1 MiB.
+    Oversize,
 }
+
+/// Longer than the 1 MiB the Bridge reads of an answer.
+const OVERSIZE: usize = 1024 * 1024 + 1;
 
 /// A fake Sonos household; dropping it stops every player.
 #[derive(Debug)]
@@ -106,8 +111,10 @@ struct Shared {
 struct HouseholdState {
     /// In the order they were added.
     players: Vec<Player>,
-    /// Every SOAP action called, as `Service#Action`.
-    actions: Vec<String>,
+    /// Every SOAP action called, as the UUID of the player called and `Service#Action`.
+    actions: Vec<(String, String)>,
+    /// How many M-SEARCHes were answered.
+    searches: usize,
     added: u32,
 }
 
@@ -273,7 +280,7 @@ impl Household {
     pub fn play(&self, coordinator: &PlayerId, track: FakeTrack) {
         let now = self.shared.clock.now();
         let mut state = self.shared.lock();
-        state.player_mut(coordinator).transport = Transport {
+        state.coordinator_mut(coordinator).transport = Transport {
             state: "PLAYING",
             track: Some(track),
             offset: Duration::ZERO,
@@ -285,7 +292,7 @@ impl Household {
     pub fn pause(&self, coordinator: &PlayerId) {
         let now = self.shared.clock.now();
         let mut state = self.shared.lock();
-        let transport = &mut state.player_mut(coordinator).transport;
+        let transport = &mut state.coordinator_mut(coordinator).transport;
         transport.offset = transport.position(now);
         transport.since = None;
         transport.state = "PAUSED_PLAYBACK";
@@ -294,10 +301,20 @@ impl Household {
     /// `coordinator`'s Group stops; its track stays loaded, back at its start.
     pub fn stop(&self, coordinator: &PlayerId) {
         let mut state = self.shared.lock();
-        let transport = &mut state.player_mut(coordinator).transport;
+        let transport = &mut state.coordinator_mut(coordinator).transport;
         transport.offset = Duration::ZERO;
         transport.since = None;
         transport.state = "STOPPED";
+    }
+
+    /// `coordinator`'s Group reports `state` as its `CurrentTransportState`, as is, such as
+    /// `TRANSITIONING` or a state UPnP doesn't define.
+    pub fn set_transport_state(&self, coordinator: &PlayerId, state: &'static str) {
+        self.shared
+            .lock()
+            .coordinator_mut(coordinator)
+            .transport
+            .state = state;
     }
 
     /// `player` misbehaves as `fault` from now on.
@@ -326,7 +343,24 @@ impl Household {
     /// Every SOAP action the household was called with, in order, as `Service#Action`, such as
     /// `ZoneGroupTopology#GetZoneGroupState`.
     pub fn actions(&self) -> Vec<String> {
-        self.shared.lock().actions.clone()
+        let state = self.shared.lock();
+        state
+            .actions
+            .iter()
+            .map(|(_, action)| action.clone())
+            .collect()
+    }
+
+    /// The SOAP actions `player` was called with, in order, as for [`Household::actions`].
+    pub fn actions_of(&self, player: &PlayerId) -> Vec<String> {
+        let state = self.shared.lock();
+        let actions = state.actions.iter().filter(|(uuid, _)| *uuid == player.0);
+        actions.map(|(_, action)| action.clone()).collect()
+    }
+
+    /// How many M-SEARCHes for ZonePlayers the household has answered.
+    pub fn searches(&self) -> usize {
+        self.shared.lock().searches
     }
 
     fn runtime(&self) -> &Runtime {
@@ -360,6 +394,13 @@ impl HouseholdState {
             .unwrap_or_else(|| panic!("no player {}", id.0))
     }
 
+    /// `id`, which must coordinate its Group: the Bridge reads a Group's playback from there.
+    fn coordinator_mut(&mut self, id: &PlayerId) -> &mut Player {
+        let player = self.player_mut(id);
+        assert_eq!(player.group, id.0, "{} does not coordinate its Group", id.0);
+        player
+    }
+
     fn find(&self, uuid: &str) -> Option<&Player> {
         self.players.iter().find(|player| player.uuid == uuid)
     }
@@ -377,7 +418,8 @@ impl HouseholdState {
         }
     }
 
-    /// The household's `ZoneGroupState` document: every Group, coordinator first.
+    /// The household's `ZoneGroupState` document: every Group, its members in the order they
+    /// were added.
     fn zone_group_state(&self) -> String {
         let mut coordinators: Vec<&str> = Vec::new();
         for player in &self.players {
@@ -440,6 +482,7 @@ async fn answer_searches(shared: Arc<Shared>, socket: tokio::net::UdpSocket) {
         if !wanted {
             continue;
         }
+        shared.lock().searches += 1;
         let answers: Vec<String> = shared
             .lock()
             .players
@@ -490,12 +533,15 @@ async fn control(State(served): State<Served>, headers: HeaderMap) -> Response {
     let service = urn.rsplit(':').nth(1).unwrap_or_default();
     let fault = {
         let mut state = served.shared.lock();
-        state.actions.push(format!("{service}#{action}"));
+        state
+            .actions
+            .push((served.uuid.clone(), format!("{service}#{action}")));
         state.find(&served.uuid).map(|player| player.fault)
     };
     match fault {
         Some(Fault::Hang) => std::future::pending().await,
         Some(Fault::Garbage) => return xml(StatusCode::OK, "<s:Envelope><unclosed".to_owned()),
+        Some(Fault::Oversize) => return xml(StatusCode::OK, " ".repeat(OVERSIZE)),
         Some(Fault::None) => {}
         // Removed from the household: as good as unplugged.
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),

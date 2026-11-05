@@ -252,15 +252,17 @@ impl EpisodeFilter {
 /// what it plays.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Group {
-    /// Its coordinator's UUID, such as `RINCON_48A6B8000001400`.
+    /// Its coordinator's UUID, such as `RINCON_48A6B8000001400`; always the coordinator's, also
+    /// when the coordinator is not a member (it is invisible in the Sonos app).
     pub id: String,
-    /// Its coordinator's room name.
+    /// The name set in the Sonos app for its coordinator (bonded speakers share it).
     pub name: String,
-    /// The players the Sonos app shows in the Group, its coordinator first; never empty. A
-    /// single speaker is a Group of one. A bonded surround or sub, the second speaker of a
-    /// stereo pair and a Boost are not members.
+    /// The players the Sonos app shows in the Group, its coordinator first when it is one of
+    /// them; never empty. A single speaker is a Group of one. A bonded surround or sub, the
+    /// second speaker of a stereo pair and a Boost are not members.
     pub members: Vec<GroupMember>,
-    /// What the Group's playback is doing; none if its coordinator didn't answer.
+    /// What the Group's playback is doing; none if its coordinator was not found by the
+    /// Bridge's searches, didn't answer, or answered too late.
     pub state: Option<TransportState>,
     /// The track it has loaded, if any and if its coordinator said.
     pub now_playing: Option<NowPlaying>,
@@ -271,7 +273,7 @@ pub struct Group {
 pub struct GroupMember {
     /// The player's UUID.
     pub id: String,
-    /// Its room name.
+    /// The name set in the Sonos app for it.
     pub name: String,
 }
 
@@ -284,6 +286,10 @@ pub enum TransportState {
     Stopped,
     /// Between states, such as while starting a track.
     Transitioning,
+    /// The coordinator answered with a state the Bridge doesn't know, or (on the App's side,
+    /// when decoding) a state from a newer Bridge. Last, as serde wants its catch-all.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The track a Group has loaded. Times are seconds.
@@ -343,9 +349,13 @@ pub enum ApiError {
     /// see.
     #[error("not_found")]
     NotFound,
-    /// The Bridge found Sonos players, but none of them told it the Groups in time.
+    /// The Bridge knows Sonos players, but none of them told it the Group topology in time.
     #[error("sonos_unreachable")]
     SonosUnreachable,
+    /// The Bridge knows no Sonos player because it could not search its network for them (its
+    /// last search could not be sent), so whether there are any is unknown.
+    #[error("sonos_search_failed")]
+    SonosSearchFailed,
     /// A code this build of the App does not know yet, from a newer Bridge. Produced only on
     /// the App's side, when decoding; the Bridge never sends it.
     #[serde(other)]
@@ -381,7 +391,8 @@ impl AsStatusCode for ApiError {
             Self::BridgeUnreachable
             | Self::NotABridge
             | Self::LibraryServerUnreachable
-            | Self::SonosUnreachable => StatusCode::BAD_GATEWAY,
+            | Self::SonosUnreachable
+            | Self::SonosSearchFailed => StatusCode::BAD_GATEWAY,
             Self::Internal | Self::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -585,7 +596,7 @@ mod tests {
     use dioxus::fullstack::{AsStatusCode, StatusCode};
     use serde_json::json;
 
-    use super::{ApiError, ApiKey, SessionToken};
+    use super::{ApiError, ApiKey, SessionToken, TransportState};
 
     #[test]
     fn error_codes_travel_as_a_code_field() {
@@ -604,6 +615,18 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ApiError>(json!({"code": "group_busy"})).unwrap(),
             ApiError::Unknown
+        );
+    }
+
+    #[test]
+    fn a_transport_state_from_a_newer_bridge_decodes_as_unknown() {
+        assert_eq!(
+            serde_json::from_value::<TransportState>(json!("recording")).unwrap(),
+            TransportState::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<TransportState>(json!("paused")).unwrap(),
+            TransportState::Paused
         );
     }
 

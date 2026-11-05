@@ -39,23 +39,46 @@ async fn players_are_searched_for_on_the_clocks_refresh_and_expire() {
     // The first search, at start, finds nobody.
     assert_eq!(names(&sonos).await, Ok(Vec::new()));
 
-    // A player plugged in now is not searched for until the clock says so...
+    // A player plugged in now is not searched for until the clock says so: no search goes out
+    // (one would reach the household at once)...
     let kitchen = household.add_player("Kitchen");
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(household.searches(), 1);
     assert_eq!(names(&sonos).await, Ok(Vec::new()));
 
-    // ...which is one refresh later.
+    // ...until one refresh later.
     clock.advance(REFRESH);
     lists(&sonos, Ok(vec!["Kitchen".into()])).await;
+    assert_eq!(household.searches(), 2);
 
     // Unplugged, it is still known but answers nothing...
     household.remove(&kitchen);
     assert_eq!(names(&sonos).await, Err(Error::Unreachable));
     clock.advance(EXPIRY - Duration::from_secs(1));
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    searched(&household, 3).await;
+    // The search's answers are only counted when its window ends; nothing signals that.
+    tokio::time::sleep(SEARCH_WINDOW).await;
     assert_eq!(names(&sonos).await, Err(Error::Unreachable));
 
     // ...until it has not answered a search for the expiry time.
     clock.advance(Duration::from_secs(1) + REFRESH);
+    searched(&household, 4).await;
     lists(&sonos, Ok(Vec::new())).await;
+}
+
+/// Longer than a search waits for answers (two seconds).
+const SEARCH_WINDOW: Duration = Duration::from_millis(2500);
+
+/// Waits until `household` has answered `count` searches.
+async fn searched(household: &Household, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while household.searches() < count {
+        assert!(
+            Instant::now() < deadline,
+            "{} searches",
+            household.searches()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(household.searches(), count);
 }
