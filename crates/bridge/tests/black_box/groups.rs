@@ -2,25 +2,17 @@
 //! exactly as grouped in Sonos with what it plays, regrouping, positions moving on the shared
 //! clock, misbehaving players, and the raw UPnP traffic in the logs.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use api::{Group, GroupMember, NowPlaying, Session, TransportState};
-use clock::ManualClock;
-use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 
 use test_support::audiobookshelf::Audiobookshelf;
 use test_support::bridge::{
-    RUST_LOG, SESSION_INVALID, TestBridge, named_library_server_toml, output_contains, sonos_toml,
+    RUST_LOG, SESSION_INVALID, SONOS_UNREACHABLE, TestBridge, named_library_server_toml,
+    output_contains, sonos_toml,
 };
-
-/// A household on a manual clock.
-fn new_household() -> (Household, ManualClock) {
-    let clock = ManualClock::new();
-    (Household::start(Arc::new(clock.clone())), clock)
-}
 
 /// A Bridge searching `household` for players, logging with `rust_log`, and a session on it.
 async fn logged_in_logging(household: &Household, rust_log: &str) -> (TestBridge, Session) {
@@ -72,7 +64,7 @@ const TEN_MINUTES: Duration = Duration::from_secs(600);
 
 #[tokio::test]
 async fn every_group_is_listed_as_grouped_in_sonos_with_what_it_plays() {
-    let (household, _) = new_household();
+    let (household, _) = Household::with_manual_clock();
     // A two-player Group, a speaker on its own, and a Beam with a bonded surround.
     let kitchen = household.add_player("Kitchen");
     let bath = household.add_player("Bath");
@@ -142,7 +134,7 @@ async fn every_group_is_listed_as_grouped_in_sonos_with_what_it_plays() {
 /// Pins the wire shape the App decodes, independent of the shared Rust types.
 #[tokio::test]
 async fn group_list_wire_shape() {
-    let (household, _) = new_household();
+    let (household, _) = Household::with_manual_clock();
     let kitchen = household.add_player("Kitchen");
     household.play(
         &kitchen,
@@ -180,7 +172,7 @@ async fn group_list_wire_shape() {
 
 #[tokio::test]
 async fn regrouping_in_sonos_shows_in_the_next_listing() {
-    let (household, _) = new_household();
+    let (household, _) = Household::with_manual_clock();
     let kitchen = household.add_player("Kitchen");
     let bath = household.add_player("Bath");
     let (bridge, session) = logged_in(&household).await;
@@ -201,7 +193,7 @@ async fn regrouping_in_sonos_shows_in_the_next_listing() {
 
 #[tokio::test]
 async fn a_playing_groups_position_moves_with_the_clock_it_shares_with_the_fake() {
-    let (household, clock) = new_household();
+    let (household, clock) = Household::with_manual_clock();
     let kitchen = household.add_player("Kitchen");
     household.play(&kitchen, FakeTrack::new("Moby Dick", TEN_MINUTES));
     let (bridge, session) = logged_in(&household).await;
@@ -230,7 +222,7 @@ async fn a_playing_groups_position_moves_with_the_clock_it_shares_with_the_fake(
 
 #[tokio::test]
 async fn a_household_without_players_has_no_groups() {
-    let (household, _) = new_household();
+    let (household, _) = Household::with_manual_clock();
     let (bridge, session) = logged_in(&household).await;
 
     assert_eq!(bridge.api().groups(&session).await, []);
@@ -238,7 +230,7 @@ async fn a_household_without_players_has_no_groups() {
 
 #[tokio::test]
 async fn groups_need_a_session() {
-    let (household, _) = new_household();
+    let (household, _) = Household::with_manual_clock();
     household.add_player("Kitchen");
     let (bridge, session) = logged_in(&household).await;
     let api = bridge.api();
@@ -256,7 +248,7 @@ async fn groups_need_a_session() {
 
 #[tokio::test]
 async fn a_player_answering_garbage_is_passed_over_for_the_topology_and_has_no_playback() {
-    let (household, _) = new_household();
+    let (household, _) = Household::with_manual_clock();
     // Asked first for the topology: players are tried in UUID order.
     let kitchen = household.add_player("Kitchen");
     let bath = household.add_player("Bath");
@@ -275,9 +267,8 @@ async fn a_player_answering_garbage_is_passed_over_for_the_topology_and_has_no_p
 
 #[tokio::test]
 async fn players_that_answer_garbage_or_never_answer_are_reported_in_bounded_time() {
-    let sonos_unreachable = (StatusCode::BAD_GATEWAY, api::ApiError::SonosUnreachable);
     for fault in [Fault::Garbage, Fault::Hang] {
-        let (household, _) = new_household();
+        let (household, _) = Household::with_manual_clock();
         let kitchen = household.add_player("Kitchen");
         household.set_fault(&kitchen, fault);
         let (bridge, session) = logged_in(&household).await;
@@ -286,7 +277,7 @@ async fn players_that_answer_garbage_or_never_answer_are_reported_in_bounded_tim
         let start = Instant::now();
         assert_eq!(
             api.get_as_error(&session, "/api/groups", &[]).await,
-            sonos_unreachable,
+            SONOS_UNREACHABLE,
             "{fault:?}"
         );
         // Well within the App's 15-second limit for a call.
@@ -307,7 +298,7 @@ async fn raw_upnp_traffic_is_logged_at_debug_only() {
     ];
 
     // At the default level, none of it shows, at any level.
-    let (household, _) = new_household();
+    let (household, _) = Household::with_manual_clock();
     household.add_player("Kitchen");
     let (bridge, session) = logged_in(&household).await;
     assert_eq!(bridge.api().groups(&session).await.len(), 1);
@@ -317,7 +308,7 @@ async fn raw_upnp_traffic_is_logged_at_debug_only() {
     }
 
     // With the raw target at debug, every SSDP datagram and SOAP body shows there, at DEBUG.
-    let (household, _) = new_household();
+    let (household, _) = Household::with_manual_clock();
     household.add_player("Kitchen");
     let (bridge, session) = logged_in_logging(&household, "sonos::raw=debug").await;
     assert_eq!(bridge.api().groups(&session).await.len(), 1);

@@ -6,7 +6,6 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clock::ManualClock;
 use sonos::{EXPIRY, Error, Group, REFRESH, Sonos, Upnp};
 use sonos_fake::Household;
 
@@ -34,8 +33,7 @@ async fn lists(sonos: &Upnp, expected: Result<Vec<String>, Error>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn players_are_searched_for_on_the_clocks_refresh_and_expire() {
-    let clock = ManualClock::new();
-    let household = Household::start(Arc::new(clock.clone()));
+    let (household, clock) = Household::with_manual_clock();
     let sonos = Upnp::start(household.ssdp(), Arc::new(clock.clone()));
 
     // The first search, at start, finds nobody.

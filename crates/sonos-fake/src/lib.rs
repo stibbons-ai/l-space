@@ -32,7 +32,7 @@ use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use clock::Clock;
+use clock::{Clock, ManualClock};
 use tokio::runtime::Runtime;
 
 const ZONE_PLAYER: &str = "urn:schemas-upnp-org:device:ZonePlayer:1";
@@ -116,9 +116,8 @@ struct Player {
     uuid: String,
     name: String,
     addr: SocketAddr,
-    /// False for a bonded speaker the Sonos app doesn't show (`Invisible="1"`).
-    visible: bool,
-    /// The visible player it is bonded to, whose Group it follows.
+    /// The player it is bonded to, whose Group it follows, for a speaker the Sonos app doesn't
+    /// show (`Invisible="1"`).
     bonded_to: Option<String>,
     /// The UUID of its Group's coordinator.
     group: String,
@@ -177,6 +176,13 @@ impl Household {
         }
     }
 
+    /// [`Household::start`] on a new `clock::ManualClock`, which it returns for the test to
+    /// advance.
+    pub fn with_manual_clock() -> (Self, ManualClock) {
+        let clock = ManualClock::new();
+        (Self::start(Arc::new(clock.clone())), clock)
+    }
+
     /// Where the household answers SSDP searches, for the Bridge's discovery.
     pub fn ssdp(&self) -> SocketAddr {
         self.ssdp
@@ -213,7 +219,6 @@ impl Household {
                 uuid: uuid.clone(),
                 name,
                 addr,
-                visible: bonded_to.is_none(),
                 bonded_to: bonded_to.map(|main| main.0.clone()),
                 group,
                 transport: Transport {
@@ -351,14 +356,16 @@ impl HouseholdState {
     }
 
     fn player_mut(&mut self, id: &PlayerId) -> &mut Player {
-        self.players
-            .iter_mut()
-            .find(|player| player.uuid == id.0)
+        self.find_mut(&id.0)
             .unwrap_or_else(|| panic!("no player {}", id.0))
     }
 
     fn find(&self, uuid: &str) -> Option<&Player> {
         self.players.iter().find(|player| player.uuid == uuid)
+    }
+
+    fn find_mut(&mut self, uuid: &str) -> Option<&mut Player> {
+        self.players.iter_mut().find(|player| player.uuid == uuid)
     }
 
     /// Puts `uuid` and the speakers bonded to it into the Group coordinated by `group`.
@@ -393,10 +400,10 @@ impl HouseholdState {
                     player.uuid,
                     location(player.addr),
                     escape(&player.name),
-                    if player.visible {
-                        ""
-                    } else {
+                    if player.bonded_to.is_some() {
                         r#" Invisible="1""#
+                    } else {
+                        ""
                     },
                 ));
             }
@@ -505,7 +512,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap) -> Response {
                 .and_then(|player| state.find(&player.group))
                 .map(|coordinator| &coordinator.transport)
             else {
-                return soap_fault(401);
+                return invalid_action();
             };
             if action == "GetTransportInfo" {
                 vec![
@@ -517,7 +524,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap) -> Response {
                 position_info(transport, now)
             }
         }
-        _ => return soap_fault(401),
+        _ => return invalid_action(),
     };
     let mut body = String::new();
     for (name, value) in arguments {
@@ -573,12 +580,11 @@ fn upnp_time(duration: Duration) -> String {
     )
 }
 
-fn soap_fault(code: u16) -> Response {
+/// The answer to an action the fake doesn't serve: UPnP's 401, Invalid Action.
+fn invalid_action() -> Response {
     xml(
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!(
-            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>{code}</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#
-        ),
+        r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns="urn:schemas-upnp-org:control-1-0"><errorCode>401</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>"#.to_owned(),
     )
 }
 

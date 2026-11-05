@@ -387,10 +387,13 @@ pub fn item_facts(language: Language, item: &Item) -> Vec<(Text, String)> {
 /// What a Group's row says about its playback: its state, then its track's title and creator
 /// where known, such as "Playing · Moby Dick · Herman Melville".
 pub fn group_playback(language: Language, group: &Group) -> String {
-    let state = group.state.map_or(Text::GroupStateUnknown, Text::from);
-    let mut parts = vec![text(language, state)];
+    let state = text(
+        language,
+        group.state.map_or(Text::GroupStateUnknown, Text::from),
+    );
+    let mut parts = vec![state.as_str()];
     if let Some(track) = &group.now_playing {
-        parts.extend(track.title.iter().chain(&track.creator).cloned());
+        parts.extend(track.title.iter().chain(&track.creator).map(String::as_str));
     }
     parts.join(" · ")
 }

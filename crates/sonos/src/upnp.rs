@@ -54,7 +54,8 @@ struct Shared {
 
 #[derive(Debug)]
 struct Player {
-    base_url: String,
+    /// Where its UPnP services answer, as it announced.
+    addr: SocketAddr,
     /// When it last answered a search.
     seen: Instant,
 }
@@ -121,21 +122,22 @@ impl Shared {
     fn saw(&self, found: Vec<ssdp::Found>) {
         let now = self.clock.now();
         let mut players = self.players.lock().unwrap_or_else(PoisonError::into_inner);
-        let before: Vec<String> = players.keys().cloned().collect();
+        let known = players.len();
+        let mut added = 0;
         for player in found {
-            let base_url = player.base_url;
-            players.insert(
-                player.uuid,
-                Player {
-                    base_url,
-                    seen: now,
-                },
-            );
+            let addr = player.addr;
+            if players
+                .insert(player.uuid, Player { addr, seen: now })
+                .is_none()
+            {
+                added += 1;
+            }
         }
         players.retain(|_, player| now.duration_since(player.seen) < EXPIRY);
-        let after: Vec<&String> = players.keys().collect();
-        if after != before.iter().collect::<Vec<_>>() {
-            tracing::info!(players = ?after, "Sonos players changed");
+        // Found players were just seen, so only those not found can have been forgotten.
+        if added > 0 || players.len() < known + added {
+            let uuids: Vec<&String> = players.keys().collect();
+            tracing::info!(players = ?uuids, "Sonos players changed");
         }
     }
 
@@ -146,41 +148,45 @@ impl Shared {
             .subscribe()
             .wait_for(|searched| *searched)
             .await;
-        let players: Vec<String> = self
+        let players: BTreeMap<String, SocketAddr> = self
             .players
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .values()
-            .map(|player| player.base_url.clone())
+            .iter()
+            .map(|(uuid, player)| (uuid.clone(), player.addr))
             .collect();
         if players.is_empty() {
             return Ok(Vec::new());
         }
-        let topology = self.topology(&players).await?;
-        let mut groups = join_all(topology.iter().filter_map(|zone| {
-            let (group, coordinator) = visible(zone)?;
-            Some(self.with_playback(group, coordinator))
+        let topology = self.topology(players.values()).await?;
+        let mut groups = join_all(topology.iter().filter_map(visible).map(|group| {
+            // Only an address a player announced for itself: the topology's could point anywhere.
+            let coordinator = players.get(&group.id).copied();
+            self.with_playback(group, coordinator)
         }))
         .await;
         groups.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
         Ok(groups)
     }
 
-    /// The Group topology, from the first of `players` (base URLs) that tells it. Every player
-    /// knows the whole household's.
-    async fn topology(&self, players: &[String]) -> Result<Vec<ZoneGroup>, Error> {
-        for player in players {
+    /// The Group topology, from the first of `players` that tells it. Every player knows the
+    /// whole household's.
+    async fn topology(
+        &self,
+        players: impl Iterator<Item = &SocketAddr>,
+    ) -> Result<Vec<ZoneGroup>, Error> {
+        for &player in players {
             match self.zone_groups(player).await {
                 Ok(topology) => return Ok(topology),
                 Err(error) => {
-                    tracing::warn!(player, %error, "cannot read the Group topology");
+                    tracing::warn!(%player, %error, "cannot read the Group topology");
                 }
             }
         }
         Err(Error::Unreachable)
     }
 
-    async fn zone_groups(&self, player: &str) -> Result<Vec<ZoneGroup>, CallError> {
+    async fn zone_groups(&self, player: SocketAddr) -> Result<Vec<ZoneGroup>, CallError> {
         let answer = soap::call(
             &self.http,
             player,
@@ -193,26 +199,26 @@ impl Shared {
         Ok(xml::zone_groups(state)?)
     }
 
-    /// `group` with its transport state and track, as its coordinator (at base URL
-    /// `coordinator`, if known) tells them.
-    async fn with_playback(&self, mut group: Group, coordinator: Option<String>) -> Group {
+    /// `group` with its transport state and track, as its coordinator (at `coordinator`, if
+    /// found by a search) tells them.
+    async fn with_playback(&self, mut group: Group, coordinator: Option<SocketAddr>) -> Group {
         let Some(coordinator) = coordinator else {
             tracing::warn!(
                 group = group.id,
-                "a Group's coordinator has no usable address"
+                "a Group's coordinator did not answer the last searches"
             );
             return group;
         };
         let (transport, position) = tokio::join!(
             soap::call(
                 &self.http,
-                &coordinator,
+                coordinator,
                 Service::AvTransport,
                 "GetTransportInfo"
             ),
             soap::call(
                 &self.http,
-                &coordinator,
+                coordinator,
                 Service::AvTransport,
                 "GetPositionInfo"
             ),
@@ -234,47 +240,38 @@ impl Shared {
     }
 }
 
-/// The Group the Sonos app shows for `zone`, without its playback, and its coordinator's base
-/// URL; none if no member is visible.
-fn visible(zone: &ZoneGroup) -> Option<(Group, Option<String>)> {
-    let coordinator = zone
+/// The Group the Sonos app shows for `zone`, without its playback; none if no member is
+/// visible.
+fn visible(zone: &ZoneGroup) -> Option<Group> {
+    let mut members: Vec<Member> = zone
         .members
         .iter()
-        .find(|member| member.uuid == zone.coordinator);
-    let shown = zone.members.iter().filter(|member| member.visible);
-    let members: Vec<Member> = shown
-        .clone()
-        .filter(|member| member.uuid == zone.coordinator)
-        .chain(shown.filter(|member| member.uuid != zone.coordinator))
+        .filter(|member| member.visible)
         .map(|member| Member {
             id: member.uuid.clone(),
             name: member.name.clone(),
         })
         .collect();
-    let name = coordinator
+    if members.is_empty() {
+        return None;
+    }
+    // Stable: the coordinator first, the others in the topology's order.
+    members.sort_by_key(|member| member.id != zone.coordinator);
+    // Bonded speakers share their room's name, so an invisible coordinator still names it.
+    let name = zone
+        .members
+        .iter()
+        .find(|member| member.uuid == zone.coordinator)
         .map(|coordinator| coordinator.name.clone())
         .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| {
-            members
-                .first()
-                .map(|first| first.name.clone())
-                .unwrap_or_default()
-        });
-    let group = Group {
+        .unwrap_or_else(|| members[0].name.clone());
+    Some(Group {
         id: zone.coordinator.clone(),
         name,
         members,
         state: None,
         track: None,
-    };
-    if group.members.is_empty() {
-        return None;
-    }
-    let base_url = coordinator
-        .and_then(|coordinator| coordinator.location.as_deref())
-        .and_then(ssdp::base_url)
-        .map(|(_, base_url)| base_url);
-    Some((group, base_url))
+    })
 }
 
 /// The loaded track in a `GetPositionInfo` answer; none without a `TrackURI`.

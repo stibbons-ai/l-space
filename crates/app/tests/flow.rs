@@ -20,7 +20,6 @@ use api::{
 use app::flow::{App, Notice, Screen};
 use app::i18n::{self, Language, LanguageChoice, Text};
 use app::storage::{DeviceStore, FileStore, LoadError, Stored};
-use clock::ManualClock;
 use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 use tempfile::TempDir;
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_PUBLISHED_AT};
@@ -176,12 +175,6 @@ fn bridge_with_abs() -> (TestBridge, Arc<Audiobookshelf>, String) {
     let unreachable = format!("http://{}", closed_port());
     let bridge = TestBridge::start(&home_config(&abs, &unreachable));
     (bridge, abs, unreachable)
-}
-
-/// A Sonos household on a manual clock.
-fn new_household() -> (Household, ManualClock) {
-    let clock = ManualClock::new();
-    (Household::start(Arc::new(clock.clone())), clock)
 }
 
 /// A Bridge with the shared Audiobookshelf as its Library Server "Home", searching `household`
@@ -1529,7 +1522,7 @@ fn a_filter_that_fails_keeps_the_episodes_shown() {
 
 #[test]
 fn the_groups_screen_shows_each_group_and_what_it_plays() {
-    let (household, clock) = new_household();
+    let (household, clock) = Household::with_manual_clock();
     let kitchen = household.add_player("Kitchen");
     let bath = household.add_player("Bath");
     household.join(&bath, &kitchen);
@@ -1631,7 +1624,7 @@ fn the_groups_screen_shows_each_group_and_what_it_plays() {
 
 #[test]
 fn the_groups_screen_is_empty_without_sonos_players() {
-    let (household, _) = new_household();
+    let (household, _) = Household::with_manual_clock();
     let (bridge, abs) = bridge_with_household(&household);
     let device = Device::new();
     run(async || {
@@ -1651,7 +1644,7 @@ fn the_groups_screen_is_empty_without_sonos_players() {
 
 #[test]
 fn groups_that_cannot_be_listed_are_explained_and_listed_on_refresh() {
-    let (household, _) = new_household();
+    let (household, _) = Household::with_manual_clock();
     let kitchen = household.add_player("Kitchen");
     household.set_fault(&kitchen, Fault::Garbage);
     let (bridge, abs) = bridge_with_household(&household);
@@ -1683,7 +1676,7 @@ fn groups_that_cannot_be_listed_are_explained_and_listed_on_refresh() {
 
 #[test]
 fn a_session_ended_elsewhere_leads_from_the_groups_to_login() {
-    let (household, _) = new_household();
+    let (household, _) = Household::with_manual_clock();
     household.add_player("Kitchen");
     let (bridge, abs) = bridge_with_household(&household);
     let device = Device::new();

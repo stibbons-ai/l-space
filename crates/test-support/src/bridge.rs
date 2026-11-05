@@ -38,6 +38,7 @@
 //! The Bridge's output is echoed to the test's output, so a failing test shows the Bridge's logs.
 
 use std::io::{BufRead, BufReader, Read};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -61,9 +62,9 @@ pub const LISTEN: &str = "listen = \"127.0.0.1:0\"\n";
 /// A database file in the Bridge's working directory.
 pub const DATABASE: &str = "database = \"bridge.db\"\n";
 
-/// Points the Bridge's Sonos discovery at a loopback port nothing answers on, so a test's Bridge
-/// never searches the LAN it runs on.
-pub const NO_SONOS: &str = "[sonos]\ndiscovery_address = \"127.0.0.1:9\"\n";
+/// Where a test's Bridge searches for Sonos players unless the test configures `[sonos]`: a
+/// loopback port nothing answers on, so it never searches the LAN it runs on.
+pub const NO_SONOS: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9));
 
 /// The `RUST_LOG` the harness sets unless a test asks for another, so the developer's own
 /// setting cannot hide the events the harness waits for.
@@ -226,9 +227,9 @@ impl TestBridge {
 /// unless `config` has a `[sonos]` section.
 fn complete(config: &str) -> String {
     let sonos = if config.contains("[sonos]") {
-        ""
+        String::new()
     } else {
-        NO_SONOS
+        sonos_toml(NO_SONOS)
     };
     format!("{LISTEN}{DATABASE}{config}{sonos}")
 }
@@ -300,13 +301,17 @@ pub fn named_library_server_toml(url: &str, name: &str) -> String {
 
 /// The configuration section pointing the Bridge's Sonos discovery at `ssdp`, such as a
 /// `sonos_fake::Household`'s address.
-pub fn sonos_toml(ssdp: std::net::SocketAddr) -> String {
+pub fn sonos_toml(ssdp: SocketAddr) -> String {
     format!("[sonos]\ndiscovery_address = \"{ssdp}\"\n")
 }
 
 /// The rejection of a call without a usable session.
 pub const SESSION_INVALID: (StatusCode, ApiError) =
     (StatusCode::UNAUTHORIZED, ApiError::SessionInvalid);
+
+/// The rejection of a Groups listing no Sonos player answered.
+pub const SONOS_UNREACHABLE: (StatusCode, ApiError) =
+    (StatusCode::BAD_GATEWAY, ApiError::SonosUnreachable);
 
 /// The rejection of a session call whose API key the Library Server rejects.
 pub const KEY_REJECTED: (StatusCode, ApiError) =

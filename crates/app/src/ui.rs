@@ -456,22 +456,6 @@ fn GroupsScreen(
     let language = app.read().language();
     // Nothing listed because the listing failed, not because there is nothing.
     let failed = groups.is_empty() && matches!(notice, Some(Notice::Api(_)));
-    let rows: Vec<_> = groups
-        .iter()
-        .map(|group| {
-            let members: Vec<_> = group
-                .members
-                .iter()
-                .map(|member| member.name.as_str())
-                .collect();
-            (
-                group.id.clone(),
-                group.name.clone(),
-                members.join(", "),
-                i18n::group_playback(language, group),
-            )
-        })
-        .collect();
     rsx! {
         nav {
             NavButton {
@@ -491,15 +475,25 @@ fn GroupsScreen(
             p { {text(Text::GroupsNone)} }
         }
         ul { class: "groups",
-            for (id, name, members, playback) in rows {
-                li { key: "{id}",
-                    span { class: "title", "{name}" }
-                    span { class: "detail", "{members}" }
-                    span { class: "detail", "{playback}" }
+            for group in groups {
+                li { key: "{group.id}",
+                    span { class: "title", "{group.name}" }
+                    span { class: "detail", {member_names(&group)} }
+                    span { class: "detail", {i18n::group_playback(language, &group)} }
                 }
             }
         }
     }
+}
+
+/// A Group's members as its row lists them: "Kitchen, Bath".
+fn member_names(group: &Group) -> String {
+    let names: Vec<&str> = group
+        .members
+        .iter()
+        .map(|member| member.name.as_str())
+        .collect();
+    names.join(", ")
 }
 
 #[component]

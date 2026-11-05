@@ -25,8 +25,8 @@ const MAX_DATAGRAM: usize = 2048;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Found {
     pub uuid: String,
-    /// `http://<address>:<port>`, where its UPnP services answer.
-    pub base_url: String,
+    /// Where its UPnP services answer.
+    pub addr: SocketAddr,
 }
 
 /// Sends one M-SEARCH to `target` and collects the players that answer within `window`,
@@ -79,12 +79,13 @@ fn answer(datagram: &str, from: SocketAddr) -> Option<Found> {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        let value = value.trim();
-        match name.trim().to_ascii_uppercase().as_str() {
-            "ST" => search_target = Some(value),
-            "USN" => usn = Some(value),
-            "LOCATION" => location = Some(value),
-            _ => {}
+        let (name, value) = (name.trim(), value.trim());
+        if name.eq_ignore_ascii_case("ST") {
+            search_target = Some(value);
+        } else if name.eq_ignore_ascii_case("USN") {
+            usn = Some(value);
+        } else if name.eq_ignore_ascii_case("LOCATION") {
+            location = Some(value);
         }
     }
     if search_target? != ZONE_PLAYER {
@@ -94,19 +95,19 @@ fn answer(datagram: &str, from: SocketAddr) -> Option<Found> {
     if uuid.is_empty() {
         return None;
     }
-    let (host, base_url) = base_url(location?)?;
-    if host != from.ip() {
+    let addr = services_at(location?)?;
+    if addr.ip() != from.ip() {
         return None;
     }
     Some(Found {
         uuid: uuid.to_owned(),
-        base_url,
+        addr,
     })
 }
 
-/// The IP address of a player's device description URL (`location`) and the base URL of its
-/// services there, `http://<ip>:<port>`; none unless it is `http` to an IP address.
-pub(crate) fn base_url(location: &str) -> Option<(IpAddr, String)> {
+/// Where the services of the player with device description URL `location` answer; none
+/// unless it is `http` to an IP address.
+fn services_at(location: &str) -> Option<SocketAddr> {
     let location = Url::parse(location).ok()?;
     let host: IpAddr = match location.host()? {
         url::Host::Ipv4(ip) => ip.into(),
@@ -116,8 +117,7 @@ pub(crate) fn base_url(location: &str) -> Option<(IpAddr, String)> {
     if location.scheme() != "http" {
         return None;
     }
-    let port = location.port_or_known_default()?;
-    Some((host, format!("http://{}", SocketAddr::new(host, port))))
+    Some(SocketAddr::new(host, location.port_or_known_default()?))
 }
 
 #[cfg(test)]
@@ -147,7 +147,7 @@ mod tests {
             found,
             Some(Found {
                 uuid: "RINCON_48A6B8000001400".into(),
-                base_url: "http://192.168.1.23:1400".into(),
+                addr: "192.168.1.23:1400".parse().unwrap(),
             })
         );
         // Header names in any case.
@@ -156,7 +156,7 @@ mod tests {
             read(lower),
             Some(Found {
                 uuid: "RINCON_A".into(),
-                base_url: "http://192.168.1.23:80".into(),
+                addr: "192.168.1.23:80".parse().unwrap(),
             })
         );
     }

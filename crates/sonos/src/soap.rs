@@ -2,6 +2,8 @@
 //! to [`MAX_BODY`] bytes and parsed for the action's output arguments. Only argument-less
 //! read actions (plus AVTransport's instance id) are sent.
 
+use std::net::SocketAddr;
+
 use reqwest::Client;
 use reqwest::header::CONTENT_TYPE;
 
@@ -68,14 +70,14 @@ impl From<reqwest::Error> for CallError {
     }
 }
 
-/// Calls `action` on `service` of the player at `base_url` and returns its output arguments.
+/// Calls `action` on `service` of the player at `player` and returns its output arguments.
 pub(crate) async fn call(
     http: &Client,
-    base_url: &str,
+    player: SocketAddr,
     service: Service,
     action: &str,
 ) -> Result<Vec<(String, String)>, CallError> {
-    let url = format!("{base_url}{}", service.path());
+    let url = format!("http://{player}{}", service.path());
     let (urn, arguments) = (service.urn(), service.arguments());
     let body = format!(
         r#"<?xml version="1.0" encoding="utf-8"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:{action} xmlns:u="{urn}">{arguments}</u:{action}></s:Body></s:Envelope>"#

@@ -49,22 +49,19 @@ impl Clock for SystemClock {
 /// is then due. Clones share one time.
 #[derive(Debug, Clone)]
 pub struct ManualClock {
-    start: Instant,
-    /// How far the clock has been advanced since `start`.
-    elapsed: Arc<watch::Sender<Duration>>,
+    now: Arc<watch::Sender<Instant>>,
 }
 
 impl ManualClock {
     pub fn new() -> Self {
         Self {
-            start: Instant::now(),
-            elapsed: Arc::new(watch::Sender::new(Duration::ZERO)),
+            now: Arc::new(watch::Sender::new(Instant::now())),
         }
     }
 
     /// Moves time forward by `duration`.
     pub fn advance(&self, duration: Duration) {
-        self.elapsed.send_modify(|elapsed| *elapsed += duration);
+        self.now.send_modify(|now| *now += duration);
     }
 }
 
@@ -76,18 +73,13 @@ impl Default for ManualClock {
 
 impl Clock for ManualClock {
     fn now(&self) -> Instant {
-        self.start + *self.elapsed.borrow()
+        *self.now.borrow()
     }
 
     fn sleep_until(&self, deadline: Instant) -> Sleep {
-        let start = self.start;
-        let mut elapsed = self.elapsed.subscribe();
+        let mut now = self.now.subscribe();
         Box::pin(async move {
-            if elapsed
-                .wait_for(|elapsed| start + *elapsed >= deadline)
-                .await
-                .is_err()
-            {
+            if now.wait_for(|now| *now >= deadline).await.is_err() {
                 // Every handle to the clock is gone, so its time never moves again.
                 std::future::pending::<()>().await;
             }

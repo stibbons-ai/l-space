@@ -36,10 +36,11 @@ fn parse(text: &str) -> Result<Document<'_>, Malformed> {
 /// and text. A SOAP fault (or anything else) has no such element.
 pub(crate) fn soap_response(body: &str, action: &str) -> Result<Vec<(String, String)>, Malformed> {
     let document = parse(body)?;
-    let name = format!("{action}Response");
     let response = document
         .descendants()
-        .find(|node| node.is_element() && node.tag_name().name() == name)
+        .find(|node| {
+            node.is_element() && node.tag_name().name().strip_suffix("Response") == Some(action)
+        })
         .ok_or(Malformed::Missing("action response"))?;
     Ok(response
         .children()
@@ -65,8 +66,6 @@ pub(crate) struct ZoneGroup {
 pub(crate) struct ZoneMember {
     pub uuid: String,
     pub name: String,
-    /// Its device description URL.
-    pub location: Option<String>,
     /// Shown in the Sonos app as (part of) a room. Bonded surrounds and subs, the second
     /// speaker of a stereo pair (`Invisible="1"`) and Boosts and Bridges (`IsZoneBridge="1"`)
     /// are not.
@@ -110,7 +109,6 @@ fn zone_member(member: Node) -> Option<ZoneMember> {
             .unwrap_or_default()
             .trim()
             .to_owned(),
-        location: non_empty(member.attribute("Location")),
         visible: !flag("Invisible") && !flag("IsZoneBridge"),
     })
 }
@@ -180,7 +178,6 @@ mod tests {
         ZoneMember {
             uuid: uuid.into(),
             name: name.into(),
-            location: Some(format!("http://192.168.1.2:1400/{uuid}.xml")),
             visible,
         }
     }
@@ -237,12 +234,7 @@ mod tests {
             zone_groups(state).unwrap(),
             [ZoneGroup {
                 coordinator: "RINCON_A".into(),
-                members: vec![ZoneMember {
-                    uuid: "RINCON_A".into(),
-                    name: "Office".into(),
-                    location: None,
-                    visible: true,
-                }],
+                members: vec![member("RINCON_A", "Office", true)],
             }]
         );
     }
