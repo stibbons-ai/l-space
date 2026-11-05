@@ -180,7 +180,7 @@ fn LoginScreen(
                             option {
                                 key: "{server.base_url}",
                                 value: "{server.base_url}",
-                                {server.name.as_deref().unwrap_or(&server.base_url)}
+                                {server_label(&server)}
                             }
                         }
                     }
@@ -234,6 +234,11 @@ fn LoginScreen(
     }
 }
 
+/// How a Library Server is named: its display name, or its base URL without one.
+fn server_label(server: &LibraryServer) -> &str {
+    server.name.as_deref().unwrap_or(&server.base_url)
+}
+
 /// The Library Servers the person has a session on besides the selected one, each to switch
 /// to without a login; nothing without any.
 #[component]
@@ -242,13 +247,9 @@ fn SwitchList(app: Signal<App>, busy: Signal<bool>) -> Element {
         .read()
         .other_sessions()
         .map(|session| {
-            let server = &session.library_server;
             (
                 session.library_server_url().to_owned(),
-                server
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| server.base_url.clone()),
+                server_label(&session.library_server).to_owned(),
                 session.user.username.clone(),
             )
         })

@@ -19,7 +19,7 @@ use api::{
 };
 use app::flow::{App, Notice, Screen};
 use app::i18n::{self, Language, LanguageChoice, Text};
-use app::storage::{DeviceStore, FileStore, LoadError, Stored};
+use app::storage::{DeviceStore, FileStore, LoadError, Stored, StoredSession};
 use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 use tempfile::TempDir;
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_PUBLISHED_AT};
@@ -218,9 +218,13 @@ async fn logged_in_behind(
     app
 }
 
-/// The session the App holds, to check it with the Bridge.
+/// The selected session the App holds, to check it with the Bridge.
 fn session(app: &App) -> Session {
-    let stored = app.session().expect("logged in");
+    as_session(app.session().expect("logged in"))
+}
+
+/// `stored` as the Bridge's App API takes it.
+fn as_session(stored: &StoredSession) -> Session {
     Session {
         token: stored.token.clone(),
         user: stored.user.clone(),
@@ -1433,14 +1437,10 @@ fn switchable(app: &App) -> Vec<String> {
 /// The stored session on `library_server` other than the selected one, to check it with the
 /// Bridge.
 fn other_session(app: &App, library_server: &str) -> Session {
-    let stored = app
-        .other_sessions()
+    app.other_sessions()
         .find(|session| session.library_server_url() == library_server)
-        .expect("a session on that Library Server");
-    Session {
-        token: stored.token.clone(),
-        user: stored.user.clone(),
-    }
+        .map(as_session)
+        .expect("a session on that Library Server")
 }
 
 /// From Settings, logs in to `library_server` as `user`, keeping the sessions there are.

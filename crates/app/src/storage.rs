@@ -30,40 +30,37 @@ pub struct Stored {
 impl Stored {
     /// The session the App uses, if one is selected.
     pub fn session(&self) -> Option<&StoredSession> {
-        let selected = self.selected.as_deref()?;
-        self.sessions
-            .iter()
-            .find(|session| session.library_server_url() == selected)
+        let index = self.position(self.selected.as_deref()?)?;
+        Some(&self.sessions[index])
     }
 
-    /// Every session, the selected one among them.
-    pub fn sessions(&self) -> &[StoredSession] {
-        &self.sessions
+    /// The sessions other than the selected one, to switch to.
+    pub fn other_sessions(&self) -> impl Iterator<Item = &StoredSession> {
+        self.sessions
+            .iter()
+            .filter(|session| Some(session.library_server_url()) != self.selected.as_deref())
+    }
+
+    /// Whether any session is stored, selected or not.
+    pub fn has_sessions(&self) -> bool {
+        !self.sessions.is_empty()
     }
 
     /// Sets the account of the selected session; whether that changed it.
     pub fn update_user(&mut self, user: CurrentUser) -> bool {
-        let selected = self.selected.as_deref();
-        let session = self
-            .sessions
-            .iter_mut()
-            .find(|session| Some(session.library_server_url()) == selected);
-        match session {
-            Some(session) if session.user != user => {
-                session.user = user;
-                true
-            }
-            _ => false,
-        }
+        let Some(index) = self.selected.as_deref().and_then(|url| self.position(url)) else {
+            return false;
+        };
+        let session = &mut self.sessions[index];
+        let changed = session.user != user;
+        session.user = user;
+        changed
     }
 
     /// Selects the session on the Library Server with base URL `library_server`; returns it,
     /// or `None` (selecting nothing new) if there is none.
     pub fn select(&mut self, library_server: &str) -> Option<&StoredSession> {
-        let index = self
-            .sessions
-            .iter()
-            .position(|session| session.library_server_url() == library_server)?;
+        let index = self.position(library_server)?;
         self.selected = Some(library_server.to_owned());
         Some(&self.sessions[index])
     }
@@ -72,12 +69,8 @@ impl Stored {
     /// Library Server, if any.
     pub fn add(&mut self, session: StoredSession) -> Option<StoredSession> {
         let library_server = session.library_server_url().to_owned();
-        let replaced = match self
-            .sessions
-            .iter_mut()
-            .find(|stored| stored.library_server_url() == library_server)
-        {
-            Some(stored) => Some(std::mem::replace(stored, session)),
+        let replaced = match self.position(&library_server) {
+            Some(index) => Some(std::mem::replace(&mut self.sessions[index], session)),
             None => {
                 self.sessions.push(session);
                 None
@@ -85,6 +78,13 @@ impl Stored {
         };
         self.selected = Some(library_server);
         replaced
+    }
+
+    /// Where the session on the Library Server with base URL `library_server` is, if any.
+    fn position(&self, library_server: &str) -> Option<usize> {
+        self.sessions
+            .iter()
+            .position(|session| session.library_server_url() == library_server)
     }
 
     /// Forgets the selected session; the others stay, none selected.

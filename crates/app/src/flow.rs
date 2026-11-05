@@ -340,12 +340,11 @@ impl App {
                     library_server,
                     user,
                 });
-                if let Some(replaced) = replaced {
-                    authorize(Some(&replaced.token));
-                    self.end_session().await;
-                }
                 authorize(self.stored.session().map(|session| &session.token));
                 let notice = self.save();
+                if let Some(replaced) = replaced {
+                    self.end_session(&replaced.token).await;
+                }
                 self.show_libraries(notice).await;
             }
             Err(error) => self.set_notice(Notice::Api(error)),
@@ -355,10 +354,10 @@ impl App {
     /// Ends the selected session on the Bridge and forgets it on the device, also when the
     /// Bridge can't be reached. The other sessions stay; Login offers them.
     pub async fn log_out(&mut self) {
-        if self.stored.session().is_none() {
+        let Some(session) = self.stored.session() else {
             return;
-        }
-        self.end_session().await;
+        };
+        self.end_session(&session.token).await;
         let not_saved = self.forget_session();
         self.show_login(None).await;
         match not_saved {
@@ -661,7 +660,7 @@ impl App {
     /// Whether the Bridge address may change: only while no session is stored, as a session
     /// belongs to its Bridge.
     pub fn can_change_bridge_url(&self) -> bool {
-        self.stored.sessions().is_empty()
+        !self.stored.has_sessions()
     }
 
     /// The selected session: its Library Server and account.
@@ -671,11 +670,7 @@ impl App {
 
     /// The sessions other than the selected one, to switch to.
     pub fn other_sessions(&self) -> impl Iterator<Item = &StoredSession> {
-        let selected = self.session().map(StoredSession::library_server_url);
-        self.stored
-            .sessions()
-            .iter()
-            .filter(move |session| Some(session.library_server_url()) != selected)
+        self.stored.other_sessions()
     }
 
     pub fn language_choice(&self) -> LanguageChoice {
@@ -745,9 +740,10 @@ impl App {
         self.save()
     }
 
-    /// Ends the session whose token the calls send now on the Bridge, as far as it can: the
-    /// device forgets it anyway.
-    async fn end_session(&self) {
+    /// Ends the session with `token` on the Bridge, as far as it can: the device forgets it
+    /// anyway. Later calls send the selected session's token again.
+    async fn end_session(&self, token: &SessionToken) {
+        authorize(Some(token));
         match self.call(api::logout()).await {
             Ok(()) => {}
             Err(error @ (ApiError::BridgeUnreachable | ApiError::SessionInvalid)) => {
@@ -757,6 +753,7 @@ impl App {
                 tracing::warn!(%error, "the Bridge did not end the session; forgetting it anyway");
             }
         }
+        authorize(self.stored.session().map(|session| &session.token));
     }
 
     /// Saves what the App remembers. Returns a notice if that failed.
