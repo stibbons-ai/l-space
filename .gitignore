@@ -11,3 +11,6 @@ entities.json
 
 # Cargo build output
 /target/
+
+# The Bridge's encryption key, as the README's run snippet creates it
+/bridge_encryption_key

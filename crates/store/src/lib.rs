@@ -27,8 +27,7 @@ pub struct LibraryUser {
 }
 
 /// Identifies an App session: the SHA-256 of its token. The token itself is never stored, so
-/// whoever reads the store cannot use the sessions in it (it still holds the API keys in plain
-/// text).
+/// whoever reads the store cannot use the sessions in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionId([u8; 32]);
 
@@ -56,6 +55,8 @@ pub struct Session {
 pub struct Error(Box<dyn std::error::Error + Send + Sync>);
 
 impl Error {
+    /// Wraps `source`. The wrapped error and its sources are logged; they must not carry
+    /// secrets or row data.
     pub fn new(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
         Self(source.into())
     }
@@ -73,7 +74,9 @@ pub trait Store: Send + Sync + 'static {
         api_key: &ApiKey,
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
-    /// The open session `id`, if any.
+    /// The open session `id`, if any. A session whose stored key can no longer be read (an
+    /// implementation that encrypts keys runs with another encryption key, or the stored key
+    /// was tampered with) is not open: the implementation ends it, and its user logs in again.
     ///
     /// Whoever acts with the session's key must check that Audiobookshelf still reports the
     /// session's user for it: an admin can move a key to another user.

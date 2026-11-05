@@ -3,6 +3,7 @@
 //! Audiobookshelf in a container. The harness is the `test-support` crate; add new areas as
 //! modules here so they share one binary.
 
+mod encryption;
 mod forwarder;
 mod library_servers;
 mod logging;

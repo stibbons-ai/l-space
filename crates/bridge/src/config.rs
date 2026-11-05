@@ -145,7 +145,8 @@ impl std::str::FromStr for Config {
 /// sequence`), so everything from its first to its last double quote becomes `REDACTED`.
 /// Non-string values and key names stay.
 fn parse_error(text: &str, error: &toml::de::Error) -> ConfigError {
-    let missing_field = error.message().starts_with("missing field");
+    let message = error.message();
+    let missing_field = message.starts_with("missing field");
     let position = error
         .span()
         .filter(|span| !(missing_field && *span == (0..0)))
@@ -159,7 +160,6 @@ fn parse_error(text: &str, error: &toml::de::Error) -> ConfigError {
                 + 1;
             (before.matches('\n').count() + 1, column)
         });
-    let message = error.message();
     let message = match (message.find('"'), message.rfind('"')) {
         (Some(open), Some(close)) if open < close => {
             format!("{}\"REDACTED\"{}", &message[..open], &message[close + 1..])

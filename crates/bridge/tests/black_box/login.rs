@@ -3,13 +3,14 @@
 
 use std::sync::Arc;
 
-use api::{ApiError, CurrentUser};
+use api::ApiError;
 use reqwest::StatusCode;
 use serde_json::json;
 
-use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
+use test_support::audiobookshelf::Audiobookshelf;
 use test_support::bridge::{
-    TestBridge, library_server_toml, named_library_server_toml, output_contains,
+    SESSION_INVALID, TestBridge, acting_as, acting_on, library_server_toml,
+    named_library_server_toml, output_contains,
 };
 use test_support::closed_port;
 
@@ -27,20 +28,6 @@ fn bridge_with_abs() -> (TestBridge, Arc<Audiobookshelf>) {
     (bridge, abs)
 }
 
-fn acting_as(abs: &Audiobookshelf, user: &AbsUser) -> CurrentUser {
-    acting_on(abs.base_url(), user)
-}
-
-fn acting_on(library_server: &str, user: &AbsUser) -> CurrentUser {
-    CurrentUser {
-        library_server: library_server.to_owned(),
-        user_id: user.id.clone(),
-        username: user.username.clone(),
-    }
-}
-
-const SESSION_INVALID: (StatusCode, ApiError) =
-    (StatusCode::UNAUTHORIZED, ApiError::SessionInvalid);
 const KEY_REJECTED: (StatusCode, ApiError) = (StatusCode::UNAUTHORIZED, ApiError::ApiKeyRejected);
 
 #[tokio::test]
