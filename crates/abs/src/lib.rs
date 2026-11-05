@@ -459,16 +459,21 @@ impl Client {
         })
     }
 
-    /// Marks the audiobook `library_item_id`, or its episode `episode_id` (a podcast's),
-    /// Finished (`finished`) or unfinished for the user `api_key` acts for:
+    /// Marks the book `library_item_id`, or the episode `episode_id` of the podcast
+    /// `library_item_id`, Finished (`finished`) or unfinished for the user `api_key` acts for:
     /// `PATCH /api/me/progress/<library item>[/<episode>]` with `{"isFinished": finished}`.
     ///
     /// As Audiobookshelf 2.37.2 does it (`User.createUpdateMediaProgressFromPayload`,
     /// `MediaProgress.applyProgressUpdate`): the user gets Progress at 0 seconds if they had
-    /// none; marking a Finished one unfinished also sets its position back to 0. It checks
-    /// neither that the user may see the library item nor that the episode belongs to it: a
-    /// caller must, before. An unknown audiobook or episode is [`Error::NotFound`]; a library
-    /// item that is no audiobook (without an episode) is [`Error::Unavailable`] (HTTP 400).
+    /// none; marking a Finished one unfinished also sets its position back to 0. An unknown
+    /// book or episode is [`Error::NotFound`]; a podcast without an episode is
+    /// [`Error::Unavailable`] (HTTP 400), while a book without audio (an ebook alone) is
+    /// accepted.
+    ///
+    /// Callers must check first that the user may see the Item: Audiobookshelf checks neither
+    /// that the user may see the library item nor that the episode belongs to it (it finds an
+    /// episode by its id alone), and the ids `batch` and `update` reach its batch route
+    /// (`/api/me/progress/batch/update`) instead.
     pub async fn set_finished(
         &self,
         base_url: &str,

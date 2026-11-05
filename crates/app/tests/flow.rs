@@ -2016,6 +2016,32 @@ fn marking_an_episode_shows_on_the_item_and_in_the_episodes_under_each_filter() 
             &listed_now(EpisodeFilter::Finished).await
         );
         assert_eq!(shown_titles(&app), ["Episode 3", "Episode 1"]);
+
+        // An older episode goes back between a newer and an older one: Finished...
+        app.open_episode(&seeded.episodes[1]).await;
+        app.mark_finished(true).await;
+        app.go_back();
+        assert_eq!(
+            shown_podcast(&app),
+            &listed_now(EpisodeFilter::Finished).await
+        );
+        assert_eq!(shown_titles(&app), ["Episode 3", "Episode 2", "Episode 1"]);
+
+        // ...and Unfinished.
+        for episode in [&seeded.episodes[0], &seeded.episodes[2]] {
+            abs.set_progress(&user, &seeded.podcast, Some(episode), 0.0, false)
+                .await;
+        }
+        app.filter_episodes(EpisodeFilter::Unfinished).await;
+        assert_eq!(shown_titles(&app), ["Episode 3", "Episode 1"]);
+        app.open_episode(&seeded.episodes[1]).await;
+        app.mark_finished(false).await;
+        app.go_back();
+        assert_eq!(
+            shown_podcast(&app),
+            &listed_now(EpisodeFilter::Unfinished).await
+        );
+        assert_eq!(shown_titles(&app), ["Episode 3", "Episode 2", "Episode 1"]);
     });
 }
 
@@ -2061,8 +2087,8 @@ fn marking_an_audiobook_finished_and_unfinished_shows_on_its_item_screen() {
     });
 }
 
-/// A mark the Library Server doesn't take leaves the Item screen as it was, saying why, and
-/// nothing changes there; the episodes to go back to stay as listed.
+/// A mark the Library Server doesn't take leaves the Item screen as the Library Server holds
+/// it, saying why; the episodes to go back to stay as listed.
 #[test]
 fn a_mark_that_fails_keeps_the_item_shown_and_says_why() {
     let (bridge, abs, proxy, failing) = bridge_behind_proxy();
@@ -2104,6 +2130,75 @@ fn a_mark_that_fails_keeps_the_item_shown_and_says_why() {
                 notice: None
             }
         );
+    });
+}
+
+/// A mark the Library Server takes, whose answer is then lost (reading the Progress back
+/// fails): the screen says why, and shows the Item and the podcast's episodes as the Library
+/// Server now holds them, the write included.
+#[test]
+fn a_mark_that_lands_but_fails_to_answer_shows_what_the_library_server_holds() {
+    let abs = Audiobookshelf::shared();
+    // Fails the first `GET /api/me` once a `PATCH` has gone through: the Bridge's readback.
+    let (patched, read_back) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (proxy, _) = proxy(abs.address(), {
+        let (patched, read_back) = (Arc::clone(&patched), Arc::clone(&read_back));
+        move |_, request| {
+            if request.starts_with(b"PATCH /api/me/progress/") {
+                patched.store(true, Ordering::SeqCst);
+                return false;
+            }
+            request.starts_with(b"GET /api/me ")
+                && patched.load(Ordering::SeqCst)
+                && !read_back.swap(true, Ordering::SeqCst)
+        }
+    });
+    let bridge = TestBridge::start(&named_library_server_toml(&proxy, "Home"));
+    let device = Device::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        let mut app = logged_in_behind(&device, &bridge, &proxy, &user).await;
+        let session = session(&app);
+        app.open_library(podcasts(&abs)).await;
+        app.open_entry(&seeded.podcast).await;
+        app.open_episode(&seeded.episodes[1]).await;
+
+        app.mark_finished(true).await;
+
+        assert!(
+            read_back.load(Ordering::SeqCst),
+            "the readback did not fail"
+        );
+        assert_eq!(
+            abs.progress(&user, &seeded.podcast, Some(&seeded.episodes[1]))
+                .await,
+            Some((0.0, true))
+        );
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::LibraryServerUnreachable))
+        );
+        assert_eq!(
+            shown_item(&app).progress,
+            Some(Progress {
+                current_time: 0.0,
+                finished: true
+            })
+        );
+        app.go_back();
+        assert_eq!(
+            shown_podcast(&app),
+            &bridge
+                .api()
+                .podcast(&session, &seeded.podcast, EpisodeFilter::Unfinished)
+                .await
+        );
+        assert_eq!(shown_titles(&app), ["Episode 3", "Episode 1"]);
+        assert!(app.session().is_some());
     });
 }
 

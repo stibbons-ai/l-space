@@ -1,8 +1,6 @@
 //! What the App sees of a Library Server while browsing: Audiobookshelf's answers, shaped
 //! into the App API's types for the session's user.
 
-use std::collections::HashMap;
-
 use api::{
     AudioFile, Chapter, Episode, EpisodeFilter, Item, ItemId, Library, LibraryEntry, LibraryKind,
     Podcast, Progress,
@@ -44,12 +42,11 @@ pub fn podcast(
     let abs::Media::Podcast(media) = item.media else {
         return Err(Missing::NotAPodcast);
     };
-    let progress_of = ProgressIndex::of(user);
     let mut episodes: Vec<_> = media
         .episodes
         .into_iter()
         .map(|episode| Episode {
-            progress: progress_of.episode(&episode.id),
+            progress: progress_in(user, &item.id, Some(&episode.id)),
             duration: episode_duration(&episode),
             id: episode.id,
             title: episode.title,
@@ -99,18 +96,22 @@ pub fn item(user: &abs::User, library_item: abs::LibraryItem, id: ItemId) -> Res
     })
 }
 
-/// `user`'s Progress in Item `id`; none if they have none. An episode is found by its own id
-/// alone: Audiobookshelf ids are unique, and it may record episode Progress without the
-/// podcast. Should it hold several entries for one Item, the first counts.
+/// `user`'s Progress in Item `id`; none if they have none.
 pub fn item_progress(user: &abs::User, id: &ItemId) -> Option<Progress> {
+    progress_in(user, &id.library_item, id.episode.as_deref())
+}
+
+/// `user`'s Progress in audiobook `library_item`, or in its episode `episode`. An episode is
+/// found by its own id alone: Audiobookshelf ids are unique, and it may record episode Progress
+/// without the podcast. Should it hold several entries for one, the first counts.
+fn progress_in(user: &abs::User, library_item: &str, episode: Option<&str>) -> Option<Progress> {
     user.media_progress
         .entries
         .iter()
-        .find(|entry| match &id.episode {
-            Some(episode) => entry.episode_id.as_ref() == Some(episode),
+        .find(|entry| match episode {
+            Some(episode) => entry.episode_id.as_deref() == Some(episode),
             None => {
-                entry.episode_id.is_none()
-                    && entry.library_item_id.as_ref() == Some(&id.library_item)
+                entry.episode_id.is_none() && entry.library_item_id.as_deref() == Some(library_item)
             }
         })
         .map(progress)
@@ -195,28 +196,6 @@ fn book_duration(tracks: &[abs::Track], duration: Option<f64>) -> Option<f64> {
         return duration;
     }
     tracks.iter().map(|track| track.duration).sum()
-}
-
-/// A user's Progress by episode, to look up many. An episode is found by its own id alone (see
-/// [`item_progress`]).
-struct ProgressIndex<'a> {
-    episodes: HashMap<&'a str, &'a abs::MediaProgress>,
-}
-
-impl<'a> ProgressIndex<'a> {
-    fn of(user: &'a abs::User) -> Self {
-        let mut episodes = HashMap::new();
-        for entry in &user.media_progress.entries {
-            if let Some(episode) = &entry.episode_id {
-                episodes.entry(episode.as_str()).or_insert(entry);
-            }
-        }
-        Self { episodes }
-    }
-
-    fn episode(&self, id: &str) -> Option<Progress> {
-        self.episodes.get(id).map(|entry| progress(entry))
-    }
 }
 
 fn progress(progress: &abs::MediaProgress) -> Progress {

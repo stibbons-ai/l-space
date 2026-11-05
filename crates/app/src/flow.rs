@@ -480,16 +480,16 @@ impl App {
 
     /// On the Item screen, marks its Item Finished (`finished`) or unfinished on the Library
     /// Server, and shows the Item as the Bridge then answers; the podcast screen to go back to
-    /// lists the episode by its new state. On failure the screen keeps what it showed and says
-    /// why.
+    /// lists the episode by its new state. On a failure that leaves the session, the write may
+    /// still have happened (the answer was lost, or reading it back failed): the Item and its
+    /// podcast's episodes are read afresh from the Library Server, and the screen says why;
+    /// what can't be read again stays as shown.
     pub async fn mark_finished(&mut self, finished: bool) {
         let Screen::Item { item, .. } = &self.screen else {
             return;
         };
-        match self
-            .call(api::mark_finished(item.id.clone(), finished))
-            .await
-        {
+        let id = item.id.clone();
+        match self.call(api::mark_finished(id.clone(), finished)).await {
             Ok(item) => {
                 for screen in &mut self.back {
                     if let Screen::Podcast { podcast, .. } = screen {
@@ -498,7 +498,41 @@ impl App {
                 }
                 self.screen = Screen::Item { item, notice: None };
             }
-            Err(error) => self.failed(error).await,
+            Err(error) => {
+                if let Some(error) = self.session_call_failed(error).await {
+                    self.reread(&id).await;
+                    self.set_notice(Notice::Api(error));
+                }
+            }
+        }
+    }
+
+    /// Shows Item `id` (on its screen) and its podcast's episodes (on the screens to go back
+    /// to) as the Library Server holds them now; any that can't be read again stay as shown.
+    async fn reread(&mut self, id: &ItemId) {
+        if let Ok(item) = self
+            .call(api::item(id.library_item.clone(), id.episode.clone()))
+            .await
+            && matches!(&self.screen, Screen::Item { item: shown, .. } if shown.id == item.id)
+        {
+            self.screen = Screen::Item { item, notice: None };
+        }
+        if id.episode.is_none() {
+            return;
+        }
+        for at in 0..self.back.len() {
+            let Screen::Podcast { podcast, .. } = &self.back[at] else {
+                continue;
+            };
+            if podcast.id != id.library_item {
+                continue;
+            }
+            let call = api::podcast(podcast.id.clone(), Some(podcast.filter));
+            if let Ok(listed) = self.call(call).await
+                && let Screen::Podcast { podcast, .. } = &mut self.back[at]
+            {
+                *podcast = listed;
+            }
         }
     }
 
@@ -836,33 +870,28 @@ impl App {
 }
 
 /// Lists episode `item` on `podcast` (if it is one of its episodes) as the podcast's filter
-/// picks it by the Item's Progress: with that Progress where it was listed, at its place by date
-/// if it newly passes, or left out.
+/// picks it by the Item's Progress: in its place where it was listed, at its place by date if
+/// it newly passes, or left out. Among episodes with the same publish date (or none) a newly
+/// listed one goes last, where the Bridge keeps the Library Server's order; cosmetic, and
+/// listing the episodes afresh restores the Bridge's order.
 fn relist_episode(podcast: &mut Podcast, item: &Item) {
-    let Some(episode_id) = &item.id.episode else {
+    let Some(episode) = Episode::of(item) else {
         return;
     };
     if podcast.id != item.id.library_item {
         return;
     }
-    let passes = podcast.filter.passes(item.progress.as_ref());
+    let passes = podcast.filter.passes(episode.progress.as_ref());
     let listed = podcast
         .episodes
         .iter()
-        .position(|episode| &episode.id == episode_id);
+        .position(|listed| listed.id == episode.id);
     match (listed, passes) {
-        (Some(at), true) => podcast.episodes[at].progress.clone_from(&item.progress),
+        (Some(at), true) => podcast.episodes[at] = episode,
         (Some(at), false) => {
             podcast.episodes.remove(at);
         }
         (None, true) => {
-            let episode = Episode {
-                id: episode_id.clone(),
-                title: item.title.clone(),
-                duration: item.duration,
-                published_at: item.published_at,
-                progress: item.progress.clone(),
-            };
             let at = podcast
                 .episodes
                 .partition_point(|listed| listed.order() <= episode.order());

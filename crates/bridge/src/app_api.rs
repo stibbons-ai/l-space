@@ -229,23 +229,24 @@ impl<S: Store> AppApi<S> {
     }
 
     async fn item(&self, token: SessionToken, id: ItemId) -> Result<Item, ApiError> {
-        Ok(self.found_item(token, id, "fetch an Item").await?.fetched)
+        let library_item_id = id.library_item.clone();
+        let request = Request {
+            operation: "fetch an Item",
+            id: Some(&library_item_id),
+        };
+        Ok(self.found_item(token, id, request).await?.fetched)
     }
 
-    /// The Item `id` from the session's Library Server as its user (the `operation` named in
-    /// log events), with what [`AppApi::browse`] fetched it for; not found unless the library
+    /// The Item `id` on the session's Library Server, with the session's user and their
+    /// Progress in it, for `request` (`id` names the library item); not found unless a library
     /// item the user can see holds it.
     async fn found_item(
         &self,
         token: SessionToken,
         id: ItemId,
-        operation: &'static str,
+        request: Request<'_>,
     ) -> Result<Browsed<'_, Item>, ApiError> {
-        let (library_item_id, episode) = (id.library_item.clone(), id.episode.clone());
-        let request = Request {
-            operation,
-            id: Some(&library_item_id),
-        };
+        let episode = id.episode.clone();
         let Browsed {
             library_server,
             session,
@@ -253,7 +254,7 @@ impl<S: Store> AppApi<S> {
             fetched: library_item,
         } = self
             .browse(token, request, async |server, key| {
-                self.abs.library_item(server, key, &library_item_id).await
+                self.abs.library_item(server, key, &id.library_item).await
             })
             .await?;
         let item = browse::item(&user, library_item, id)
@@ -276,29 +277,36 @@ impl<S: Store> AppApi<S> {
         id: ItemId,
         finished: bool,
     ) -> Result<Item, ApiError> {
-        const OPERATION: &str = "mark an Item Finished or unfinished";
+        let (library_item_id, episode) = (id.library_item.clone(), id.episode.clone());
+        let episode = episode.as_deref();
+        let request = Request {
+            operation: "mark an Item Finished or unfinished",
+            id: Some(&library_item_id),
+        };
         let Browsed {
             library_server,
             session,
             user,
             fetched: mut item,
-        } = self.found_item(token, id, OPERATION).await?;
-        let (library_item_id, episode) = (&item.id.library_item, item.id.episode.as_deref());
+        } = self.found_item(token, id, request).await?;
         if let Err(error) = self
             .abs
             .set_finished(
                 library_server,
                 &session.api_key,
-                library_item_id,
+                &library_item_id,
                 episode,
                 finished,
             )
             .await
         {
-            let request = Request {
-                operation: OPERATION,
-                id: Some(library_item_id),
-            };
+            tracing::info!(
+                library_server,
+                library_item = library_item_id,
+                episode,
+                finished,
+                "an Item was not marked"
+            );
             return Err(self.failure(library_server, &session, request, error).await);
         }
         tracing::info!(
@@ -776,7 +784,8 @@ fn random_hex(what: &str) -> Result<String, ApiError> {
     Ok(hex)
 }
 
-/// What [`AppApi::browse`] fetched from the session's Library Server, and for whom.
+/// Something fetched from the session's Library Server as its user ([`AppApi::browse`]), or
+/// shaped from that ([`AppApi::found_item`]), and for whom.
 struct Browsed<'a, T> {
     /// The session's Library Server.
     library_server: &'a str,
