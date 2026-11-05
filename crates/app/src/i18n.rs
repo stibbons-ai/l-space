@@ -160,8 +160,8 @@ texts! {
     GroupPaused => "group-paused",
     GroupStopped => "group-stopped",
     GroupTransitioning => "group-transitioning",
+    GroupNotAnswering => "group-not-answering",
     GroupStateUnknown => "group-state-unknown",
-    GroupUnknown => "group-unknown",
     SettingsTitle => "settings-title",
     SettingsLibraryServer => "settings-library-server",
     SettingsAccount => "settings-account",
@@ -279,7 +279,7 @@ impl From<TransportState> for Text {
             TransportState::Paused => Self::GroupPaused,
             TransportState::Stopped => Self::GroupStopped,
             TransportState::Transitioning => Self::GroupTransitioning,
-            TransportState::Unknown => Self::GroupUnknown,
+            TransportState::Unknown => Self::GroupStateUnknown,
         }
     }
 }
@@ -393,7 +393,7 @@ pub fn item_facts(language: Language, item: &Item) -> Vec<(Text, String)> {
 pub fn group_playback(language: Language, group: &Group) -> String {
     let state = text(
         language,
-        group.state.map_or(Text::GroupStateUnknown, Text::from),
+        group.state.map_or(Text::GroupNotAnswering, Text::from),
     );
     let mut parts = vec![state.as_str()];
     if let Some(track) = &group.now_playing {

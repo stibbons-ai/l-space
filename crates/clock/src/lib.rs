@@ -63,6 +63,12 @@ impl ManualClock {
     pub fn advance(&self, duration: Duration) {
         self.now.send_modify(|now| *now += duration);
     }
+
+    /// How many waits on this clock are pending: made, and neither completed nor dropped. A
+    /// test can wait for a task to park on the clock before advancing it.
+    pub fn sleepers(&self) -> usize {
+        self.now.receiver_count()
+    }
 }
 
 impl Default for ManualClock {
@@ -139,16 +145,19 @@ mod tests {
     #[tokio::test]
     async fn a_manual_sleep_wakes_a_task_waiting_on_it() {
         let clock = ManualClock::new();
+        assert_eq!(clock.sleepers(), 0);
         let sleep = clock.sleep(Duration::from_secs(5));
         let waiting = tokio::spawn(sleep);
         tokio::time::sleep(SETTLE).await;
         assert!(!waiting.is_finished());
+        assert_eq!(clock.sleepers(), 1);
 
         clock.advance(Duration::from_secs(5));
         tokio::time::timeout(SETTLE, waiting)
             .await
             .expect("woken")
             .expect("task");
+        assert_eq!(clock.sleepers(), 0);
     }
 
     #[tokio::test]

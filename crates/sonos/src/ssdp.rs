@@ -9,7 +9,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use url::Url;
 
-use crate::RAW;
+use crate::{RAW, xml};
 
 /// SSDP's multicast group and port, where every UPnP device on the LAN listens.
 pub const MULTICAST: SocketAddr =
@@ -80,12 +80,16 @@ pub(crate) async fn search(target: SocketAddr) -> io::Result<Vec<Found>> {
             }
         }
     }
+    if found.len() == MAX_PLAYERS {
+        tracing::warn!(%target, players = MAX_PLAYERS, "SSDP search stopped at the most players kept");
+    }
     Ok(found)
 }
 
 /// The player in an M-SEARCH answer from `from`: a `200` for [`ZONE_PLAYER`] with a
-/// `uuid:` USN and an `http` LOCATION at the address the answer came from. A LOCATION
-/// elsewhere is refused, so an answer can't point the Bridge at another host.
+/// `uuid:` USN holding a Sonos player UUID (`RINCON_…`, at most 64 characters) and an `http`
+/// LOCATION at the IP address the answer came from. A LOCATION elsewhere is refused, so an
+/// answer can't point the Bridge at another host.
 fn answer(datagram: &str, from: SocketAddr) -> Option<Found> {
     let mut lines = datagram.split("\r\n");
     let status = lines.next()?;
@@ -110,8 +114,7 @@ fn answer(datagram: &str, from: SocketAddr) -> Option<Found> {
         return None;
     }
     let uuid = usn?.strip_prefix("uuid:")?.split("::").next()?.trim();
-    // Every Sonos player's UUID looks like `RINCON_48A6B8000001400`.
-    if !uuid.starts_with("RINCON_") || uuid.len() > 64 {
+    if !xml::is_player_uuid(uuid) {
         return None;
     }
     let addr = services_at(location?)?;

@@ -13,11 +13,11 @@ use futures::future::{BoxFuture, join_all};
 use futures::stream::FuturesUnordered;
 use reqwest::Client;
 use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::task::AbortHandle;
 
 use crate::soap::{self, CallError, Service, argument};
 use crate::xml::{self, ZoneGroup};
-use crate::{Error, Group, Member, Sonos, Track, ssdp};
+use crate::{Error, Group, Member, Sonos, Track, TransportState, ssdp};
 
 /// How long after one search the next one starts, on the [`Clock`].
 pub const REFRESH: Duration = Duration::from_secs(60);
@@ -26,23 +26,24 @@ pub const REFRESH: Duration = Duration::from_secs(60);
 /// searches, so one lost datagram doesn't drop it.
 pub const EXPIRY: Duration = Duration::from_secs(3 * 60);
 
+/// How long [`Upnp::groups`] may take in all, waiting for the first search included; shorter
+/// than the App's limit for a call to the Bridge.
+pub const LISTING_TIMEOUT: Duration = Duration::from_secs(8);
+
 /// How long one SOAP call may take, connecting included.
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long after asking one player for the topology the next is asked too, while the first
-/// hasn't answered: a player that stopped answering only delays the listing by this much.
+/// How long the topology waits for the player asked last before it asks the next one too, if
+/// that player has neither answered nor failed: one that stopped answering delays the listing
+/// by this much, not by [`CALL_TIMEOUT`].
 const STAGGER: Duration = Duration::from_millis(500);
-
-/// How long [`Upnp::groups`] may take in all, waiting for the first search included; shorter
-/// than the App's limit for a call to the Bridge.
-const LISTING_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Sonos over local UPnP. Searching for players starts with [`Upnp::start`] and repeats every
 /// [`REFRESH`] until this is dropped.
 #[derive(Debug)]
 pub struct Upnp {
     shared: Arc<Shared>,
-    discovery: JoinHandle<()>,
+    discovery: AbortHandle,
 }
 
 #[derive(Debug)]
@@ -50,7 +51,7 @@ struct Shared {
     http: Client,
     clock: Arc<dyn Clock>,
     known: Mutex<Known>,
-    /// Whether the first search is over.
+    /// Whether the first search is over (or searching stopped for good).
     searched: watch::Sender<bool>,
 }
 
@@ -59,11 +60,12 @@ struct Shared {
 struct Known {
     /// The players found, by UUID; at most [`ssdp::MAX_PLAYERS`].
     players: BTreeMap<String, Player>,
-    /// Whether the last search could not be sent.
+    /// Whether the last search could not be sent (its socket not bound, or its datagram not
+    /// sent), or searching stopped for good.
     search_failed: bool,
-    /// How promising each player is to ask for the topology, from the last one read (lower is
-    /// better; see [`rank`]).
-    ranks: BTreeMap<String, u8>,
+    /// How promising each player is to ask for the topology, from the last one read; see
+    /// [`ranks`].
+    ranks: BTreeMap<String, Rank>,
 }
 
 #[derive(Debug)]
@@ -74,31 +76,44 @@ struct Player {
     seen: Instant,
 }
 
+/// How promising a player is to ask for the topology, best first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    /// It told the last topology, as one of its visible members.
+    LastTeller,
+    VisibleCoordinator,
+    VisibleMember,
+    /// Not a member of the last topology read (or none was read yet).
+    Unlisted,
+    /// Bonded satellites and other players the Sonos app doesn't show: they can tell an
+    /// outdated topology (SoCo, `zonegroupstate.py`).
+    Invisible,
+}
+
 impl Upnp {
     /// Starts searching for players by sending M-SEARCH to `ssdp` (normally [`crate::MULTICAST`]),
     /// timed by `clock`. Must be called on a Tokio runtime.
     pub fn start(ssdp: SocketAddr, clock: Arc<dyn Clock>) -> Self {
-        let http = Client::builder()
-            .timeout(CALL_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .expect("an HTTP client without TLS builds");
-        let shared = Arc::new(Shared {
-            http,
-            clock,
-            known: Mutex::default(),
-            searched: watch::Sender::new(false),
-        });
+        let shared = Arc::new(Shared::new(clock));
         let discovery = tokio::spawn(discover(Arc::clone(&shared), ssdp));
-        Self { shared, discovery }
+        let handle = discovery.abort_handle();
+        let watched = Arc::clone(&shared);
+        tokio::spawn(async move {
+            // The search loops forever: it ends only by panicking, or being aborted on drop.
+            if let Err(error) = discovery.await
+                && !error.is_cancelled()
+            {
+                tracing::error!(%error, "the search for Sonos players stopped");
+                watched.stopped();
+            }
+        });
+        Self {
+            shared,
+            discovery: handle,
+        }
     }
 
     async fn groups(&self) -> Result<Vec<Group>, Error> {
-        if self.discovery.is_finished() {
-            // It loops forever, so it panicked: the players known stay as they were.
-            tracing::error!("the search for Sonos players stopped");
-        }
         let deadline = tokio::time::Instant::now() + LISTING_TIMEOUT;
         self.shared.groups(deadline).await
     }
@@ -129,6 +144,21 @@ async fn discover(shared: Arc<Shared>, target: SocketAddr) {
 }
 
 impl Shared {
+    fn new(clock: Arc<dyn Clock>) -> Self {
+        let http = Client::builder()
+            .timeout(CALL_TIMEOUT)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .expect("an HTTP client without TLS builds");
+        Self {
+            http,
+            clock,
+            known: Mutex::default(),
+            searched: watch::Sender::new(false),
+        }
+    }
+
     fn known(&self) -> MutexGuard<'_, Known> {
         self.known.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -141,7 +171,7 @@ impl Shared {
         known.search_failed = found.is_err();
         let players = &mut known.players;
         let before = players.len();
-        let mut added = 0;
+        let (mut added, mut refused) = (0, 0);
         for player in found.unwrap_or_default() {
             if let Some(known) = players.get_mut(&player.uuid) {
                 *known = Player {
@@ -152,7 +182,16 @@ impl Shared {
                 let addr = player.addr;
                 players.insert(player.uuid, Player { addr, seen: now });
                 added += 1;
+            } else {
+                refused += 1;
             }
+        }
+        if refused > 0 {
+            tracing::warn!(
+                refused,
+                players = ssdp::MAX_PLAYERS,
+                "Sonos players not kept: the most players are already known"
+            );
         }
         players.retain(|_, player| now.duration_since(player.seen) < EXPIRY);
         // Found players were just seen, so only those not found can have been forgotten.
@@ -162,8 +201,15 @@ impl Shared {
         }
     }
 
+    /// Searching stopped for good: listings stop waiting for a first search, and with no
+    /// player known they say the Bridge can't search.
+    fn stopped(&self) {
+        self.known().search_failed = true;
+        self.searched.send_replace(true);
+    }
+
     /// Every Group, if the topology could be read by `deadline`. A Group whose coordinator
-    /// didn't tell its playback by then is listed without it.
+    /// didn't tell its playback by then is listed without what it didn't tell.
     async fn groups(&self, deadline: tokio::time::Instant) -> Result<Vec<Group>, Error> {
         // Without a first search, an empty list would only mean "not searched yet".
         let mut searched = self.searched.subscribe();
@@ -172,7 +218,7 @@ impl Shared {
             .is_err()
         {
             tracing::warn!("the first search for Sonos players did not end in time");
-            return Err(Error::Unreachable);
+            return Err(Error::SearchFailed);
         }
         let (players, candidates) = {
             let known = self.known();
@@ -188,17 +234,15 @@ impl Shared {
                 .iter()
                 .map(|(uuid, player)| (uuid.clone(), player.addr))
                 .collect();
-            let mut candidates: Vec<(&String, &SocketAddr)> = players.iter().collect();
-            candidates.sort_by_key(|(uuid, _)| known.ranks.get(*uuid).copied().unwrap_or(RANK_NEW));
-            let candidates: Vec<(String, SocketAddr)> = candidates
-                .into_iter()
-                .map(|(uuid, addr)| (uuid.clone(), *addr))
-                .collect();
+            let candidates = candidates(&players, &known.ranks);
             (players, candidates)
         };
         let Ok(topology) = tokio::time::timeout_at(deadline, self.topology(&candidates)).await
         else {
-            tracing::warn!(timeout = ?LISTING_TIMEOUT, "no Sonos player told the Group topology in time");
+            tracing::warn!(
+                timeout = ?LISTING_TIMEOUT,
+                "no Sonos player told the Group topology within the listing's time"
+            );
             return Err(Error::Unreachable);
         };
         let (from, topology) = topology?;
@@ -206,19 +250,7 @@ impl Shared {
         let mut groups = join_all(topology.iter().filter_map(visible).map(|group| {
             // Only an address a player announced for itself: the topology's could point anywhere.
             let coordinator = players.get(&group.id).copied();
-            async move {
-                let id = group.id.clone();
-                let without_playback = group.clone();
-                tokio::time::timeout_at(deadline, self.with_playback(group, coordinator))
-                    .await
-                    .unwrap_or_else(|_| {
-                        tracing::warn!(
-                            group = id,
-                            "a Group's coordinator did not tell its playback in time"
-                        );
-                        without_playback
-                    })
-            }
+            self.with_playback(group, coordinator, deadline)
         }))
         .await;
         groups.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
@@ -226,8 +258,8 @@ impl Shared {
     }
 
     /// The Group topology and the UUID of the player that told it, asking `candidates` (UUID,
-    /// address) in order. Every player knows the whole household's. A player that hasn't
-    /// answered after [`STAGGER`] doesn't hold up asking the next.
+    /// address) in order. Every player knows the whole household's. The next player is asked
+    /// as soon as one fails, or after [`STAGGER`] if the one asked last hasn't answered yet.
     async fn topology(
         &self,
         candidates: &[(String, SocketAddr)],
@@ -266,8 +298,14 @@ impl Shared {
     }
 
     /// `group` with its transport state and track, as its coordinator (at `coordinator`, if
-    /// found by a search) tells them.
-    async fn with_playback(&self, mut group: Group, coordinator: Option<SocketAddr>) -> Group {
+    /// found by a search) tells them by `deadline`. Each is kept if it came in time; a track
+    /// without a state is not shown.
+    async fn with_playback(
+        &self,
+        mut group: Group,
+        coordinator: Option<SocketAddr>,
+        deadline: tokio::time::Instant,
+    ) -> Group {
         let Some(coordinator) = coordinator else {
             tracing::warn!(
                 group = group.id,
@@ -275,56 +313,85 @@ impl Shared {
             );
             return group;
         };
-        let (transport, position) = tokio::join!(
-            soap::call(
-                &self.http,
-                coordinator,
-                Service::AvTransport,
-                "GetTransportInfo"
-            ),
-            soap::call(
-                &self.http,
-                coordinator,
-                Service::AvTransport,
-                "GetPositionInfo"
-            ),
-        );
+        let call = |action| async move {
+            tokio::time::timeout_at(
+                deadline,
+                soap::call(&self.http, coordinator, Service::AvTransport, action),
+            )
+            .await
+        };
+        let (transport, position) = tokio::join!(call("GetTransportInfo"), call("GetPositionInfo"));
         match transport {
-            Ok(answer) => {
-                group.state = argument(&answer, "CurrentTransportState").map(xml::transport_state);
-            }
-            Err(error) => {
+            Ok(Ok(answer)) => group.state = Some(state(&group.id, &answer)),
+            Ok(Err(error)) => {
                 tracing::warn!(group = group.id, %error, "cannot read a Group's transport state")
             }
+            Err(_) => tracing::warn!(
+                group = group.id,
+                "a Group's coordinator did not tell its transport state within the listing's time"
+            ),
         }
         match position {
-            Ok(answer) => group.track = track(&answer),
-            Err(error) => tracing::warn!(group = group.id, %error, "cannot read a Group's track"),
+            Ok(Ok(answer)) if group.state.is_some() => group.track = track(&answer),
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(group = group.id, %error, "cannot read a Group's track")
+            }
+            Err(_) => tracing::warn!(
+                group = group.id,
+                "a Group's coordinator did not tell its track within the listing's time"
+            ),
         }
         group
     }
 }
 
-/// The rank of a player not in the last topology read.
-const RANK_NEW: u8 = 3;
+/// The transport state in Group `group`'s `GetTransportInfo` answer: unknown, and logged with
+/// its first 32 characters, when it is missing or not one UPnP defines.
+fn state(group: &str, answer: &[(String, String)]) -> TransportState {
+    let raw = argument(answer, "CurrentTransportState");
+    let state = raw.map_or(TransportState::Unknown, xml::transport_state);
+    if state == TransportState::Unknown {
+        let state: String = raw.unwrap_or_default().chars().take(32).collect();
+        tracing::warn!(group, state, "unknown Sonos transport state");
+    }
+    state
+}
 
-/// How promising each player in `topology` is to ask for it next time (lower is better): the
-/// one that told it (`from`) first, then the visible coordinators, the other visible members,
-/// and last the invisible ones, since bonded satellites can tell an outdated topology (SoCo,
-/// `zonegroupstate.py`).
-fn ranks(from: &str, topology: &[ZoneGroup]) -> BTreeMap<String, u8> {
+/// `players` (by UUID) in the order to ask them for the topology: by their [`Rank`] from the
+/// last topology read, ties in UUID order.
+fn candidates(
+    players: &BTreeMap<String, SocketAddr>,
+    ranks: &BTreeMap<String, Rank>,
+) -> Vec<(String, SocketAddr)> {
+    let mut candidates: Vec<(String, SocketAddr)> = players
+        .iter()
+        .map(|(uuid, addr)| (uuid.clone(), *addr))
+        .collect();
+    candidates.sort_by_key(|(uuid, _)| ranks.get(uuid).copied().unwrap_or(Rank::Unlisted));
+    candidates
+}
+
+/// How promising each player in `topology` is to ask for it next time. The player that told
+/// it (`from`) comes first only if it is a visible member; otherwise it keeps the rank of
+/// what it is (an invisible member, or unlisted).
+fn ranks(from: &str, topology: &[ZoneGroup]) -> BTreeMap<String, Rank> {
     let mut ranks = BTreeMap::new();
     for zone in topology {
         for member in &zone.members {
             let rank = match (member.visible, member.uuid == zone.coordinator) {
-                (true, true) => 1,
-                (true, false) => 2,
-                (false, _) => 4,
+                (true, true) => Rank::VisibleCoordinator,
+                (true, false) => Rank::VisibleMember,
+                (false, _) => Rank::Invisible,
             };
             ranks.insert(member.uuid.clone(), rank);
         }
     }
-    ranks.insert(from.to_owned(), 0);
+    if let Some(rank) = ranks.get_mut(from)
+        && *rank < Rank::Unlisted
+    {
+        *rank = Rank::LastTeller;
+    }
     ranks
 }
 
@@ -379,6 +446,9 @@ fn track(answer: &[(String, String)]) -> Option<Track> {
 
 #[cfg(test)]
 mod tests {
+    use clock::ManualClock;
+    use sonos_fake::{FakeTrack, Fault, Household};
+
     use super::*;
     use crate::xml::ZoneMember;
 
@@ -435,7 +505,7 @@ mod tests {
         let pair = zone(
             "RINCON_R",
             vec![
-                member("RINCON_L", "Living Room", true),
+                member("RINCON_L", "Left", true),
                 member("RINCON_R", "Living Room", false),
             ],
         );
@@ -457,9 +527,9 @@ mod tests {
         assert_eq!(visible(&nameless).unwrap().name, "Den");
     }
 
-    #[test]
-    fn the_player_that_told_the_topology_is_asked_first_and_satellites_last() {
-        let topology = [
+    /// A Kitchen + Bath Group and a TV with a bonded satellite.
+    fn household_topology() -> [ZoneGroup; 2] {
+        [
             zone(
                 "RINCON_K",
                 vec![
@@ -474,11 +544,133 @@ mod tests {
                     member("RINCON_S", "TV", false),
                 ],
             ),
-        ];
-        let ranks = ranks("RINCON_B", &topology);
-        let mut order: Vec<&String> = ranks.keys().collect();
-        order.sort_by_key(|uuid| ranks[*uuid]);
-        assert_eq!(order, ["RINCON_B", "RINCON_K", "RINCON_T", "RINCON_S"]);
-        assert!(ranks["RINCON_S"] > RANK_NEW);
+        ]
+    }
+
+    /// The order players are asked in, after `from` told `topology`.
+    fn order(from: &str, topology: &[ZoneGroup], unlisted: &[&str]) -> Vec<String> {
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut players: BTreeMap<String, SocketAddr> = topology
+            .iter()
+            .flat_map(|zone| {
+                zone.members
+                    .iter()
+                    .map(|member| (member.uuid.clone(), addr))
+            })
+            .collect();
+        players.extend(unlisted.iter().map(|uuid| (uuid.to_string(), addr)));
+        candidates(&players, &ranks(from, topology))
+            .into_iter()
+            .map(|(uuid, _)| uuid)
+            .collect()
+    }
+
+    #[test]
+    fn a_visible_teller_is_asked_first_and_satellites_last() {
+        assert_eq!(
+            order("RINCON_B", &household_topology(), &["RINCON_N"]),
+            ["RINCON_B", "RINCON_K", "RINCON_T", "RINCON_N", "RINCON_S"]
+        );
+    }
+
+    #[test]
+    fn a_teller_that_is_invisible_or_unlisted_is_not_promoted() {
+        assert_eq!(
+            order("RINCON_S", &household_topology(), &["RINCON_N"]),
+            ["RINCON_K", "RINCON_T", "RINCON_B", "RINCON_N", "RINCON_S"]
+        );
+        assert_eq!(
+            order("RINCON_N", &household_topology(), &["RINCON_N"]),
+            ["RINCON_K", "RINCON_T", "RINCON_B", "RINCON_N", "RINCON_S"]
+        );
+    }
+
+    /// A [`Shared`] that knows the players of `household`, found by a real search.
+    async fn knowing(household: &Household, clock: &ManualClock) -> Shared {
+        let shared = Shared::new(Arc::new(clock.clone()));
+        shared.saw(Ok(ssdp::search(household.ssdp()).await.unwrap()));
+        shared.searched.send_replace(true);
+        shared
+    }
+
+    fn soon(after: Duration) -> tokio::time::Instant {
+        tokio::time::Instant::now() + after
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_a_coordinator_tells_in_time_is_kept_and_the_rest_left_out() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        household.play(
+            &kitchen,
+            FakeTrack::new("Moby Dick", Duration::from_secs(600)),
+        );
+        // Its track comes after the listing's time, though within one call's.
+        household.set_fault(&kitchen, Fault::SlowPosition(Duration::from_millis(1500)));
+        let office = household.add_player("Office");
+        household.play(&office, FakeTrack::new("Silence", Duration::from_secs(600)));
+        let shared = knowing(&household, &clock).await;
+
+        let start = tokio::time::Instant::now();
+        let groups = shared
+            .groups(soon(Duration::from_millis(800)))
+            .await
+            .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(1200),
+            "{:?}",
+            start.elapsed()
+        );
+        let names: Vec<&str> = groups.iter().map(|group| group.name.as_str()).collect();
+        assert_eq!(names, ["Kitchen", "Office"]);
+        assert_eq!(groups[0].state, Some(TransportState::Playing));
+        assert_eq!(groups[0].track, None);
+        assert_eq!(groups[1].state, Some(TransportState::Playing));
+        assert!(groups[1].track.is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_search_keeps_the_players_known_and_a_good_one_clears_it() {
+        let (household, clock) = Household::with_manual_clock();
+        household.add_player("Kitchen");
+        let shared = knowing(&household, &clock).await;
+
+        shared.saw(Err(()));
+        let groups = shared.groups(soon(LISTING_TIMEOUT)).await.unwrap();
+        assert_eq!(groups.len(), 1);
+
+        let shared = Shared::new(Arc::new(clock.clone()));
+        shared.saw(Err(()));
+        shared.searched.send_replace(true);
+        assert_eq!(
+            shared.groups(soon(LISTING_TIMEOUT)).await,
+            Err(Error::SearchFailed)
+        );
+        shared.saw(Ok(Vec::new()));
+        assert_eq!(shared.groups(soon(LISTING_TIMEOUT)).await, Ok(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn never_having_searched_is_a_failed_search() {
+        let shared = Shared::new(Arc::new(ManualClock::new()));
+        assert_eq!(
+            shared.groups(soon(Duration::from_millis(50))).await,
+            Err(Error::SearchFailed)
+        );
+        shared.stopped();
+        assert_eq!(
+            shared.groups(soon(LISTING_TIMEOUT)).await,
+            Err(Error::SearchFailed)
+        );
+    }
+
+    #[test]
+    fn a_transport_answer_without_a_known_state_is_an_unknown_state() {
+        let without: Vec<(String, String)> = vec![("CurrentTransportStatus".into(), "OK".into())];
+        assert_eq!(state("RINCON_K", &without), TransportState::Unknown);
+        let recording = vec![("CurrentTransportState".into(), "RECORDING".into())];
+        assert_eq!(state("RINCON_K", &recording), TransportState::Unknown);
+        let playing = vec![("CurrentTransportState".into(), "PLAYING".into())];
+        assert_eq!(state("RINCON_K", &playing), TransportState::Playing);
     }
 }

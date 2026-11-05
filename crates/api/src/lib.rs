@@ -286,8 +286,8 @@ pub enum TransportState {
     Stopped,
     /// Between states, such as while starting a track.
     Transitioning,
-    /// The coordinator answered with a state the Bridge doesn't know, or (on the App's side,
-    /// when decoding) a state from a newer Bridge. Last, as serde wants its catch-all.
+    /// The coordinator's answer had no state, or one the Bridge doesn't know; or (on the App's
+    /// side, when decoding) a state from a newer Bridge. Last, as serde wants its catch-all.
     #[serde(other)]
     Unknown,
 }
@@ -349,11 +349,13 @@ pub enum ApiError {
     /// see.
     #[error("not_found")]
     NotFound,
-    /// The Bridge knows Sonos players, but none of them told it the Group topology in time.
+    /// The Bridge knows Sonos players, but none of them told it the Group topology within the
+    /// listing's time.
     #[error("sonos_unreachable")]
     SonosUnreachable,
-    /// The Bridge knows no Sonos player because it could not search its network for them (its
-    /// last search could not be sent), so whether there are any is unknown.
+    /// The Bridge knows no Sonos player, and can't tell whether there are any: its last search
+    /// could not be sent (socket not bound, or datagram not sent), its searching stopped, or
+    /// its first search didn't end within the listing's time.
     #[error("sonos_search_failed")]
     SonosSearchFailed,
     /// A code this build of the App does not know yet, from a newer Bridge. Produced only on

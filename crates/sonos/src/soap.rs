@@ -10,8 +10,9 @@ use reqwest::header::CONTENT_TYPE;
 use crate::RAW;
 use crate::xml::{self, Malformed};
 
-/// Larger than the topology of a household with dozens of players.
-const MAX_BODY: usize = 1024 * 1024;
+/// The most bytes read of a player's answer; a longer one is refused. Larger than the
+/// topology of a household with dozens of players.
+pub const MAX_BODY: usize = 1024 * 1024;
 
 /// A Sonos UPnP service, at the control path every player serves it on.
 #[derive(Debug, Clone, Copy)]

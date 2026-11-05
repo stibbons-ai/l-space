@@ -57,8 +57,8 @@ group-playing = Playing
 group-paused = Paused
 group-stopped = Stopped
 group-transitioning = Starting…
-group-state-unknown = Not answering
-group-unknown = Unknown state
+group-not-answering = Not answering
+group-state-unknown = Unknown state
 
 date = { $month ->
         [1] January

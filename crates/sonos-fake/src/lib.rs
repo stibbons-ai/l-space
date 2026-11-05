@@ -86,12 +86,12 @@ pub enum Fault {
     Garbage,
     /// It accepts SOAP calls and never answers them (its device description still answers).
     Hang,
-    /// It answers every SOAP call with `200 OK` and a body longer than 1 MiB.
-    Oversize,
+    /// It answers every SOAP call correctly, padded with whitespace inside the envelope to at
+    /// least this many bytes.
+    Padded(usize),
+    /// It answers `GetPositionInfo` correctly, but only after this long.
+    SlowPosition(Duration),
 }
-
-/// Longer than the 1 MiB the Bridge reads of an answer.
-const OVERSIZE: usize = 1024 * 1024 + 1;
 
 /// A fake Sonos household; dropping it stops every player.
 #[derive(Debug)]
@@ -113,7 +113,7 @@ struct HouseholdState {
     players: Vec<Player>,
     /// Every SOAP action called, as the UUID of the player called and `Service#Action`.
     actions: Vec<(String, String)>,
-    /// How many M-SEARCHes were answered.
+    /// How many M-SEARCHes for ZonePlayers were received.
     searches: usize,
     added: u32,
 }
@@ -308,7 +308,7 @@ impl Household {
     }
 
     /// `coordinator`'s Group reports `state` as its `CurrentTransportState`, as is, such as
-    /// `TRANSITIONING` or a state UPnP doesn't define.
+    /// `TRANSITIONING`, or one the Bridge doesn't know.
     pub fn set_transport_state(&self, coordinator: &PlayerId, state: &'static str) {
         self.shared
             .lock()
@@ -358,7 +358,8 @@ impl Household {
         actions.map(|(_, action)| action.clone()).collect()
     }
 
-    /// How many M-SEARCHes for ZonePlayers the household has answered.
+    /// How many M-SEARCHes for ZonePlayers the household has received, counted as each
+    /// arrives (before it is answered).
     pub fn searches(&self) -> usize {
         self.shared.lock().searches
     }
@@ -541,8 +542,10 @@ async fn control(State(served): State<Served>, headers: HeaderMap) -> Response {
     match fault {
         Some(Fault::Hang) => std::future::pending().await,
         Some(Fault::Garbage) => return xml(StatusCode::OK, "<s:Envelope><unclosed".to_owned()),
-        Some(Fault::Oversize) => return xml(StatusCode::OK, " ".repeat(OVERSIZE)),
-        Some(Fault::None) => {}
+        Some(Fault::SlowPosition(delay)) if action == "GetPositionInfo" => {
+            tokio::time::sleep(delay).await;
+        }
+        Some(Fault::None | Fault::Padded(_) | Fault::SlowPosition(_)) => {}
         // Removed from the household: as good as unplugged.
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -572,16 +575,20 @@ async fn control(State(served): State<Served>, headers: HeaderMap) -> Response {
         }
         _ => return invalid_action(),
     };
+    drop(state);
     let mut body = String::new();
     for (name, value) in arguments {
         body.push_str(&format!("<{name}>{}</{name}>", escape(&value)));
     }
-    xml(
-        StatusCode::OK,
-        format!(
-            r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:{action}Response xmlns:u="{urn}">{body}</u:{action}Response></s:Body></s:Envelope>"#
-        ),
-    )
+    let mut envelope = format!(
+        r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:{action}Response xmlns:u="{urn}">{body}</u:{action}Response></s:Body></s:Envelope>"#
+    );
+    if let Some(Fault::Padded(length)) = fault {
+        // Whitespace inside the envelope keeps the answer valid however long it gets.
+        let padding = " ".repeat(length.saturating_sub(envelope.len()));
+        envelope = envelope.replacen("<s:Body>", &format!("<s:Body>{padding}"), 1);
+    }
+    xml(StatusCode::OK, envelope)
 }
 
 fn position_info(transport: &Transport, now: Instant) -> Vec<(&'static str, String)> {

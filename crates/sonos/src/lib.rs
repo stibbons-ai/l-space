@@ -16,8 +16,9 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 
+pub use soap::MAX_BODY;
 pub use ssdp::MULTICAST;
-pub use upnp::{EXPIRY, REFRESH, Upnp};
+pub use upnp::{EXPIRY, LISTING_TIMEOUT, REFRESH, Upnp};
 
 /// The `tracing` target of the raw UPnP traffic: each SSDP datagram and SOAP request and
 /// response body, at DEBUG. Enable it with `RUST_LOG=sonos::raw=debug`.
@@ -33,11 +34,12 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
 /// Why Sonos could not answer.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
-    /// Players were found, but none of them told the Group topology in time.
+    /// Players are known, but none of them told the Group topology within the listing's time.
     #[error("no Sonos player told the Group topology")]
     Unreachable,
-    /// No player is known and the last search could not be sent or received, so whether there
-    /// are players is unknown.
+    /// No player is known, and whether there are any is too: the last search could not be
+    /// sent (its socket not bound, or its datagram not sent), searching stopped, or the first
+    /// search didn't end within the listing's time.
     #[error("cannot search for Sonos players")]
     SearchFailed,
 }
@@ -78,7 +80,7 @@ pub enum TransportState {
     Paused,
     Stopped,
     Transitioning,
-    /// The coordinator answered with a state UPnP doesn't define.
+    /// The coordinator's answer had no state, or one UPnP doesn't define.
     Unknown,
 }
 

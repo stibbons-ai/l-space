@@ -100,7 +100,8 @@ pub(crate) struct ZoneMember {
 
 /// The Groups in a `ZoneGroupState` value: the document `GetZoneGroupState` returns escaped
 /// inside its answer, rooted at `ZoneGroupState` (current firmware) or `ZoneGroups` (older).
-/// A `ZoneGroup` without a coordinator, and a member without a UUID, are left out.
+/// A `ZoneGroup` or member without a Sonos player UUID (`RINCON_…`, at most 64 characters) is
+/// left out.
 /// `Satellite` elements (bonded home theatre speakers on current firmware) are not members.
 pub(crate) fn zone_groups(state: &str) -> Result<Vec<ZoneGroup>, Malformed> {
     let document = parse(state)?;
@@ -113,7 +114,7 @@ pub(crate) fn zone_groups(state: &str) -> Result<Vec<ZoneGroup>, Malformed> {
         .children()
         .filter(|node| node.has_tag_name("ZoneGroup"))
     {
-        let Some(coordinator) = non_empty(group.attribute("Coordinator")) else {
+        let Some(coordinator) = player_uuid(group.attribute("Coordinator")) else {
             skipped_groups += 1;
             continue;
         };
@@ -136,7 +137,7 @@ pub(crate) fn zone_groups(state: &str) -> Result<Vec<ZoneGroup>, Malformed> {
         tracing::debug!(
             skipped_groups,
             skipped_members,
-            "left out Groups without a coordinator and members without a UUID"
+            "left out Groups and members without a Sonos player UUID"
         );
     }
     Ok(groups)
@@ -145,7 +146,7 @@ pub(crate) fn zone_groups(state: &str) -> Result<Vec<ZoneGroup>, Malformed> {
 fn zone_member(member: Node) -> Option<ZoneMember> {
     let flag = |name| member.attribute(name) == Some("1");
     Some(ZoneMember {
-        uuid: non_empty(member.attribute("UUID"))?,
+        uuid: player_uuid(member.attribute("UUID"))?,
         name: member
             .attribute("ZoneName")
             .unwrap_or_default()
@@ -153,6 +154,10 @@ fn zone_member(member: Node) -> Option<ZoneMember> {
             .to_owned(),
         visible: !flag("Invisible") && !flag("IsZoneBridge"),
     })
+}
+
+fn player_uuid(value: Option<&str>) -> Option<String> {
+    non_empty(value).filter(|uuid| is_player_uuid(uuid))
 }
 
 fn non_empty(value: Option<&str>) -> Option<String> {
@@ -163,19 +168,21 @@ fn non_empty(value: Option<&str>) -> Option<String> {
 }
 
 /// AVTransport's `CurrentTransportState`. `NO_MEDIA_PRESENT` counts as stopped; any other
-/// state is unknown, and logged (its first 32 characters) so it can be added.
+/// state is unknown.
 pub(crate) fn transport_state(state: &str) -> TransportState {
     match state.trim() {
         "PLAYING" => TransportState::Playing,
         "PAUSED_PLAYBACK" | "PAUSED_RECORDING" => TransportState::Paused,
         "STOPPED" | "NO_MEDIA_PRESENT" => TransportState::Stopped,
         "TRANSITIONING" => TransportState::Transitioning,
-        state => {
-            let state: String = state.chars().take(32).collect();
-            tracing::warn!(state, "unknown Sonos transport state");
-            TransportState::Unknown
-        }
+        _ => TransportState::Unknown,
     }
+}
+
+/// Whether `uuid` looks like a Sonos player's, such as `RINCON_48A6B8000001400`: anything else
+/// is not one, and is never logged above DEBUG.
+pub(crate) fn is_player_uuid(uuid: &str) -> bool {
+    uuid.starts_with("RINCON_") && uuid.len() <= 64
 }
 
 /// A track's title and creator from its DIDL-Lite metadata (`TrackMetaData`), each if present
@@ -287,10 +294,11 @@ mod tests {
     }
 
     #[test]
-    fn leaves_out_groups_without_a_coordinator_and_members_without_a_uuid() {
+    fn leaves_out_groups_and_members_without_a_sonos_player_uuid() {
         let state = r#"<ZoneGroups>
             <ZoneGroup ID="x"><ZoneGroupMember UUID="RINCON_A" ZoneName="A"/></ZoneGroup>
-            <ZoneGroup Coordinator="RINCON_B"><ZoneGroupMember ZoneName="nameless"/><ZoneGroupMember UUID=" " ZoneName="blank"/></ZoneGroup>
+            <ZoneGroup Coordinator="evil"><ZoneGroupMember UUID="RINCON_C" ZoneName="C"/></ZoneGroup>
+            <ZoneGroup Coordinator="RINCON_B"><ZoneGroupMember ZoneName="nameless"/><ZoneGroupMember UUID=" " ZoneName="blank"/><ZoneGroupMember UUID="not-sonos" ZoneName="other"/></ZoneGroup>
           </ZoneGroups>"#;
         assert_eq!(
             zone_groups(state).unwrap(),
