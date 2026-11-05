@@ -182,7 +182,7 @@ pub struct AudioFile {
     /// Audiobookshelf's id for the file within its audiobook or podcast.
     pub id: String,
     /// Seconds into the whole Item where this file starts; unknown once a file before it has
-    /// an unknown duration.
+    /// an unknown duration, or when the Library Server doesn't say.
     pub start_offset: Option<f64>,
     /// Unknown if the Library Server could not tell.
     pub duration: Option<f64>,

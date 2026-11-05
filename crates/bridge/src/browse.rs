@@ -5,8 +5,8 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use api::{
-    ApiError, AudioFile, Chapter, Episode, EpisodeFilter, Item, ItemId, Library, LibraryEntry,
-    LibraryKind, Podcast, Progress,
+    AudioFile, Chapter, Episode, EpisodeFilter, Item, ItemId, Library, LibraryEntry, LibraryKind,
+    Podcast, Progress,
 };
 
 pub fn library(library: abs::Library) -> Library {
@@ -41,9 +41,9 @@ pub fn podcast(
     user: &abs::User,
     item: abs::LibraryItem,
     filter: EpisodeFilter,
-) -> Result<Podcast, ApiError> {
+) -> Result<Podcast, Missing> {
     let abs::Media::Podcast(media) = item.media else {
-        return Err(ApiError::NotFound);
+        return Err(Missing::NotAPodcast);
     };
     let progress_of = ProgressIndex::of(user);
     let mut episodes: Vec<_> = media
@@ -70,32 +70,31 @@ pub fn podcast(
 }
 
 /// The Item `id` in `library_item` (an audiobook, or the podcast holding the episode), with
-/// `user`'s Progress; not found if `library_item` has no such Item.
-pub fn item(
-    user: &abs::User,
-    library_item: abs::LibraryItem,
-    id: ItemId,
-) -> Result<Item, ApiError> {
+/// `user`'s Progress; or why `library_item` holds no such Item.
+pub fn item(user: &abs::User, library_item: abs::LibraryItem, id: ItemId) -> Result<Item, Missing> {
     let progress_of = ProgressIndex::of(user);
     match (library_item.media, &id.episode) {
-        (abs::Media::Book(book), None) if is_audiobook(&book) => Ok(Item {
+        (abs::Media::Book(book), None) if !is_audiobook(&book) => Err(Missing::EbookAlone),
+        (abs::Media::Book(book), None) => Ok(Item {
             title: book.metadata.title,
             author: non_empty(book.metadata.author_name),
             podcast: None,
             description: non_empty(book.metadata.description),
-            duration: book.duration,
+            duration: book_duration(&book.tracks, book.duration),
             published_at: None,
             progress: progress_of.audiobook(&library_item.id),
-            chapters: book.chapters.into_iter().map(chapter).collect(),
+            chapters: book.chapters.entries.into_iter().map(chapter).collect(),
             audio_files: audio_files(book.tracks),
             id,
         }),
+        (abs::Media::Book(_), Some(_)) => Err(Missing::EpisodeOfAudiobook),
+        (abs::Media::Podcast(_), None) => Err(Missing::PodcastWithoutEpisode),
         (abs::Media::Podcast(podcast), Some(episode_id)) => {
             let episode = podcast
                 .episodes
                 .into_iter()
                 .find(|episode| &episode.id == episode_id)
-                .ok_or(ApiError::NotFound)?;
+                .ok_or(Missing::NoSuchEpisode)?;
             Ok(Item {
                 duration: episode_duration(&episode),
                 progress: progress_of.episode(&episode.id),
@@ -109,8 +108,33 @@ pub fn item(
                 id,
             })
         }
-        _ => Err(ApiError::NotFound),
     }
+}
+
+/// Why a library item that exists holds nothing the App asked for: the App answers
+/// `not_found` either way, the reason goes to the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Missing {
+    /// A podcast was asked for, and it is an audiobook.
+    NotAPodcast,
+    /// An audiobook was asked for, and it is a book without audio.
+    EbookAlone,
+    /// An episode was asked for in an audiobook.
+    EpisodeOfAudiobook,
+    /// An Item was asked for in a podcast without naming the episode.
+    PodcastWithoutEpisode,
+    /// The podcast has no episode with that id.
+    NoSuchEpisode,
+}
+
+/// An audiobook's duration: the sum of its audio files' if each one is known, else unknown.
+/// Audiobookshelf's own figure counts an unprobed file as 0 and still includes excluded ones,
+/// so it serves only for a book without listed files.
+fn book_duration(tracks: &[abs::Track], duration: Option<f64>) -> Option<f64> {
+    if tracks.is_empty() {
+        return duration;
+    }
+    tracks.iter().map(|track| track.duration).sum()
 }
 
 /// A user's Progress by audiobook and by episode. An episode is found by its own id alone:
@@ -187,7 +211,8 @@ fn is_audiobook(book: &abs::Book) -> bool {
 }
 
 /// An episode's duration in seconds: its own, else its audio file's (the same value on
-/// Audiobookshelf 2.37.2, kept for older episodes), else unknown.
+/// Audiobookshelf 2.37.2; the fallback serves an answer without the episode's own), else
+/// unknown.
 fn episode_duration(episode: &abs::Episode) -> Option<f64> {
     episode.duration.or_else(|| {
         episode
@@ -206,7 +231,7 @@ fn non_empty(text: Option<String>) -> Option<String> {
 mod tests {
     use api::{EpisodeFilter, Progress};
 
-    use super::{item, library_entry, podcast};
+    use super::{Missing, item, library_entry, podcast};
 
     fn episode(id: &str, published_at: Option<i64>, duration: Option<f64>) -> abs::Episode {
         abs::Episode {
@@ -361,10 +386,11 @@ mod tests {
         let book = decoded(serde_json::json!({
             "id": "li-2",
             "mediaType": "book",
-            "media": {"metadata": {"title": "Book"}, "numTracks": 3, "tracks": [
+            "media": {"metadata": {"title": "Book"}, "numTracks": 4, "tracks": [
                 {"ino": "1", "startOffset": 0, "duration": 100},
                 {"ino": "2", "startOffset": 100, "duration": null},
                 {"ino": "3", "startOffset": 100, "duration": 50},
+                {"ino": "4", "startOffset": 150, "duration": 30},
             ]},
         }));
         let shown = item(&user(Vec::new()), book, audiobook_id()).unwrap();
@@ -373,7 +399,32 @@ mod tests {
             .iter()
             .map(|file| file.start_offset)
             .collect();
-        assert_eq!(offsets, [Some(0.0), Some(100.0), None]);
+        assert_eq!(offsets, [Some(0.0), Some(100.0), None, None]);
+    }
+
+    /// An audiobook's duration is the sum of its audio files' when each is known: the
+    /// Library Server's own figure counts an unprobed file as 0.
+    #[test]
+    fn an_audiobooks_duration_needs_every_files_duration() {
+        let book = |middle: serde_json::Value| {
+            decoded(serde_json::json!({
+                "id": "li-2",
+                "mediaType": "book",
+                "media": {"metadata": {"title": "Book"}, "numTracks": 3, "duration": 150,
+                          "tracks": [
+                              {"ino": "1", "startOffset": 0, "duration": 100},
+                              {"ino": "2", "startOffset": 100, "duration": middle},
+                              {"ino": "3", "startOffset": 100, "duration": 50},
+                          ]},
+            }))
+        };
+        let duration = |book| {
+            item(&user(Vec::new()), book, audiobook_id())
+                .unwrap()
+                .duration
+        };
+        assert_eq!(duration(book(serde_json::Value::Null)), None);
+        assert_eq!(duration(book(serde_json::json!(20))), Some(170.0));
     }
 
     /// Only an explicit count of no audio files makes a book an ebook alone, which is no Item.
@@ -387,7 +438,10 @@ mod tests {
             decoded(serde_json::json!({"id": "li-2", "mediaType": "book", "media": media}))
         };
         assert!(library_entry(book(Some(0))).is_none());
-        assert!(item(&user(Vec::new()), book(Some(0)), audiobook_id()).is_err());
+        assert_eq!(
+            item(&user(Vec::new()), book(Some(0)), audiobook_id()),
+            Err(Missing::EbookAlone)
+        );
         for num_tracks in [None, Some(2)] {
             assert!(library_entry(book(num_tracks)).is_some(), "{num_tracks:?}");
             assert!(

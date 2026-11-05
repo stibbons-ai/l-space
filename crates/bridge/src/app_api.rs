@@ -129,7 +129,7 @@ impl<S: Store> AppApi<S> {
                 self.abs.libraries(server, key).await
             })
             .await?;
-        warn_dropped(library_server, "Libraries", libraries.dropped);
+        warn_dropped(library_server, None, "Libraries", libraries.dropped);
         Ok(libraries.entries.into_iter().map(browse::library).collect())
     }
 
@@ -168,37 +168,23 @@ impl<S: Store> AppApi<S> {
                 self.abs.library_item(server, key, &podcast).await
             })
             .await?;
-        browse::podcast(&user, item, filter).inspect_err(|_| {
-            tracing::info!(
-                library_server,
-                operation = request.operation,
-                library_item = podcast,
-                "the library item is no podcast"
-            );
-        })
+        browse::podcast(&user, item, filter)
+            .map_err(|reason| missing(library_server, request, None, reason))
     }
 
     async fn item(&self, token: SessionToken, id: ItemId) -> Result<Item, ApiError> {
+        let (library_item_id, episode) = (id.library_item.clone(), id.episode.clone());
         let request = Request {
             operation: "fetch an Item",
-            id: Some(&id.library_item),
+            id: Some(&library_item_id),
         };
         let (library_server, user, library_item) = self
             .browse(token, request, async |server, key| {
-                self.abs.library_item(server, key, &id.library_item).await
+                self.abs.library_item(server, key, &library_item_id).await
             })
             .await?;
-        let operation = request.operation;
-        let (library_item_id, episode_id) = (id.library_item.clone(), id.episode.clone());
-        browse::item(&user, library_item, id).inspect_err(|_| {
-            tracing::info!(
-                library_server,
-                operation,
-                library_item = library_item_id,
-                episode = episode_id,
-                "the library item holds no such Item"
-            );
-        })
+        browse::item(&user, library_item, id)
+            .map_err(|reason| missing(library_server, request, episode.as_deref(), reason))
     }
 
     /// The session `token` names, and the configured Library Server it belongs to.
@@ -256,6 +242,7 @@ impl<S: Store> AppApi<S> {
             Ok(user) if user.id == session.user.user_id => {
                 warn_dropped(
                     library_server,
+                    Some(&user.id),
                     "Progress entries",
                     user.media_progress.dropped,
                 );
@@ -402,17 +389,37 @@ impl Request<'_> {
     };
 }
 
-/// Logs that `dropped` of the `what` a Library Server sent were left out because the Bridge
-/// doesn't know their shape.
-fn warn_dropped(library_server: &str, what: &'static str, dropped: usize) {
+/// Logs that `dropped` of the `what` a Library Server sent (for user `user_id`, if any) were
+/// left out because the Bridge doesn't know their shape.
+fn warn_dropped(library_server: &str, user_id: Option<&str>, what: &'static str, dropped: usize) {
     if dropped > 0 {
         tracing::warn!(
             library_server,
+            user_id,
             what,
             dropped,
             "entries in a shape the Bridge doesn't know were left out"
         );
     }
+}
+
+/// The `not_found` a call answers with when the library item it fetched (`request`) holds
+/// nothing it asked for, logged with the `reason` (and the `episode` asked for, if any).
+fn missing(
+    library_server: &str,
+    request: Request,
+    episode: Option<&str>,
+    reason: browse::Missing,
+) -> ApiError {
+    tracing::info!(
+        library_server,
+        operation = request.operation,
+        library_item = request.id,
+        episode,
+        reason = ?reason,
+        "the library item holds nothing asked for"
+    );
+    ApiError::NotFound
 }
 
 fn abs_error(library_server: &str, request: Request, error: abs::Error) -> ApiError {

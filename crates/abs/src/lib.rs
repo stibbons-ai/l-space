@@ -163,8 +163,9 @@ pub struct Book {
     /// Unknown if Audiobookshelf leaves it out.
     #[serde(default)]
     pub num_tracks: Option<usize>,
+    /// Its chapters; one in a shape this client doesn't know is left out.
     #[serde(default)]
-    pub chapters: Vec<Chapter>,
+    pub chapters: Known<Chapter>,
     /// The audio files in playing order.
     #[serde(default)]
     pub tracks: Vec<Track>,
@@ -224,7 +225,7 @@ pub struct Track {
     /// Audiobookshelf's id for the file within its library item.
     pub ino: String,
     /// Seconds into the whole audiobook where this file starts, as Audiobookshelf adds up the
-    /// durations of the files before it.
+    /// durations of the files before it; an episode's file starts at 0.
     #[serde(default)]
     pub start_offset: Option<f64>,
     /// Seconds; none when Audiobookshelf could not probe the file.
@@ -247,12 +248,12 @@ pub enum Error {
     #[error("the API key was rejected")]
     Rejected,
     /// No usable answer: the Library Server could not be reached in time, or answered with
-    /// something other than success, a rejection or a "not found": a server error, a
-    /// redirect, a body that is not what Audiobookshelf sends, or a 403 or 404 on `/api/me`
-    /// or `/api/libraries`, which every Audiobookshelf answers, so something in front of it
-    /// did (a proxy, for example). The message describes the cause in full, without the URL;
-    /// a cause may still name the host (a TLS certificate that doesn't match it, for
-    /// example).
+    /// something other than success, a rejection or a "not found", for example a server
+    /// error, a redirect, a body that is not what Audiobookshelf sends, or a 403 or 404 on
+    /// `/api/me` or `/api/libraries`, which every Audiobookshelf answers, so something in
+    /// front of it did (a proxy, for example). The message describes the cause in full,
+    /// without the URL; a cause may still name the host (a TLS certificate that doesn't match
+    /// it, for example).
     #[error("the Library Server gave no usable answer: {0}")]
     Unavailable(String),
     /// The Library Server has no Library or library item with this id that the user may see.
@@ -323,8 +324,8 @@ impl Client {
         Ok(user)
     }
 
-    /// The Libraries the user can see, in the Library Server's order; one of a kind this
-    /// client doesn't know is left out and counted.
+    /// The Libraries the user can see, in the Library Server's order; one in a shape this
+    /// client doesn't know (another kind, for example) is left out and counted.
     pub async fn libraries(
         &self,
         base_url: &str,
@@ -403,9 +404,9 @@ impl Client {
             (StatusCode::FORBIDDEN, Names::One) => Err(Error::NotFound(NotFound::Forbidden)),
             (StatusCode::NOT_FOUND, Names::One) => Err(Error::NotFound(NotFound::Missing)),
             (status, _) if status.is_success() => response.json().await.map_err(Error::unavailable),
-            // Any other answer: a server error, a redirect, or a 403/404 on `/api/me` or
-            // `/api/libraries`, which every Audiobookshelf answers, so something in front of
-            // it did.
+            // Any other answer, for example a server error, a redirect, or a 403/404 on
+            // `/api/me` or `/api/libraries`, which every Audiobookshelf answers, so something
+            // in front of it did.
             (status, _) => Err(Error::Unavailable(format!("HTTP {status}"))),
         }
     }
@@ -719,9 +720,10 @@ mod tests {
         }
     }
 
-    /// A Library of a kind this client doesn't know is left out, not the whole list.
+    /// A Library in a shape this client doesn't know (another kind, for example) is left out,
+    /// not the whole list.
     #[tokio::test]
-    async fn a_library_of_an_unknown_kind_is_left_out() {
+    async fn a_library_in_an_unknown_shape_is_left_out() {
         let base_url = serve(Router::new().route(
             "/api/libraries",
             get(|| async {
@@ -848,5 +850,34 @@ mod tests {
         assert_eq!(book.tracks[0].duration, None);
         assert_eq!(book.tracks[0].start_offset, None);
         assert_eq!(book.duration, None);
+    }
+
+    /// Chapters of null, or a chapter in a shape this client can't read, must not fail the
+    /// whole audiobook.
+    #[test]
+    fn unreadable_chapters_are_left_out() {
+        let book = |chapters: serde_json::Value| -> Known<super::Chapter> {
+            let item: LibraryItem = serde_json::from_value(json!({
+                "id": "li", "mediaType": "book",
+                "media": {"metadata": {"title": "B"}, "numTracks": 1, "chapters": chapters},
+            }))
+            .unwrap();
+            let Media::Book(book) = item.media else {
+                panic!("{item:?}");
+            };
+            book.chapters
+        };
+        assert_eq!(book(json!(null)), Known::default());
+        let chapters = book(json!([
+            {"title": "One", "start": 0, "end": 10},
+            {"title": "Two", "start": "ten", "end": 20},
+        ]));
+        let titles: Vec<_> = chapters
+            .entries
+            .iter()
+            .map(|chapter| chapter.title.as_str())
+            .collect();
+        assert_eq!(titles, ["One"]);
+        assert_eq!(chapters.dropped, 1);
     }
 }
