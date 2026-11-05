@@ -89,8 +89,13 @@ pub enum Fault {
     /// It answers every SOAP call correctly, padded with whitespace inside the envelope to at
     /// least this many bytes.
     Padded(usize),
-    /// It answers `GetPositionInfo` correctly, but only after this long.
+    /// It answers `GetPositionInfo` correctly, but only after this long (in real time, on the
+    /// Tokio timer, not the household's clock).
     SlowPosition(Duration),
+    /// It answers `GetTransportInfo` without a `CurrentTransportState`.
+    NoTransportState,
+    /// It answers `GetTransportInfo` with a SOAP fault, and everything else correctly.
+    FailTransportInfo,
 }
 
 /// A fake Sonos household; dropping it stops every player.
@@ -545,7 +550,14 @@ async fn control(State(served): State<Served>, headers: HeaderMap) -> Response {
         Some(Fault::SlowPosition(delay)) if action == "GetPositionInfo" => {
             tokio::time::sleep(delay).await;
         }
-        Some(Fault::None | Fault::Padded(_) | Fault::SlowPosition(_)) => {}
+        Some(Fault::FailTransportInfo) if action == "GetTransportInfo" => return invalid_action(),
+        Some(
+            Fault::None
+            | Fault::Padded(_)
+            | Fault::SlowPosition(_)
+            | Fault::NoTransportState
+            | Fault::FailTransportInfo,
+        ) => {}
         // Removed from the household: as good as unplugged.
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -564,11 +576,14 @@ async fn control(State(served): State<Served>, headers: HeaderMap) -> Response {
                 return invalid_action();
             };
             if action == "GetTransportInfo" {
-                vec![
-                    ("CurrentTransportState", transport.state.to_owned()),
+                let mut arguments = vec![
                     ("CurrentTransportStatus", "OK".to_owned()),
                     ("CurrentSpeed", "1".to_owned()),
-                ]
+                ];
+                if fault != Some(Fault::NoTransportState) {
+                    arguments.insert(0, ("CurrentTransportState", transport.state.to_owned()));
+                }
+                arguments
             } else {
                 position_info(transport, now)
             }

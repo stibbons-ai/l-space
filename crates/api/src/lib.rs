@@ -264,7 +264,8 @@ pub struct Group {
     /// What the Group's playback is doing; none if its coordinator was not found by the
     /// Bridge's searches, didn't answer, or answered too late.
     pub state: Option<TransportState>,
-    /// The track it has loaded, if any and if its coordinator said.
+    /// The track it has loaded, if any and if its coordinator said; none whenever `state` is
+    /// none.
     pub now_playing: Option<NowPlaying>,
 }
 

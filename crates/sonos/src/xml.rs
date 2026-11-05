@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use roxmltree::{Document, Node, ParsingOptions};
 
-use crate::{RAW, TransportState};
+use crate::{RAW, TransportState, ssdp};
 
 /// More than a household of dozens of players needs.
 const MAX_NODES: u32 = 100_000;
@@ -100,8 +100,9 @@ pub(crate) struct ZoneMember {
 
 /// The Groups in a `ZoneGroupState` value: the document `GetZoneGroupState` returns escaped
 /// inside its answer, rooted at `ZoneGroupState` (current firmware) or `ZoneGroups` (older).
-/// A `ZoneGroup` or member without a Sonos player UUID (`RINCON_…`, at most 64 characters) is
-/// left out.
+/// A `ZoneGroup` or member without a Sonos player UUID (see [`is_player_uuid`]) is left out,
+/// as is a `ZoneGroup` whose coordinator an earlier one has, and every one after the first
+/// [`ssdp::MAX_PLAYERS`]: a household has no more, and each costs calls to its coordinator.
 /// `Satellite` elements (bonded home theatre speakers on current firmware) are not members.
 pub(crate) fn zone_groups(state: &str) -> Result<Vec<ZoneGroup>, Malformed> {
     let document = parse(state)?;
@@ -109,7 +110,8 @@ pub(crate) fn zone_groups(state: &str) -> Result<Vec<ZoneGroup>, Malformed> {
         .descendants()
         .find(|node| node.has_tag_name("ZoneGroups"))
         .ok_or(Malformed::Missing("ZoneGroups"))?;
-    let (mut groups, mut skipped_groups, mut skipped_members) = (Vec::new(), 0, 0);
+    let mut groups: Vec<ZoneGroup> = Vec::new();
+    let (mut skipped_groups, mut skipped_members, mut duplicates, mut excess) = (0, 0, 0, 0);
     for group in groups_root
         .children()
         .filter(|node| node.has_tag_name("ZoneGroup"))
@@ -118,6 +120,14 @@ pub(crate) fn zone_groups(state: &str) -> Result<Vec<ZoneGroup>, Malformed> {
             skipped_groups += 1;
             continue;
         };
+        if groups.iter().any(|known| known.coordinator == coordinator) {
+            duplicates += 1;
+            continue;
+        }
+        if groups.len() == ssdp::MAX_PLAYERS {
+            excess += 1;
+            continue;
+        }
         let mut members = Vec::new();
         for member in group
             .children()
@@ -133,11 +143,13 @@ pub(crate) fn zone_groups(state: &str) -> Result<Vec<ZoneGroup>, Malformed> {
             members,
         });
     }
-    if skipped_groups > 0 || skipped_members > 0 {
-        tracing::debug!(
+    if skipped_groups + skipped_members + duplicates + excess > 0 {
+        tracing::warn!(
             skipped_groups,
             skipped_members,
-            "left out Groups and members without a Sonos player UUID"
+            duplicates,
+            excess,
+            "left out Groups and members of a Group topology: without a Sonos player UUID, with a coordinator already listed, or past the most Groups kept"
         );
     }
     Ok(groups)
@@ -179,10 +191,14 @@ pub(crate) fn transport_state(state: &str) -> TransportState {
     }
 }
 
-/// Whether `uuid` looks like a Sonos player's, such as `RINCON_48A6B8000001400`: anything else
-/// is not one, and is never logged above DEBUG.
+/// Whether `uuid` looks like a Sonos player's, such as `RINCON_48A6B8000001400`: `RINCON_`
+/// and ASCII letters and digits, at most 64 bytes in all. Anything else is not one, and is
+/// never logged.
 pub(crate) fn is_player_uuid(uuid: &str) -> bool {
-    uuid.starts_with("RINCON_") && uuid.len() <= 64
+    uuid.len() <= 64
+        && uuid
+            .strip_prefix("RINCON_")
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_alphanumeric()))
 }
 
 /// A track's title and creator from its DIDL-Lite metadata (`TrackMetaData`), each if present
@@ -307,6 +323,51 @@ mod tests {
                 members: Vec::new(),
             }]
         );
+    }
+
+    #[test]
+    fn keeps_each_coordinator_once_and_at_most_the_most_groups() {
+        let mut state = String::from(
+            r#"<ZoneGroups><ZoneGroup Coordinator="RINCON_A"><ZoneGroupMember UUID="RINCON_A" ZoneName="A"/></ZoneGroup>"#,
+        );
+        // A hostile player naming one coordinator over and over, then too many others.
+        for _ in 0..1000 {
+            state.push_str(r#"<ZoneGroup Coordinator="RINCON_A"><ZoneGroupMember UUID="RINCON_X" ZoneName="X"/></ZoneGroup>"#);
+        }
+        for n in 0..1000 {
+            state.push_str(&format!(r#"<ZoneGroup Coordinator="RINCON_N{n}"/>"#));
+        }
+        state.push_str("</ZoneGroups>");
+
+        let groups = zone_groups(&state).unwrap();
+        assert_eq!(groups.len(), ssdp::MAX_PLAYERS);
+        assert_eq!(groups[0].members, [member("RINCON_A", "A", true)]);
+        let coordinators: std::collections::BTreeSet<_> =
+            groups.iter().map(|group| &group.coordinator).collect();
+        assert_eq!(coordinators.len(), groups.len());
+    }
+
+    #[test]
+    fn a_player_uuid_is_rincon_and_letters_and_digits() {
+        for uuid in [
+            "RINCON_48A6B8000001400",
+            "RINCON_A",
+            &format!("RINCON_{}", "0".repeat(57)),
+        ] {
+            assert!(is_player_uuid(uuid), "{uuid:?}");
+        }
+        for uuid in [
+            "",
+            "RINCON_",
+            "rincon_A",
+            "RINCON_A B",
+            "RINCON_A-1",
+            "RINCON_Ä",
+            "RINCON_<script>",
+            &format!("RINCON_{}", "0".repeat(58)),
+        ] {
+            assert!(!is_player_uuid(uuid), "{uuid:?}");
+        }
     }
 
     #[test]

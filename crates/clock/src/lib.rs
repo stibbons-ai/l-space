@@ -64,8 +64,10 @@ impl ManualClock {
         self.now.send_modify(|now| *now += duration);
     }
 
-    /// How many waits on this clock are pending: made, and neither completed nor dropped. A
-    /// test can wait for a task to park on the clock before advancing it.
+    /// How many sleeps on this clock exist: created by [`Clock::sleep`] or
+    /// [`Clock::sleep_until`] and not yet dropped, whether or not they are due or awaited. A
+    /// test can wait for a task to park on the clock (create its next sleep) before advancing
+    /// it.
     pub fn sleepers(&self) -> usize {
         self.now.receiver_count()
     }

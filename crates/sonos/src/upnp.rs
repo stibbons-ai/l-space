@@ -34,8 +34,9 @@ pub const LISTING_TIMEOUT: Duration = Duration::from_secs(8);
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long the topology waits for the player asked last before it asks the next one too, if
-/// that player has neither answered nor failed: one that stopped answering delays the listing
-/// by this much, not by [`CALL_TIMEOUT`].
+/// that player has neither answered nor failed: one that stopped answering delays asking the
+/// next by this much, not by [`CALL_TIMEOUT`]. The last one asked, and a coordinator asked for
+/// its playback, may still take up to [`CALL_TIMEOUT`].
 const STAGGER: Duration = Duration::from_millis(500);
 
 /// Sonos over local UPnP. Searching for players starts with [`Upnp::start`] and repeats every
@@ -83,10 +84,13 @@ enum Rank {
     LastTeller,
     VisibleCoordinator,
     VisibleMember,
-    /// Not a member of the last topology read (or none was read yet).
+    /// Not a member of the last topology read (or none was read yet). Bonded home theatre
+    /// satellites are listed only as `Satellite`s, which aren't members, so they rank here:
+    /// after every visible player.
     Unlisted,
-    /// Bonded satellites and other players the Sonos app doesn't show: they can tell an
-    /// outdated topology (SoCo, `zonegroupstate.py`).
+    /// Members the Sonos app doesn't show (`Invisible="1"`, such as the second speaker of a
+    /// stereo pair or a bonded speaker on older firmware), which can tell an outdated topology
+    /// (SoCo, `zonegroupstate.py`).
     Invisible,
 }
 
@@ -138,7 +142,6 @@ async fn discover(shared: Arc<Shared>, target: SocketAddr) {
             tracing::warn!(%target, %error, "SSDP search failed");
         });
         shared.saw(found);
-        shared.searched.send_replace(true);
         shared.clock.sleep(REFRESH).await;
     }
 }
@@ -163,15 +166,18 @@ impl Shared {
         self.known.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Records the players a search found (or that it failed), and forgets those unseen for
-    /// [`EXPIRY`].
+    /// Records what a search found (or that it failed): forgets the players unseen for
+    /// [`EXPIRY`], keeps those found (at most [`ssdp::MAX_PLAYERS`]), and marks the first
+    /// search over.
     fn saw(&self, found: Result<Vec<ssdp::Found>, ()>) {
         let now = self.clock.now();
         let mut known = self.known();
         known.search_failed = found.is_err();
         let players = &mut known.players;
         let before = players.len();
-        let (mut added, mut refused) = (0, 0);
+        players.retain(|_, player| now.duration_since(player.seen) < EXPIRY);
+        let mut changed = players.len() < before;
+        let mut refused = 0;
         for player in found.unwrap_or_default() {
             if let Some(known) = players.get_mut(&player.uuid) {
                 *known = Player {
@@ -181,7 +187,7 @@ impl Shared {
             } else if players.len() < ssdp::MAX_PLAYERS {
                 let addr = player.addr;
                 players.insert(player.uuid, Player { addr, seen: now });
-                added += 1;
+                changed = true;
             } else {
                 refused += 1;
             }
@@ -193,12 +199,12 @@ impl Shared {
                 "Sonos players not kept: the most players are already known"
             );
         }
-        players.retain(|_, player| now.duration_since(player.seen) < EXPIRY);
-        // Found players were just seen, so only those not found can have been forgotten.
-        if added > 0 || players.len() < before + added {
+        if changed {
             let uuids: Vec<&String> = players.keys().collect();
             tracing::info!(players = ?uuids, "Sonos players changed");
         }
+        drop(known);
+        self.searched.send_replace(true);
     }
 
     /// Searching stopped for good: listings stop waiting for a first search, and with no
@@ -222,18 +228,21 @@ impl Shared {
         }
         let (players, candidates) = {
             let known = self.known();
-            if known.players.is_empty() {
+            // Expired players are skipped here too, in case searching stopped.
+            let now = self.clock.now();
+            let players: BTreeMap<String, SocketAddr> = known
+                .players
+                .iter()
+                .filter(|(_, player)| now.duration_since(player.seen) < EXPIRY)
+                .map(|(uuid, player)| (uuid.clone(), player.addr))
+                .collect();
+            if players.is_empty() {
                 return if known.search_failed {
                     Err(Error::SearchFailed)
                 } else {
                     Ok(Vec::new())
                 };
             }
-            let players: BTreeMap<String, SocketAddr> = known
-                .players
-                .iter()
-                .map(|(uuid, player)| (uuid.clone(), player.addr))
-                .collect();
             let candidates = candidates(&players, &known.ranks);
             (players, candidates)
         };
@@ -347,7 +356,7 @@ impl Shared {
 }
 
 /// The transport state in Group `group`'s `GetTransportInfo` answer: unknown, and logged with
-/// its first 32 characters, when it is missing or not one UPnP defines.
+/// its first 32 characters, when it is missing or not one the Bridge knows.
 fn state(group: &str, answer: &[(String, String)]) -> TransportState {
     let raw = argument(answer, "CurrentTransportState");
     let state = raw.map_or(TransportState::Unknown, xml::transport_state);
@@ -388,7 +397,7 @@ fn ranks(from: &str, topology: &[ZoneGroup]) -> BTreeMap<String, Rank> {
         }
     }
     if let Some(rank) = ranks.get_mut(from)
-        && *rank < Rank::Unlisted
+        && matches!(rank, Rank::VisibleCoordinator | Rank::VisibleMember)
     {
         *rank = Rank::LastTeller;
     }
@@ -589,7 +598,6 @@ mod tests {
     async fn knowing(household: &Household, clock: &ManualClock) -> Shared {
         let shared = Shared::new(Arc::new(clock.clone()));
         shared.saw(Ok(ssdp::search(household.ssdp()).await.unwrap()));
-        shared.searched.send_replace(true);
         shared
     }
 
@@ -641,7 +649,6 @@ mod tests {
 
         let shared = Shared::new(Arc::new(clock.clone()));
         shared.saw(Err(()));
-        shared.searched.send_replace(true);
         assert_eq!(
             shared.groups(soon(LISTING_TIMEOUT)).await,
             Err(Error::SearchFailed)
@@ -653,14 +660,26 @@ mod tests {
     #[tokio::test]
     async fn never_having_searched_is_a_failed_search() {
         let shared = Shared::new(Arc::new(ManualClock::new()));
+        let start = tokio::time::Instant::now();
         assert_eq!(
             shared.groups(soon(Duration::from_millis(50))).await,
             Err(Error::SearchFailed)
         );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            start.elapsed()
+        );
         shared.stopped();
+        let start = tokio::time::Instant::now();
         assert_eq!(
             shared.groups(soon(LISTING_TIMEOUT)).await,
             Err(Error::SearchFailed)
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            start.elapsed()
         );
     }
 
@@ -672,5 +691,63 @@ mod tests {
         assert_eq!(state("RINCON_K", &recording), TransportState::Unknown);
         let playing = vec![("CurrentTransportState".into(), "PLAYING".into())];
         assert_eq!(state("RINCON_K", &playing), TransportState::Playing);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_state_missing_from_the_answer_is_unknown_and_a_failed_one_shows_no_track() {
+        let (household, clock) = Household::with_manual_clock();
+        let track = || FakeTrack::new("Moby Dick", Duration::from_secs(600));
+        let kitchen = household.add_player("Kitchen");
+        household.play(&kitchen, track());
+        household.set_fault(&kitchen, Fault::NoTransportState);
+        let office = household.add_player("Office");
+        household.play(&office, track());
+        household.set_fault(&office, Fault::FailTransportInfo);
+        let shared = knowing(&household, &clock).await;
+
+        let groups = shared.groups(soon(LISTING_TIMEOUT)).await.unwrap();
+        let names: Vec<&str> = groups.iter().map(|group| group.name.as_str()).collect();
+        assert_eq!(names, ["Kitchen", "Office"]);
+        assert_eq!(groups[0].state, Some(TransportState::Unknown));
+        assert!(groups[0].track.is_some());
+        // Office told its track, but without a state it isn't shown.
+        assert_eq!((groups[1].state, &groups[1].track), (None, &None));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_topology_is_given_up_on_at_the_deadline() {
+        let (household, clock) = Household::with_manual_clock();
+        for n in 0..6 {
+            let silent = household.add_player(&format!("Silent {n}"));
+            household.set_fault(&silent, Fault::Hang);
+        }
+        let shared = knowing(&household, &clock).await;
+
+        // Asking each in turn would take 2.5 s of stagger and 2 s for the last to time out.
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            shared.groups(soon(Duration::from_secs(1))).await,
+            Err(Error::Unreachable)
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(1300),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn players_expire_when_listed_even_after_searching_stopped() {
+        let (household, clock) = Household::with_manual_clock();
+        household.add_player("Kitchen");
+        let shared = knowing(&household, &clock).await;
+        shared.stopped();
+        assert_eq!(shared.groups(soon(LISTING_TIMEOUT)).await.unwrap().len(), 1);
+
+        clock.advance(EXPIRY);
+        assert_eq!(
+            shared.groups(soon(LISTING_TIMEOUT)).await,
+            Err(Error::SearchFailed)
+        );
     }
 }

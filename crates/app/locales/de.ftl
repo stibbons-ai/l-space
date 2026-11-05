@@ -95,5 +95,5 @@ error-library-server-unreachable = Clacks erreicht diesen Library Server gerade 
 error-not-found = Das ist auf deinem Library Server nicht (mehr) für dich verfügbar.
 error-session-invalid = Deine Sitzung ist beendet. Bitte melde dich erneut an.
 error-sonos-unreachable = Clacks hat deine Sonos-Lautsprecher gefunden, aber gerade antwortet keiner. Bitte versuche es noch einmal.
-error-sonos-search-failed = Clacks kann dein Netzwerk gerade nicht nach Sonos-Lautsprechern durchsuchen. Bitte die Person, die Clacks betreibt, die Netzwerkeinrichtung zu prüfen.
+error-sonos-search-failed = Clacks kann dein Netzwerk gerade nicht nach Sonos-Lautsprechern durchsuchen. Bitte die Person, die Clacks betreibt, die Netzwerkeinrichtung und die Logs von Clacks zu prüfen.
 error-unknown = Etwas Unerwartetes ist schiefgegangen. Ein Update von Ook kann helfen.

@@ -37,9 +37,9 @@ pub enum Error {
     /// Players are known, but none of them told the Group topology within the listing's time.
     #[error("no Sonos player told the Group topology")]
     Unreachable,
-    /// No player is known, and whether there are any is too: the last search could not be
-    /// sent (its socket not bound, or its datagram not sent), searching stopped, or the first
-    /// search didn't end within the listing's time.
+    /// No player is known, and the Bridge can't tell whether there are any: the last search
+    /// could not be sent (its socket not bound, or its datagram not sent), searching stopped,
+    /// or the first search didn't end within the listing's time.
     #[error("cannot search for Sonos players")]
     SearchFailed,
 }
@@ -60,7 +60,8 @@ pub struct Group {
     /// What the Group's transport is doing; none if its coordinator was not found by the
     /// searches, didn't answer, or answered too late.
     pub state: Option<TransportState>,
-    /// The current track, if one is loaded and the coordinator said so.
+    /// The current track, if one is loaded and the coordinator said so; none whenever `state`
+    /// is none.
     pub track: Option<Track>,
 }
 
@@ -80,7 +81,7 @@ pub enum TransportState {
     Paused,
     Stopped,
     Transitioning,
-    /// The coordinator's answer had no state, or one UPnP doesn't define.
+    /// The coordinator's answer had no state, or one the Bridge doesn't know.
     Unknown,
 }
 

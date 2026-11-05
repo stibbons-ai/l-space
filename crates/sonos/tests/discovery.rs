@@ -47,18 +47,18 @@ async fn players_are_searched_for_on_the_clocks_refresh_and_expire() {
     assert_eq!(names(&sonos).await, Ok(Vec::new()));
 }
 
-/// Waits until search number `count` reached `household` and is over: the search parks on
-/// `clock` (its only waiter) once it has recorded what it found.
+/// Waits until search number `count` reached `household` and is over: once it has recorded
+/// what it found, the search loop creates its next sleep on `clock`, the only sleep on it.
 async fn parked(household: &Household, clock: &ManualClock, count: usize) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while household.searches() < count || clock.sleepers() == 0 {
+    while household.searches() < count || clock.sleepers() != 1 {
         assert!(
             Instant::now() < deadline,
-            "{} searches, {} waiting on the clock",
+            "{} searches, {} sleeps on the clock",
             household.searches(),
             clock.sleepers()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(household.searches(), count);
+    assert_eq!((household.searches(), clock.sleepers()), (count, 1));
 }

@@ -382,12 +382,19 @@ async fn a_failed_search_is_reported_rather_than_an_empty_household() {
     let user = abs.new_user().await;
     let session = bridge.api().login(abs.base_url(), &user.api_key.key).await;
 
+    let start = Instant::now();
     assert_eq!(
         bridge
             .api()
             .get_as_error(&session, "/api/groups", &[])
             .await,
         SONOS_SEARCH_FAILED
+    );
+    // Answered at once, not when the listing's time is up.
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
     );
 }
 
@@ -399,8 +406,8 @@ async fn the_player_that_told_the_topology_is_asked_first_next_time() {
     household.set_fault(&silent, Fault::Hang);
     let kitchen = household.add_player("Kitchen");
     let (bridge, session) = logged_in(&household).await;
-    let asked_silent = || {
-        let actions = household.actions_of(&silent);
+    let asked_for_topology = |player| {
+        let actions = household.actions_of(player);
         actions
             .iter()
             .filter(|action| *action == "ZoneGroupTopology#GetZoneGroupState")
@@ -408,13 +415,14 @@ async fn the_player_that_told_the_topology_is_asked_first_next_time() {
     };
 
     assert_eq!(bridge.api().groups(&session).await.len(), 2);
-    assert_eq!(asked_silent(), 1);
-    let told = household.actions_of(&kitchen);
+    assert_eq!(asked_for_topology(&silent), 1);
+    assert_eq!(asked_for_topology(&kitchen), 1);
 
-    // Kitchen told it, and answers at once, so the silent player isn't asked again.
+    // Kitchen told it, and answers at once (within the stagger), so the silent player isn't
+    // asked again.
     assert_eq!(bridge.api().groups(&session).await.len(), 2);
-    assert_eq!(asked_silent(), 1);
-    assert!(household.actions_of(&kitchen).len() > told.len());
+    assert_eq!(asked_for_topology(&silent), 1);
+    assert_eq!(asked_for_topology(&kitchen), 2);
 }
 
 #[tokio::test]
