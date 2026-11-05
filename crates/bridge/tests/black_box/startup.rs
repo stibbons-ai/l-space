@@ -271,6 +271,10 @@ fn unusable_encryption_key_file() {
         ("\n\n", "is empty"),
         ("s3cret-is-not-base64!\n", "is not base64"),
         ("i6n08ZhvCMQSMfsPMru0Tw==\n", "decodes to 16 bytes, not 32"),
+        (
+            "XI5RQJRCfpAnYDpji+U84BcbVNSWHdXV0RL2qChwW5Qj\n",
+            "decodes to 33 bytes, not 32",
+        ),
         (&too_long, "is longer than 1024 bytes, too long for a key"),
     ] {
         let secrets: &[&str] = if contents.trim().is_empty() {
@@ -307,6 +311,23 @@ fn missing_encryption_key_file() {
     let error = refused_key(
         &KeyEnv {
             file: named_file("no-such-key-file"),
+            value: None,
+        },
+        &[],
+    );
+    assert!(
+        error.starts_with("BRIDGE_ENCRYPTION_KEY_FILE: cannot read the file it names: "),
+        "{error}"
+    );
+}
+
+/// A directory opens but can't be read: the read fails, not the open.
+#[cfg(unix)]
+#[test]
+fn a_directory_as_the_key_file_is_unreadable() {
+    let error = refused_key(
+        &KeyEnv {
+            file: named_file("."),
             value: None,
         },
         &[],

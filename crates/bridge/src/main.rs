@@ -67,7 +67,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    let store = match SqliteStore::open(&config.database, &key) {
+    let store = match SqliteStore::open(&config.database, key) {
         Ok(store) => store,
         Err(error) => {
             let error = error_chain(&error);
