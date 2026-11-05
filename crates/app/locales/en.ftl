@@ -24,10 +24,10 @@ settings-language = Language
 settings-logout = Log out
 
 libraries-title = Libraries
-libraries-none = There are no Libraries on your Library Server yet.
+libraries-none = You can't see any Libraries on your Library Server yet.
 library-kind-audiobooks = Audiobooks
 library-kind-podcasts = Podcasts
-library-empty = This Library is empty.
+library-empty = There is nothing to listen to in this Library yet.
 back = Back
 
 episodes-unfinished = Unfinished

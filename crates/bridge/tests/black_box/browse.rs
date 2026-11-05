@@ -225,7 +225,7 @@ async fn an_audiobook_shows_details_progress_chapters_and_audio_files_at_their_o
                 .zip(&file_ids)
                 .map(|((start_offset, duration), id)| AudioFile {
                     id: id.clone(),
-                    start_offset,
+                    start_offset: Some(start_offset),
                     duration: Some(duration),
                 })
                 .collect(),
@@ -278,7 +278,7 @@ async fn an_episode_shows_its_podcast_details_and_progress() {
             item.audio_files[0].start_offset,
             item.audio_files[0].duration
         ),
-        (0.0, Some(600.0))
+        (Some(0.0), Some(600.0))
     );
 }
 
@@ -680,4 +680,57 @@ async fn an_ebook_without_audio_is_no_item() {
             .await,
         NOT_FOUND
     );
+}
+
+/// Pins the wire shape the App decodes, independent of the shared Rust types: the filter names
+/// in the query and in the answer, and the episodes each picks.
+#[tokio::test]
+async fn podcast_wire_shape() {
+    let (bridge, abs, user, session) = logged_in().await;
+    let seeded = abs.seeded();
+    abs.set_progress(&user, &seeded.podcast, Some(&seeded.episodes[0]), 0.0, true)
+        .await;
+    let api = bridge.api();
+    let podcast = async |filter: &str| -> serde_json::Value {
+        api.get_as(
+            &session,
+            "/api/podcast",
+            &[("id", seeded.podcast.as_str()), ("filter", filter)],
+        )
+        .await
+    };
+
+    let all = podcast("all").await;
+    assert_eq!(
+        all,
+        json!({
+            "id": seeded.podcast,
+            "title": "The Clacks Hour",
+            "author": "Ankh-Morpork Radio",
+            "filter": "all",
+            "episodes": [
+                {"id": seeded.episodes[2], "title": "Episode 3", "duration": 3960.0,
+                 "published_at": EPISODE_PUBLISHED_AT[2], "progress": null},
+                {"id": seeded.episodes[1], "title": "Episode 2", "duration": 900.0,
+                 "published_at": EPISODE_PUBLISHED_AT[1], "progress": null},
+                {"id": seeded.episodes[0], "title": "Episode 1", "duration": 600.0,
+                 "published_at": EPISODE_PUBLISHED_AT[0],
+                 "progress": {"current_time": 0.0, "finished": true}},
+            ],
+        })
+    );
+    for (filter, titles) in [
+        ("unfinished", json!(["Episode 3", "Episode 2"])),
+        ("finished", json!(["Episode 1"])),
+    ] {
+        let answer = podcast(filter).await;
+        assert_eq!(answer["filter"], filter);
+        let picked: Vec<_> = answer["episodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|episode| episode["title"].clone())
+            .collect();
+        assert_eq!(serde_json::Value::Array(picked), titles, "{filter}");
+    }
 }

@@ -83,11 +83,11 @@ pub fn item(
             author: non_empty(book.metadata.author_name),
             podcast: None,
             description: non_empty(book.metadata.description),
-            duration: known(book.duration),
+            duration: book.duration,
             published_at: None,
             progress: progress_of.audiobook(&library_item.id),
             chapters: book.chapters.into_iter().map(chapter).collect(),
-            audio_files: book.tracks.into_iter().map(audio_file).collect(),
+            audio_files: audio_files(book.tracks),
             id,
         }),
         (abs::Media::Podcast(podcast), Some(episode_id)) => {
@@ -105,7 +105,7 @@ pub fn item(
                 description: non_empty(episode.description),
                 published_at: episode.published_at,
                 chapters: Vec::new(),
-                audio_files: episode.audio_track.into_iter().map(audio_file).collect(),
+                audio_files: audio_files(episode.audio_track),
                 id,
             })
         }
@@ -161,34 +161,40 @@ fn chapter(chapter: abs::Chapter) -> Chapter {
     }
 }
 
-fn audio_file(track: abs::Track) -> AudioFile {
-    AudioFile {
-        id: track.ino,
-        start_offset: track.start_offset,
-        duration: known(track.duration),
-    }
+/// An Item's audio files in playing order. A file's start offset is known only while every
+/// file before it has a known duration: Audiobookshelf adds them up, counting an unknown one
+/// as 0.
+fn audio_files(tracks: impl IntoIterator<Item = abs::Track>) -> Vec<AudioFile> {
+    let mut offsets_known = true;
+    tracks
+        .into_iter()
+        .map(|track| {
+            let start_offset = track.start_offset.filter(|_| offsets_known);
+            offsets_known &= track.duration.is_some();
+            AudioFile {
+                id: track.ino,
+                start_offset,
+                duration: track.duration,
+            }
+        })
+        .collect()
 }
 
-/// Whether a library item listed as a book is an audiobook: one with audio files, not an
-/// ebook alone, which is no Item.
+/// Whether a library item listed as a book is an audiobook: not an ebook alone, which is no
+/// Item. Only an explicit count of 0 audio files says so.
 fn is_audiobook(book: &abs::Book) -> bool {
-    book.num_tracks > 0
+    book.num_tracks != Some(0)
 }
 
-/// An episode's duration in seconds: its own, else its audio file's, else unknown.
+/// An episode's duration in seconds: its own, else its audio file's (the same value on
+/// Audiobookshelf 2.37.2, kept for older episodes), else unknown.
 fn episode_duration(episode: &abs::Episode) -> Option<f64> {
-    known(episode.duration).or_else(|| {
+    episode.duration.or_else(|| {
         episode
             .audio_track
             .as_ref()
-            .and_then(|track| known(track.duration))
+            .and_then(|track| track.duration)
     })
-}
-
-/// A duration in seconds, unless Audiobookshelf doesn't know it: it sends 0 then (and may
-/// send null).
-fn known(seconds: Option<f64>) -> Option<f64> {
-    seconds.filter(|seconds| seconds.is_finite() && *seconds > 0.0)
 }
 
 /// `text`, unless it is missing or blank.
@@ -200,7 +206,7 @@ fn non_empty(text: Option<String>) -> Option<String> {
 mod tests {
     use api::{EpisodeFilter, Progress};
 
-    use super::{item, podcast};
+    use super::{item, library_entry, podcast};
 
     fn episode(id: &str, published_at: Option<i64>, duration: Option<f64>) -> abs::Episode {
         abs::Episode {
@@ -259,7 +265,7 @@ mod tests {
         let mut from_file = episode("file", Some(2), None);
         from_file.audio_track = Some(abs::Track {
             ino: "1".into(),
-            start_offset: 0.0,
+            start_offset: Some(0.0),
             duration: Some(60.0),
         });
         let mut own = episode("own", Some(3), Some(30.0));
@@ -299,24 +305,34 @@ mod tests {
         );
     }
 
-    /// Audiobookshelf sends 0 for a duration it doesn't know.
+    fn decoded(item: serde_json::Value) -> abs::LibraryItem {
+        serde_json::from_value(item).unwrap()
+    }
+
+    fn audiobook_id() -> api::ItemId {
+        api::ItemId {
+            library_item: "li-2".into(),
+            episode: None,
+        }
+    }
+
+    /// Audiobookshelf sends 0 for a duration it doesn't know: from its answer to the App,
+    /// that is no duration.
     #[test]
     fn a_zero_duration_is_unknown() {
-        let track = |duration| {
-            Some(abs::Track {
-                ino: "1".into(),
-                start_offset: 0.0,
-                duration,
-            })
-        };
-        let mut zero_with_file = episode("zero-with-file", Some(3), Some(0.0));
-        zero_with_file.audio_track = track(Some(60.0));
-        let mut zero_with_zero_file = episode("zero-with-zero-file", Some(2), Some(0.0));
-        zero_with_zero_file.audio_track = track(Some(0.0));
-        let zero_alone = episode("zero-alone", Some(1), Some(0.0));
         let listed = podcast(
             &user(Vec::new()),
-            the_podcast(vec![zero_with_file, zero_with_zero_file, zero_alone]),
+            decoded(serde_json::json!({
+                "id": "li-1",
+                "mediaType": "podcast",
+                "media": {"metadata": {"title": "Podcast"}, "episodes": [
+                    {"id": "zero-with-file", "title": "a", "publishedAt": 3, "duration": 0,
+                     "audioTrack": {"ino": "1", "startOffset": 0, "duration": 60}},
+                    {"id": "zero-with-zero-file", "title": "b", "publishedAt": 2, "duration": 0,
+                     "audioTrack": {"ino": "2", "startOffset": 0, "duration": 0}},
+                    {"id": "zero-alone", "title": "c", "publishedAt": 1, "duration": 0},
+                ]},
+            })),
             EpisodeFilter::All,
         )
         .unwrap();
@@ -327,31 +343,58 @@ mod tests {
             .collect();
         assert_eq!(durations, [Some(60.0), None, None]);
 
-        let book = abs::LibraryItem {
-            id: "li-2".into(),
-            media: abs::Media::Book(abs::Book {
-                metadata: abs::BookMetadata {
-                    title: "Book".into(),
-                    author_name: None,
-                    description: None,
-                },
-                duration: Some(0.0),
-                num_tracks: 1,
-                chapters: Vec::new(),
-                tracks: vec![abs::Track {
-                    ino: "1".into(),
-                    start_offset: 0.0,
-                    duration: Some(0.0),
-                }],
-            }),
-        };
-        let id = api::ItemId {
-            library_item: "li-2".into(),
-            episode: None,
-        };
-        let shown = item(&user(Vec::new()), book, id).unwrap();
+        let book = decoded(serde_json::json!({
+            "id": "li-2",
+            "mediaType": "book",
+            "media": {"metadata": {"title": "Book"}, "duration": 0, "numTracks": 1,
+                      "tracks": [{"ino": "1", "startOffset": 0, "duration": 0}]},
+        }));
+        let shown = item(&user(Vec::new()), book, audiobook_id()).unwrap();
         assert_eq!(shown.duration, None);
         assert_eq!(shown.audio_files[0].duration, None);
+    }
+
+    /// Audiobookshelf adds up the files' durations for the offsets, counting an unknown one
+    /// as 0: from there on, the offsets are unknown.
+    #[test]
+    fn offsets_after_a_file_of_unknown_duration_are_unknown() {
+        let book = decoded(serde_json::json!({
+            "id": "li-2",
+            "mediaType": "book",
+            "media": {"metadata": {"title": "Book"}, "numTracks": 3, "tracks": [
+                {"ino": "1", "startOffset": 0, "duration": 100},
+                {"ino": "2", "startOffset": 100, "duration": null},
+                {"ino": "3", "startOffset": 100, "duration": 50},
+            ]},
+        }));
+        let shown = item(&user(Vec::new()), book, audiobook_id()).unwrap();
+        let offsets: Vec<_> = shown
+            .audio_files
+            .iter()
+            .map(|file| file.start_offset)
+            .collect();
+        assert_eq!(offsets, [Some(0.0), Some(100.0), None]);
+    }
+
+    /// Only an explicit count of no audio files makes a book an ebook alone, which is no Item.
+    #[test]
+    fn only_a_book_with_no_audio_files_is_left_out() {
+        let book = |num_tracks: Option<u64>| {
+            let mut media = serde_json::json!({"metadata": {"title": "Book"}});
+            if let Some(num_tracks) = num_tracks {
+                media["numTracks"] = num_tracks.into();
+            }
+            decoded(serde_json::json!({"id": "li-2", "mediaType": "book", "media": media}))
+        };
+        assert!(library_entry(book(Some(0))).is_none());
+        assert!(item(&user(Vec::new()), book(Some(0)), audiobook_id()).is_err());
+        for num_tracks in [None, Some(2)] {
+            assert!(library_entry(book(num_tracks)).is_some(), "{num_tracks:?}");
+            assert!(
+                item(&user(Vec::new()), book(num_tracks), audiobook_id()).is_ok(),
+                "{num_tracks:?}"
+            );
+        }
     }
 
     #[test]

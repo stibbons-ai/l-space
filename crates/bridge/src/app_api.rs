@@ -124,18 +124,12 @@ impl<S: Store> AppApi<S> {
             operation: "list the Libraries",
             id: None,
         };
-        let (_, libraries) = self
+        let (library_server, _, libraries) = self
             .browse(token, request, async |server, key| {
                 self.abs.libraries(server, key).await
             })
             .await?;
-        if libraries.dropped > 0 {
-            tracing::warn!(
-                operation = request.operation,
-                dropped = libraries.dropped,
-                "Libraries of a kind the Bridge doesn't know were left out"
-            );
-        }
+        warn_dropped(library_server, "Libraries", libraries.dropped);
         Ok(libraries.entries.into_iter().map(browse::library).collect())
     }
 
@@ -148,7 +142,7 @@ impl<S: Store> AppApi<S> {
             operation: "list a Library",
             id: Some(&library),
         };
-        let (_, items) = self
+        let (_, _, items) = self
             .browse(token, request, async |server, key| {
                 self.abs.library_items(server, key, &library).await
             })
@@ -169,12 +163,19 @@ impl<S: Store> AppApi<S> {
             operation: "fetch a podcast",
             id: Some(&podcast),
         };
-        let (user, item) = self
+        let (library_server, user, item) = self
             .browse(token, request, async |server, key| {
                 self.abs.library_item(server, key, &podcast).await
             })
             .await?;
-        browse::podcast(&user, item, filter)
+        browse::podcast(&user, item, filter).inspect_err(|_| {
+            tracing::info!(
+                library_server,
+                operation = request.operation,
+                library_item = podcast,
+                "the library item is no podcast"
+            );
+        })
     }
 
     async fn item(&self, token: SessionToken, id: ItemId) -> Result<Item, ApiError> {
@@ -182,12 +183,22 @@ impl<S: Store> AppApi<S> {
             operation: "fetch an Item",
             id: Some(&id.library_item),
         };
-        let (user, library_item) = self
+        let (library_server, user, library_item) = self
             .browse(token, request, async |server, key| {
                 self.abs.library_item(server, key, &id.library_item).await
             })
             .await?;
-        browse::item(&user, library_item, id)
+        let operation = request.operation;
+        let (library_item_id, episode_id) = (id.library_item.clone(), id.episode.clone());
+        browse::item(&user, library_item, id).inspect_err(|_| {
+            tracing::info!(
+                library_server,
+                operation,
+                library_item = library_item_id,
+                episode = episode_id,
+                "the library item holds no such Item"
+            );
+        })
     }
 
     /// The session `token` names, and the configured Library Server it belongs to.
@@ -213,13 +224,13 @@ impl<S: Store> AppApi<S> {
 
     /// Fetches something with `fetch` (the `request`) from the session's Library Server as its
     /// user, and checks at the same time that the session's key still acts for that user.
-    /// Returns the user, with their Progress, and what was fetched.
+    /// Returns the Library Server, the user with their Progress, and what was fetched.
     async fn browse<T>(
         &self,
         token: SessionToken,
         request: Request<'_>,
         fetch: impl AsyncFnOnce(&str, &abs::ApiKey) -> Result<T, abs::Error>,
-    ) -> Result<(abs::User, T), ApiError> {
+    ) -> Result<(&str, abs::User, T), ApiError> {
         let (library_server, session) = self.session(&token).await?;
         let (user, fetched) = tokio::join!(
             self.abs.me(library_server, &session.api_key),
@@ -227,7 +238,7 @@ impl<S: Store> AppApi<S> {
         );
         let user = self.verified(library_server, &session, user).await?;
         match fetched {
-            Ok(fetched) => Ok((user, fetched)),
+            Ok(fetched) => Ok((library_server, user, fetched)),
             Err(error) => Err(self.failure(library_server, &session, request, error).await),
         }
     }
@@ -243,14 +254,11 @@ impl<S: Store> AppApi<S> {
     ) -> Result<abs::User, ApiError> {
         match me {
             Ok(user) if user.id == session.user.user_id => {
-                if user.media_progress.dropped > 0 {
-                    tracing::warn!(
-                        library_server,
-                        user_id = user.id,
-                        dropped = user.media_progress.dropped,
-                        "Progress entries in a shape the Bridge doesn't know were left out"
-                    );
-                }
+                warn_dropped(
+                    library_server,
+                    "Progress entries",
+                    user.media_progress.dropped,
+                );
                 Ok(user)
             }
             // An admin can move a key to another user; the session must not follow it.
@@ -394,15 +402,28 @@ impl Request<'_> {
     };
 }
 
+/// Logs that `dropped` of the `what` a Library Server sent were left out because the Bridge
+/// doesn't know their shape.
+fn warn_dropped(library_server: &str, what: &'static str, dropped: usize) {
+    if dropped > 0 {
+        tracing::warn!(
+            library_server,
+            what,
+            dropped,
+            "entries in a shape the Bridge doesn't know were left out"
+        );
+    }
+}
+
 fn abs_error(library_server: &str, request: Request, error: abs::Error) -> ApiError {
     match error {
         abs::Error::Rejected => ApiError::ApiKeyRejected,
-        abs::Error::NotFound { status } => {
+        abs::Error::NotFound(cause) => {
             tracing::info!(
                 library_server,
                 operation = request.operation,
                 id = request.id,
-                status,
+                cause = ?cause,
                 "not found on the Library Server"
             );
             ApiError::NotFound

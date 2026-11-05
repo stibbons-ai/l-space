@@ -146,7 +146,7 @@ pub struct Item {
     /// An episode's podcast, by title.
     pub podcast: Option<String>,
     pub description: Option<String>,
-    /// Unknown if the Library Server doesn't know it (an episode's may be missing).
+    /// Unknown if the Library Server doesn't know it, for an audiobook or an episode alike.
     pub duration: Option<f64>,
     /// When an episode was published, in milliseconds since the Unix epoch.
     pub published_at: Option<i64>,
@@ -181,8 +181,9 @@ pub struct Chapter {
 pub struct AudioFile {
     /// Audiobookshelf's id for the file within its audiobook or podcast.
     pub id: String,
-    /// Seconds into the whole Item where this file starts.
-    pub start_offset: f64,
+    /// Seconds into the whole Item where this file starts; unknown once a file before it has
+    /// an unknown duration.
+    pub start_offset: Option<f64>,
     /// Unknown if the Library Server could not tell.
     pub duration: Option<f64>,
 }

@@ -134,8 +134,9 @@ pub enum MediaType {
     Podcast,
 }
 
-/// An entry in a Library: an audiobook or a podcast. Listed in a Library, only the metadata
-/// is filled in; [`Client::library_item`] brings the rest.
+/// An entry in a Library: an audiobook or a podcast (an ebook too, at this layer). Listed in
+/// a Library, only the metadata, a book's `numTracks` and `duration` are filled in;
+/// [`Client::library_item`] brings the rest.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LibraryItem {
     pub id: String,
@@ -155,12 +156,13 @@ pub enum Media {
 #[serde(rename_all = "camelCase")]
 pub struct Book {
     pub metadata: BookMetadata,
-    /// Seconds, all audio files together; 0 when unknown.
-    #[serde(default)]
+    /// Seconds, all audio files together; none when Audiobookshelf doesn't know it.
+    #[serde(default, deserialize_with = "known_seconds")]
     pub duration: Option<f64>,
-    /// How many audio files it has; none for an ebook without audio.
-    #[serde(default, deserialize_with = "null_as_default")]
-    pub num_tracks: usize,
+    /// How many audio files it has that aren't excluded; 0 for an ebook without audio.
+    /// Unknown if Audiobookshelf leaves it out.
+    #[serde(default)]
+    pub num_tracks: Option<usize>,
     #[serde(default)]
     pub chapters: Vec<Chapter>,
     /// The audio files in playing order.
@@ -200,7 +202,8 @@ pub struct Episode {
     pub description: Option<String>,
     /// Milliseconds since the Unix epoch.
     pub published_at: Option<i64>,
-    /// Seconds.
+    /// Seconds; none when Audiobookshelf doesn't know it.
+    #[serde(default, deserialize_with = "known_seconds")]
     pub duration: Option<f64>,
     pub audio_track: Option<Track>,
 }
@@ -220,11 +223,19 @@ pub struct Chapter {
 pub struct Track {
     /// Audiobookshelf's id for the file within its library item.
     pub ino: String,
-    /// Seconds into the whole audiobook where this file starts.
-    #[serde(default, deserialize_with = "null_as_default")]
-    pub start_offset: f64,
-    /// Seconds; Audiobookshelf may not know it (null) when it could not probe the file.
+    /// Seconds into the whole audiobook where this file starts, as Audiobookshelf adds up the
+    /// durations of the files before it.
+    #[serde(default)]
+    pub start_offset: Option<f64>,
+    /// Seconds; none when Audiobookshelf could not probe the file.
+    #[serde(default, deserialize_with = "known_seconds")]
     pub duration: Option<f64>,
+}
+
+/// A duration in seconds, unless Audiobookshelf doesn't know it: it then sends 0 (or null).
+fn known_seconds<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
+    Ok(Option::<f64>::deserialize(deserializer)?
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0))
 }
 
 /// Why a request to a Library Server failed.
@@ -244,11 +255,20 @@ pub enum Error {
     /// example).
     #[error("the Library Server gave no usable answer: {0}")]
     Unavailable(String),
-    /// The Library Server has no Library or library item with this id that the user may see,
-    /// answering with `status`: 404, or the 403 Audiobookshelf answers when the user may not
-    /// see it. Without a status, the id is not an Audiobookshelf id and was never sent.
-    #[error("no such Library or library item")]
-    NotFound { status: Option<u16> },
+    /// The Library Server has no Library or library item with this id that the user may see.
+    #[error("no such Library or library item ({0:?})")]
+    NotFound(NotFound),
+}
+
+/// Why a Library or library item is not found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotFound {
+    /// HTTP 403: Audiobookshelf answers this when the user may not see it.
+    Forbidden,
+    /// HTTP 404.
+    Missing,
+    /// The id is not an Audiobookshelf id; it was never sent.
+    InvalidId,
 }
 
 impl Error {
@@ -320,7 +340,8 @@ impl Client {
         Ok(libraries.libraries)
     }
 
-    /// Every audiobook or podcast in Library `library_id`, by title, with metadata only.
+    /// Every audiobook or podcast in Library `library_id` (books without audio included), by
+    /// title, with metadata, a book's `numTracks` and `duration` only.
     ///
     /// One request: without a `limit`, Audiobookshelf answers with all of them (2.37.2:
     /// `LibraryController.getLibraryItems` defaults `limit` to 0, which its item queries
@@ -379,14 +400,12 @@ impl Client {
         match (response.status(), names) {
             (StatusCode::UNAUTHORIZED, _) => Err(Error::Rejected),
             // Audiobookshelf answers 403 for a Library or item the user may not see.
-            (status @ (StatusCode::FORBIDDEN | StatusCode::NOT_FOUND), Names::One) => {
-                Err(Error::NotFound {
-                    status: Some(status.as_u16()),
-                })
-            }
+            (StatusCode::FORBIDDEN, Names::One) => Err(Error::NotFound(NotFound::Forbidden)),
+            (StatusCode::NOT_FOUND, Names::One) => Err(Error::NotFound(NotFound::Missing)),
             (status, _) if status.is_success() => response.json().await.map_err(Error::unavailable),
-            // Only a 403 or 404 on `/api/me` or `/api/libraries` ends here: every
-            // Audiobookshelf answers those, so something in front of it did, a proxy for example.
+            // Any other answer: a server error, a redirect, or a 403/404 on `/api/me` or
+            // `/api/libraries`, which every Audiobookshelf answers, so something in front of
+            // it did.
             (status, _) => Err(Error::Unavailable(format!("HTTP {status}"))),
         }
     }
@@ -408,7 +427,7 @@ fn id_segment(id: &str) -> Result<&str, Error> {
     if plain {
         Ok(id)
     } else {
-        Err(Error::NotFound { status: None })
+        Err(Error::NotFound(NotFound::InvalidId))
     }
 }
 
@@ -425,7 +444,7 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        ApiKey, Client, Error, Known, Library, LibraryItem, Media, MediaProgress, MediaType, User,
+        ApiKey, Client, Error, Known, LibraryItem, Media, MediaProgress, MediaType, NotFound, User,
     };
 
     async fn serve(router: Router) -> String {
@@ -628,11 +647,11 @@ mod tests {
         let key = ApiKey::new("key");
         assert!(matches!(
             client.library_item(&base_url, &key, "li-1").await,
-            Err(Error::NotFound { status: Some(403) })
+            Err(Error::NotFound(NotFound::Forbidden))
         ));
         assert!(matches!(
             client.library_items(&base_url, &key, "lib-1").await,
-            Err(Error::NotFound { status: Some(403) })
+            Err(Error::NotFound(NotFound::Forbidden))
         ));
     }
 
@@ -646,14 +665,14 @@ mod tests {
             assert!(
                 matches!(
                     client.library_item("http://127.0.0.1:9", &key, id).await,
-                    Err(Error::NotFound { status: None })
+                    Err(Error::NotFound(NotFound::InvalidId))
                 ),
                 "{id:?}"
             );
             assert!(
                 matches!(
                     client.library_items("http://127.0.0.1:9", &key, id).await,
-                    Err(Error::NotFound { status: None })
+                    Err(Error::NotFound(NotFound::InvalidId))
                 ),
                 "{id:?}"
             );
@@ -667,7 +686,7 @@ mod tests {
             Client::new()
                 .library_item(&base_url, &ApiKey::new("key"), "li-1")
                 .await,
-            Err(Error::NotFound { status: Some(404) })
+            Err(Error::NotFound(NotFound::Missing))
         ));
     }
 
@@ -701,14 +720,23 @@ mod tests {
     }
 
     /// A Library of a kind this client doesn't know is left out, not the whole list.
-    #[test]
-    fn a_library_of_an_unknown_kind_is_left_out() {
-        let libraries: Known<Library> = serde_json::from_value(json!([
-            {"id": "l1", "name": "Books", "mediaType": "book"},
-            {"id": "l2", "name": "Comics", "mediaType": "comic"},
-            {"id": "l3", "name": "Shows", "mediaType": "podcast"},
-        ]))
-        .unwrap();
+    #[tokio::test]
+    async fn a_library_of_an_unknown_kind_is_left_out() {
+        let base_url = serve(Router::new().route(
+            "/api/libraries",
+            get(|| async {
+                axum::Json(json!({"libraries": [
+                    {"id": "l1", "name": "Books", "mediaType": "book"},
+                    {"id": "l2", "name": "Comics", "mediaType": "comic"},
+                    {"id": "l3", "name": "Shows", "mediaType": "podcast"},
+                ]}))
+            }),
+        ))
+        .await;
+        let libraries = Client::new()
+            .libraries(&base_url, &ApiKey::new("key"))
+            .await
+            .unwrap();
         let kinds: Vec<_> = libraries
             .entries
             .iter()
@@ -716,6 +744,61 @@ mod tests {
             .collect();
         assert_eq!(kinds, [("l1", MediaType::Book), ("l3", MediaType::Podcast)]);
         assert_eq!(libraries.dropped, 1);
+    }
+
+    /// Audiobookshelf sends 0 (or null) for a duration it doesn't know; that is no duration.
+    #[test]
+    fn a_zero_or_null_duration_is_unknown() {
+        let item: LibraryItem = serde_json::from_value(json!({
+            "id": "li-1",
+            "mediaType": "podcast",
+            "media": {
+                "metadata": {"title": "Podcast"},
+                "episodes": [
+                    {"id": "e1", "title": "Zero", "duration": 0,
+                     "audioTrack": {"ino": "1", "startOffset": 0, "duration": 0}},
+                    {"id": "e2", "title": "Null", "duration": null},
+                    {"id": "e3", "title": "Known", "duration": 60.5},
+                ],
+            },
+        }))
+        .unwrap();
+        let Media::Podcast(podcast) = item.media else {
+            panic!("{item:?}");
+        };
+        let durations: Vec<_> = podcast
+            .episodes
+            .iter()
+            .map(|episode| episode.duration)
+            .collect();
+        assert_eq!(durations, [None, None, Some(60.5)]);
+        assert_eq!(
+            podcast.episodes[0].audio_track.as_ref().unwrap().duration,
+            None
+        );
+    }
+
+    /// Only an explicit 0 says a book has no audio; without `numTracks` it is not known.
+    #[test]
+    fn a_book_without_num_tracks_is_not_taken_for_an_ebook() {
+        let book = |media: serde_json::Value| -> Option<usize> {
+            let item: LibraryItem =
+                serde_json::from_value(json!({"id": "li", "mediaType": "book", "media": media}))
+                    .unwrap();
+            let Media::Book(book) = item.media else {
+                panic!("{item:?}");
+            };
+            book.num_tracks
+        };
+        assert_eq!(book(json!({"metadata": {"title": "B"}})), None);
+        assert_eq!(
+            book(json!({"metadata": {"title": "B"}, "numTracks": 0})),
+            Some(0)
+        );
+        assert_eq!(
+            book(json!({"metadata": {"title": "B"}, "numTracks": 3})),
+            Some(3)
+        );
     }
 
     /// A Library's contents come in one request without `limit` or `page` (Audiobookshelf
@@ -763,6 +846,7 @@ mod tests {
             panic!("{item:?}");
         };
         assert_eq!(book.tracks[0].duration, None);
-        assert_eq!(book.tracks[0].start_offset, 0.0);
+        assert_eq!(book.tracks[0].start_offset, None);
+        assert_eq!(book.duration, None);
     }
 }
