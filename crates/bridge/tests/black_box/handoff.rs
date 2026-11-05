@@ -783,9 +783,14 @@ async fn a_speaker_hanging_up_mid_file_logs_nothing() {
         .unwrap()
         .parse()
         .unwrap();
-    // Read what comes until nothing more does for 200 ms: the Library Server really stalls,
-    // short of the whole file.
-    let mut received = 0;
+    // The start of the file comes (however slowly), then nothing more for 200 ms: the Library
+    // Server really stalls, short of the whole file.
+    let first = tokio::time::timeout(Duration::from_secs(10), response.chunk())
+        .await
+        .expect("the start of the file in time")
+        .unwrap()
+        .expect("the start of the file");
+    let mut received = first.len();
     while let Ok(chunk) = tokio::time::timeout(Duration::from_millis(200), response.chunk()).await {
         let chunk = chunk.unwrap().expect("the file ends only after the stall");
         received += chunk.len();
