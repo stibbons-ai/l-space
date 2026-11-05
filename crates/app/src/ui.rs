@@ -85,10 +85,13 @@ fn BridgeUrlScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>)
                 {text(Text::BridgeUrlLabel)}
                 input {
                     // Not `url`: native validation would reject bare addresses such as
-                    // `192.168.1.10:8080` before the flow can add `http://`.
+                    // `192.168.1.10:8080` before the flow can add `http://`. `url` also turned
+                    // iOS autocorrection off, which a text input needs `autocorrect` for: a
+                    // host name such as `clacks.lan` must not be "corrected".
                     r#type: "text",
                     inputmode: "url",
                     autocapitalize: "none",
+                    autocorrect: "off",
                     autocomplete: "off",
                     spellcheck: false,
                     placeholder: "http://192.168.1.10:8080",
