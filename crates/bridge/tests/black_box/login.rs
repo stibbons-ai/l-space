@@ -1,22 +1,24 @@
 //! Logging in with an Audiobookshelf API key, the session it opens, and how that session ends
 //! (ADR 0011), against a real Audiobookshelf.
 
-use std::net::TcpListener;
 use std::sync::Arc;
 
 use api::ApiError;
 use reqwest::StatusCode;
 use serde_json::json;
 
-use crate::audiobookshelf::Audiobookshelf;
-use crate::forwarder::Forwarder;
-use crate::support::{
-    SESSION_INVALID, TestBridge, acting_as, acting_on, library_server_toml, output_contains,
+use test_support::audiobookshelf::Audiobookshelf;
+use test_support::bridge::{
+    SESSION_INVALID, TestBridge, acting_as, acting_on, library_server_toml,
+    named_library_server_toml, output_contains,
 };
+use test_support::closed_port;
+
+use crate::forwarder::Forwarder;
 
 /// The configuration naming `abs` as the one Library Server.
 fn abs_config(abs: &Audiobookshelf) -> String {
-    format!("{}name = \"Home\"\n", library_server_toml(abs.base_url()))
+    named_library_server_toml(abs.base_url(), "Home")
 }
 
 /// A Bridge with the shared Audiobookshelf as its one Library Server.
@@ -24,14 +26,6 @@ fn bridge_with_abs() -> (TestBridge, Arc<Audiobookshelf>) {
     let abs = Audiobookshelf::shared();
     let bridge = TestBridge::start(&abs_config(&abs));
     (bridge, abs)
-}
-
-/// A loopback address nothing listens on.
-fn closed_port() -> std::net::SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
 }
 
 const KEY_REJECTED: (StatusCode, ApiError) = (StatusCode::UNAUTHORIZED, ApiError::ApiKeyRejected);

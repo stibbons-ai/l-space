@@ -1,8 +1,13 @@
 //! The black-box Bridge harness.
 //!
 //! A test starts the real `bridge` binary as a subprocess and acts on it through the App API,
-//! speaking its HTTP wire format; it also observes the exit status and log events, as an
-//! operator would. It never reaches into the Bridge's modules or state.
+//! speaking its HTTP wire format (or, for the App's tests, through the App at [`TestBridge::url`]);
+//! it also observes the exit status and log events, as an operator would. It never reaches into
+//! the Bridge's modules or state.
+//!
+//! The binary is the `bridge` next to the test executable's directory (`target/<profile>/`).
+//! The Bridge's own tests get it built by Cargo; other packages' tests need a
+//! `cargo build -p bridge` first.
 //!
 //! ```ignore
 //! let bridge = TestBridge::start(r#"
@@ -102,6 +107,7 @@ pub enum KeyFile {
 }
 
 /// A running Bridge, killed on drop.
+#[derive(Debug)]
 pub struct TestBridge {
     running: Running,
     config: PathBuf,
@@ -111,6 +117,7 @@ pub struct TestBridge {
 }
 
 /// One Bridge process, serving.
+#[derive(Debug)]
 struct Running {
     child: Child,
     output: Receiver<Value>,
@@ -197,6 +204,11 @@ impl TestBridge {
         &self.running.api
     }
 
+    /// The Bridge's base URL, as a person would enter it in the App.
+    pub fn url(&self) -> &str {
+        &self.running.api.base_url
+    }
+
     /// Everything the Bridge wrote up to and including its `listening` event.
     pub fn startup_output(&self) -> &[Value] {
         &self.running.startup
@@ -261,6 +273,11 @@ fn bearer(session: &Session) -> String {
 /// The configuration entry for a Library Server at `url`.
 pub fn library_server_toml(url: &str) -> String {
     format!("[[library_servers]]\nurl = \"{url}\"\n")
+}
+
+/// The configuration entry for a Library Server at `url` named `name`.
+pub fn named_library_server_toml(url: &str, name: &str) -> String {
+    format!("{}name = \"{name}\"\n", library_server_toml(url))
 }
 
 /// The rejection of a call without a usable session.
@@ -482,11 +499,28 @@ pub fn config_file(contents: &str) -> (TempDir, PathBuf) {
     (dir, path)
 }
 
+/// The `bridge` binary in the Cargo target directory this test executable was built into.
+fn bridge_binary() -> PathBuf {
+    let test_exe = std::env::current_exe().expect("path of the test executable");
+    // `target/<profile>/deps/<test>` → `target/<profile>/bridge`
+    let binary = test_exe
+        .parent()
+        .and_then(Path::parent)
+        .expect("test executable in target/<profile>/deps")
+        .join(format!("bridge{}", std::env::consts::EXE_SUFFIX));
+    assert!(
+        binary.is_file(),
+        "no Bridge binary at {}: run `cargo build -p bridge` first",
+        binary.display()
+    );
+    binary
+}
+
 /// Starts the Bridge in the config file's directory and forwards its output lines until it
 /// closes stdout and stderr (exits). A key file is written to that directory.
 fn spawn(config: &Path, rust_log: &str, key: &KeyEnv) -> (Child, Receiver<Value>) {
     let dir = config.parent().expect("config file in a directory");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bridge"));
+    let mut command = Command::new(bridge_binary());
     command
         .arg("--config")
         .arg(config)

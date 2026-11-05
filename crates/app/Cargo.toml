@@ -1,0 +1,32 @@
+[package]
+name = "app"
+description = "The L-Space App (shipped as Ook): a Dioxus mobile app that is a remote for the Bridge"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+api.workspace = true
+# No `fullstack` here: `dx` would then also build and launch a server half on the host (a
+# desktop window). `api` enables it, which gives the App the server function client.
+dioxus = { workspace = true, features = ["mobile", "launch", "lib", "logger"] }
+dirs.workspace = true
+fluent-bundle.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sys-locale.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
+unic-langid.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+fluent-syntax.workspace = true
+tempfile.workspace = true
+test-support.workspace = true
+
+[lints]
+workspace = true

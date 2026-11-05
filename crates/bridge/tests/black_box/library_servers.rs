@@ -1,6 +1,6 @@
 use api::LibraryServer;
 
-use crate::support::TestBridge;
+use test_support::bridge::TestBridge;
 
 #[tokio::test]
 async fn lists_configured_library_servers_with_normalized_urls_in_file_order() {

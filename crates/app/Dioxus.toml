@@ -1,0 +1,24 @@
+[application]
+name = "Ook"
+
+[bundle]
+identifier = "ai.stibbons.ook"
+publisher = "stibbons-ai"
+
+[ios.plist]
+# English only: dx doesn't generate InfoPlist.strings.
+NSLocalNetworkUsageDescription = "Ook connects to Clacks on your network."
+CFBundleDisplayName = "Ook"
+
+# The Bridge may be a plain-HTTP address on the LAN.
+[ios.plist.NSAppTransportSecurity]
+NSAllowsArbitraryLoads = true
+
+# The iOS 27 SDK refuses to launch apps without a static UIScene manifest. tao (0.37+) vends
+# `TaoSceneDelegate`; the launch check only reads Info.plist, so name it here (ADR 0007).
+[ios.plist.UIApplicationSceneManifest]
+UIApplicationSupportsMultipleScenes = false
+
+[[ios.plist.UIApplicationSceneManifest.UISceneConfigurations.UIWindowSceneSessionRoleApplication]]
+UISceneConfigurationName = "Default Configuration"
+UISceneDelegateClassName = "TaoSceneDelegate"

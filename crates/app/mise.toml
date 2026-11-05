@@ -1,0 +1,7 @@
+[tools]
+# Dioxus's CLI, matching the workspace's `dioxus` pin. Also shadows Deno's unrelated `dx`.
+"cargo:dioxus-cli" = "0.8.0-alpha.3"
+
+[env]
+# Xcode, not the Command Line Tools, for iOS builds, without a global `xcode-select -s`.
+DEVELOPER_DIR = "/Applications/Xcode.app/Contents/Developer"

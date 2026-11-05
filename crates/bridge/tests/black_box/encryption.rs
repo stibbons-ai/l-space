@@ -7,8 +7,8 @@ use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::audiobookshelf::Audiobookshelf;
-use crate::support::{
+use test_support::audiobookshelf::Audiobookshelf;
+use test_support::bridge::{
     KEY, KeyEnv, KeyFile, OTHER_KEY, SESSION_INVALID, TestBridge, acting_as, library_server_toml,
     output_contains,
 };

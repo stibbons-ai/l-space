@@ -4,7 +4,7 @@
 
 use std::net::TcpListener;
 
-use crate::support::{
+use test_support::bridge::{
     DATABASE, Exited, KEY, KeyEnv, KeyFile, LISTEN, RUST_LOG, config_file, is_listening,
     library_server_toml, run_until_exit, run_until_exit_with_key,
 };

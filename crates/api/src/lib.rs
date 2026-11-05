@@ -101,10 +101,16 @@ pub struct CurrentUser {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(tag = "code", rename_all = "snake_case")]
 pub enum ApiError {
-    /// The App could not reach the Bridge, or could not understand its answer. Produced only
-    /// on the App's side, by the client half of a server function; the Bridge never sends it.
+    /// The App could not reach the Bridge. Produced only on the App's side, by the client half
+    /// of a server function; the Bridge never sends it.
     #[error("bridge_unreachable")]
     BridgeUnreachable,
+    /// Something answered at the Bridge's address, but not as a Bridge: an HTTP error without
+    /// an App API error code (other than 502, 503 and 504, which count as
+    /// [`ApiError::BridgeUnreachable`]), or a body the App cannot decode. Produced only on the
+    /// App's side; the Bridge never sends it.
+    #[error("not_a_bridge")]
+    NotABridge,
     /// The Bridge failed in a way the user cannot fix.
     #[error("internal")]
     Internal,
@@ -136,12 +142,21 @@ pub enum ApiError {
     Unknown,
 }
 
+/// How the client half of a server function reports a call that got no App API answer.
 impl From<ServerFnError> for ApiError {
     fn from(error: ServerFnError) -> Self {
+        // These errors carry the response's body, not the request, so no session token or API
+        // key shows in the log.
+        tracing::debug!(%error, "server function call failed");
         match error {
-            ServerFnError::Request(_)
-            | ServerFnError::StreamError(_)
-            | ServerFnError::Deserialization(_) => Self::BridgeUnreachable,
+            ServerFnError::Request(_) | ServerFnError::StreamError(_) => Self::BridgeUnreachable,
+            // A reverse proxy in front of the Bridge that can't reach it answers like this.
+            ServerFnError::ServerError {
+                code: 502..=504, ..
+            } => Self::BridgeUnreachable,
+            ServerFnError::ServerError { .. } | ServerFnError::Deserialization(_) => {
+                Self::NotABridge
+            }
             _ => Self::Internal,
         }
     }
@@ -152,7 +167,9 @@ impl AsStatusCode for ApiError {
         match self {
             Self::ApiKeyRejected | Self::SessionInvalid => StatusCode::UNAUTHORIZED,
             Self::LibraryServerNotConfigured => StatusCode::NOT_FOUND,
-            Self::BridgeUnreachable | Self::LibraryServerUnreachable => StatusCode::BAD_GATEWAY,
+            Self::BridgeUnreachable | Self::NotABridge | Self::LibraryServerUnreachable => {
+                StatusCode::BAD_GATEWAY
+            }
             Self::Internal | Self::Unknown => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -294,6 +311,34 @@ mod tests {
         assert_eq!(
             ApiError::Unknown.as_status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn an_answer_without_an_app_api_code_is_a_gateway_failure_or_not_a_bridge() {
+        use dioxus::fullstack::ServerFnError;
+        let without_code = |code| ServerFnError::ServerError {
+            message: format!("HTTP {code}: <html>"),
+            code,
+            details: None,
+        };
+        for code in [502, 503, 504] {
+            assert_eq!(
+                ApiError::from(without_code(code)),
+                ApiError::BridgeUnreachable,
+                "{code}"
+            );
+        }
+        for code in [200, 404, 405, 422, 500, 501, 505] {
+            assert_eq!(
+                ApiError::from(without_code(code)),
+                ApiError::NotABridge,
+                "{code}"
+            );
+        }
+        assert_eq!(
+            ApiError::from(ServerFnError::Deserialization("<html>".into())),
+            ApiError::NotABridge
         );
     }
 
