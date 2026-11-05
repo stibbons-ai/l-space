@@ -82,6 +82,6 @@ error-internal = Bei Clacks ist etwas schiefgegangen. Bitte versuche es später 
 error-api-key-rejected = Audiobookshelf hat diesen API-Schlüssel abgelehnt: Er ist falsch, wurde widerrufen oder ist abgelaufen. Bitte deinen Audiobookshelf-Admin um einen neuen.
 error-library-server-not-configured = Dieser Library Server ist auf Clacks nicht mehr eingerichtet. Wähle einen anderen oder wende dich an die Person, die Clacks betreibt.
 error-library-server-unreachable = Clacks erreicht diesen Library Server gerade nicht. Bitte versuche es später noch einmal.
-error-not-found = Das gibt es auf deinem Library Server (nicht mehr).
+error-not-found = Das ist auf deinem Library Server nicht (mehr) für dich verfügbar.
 error-session-invalid = Deine Sitzung ist beendet. Bitte melde dich erneut an.
 error-unknown = Etwas Unerwartetes ist schiefgegangen. Ein Update von Ook kann helfen.

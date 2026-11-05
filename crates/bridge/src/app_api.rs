@@ -129,7 +129,14 @@ impl<S: Store> AppApi<S> {
                 self.abs.libraries(server, key).await
             })
             .await?;
-        Ok(libraries.into_iter().map(browse::library).collect())
+        if libraries.dropped > 0 {
+            tracing::warn!(
+                operation = request.operation,
+                dropped = libraries.dropped,
+                "Libraries of a kind the Bridge doesn't know were left out"
+            );
+        }
+        Ok(libraries.entries.into_iter().map(browse::library).collect())
     }
 
     async fn library_entries(
@@ -146,7 +153,10 @@ impl<S: Store> AppApi<S> {
                 self.abs.library_items(server, key, &library).await
             })
             .await?;
-        Ok(items.into_iter().map(browse::library_entry).collect())
+        Ok(items
+            .into_iter()
+            .filter_map(browse::library_entry)
+            .collect())
     }
 
     async fn podcast(
@@ -232,7 +242,17 @@ impl<S: Store> AppApi<S> {
         me: Result<abs::User, abs::Error>,
     ) -> Result<abs::User, ApiError> {
         match me {
-            Ok(user) if user.id == session.user.user_id => Ok(user),
+            Ok(user) if user.id == session.user.user_id => {
+                if user.media_progress.dropped > 0 {
+                    tracing::warn!(
+                        library_server,
+                        user_id = user.id,
+                        dropped = user.media_progress.dropped,
+                        "Progress entries in a shape the Bridge doesn't know were left out"
+                    );
+                }
+                Ok(user)
+            }
             // An admin can move a key to another user; the session must not follow it.
             Ok(_) => Err(self
                 .revoke(session, "the API key now acts for another user")
@@ -377,7 +397,16 @@ impl Request<'_> {
 fn abs_error(library_server: &str, request: Request, error: abs::Error) -> ApiError {
     match error {
         abs::Error::Rejected => ApiError::ApiKeyRejected,
-        abs::Error::NotFound => ApiError::NotFound,
+        abs::Error::NotFound { status } => {
+            tracing::info!(
+                library_server,
+                operation = request.operation,
+                id = request.id,
+                status,
+                "not found on the Library Server"
+            );
+            ApiError::NotFound
+        }
         abs::Error::Unavailable(_) => {
             tracing::warn!(
                 library_server,

@@ -42,8 +42,8 @@ pub fn root() -> Element {
                 Screen::Library { library, entries, notice } => rsx! {
                     LibraryScreen { app, busy, library, entries, notice }
                 },
-                Screen::Podcast { podcast, filter, notice } => rsx! {
-                    PodcastScreen { app, busy, podcast, filter, notice }
+                Screen::Podcast { podcast, notice } => rsx! {
+                    PodcastScreen { app, busy, podcast, notice }
                 },
                 Screen::Item { item, notice } => rsx! {
                     ItemScreen { app, busy, item, notice }
@@ -352,11 +352,11 @@ fn PodcastScreen(
     app: Signal<App>,
     busy: Signal<bool>,
     podcast: api::Podcast,
-    filter: EpisodeFilter,
     notice: Option<Notice>,
 ) -> Element {
     let text = |text| app.read().text(text);
     let language = app.read().language();
+    let filter = podcast.filter;
     rsx! {
         BackButton { app, busy }
         h1 { "{podcast.title}" }
@@ -424,10 +424,10 @@ fn ItemScreen(app: Signal<App>, busy: Signal<bool>, item: Item, notice: Option<N
         if !item.chapters.is_empty() {
             h2 { {text(Text::ItemChapters)} }
             ol { class: "chapters",
-                for (index, chapter) in item.chapters.iter().enumerate() {
+                for (index, (title, start)) in i18n::chapter_rows(&item).into_iter().enumerate() {
                     li { key: "{index}",
-                        span { class: "title", "{chapter.title}" }
-                        span { class: "detail", {i18n::clock(chapter.start)} }
+                        span { class: "title", "{title}" }
+                        span { class: "detail", "{start}" }
                     }
                 }
             }

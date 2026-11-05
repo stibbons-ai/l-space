@@ -45,10 +45,9 @@ pub enum Screen {
         entries: Vec<LibraryEntry>,
         notice: Option<Notice>,
     },
-    /// A podcast's episodes `filter` picks.
+    /// A podcast's episodes, as the filter the Bridge applied (`podcast.filter`) picked them.
     Podcast {
         podcast: Podcast,
-        filter: EpisodeFilter,
         notice: Option<Notice>,
     },
     /// One Item: its details, the person's Progress, and an audiobook's chapters.
@@ -58,6 +57,14 @@ pub enum Screen {
 }
 
 impl Screen {
+    /// The screen showing `podcast`'s episodes, without a notice.
+    fn podcast(podcast: Podcast) -> Self {
+        Self::Podcast {
+            podcast,
+            notice: None,
+        }
+    }
+
     /// What the screen tells the person about the last action, if anything.
     pub fn notice(&self) -> Option<&Notice> {
         match self {
@@ -376,15 +383,8 @@ impl App {
 
     /// Opens podcast `id`, listing its unfinished episodes.
     pub async fn open_podcast(&mut self, id: &str) {
-        let filter = EpisodeFilter::default();
-        self.go(api::podcast(id.to_owned(), Some(filter)), |podcast| {
-            Screen::Podcast {
-                podcast,
-                filter,
-                notice: None,
-            }
-        })
-        .await;
+        let call = api::podcast(id.to_owned(), Some(EpisodeFilter::default()));
+        self.go(call, Screen::podcast).await;
     }
 
     /// Lists the episodes `filter` picks, on the podcast shown.
@@ -396,13 +396,7 @@ impl App {
             .call(api::podcast(podcast.id.clone(), Some(filter)))
             .await
         {
-            Ok(podcast) => {
-                self.screen = Screen::Podcast {
-                    podcast,
-                    filter,
-                    notice: None,
-                }
-            }
+            Ok(podcast) => self.screen = Screen::podcast(podcast),
             Err(error) => self.failed(error).await,
         }
     }
@@ -427,7 +421,8 @@ impl App {
         .await;
     }
 
-    /// Opens Settings, from the Libraries screen.
+    /// Opens Settings, from any logged-in screen; the screens to go back to are dropped (the
+    /// UI offers it on the Libraries screen).
     pub fn open_settings(&mut self) {
         if self.stored.session.is_some() {
             self.back.clear();

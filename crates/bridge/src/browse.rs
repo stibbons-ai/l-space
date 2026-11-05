@@ -20,16 +20,19 @@ pub fn library(library: abs::Library) -> Library {
     }
 }
 
-pub fn library_entry(item: abs::LibraryItem) -> LibraryEntry {
+/// How a Library lists `item`; nothing for a book without audio (an ebook alone), which
+/// is no Item.
+pub fn library_entry(item: abs::LibraryItem) -> Option<LibraryEntry> {
     let (title, author) = match item.media {
+        abs::Media::Book(book) if !is_audiobook(&book) => return None,
         abs::Media::Book(book) => (book.metadata.title, book.metadata.author_name),
         abs::Media::Podcast(podcast) => (podcast.metadata.title, podcast.metadata.author),
     };
-    LibraryEntry {
+    Some(LibraryEntry {
         id: item.id,
         title,
         author: non_empty(author),
-    }
+    })
 }
 
 /// The podcast `item` with the episodes `filter` picks by `user`'s Progress, newest first
@@ -61,6 +64,7 @@ pub fn podcast(
         id: item.id,
         title: media.metadata.title,
         author: non_empty(media.metadata.author),
+        filter,
         episodes,
     })
 }
@@ -74,12 +78,12 @@ pub fn item(
 ) -> Result<Item, ApiError> {
     let progress_of = ProgressIndex::of(user);
     match (library_item.media, &id.episode) {
-        (abs::Media::Book(book), None) => Ok(Item {
+        (abs::Media::Book(book), None) if is_audiobook(&book) => Ok(Item {
             title: book.metadata.title,
             author: non_empty(book.metadata.author_name),
             podcast: None,
             description: non_empty(book.metadata.description),
-            duration: book.duration,
+            duration: known(book.duration),
             published_at: None,
             progress: progress_of.audiobook(&library_item.id),
             chapters: book.chapters.into_iter().map(chapter).collect(),
@@ -123,7 +127,7 @@ impl<'a> ProgressIndex<'a> {
             audiobooks: HashMap::new(),
             episodes: HashMap::new(),
         };
-        for entry in &user.media_progress {
+        for entry in &user.media_progress.entries {
             if let Some(episode) = &entry.episode_id {
                 index.episodes.entry(episode).or_insert(entry);
             } else if let Some(audiobook) = &entry.library_item_id {
@@ -161,15 +165,30 @@ fn audio_file(track: abs::Track) -> AudioFile {
     AudioFile {
         id: track.ino,
         start_offset: track.start_offset,
-        duration: track.duration,
+        duration: known(track.duration),
     }
+}
+
+/// Whether a library item listed as a book is an audiobook: one with audio files, not an
+/// ebook alone, which is no Item.
+fn is_audiobook(book: &abs::Book) -> bool {
+    book.num_tracks > 0
 }
 
 /// An episode's duration in seconds: its own, else its audio file's, else unknown.
 fn episode_duration(episode: &abs::Episode) -> Option<f64> {
-    episode
-        .duration
-        .or(episode.audio_track.as_ref().map(|track| track.duration))
+    known(episode.duration).or_else(|| {
+        episode
+            .audio_track
+            .as_ref()
+            .and_then(|track| known(track.duration))
+    })
+}
+
+/// A duration in seconds, unless Audiobookshelf doesn't know it: it sends 0 then (and may
+/// send null).
+fn known(seconds: Option<f64>) -> Option<f64> {
+    seconds.filter(|seconds| seconds.is_finite() && *seconds > 0.0)
 }
 
 /// `text`, unless it is missing or blank.
@@ -181,7 +200,7 @@ fn non_empty(text: Option<String>) -> Option<String> {
 mod tests {
     use api::{EpisodeFilter, Progress};
 
-    use super::podcast;
+    use super::{item, podcast};
 
     fn episode(id: &str, published_at: Option<i64>, duration: Option<f64>) -> abs::Episode {
         abs::Episode {
@@ -211,7 +230,10 @@ mod tests {
         abs::User {
             id: "u1".into(),
             username: "alice".into(),
-            media_progress,
+            media_progress: abs::Known {
+                entries: media_progress,
+                dropped: 0,
+            },
         }
     }
 
@@ -238,7 +260,7 @@ mod tests {
         from_file.audio_track = Some(abs::Track {
             ino: "1".into(),
             start_offset: 0.0,
-            duration: 60.0,
+            duration: Some(60.0),
         });
         let mut own = episode("own", Some(3), Some(30.0));
         own.audio_track = from_file.audio_track.clone();
@@ -275,5 +297,68 @@ mod tests {
                 finished: false
             })
         );
+    }
+
+    /// Audiobookshelf sends 0 for a duration it doesn't know.
+    #[test]
+    fn a_zero_duration_is_unknown() {
+        let track = |duration| {
+            Some(abs::Track {
+                ino: "1".into(),
+                start_offset: 0.0,
+                duration,
+            })
+        };
+        let mut zero_with_file = episode("zero-with-file", Some(3), Some(0.0));
+        zero_with_file.audio_track = track(Some(60.0));
+        let mut zero_with_zero_file = episode("zero-with-zero-file", Some(2), Some(0.0));
+        zero_with_zero_file.audio_track = track(Some(0.0));
+        let zero_alone = episode("zero-alone", Some(1), Some(0.0));
+        let listed = podcast(
+            &user(Vec::new()),
+            the_podcast(vec![zero_with_file, zero_with_zero_file, zero_alone]),
+            EpisodeFilter::All,
+        )
+        .unwrap();
+        let durations: Vec<_> = listed
+            .episodes
+            .iter()
+            .map(|episode| episode.duration)
+            .collect();
+        assert_eq!(durations, [Some(60.0), None, None]);
+
+        let book = abs::LibraryItem {
+            id: "li-2".into(),
+            media: abs::Media::Book(abs::Book {
+                metadata: abs::BookMetadata {
+                    title: "Book".into(),
+                    author_name: None,
+                    description: None,
+                },
+                duration: Some(0.0),
+                num_tracks: 1,
+                chapters: Vec::new(),
+                tracks: vec![abs::Track {
+                    ino: "1".into(),
+                    start_offset: 0.0,
+                    duration: Some(0.0),
+                }],
+            }),
+        };
+        let id = api::ItemId {
+            library_item: "li-2".into(),
+            episode: None,
+        };
+        let shown = item(&user(Vec::new()), book, id).unwrap();
+        assert_eq!(shown.duration, None);
+        assert_eq!(shown.audio_files[0].duration, None);
+    }
+
+    #[test]
+    fn the_applied_filter_comes_with_the_episodes() {
+        for filter in EpisodeFilter::CHOICES {
+            let listed = podcast(&user(Vec::new()), the_podcast(Vec::new()), filter).unwrap();
+            assert_eq!(listed.filter, filter);
+        }
     }
 }

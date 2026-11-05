@@ -282,8 +282,8 @@ fn html_page_server() -> String {
     web_server("200 OK", "text/html", "<html><body>Welcome</body></html>")
 }
 
-/// What went through a [`bridge_then_gone`] proxy: each request line, and after the first the
-/// status line the Bridge answered it with.
+/// What went through a [`proxy`]: each request line, and for each one passed on the status
+/// line of the answer.
 type ProxyLog = Arc<Mutex<Vec<String>>>;
 
 /// A loopback proxy that passes the first request on to `bridge` and answers every later one
@@ -291,35 +291,8 @@ type ProxyLog = Arc<Mutex<Vec<String>>>;
 fn bridge_then_gone(bridge: &str) -> (String, ProxyLog) {
     let target = bridge
         .strip_prefix("http://")
-        .expect("an http:// Bridge URL")
-        .to_owned();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    let log = ProxyLog::default();
-    let written = Arc::clone(&log);
-    std::thread::spawn(move || {
-        for (index, mut stream) in listener.incoming().flatten().enumerate() {
-            let request = read_request(&stream);
-            let record = |bytes: &[u8]| {
-                let line = String::from_utf8_lossy(bytes)
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .to_owned();
-                written.lock().unwrap().push(line);
-            };
-            record(&request);
-            let response = if index == 0 {
-                let response = forward(&target, &request);
-                record(&response);
-                response
-            } else {
-                UNAVAILABLE.to_vec()
-            };
-            let _ = stream.write_all(&response);
-        }
-    });
-    (format!("http://{addr}"), log)
+        .expect("an http:// Bridge URL");
+    proxy(target, |index, _| index > 0)
 }
 
 /// One HTTP/1.1 request from `stream`, rewritten to close the connection after the response,
@@ -370,30 +343,57 @@ type Failing = Arc<Mutex<Option<&'static str>>>;
 /// A loopback proxy in front of Audiobookshelf at `abs` (`host:port`) that answers the
 /// requests `failing` names with `503 Service Unavailable` and passes every other one on.
 fn abs_proxy(abs: &str) -> (String, Failing) {
-    let target = abs.to_owned();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
     let failing = Failing::default();
     let fails = Arc::clone(&failing);
+    let (url, _) = proxy(abs, move |_, request| {
+        fails
+            .lock()
+            .unwrap()
+            .is_some_and(|prefix| request.starts_with(prefix.as_bytes()))
+    });
+    (url, failing)
+}
+
+/// A loopback proxy in front of `target` (`host:port`): answers the `index`th request with
+/// `503 Service Unavailable` when `fails(index, request)`, else passes it on. Logs each
+/// request line and, for those passed on, the status line of the answer.
+fn proxy(
+    target: &str,
+    fails: impl Fn(usize, &[u8]) -> bool + Send + Sync + 'static,
+) -> (String, ProxyLog) {
+    let target = target.to_owned();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log = ProxyLog::default();
+    let written = Arc::clone(&log);
+    let fails = Arc::new(fails);
     std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
-            let (target, fails) = (target.clone(), Arc::clone(&fails));
+        for (index, mut stream) in listener.incoming().flatten().enumerate() {
+            let (target, written, fails) =
+                (target.clone(), Arc::clone(&written), Arc::clone(&fails));
             std::thread::spawn(move || {
                 let request = read_request(&stream);
-                let fail = fails
-                    .lock()
-                    .unwrap()
-                    .is_some_and(|prefix| request.starts_with(prefix.as_bytes()));
-                let response = if fail {
+                let record = |bytes: &[u8]| {
+                    let line = String::from_utf8_lossy(bytes)
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_owned();
+                    written.lock().unwrap().push(line);
+                };
+                record(&request);
+                let response = if fails(index, &request) {
                     UNAVAILABLE.to_vec()
                 } else {
-                    forward(&target, &request)
+                    let response = forward(&target, &request);
+                    record(&response);
+                    response
                 };
                 let _ = stream.write_all(&response);
             });
         }
     });
-    (format!("http://{addr}"), failing)
+    (format!("http://{addr}"), log)
 }
 
 /// A Bridge whose Library Server "Home" is the shared Audiobookshelf behind an [`abs_proxy`].
@@ -1155,10 +1155,9 @@ fn a_podcasts_episodes_are_filtered_by_the_persons_progress() {
         assert_eq!(app.screen(), &library);
 
         let episodes = |app: &App| match app.screen() {
-            Screen::Podcast {
-                podcast, filter, ..
-            } => (
-                *filter,
+            // The filter the Bridge says it applied.
+            Screen::Podcast { podcast, .. } => (
+                podcast.filter,
                 podcast
                     .episodes
                     .iter()
@@ -1263,13 +1262,8 @@ fn an_audiobook_shows_its_details_progress_and_chapters_in_english_and_german() 
                 finished: false
             })
         );
-        let chapters: Vec<_> = item
-            .chapters
-            .iter()
-            .map(|chapter| (chapter.title.as_str(), i18n::clock(chapter.start)))
-            .collect();
         assert_eq!(
-            chapters,
+            i18n::chapter_rows(item),
             [
                 ("01 - Part One", "0:00".to_owned()),
                 ("02 - Part Two", "40:00".to_owned()),
@@ -1347,7 +1341,7 @@ fn an_episode_shows_its_podcast_publish_date_and_progress() {
         // Back to the episodes, as they were.
         app.go_back();
         assert!(
-            matches!(app.screen(), Screen::Podcast { filter: EpisodeFilter::Unfinished, podcast, .. } if podcast.episodes.len() == 3),
+            matches!(app.screen(), Screen::Podcast { podcast, .. } if podcast.filter == EpisodeFilter::Unfinished && podcast.episodes.len() == 3),
             "{:?}",
             app.screen()
         );
@@ -1504,7 +1498,6 @@ fn a_filter_that_fails_keeps_the_episodes_shown() {
             app.screen(),
             &Screen::Podcast {
                 podcast,
-                filter: EpisodeFilter::Unfinished,
                 notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
             }
         );

@@ -377,7 +377,7 @@ impl AppApi {
         self.get_as(
             session,
             "/api/podcast",
-            &[("id", id), ("filter", filter_name(filter))],
+            &[("id", id), ("filter", &filter_name(filter))],
         )
         .await
     }
@@ -480,12 +480,11 @@ pub fn item_query<'a>(library_item: &'a str, episode: Option<&'a str>) -> Vec<(&
     query
 }
 
-/// How an [`EpisodeFilter`] travels in a query.
-pub fn filter_name(filter: EpisodeFilter) -> &'static str {
-    match filter {
-        EpisodeFilter::Unfinished => "unfinished",
-        EpisodeFilter::Finished => "finished",
-        EpisodeFilter::All => "all",
+/// How an [`EpisodeFilter`] travels in a query: as it serializes.
+pub fn filter_name(filter: EpisodeFilter) -> String {
+    match serde_json::to_value(filter) {
+        Ok(Value::String(name)) => name,
+        other => panic!("{filter:?} serializes as {other:?}"),
     }
 }
 

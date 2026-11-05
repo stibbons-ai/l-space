@@ -6,8 +6,10 @@
 //! The language follows the device unless the person picked one in Settings
 //! ([`LanguageChoice`]); a device language other than German falls back to English.
 //!
-//! Durations, Progress and dates are formatted here too ([`duration`], [`progress`],
-//! [`date`]), with the words and word order from the same Fluent resources.
+//! What the screens say about Items is composed here too, with the words and word order from
+//! the same Fluent resources: [`duration`], [`progress`], [`date`], an episode's row
+//! ([`episode_summary`]), an Item's facts ([`item_facts`]) and its chapters with their start
+//! times ([`chapter_rows`], [`clock`]).
 
 use std::sync::LazyLock;
 
@@ -357,6 +359,14 @@ pub fn item_facts(language: Language, item: &Item) -> Vec<(Text, String)> {
         facts.push((Text::ItemPublished, date(language, published_at)));
     }
     facts
+}
+
+/// An Item's chapters as the Item screen lists them: each title with its start time.
+pub fn chapter_rows(item: &Item) -> Vec<(&str, String)> {
+    item.chapters
+        .iter()
+        .map(|chapter| (chapter.title.as_str(), clock(chapter.start)))
+        .collect()
 }
 
 /// A point `seconds` into an Item as a clock reading, the same in every language the App has:

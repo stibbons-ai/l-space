@@ -51,6 +51,12 @@ const AUDIO_FILES: [(&str, u32); 7] = [
     ("/podcasts/The Clacks Hour/Episode 3.wav", 3960),
 ];
 
+/// The seeded ebook without audio, in the audiobook Library.
+const EBOOK_FILE: &str = "/audiobooks/Rincewind/Only Words/only.pdf";
+
+/// Enough of a PDF for Audiobookshelf to scan it as an ebook: it reads only the extension.
+const MINIMAL_PDF: &[u8] = b"%PDF-1.4\n%%EOF\n";
+
 /// The seeded episodes' publish dates, oldest first: 2026-01-01, 2026-02-15 and 2026-03-31,
 /// midnight UTC, in milliseconds since the Unix epoch.
 pub const EPISODE_PUBLISHED_AT: [i64; 3] =
@@ -59,8 +65,8 @@ pub const EPISODE_PUBLISHED_AT: [i64; 3] =
 /// What the shared Audiobookshelf holds, by Audiobookshelf id.
 #[derive(Debug, Clone, Default)]
 pub struct Seeded {
-    /// The audiobook Library "Audiobooks": [`Seeded::long_book`] and "Silence" (one second,
-    /// by L-Space).
+    /// The audiobook Library "Audiobooks": [`Seeded::long_book`], "Silence" (one second, by
+    /// L-Space) and the ebook [`Seeded::ebook_only`].
     pub audiobook_library: String,
     /// The podcast Library "Podcasts": [`Seeded::podcast`].
     pub podcast_library: String,
@@ -68,6 +74,8 @@ pub struct Seeded {
     /// 40, 30 and 2 minutes, one chapter each ("01 - Part One", "02 - Part Two",
     /// "03 - Part Three"), 72 minutes in all.
     pub long_book: String,
+    /// "Only Words" by Rincewind: an ebook (a PDF) without audio, so not an audiobook.
+    pub ebook_only: String,
     /// "The Clacks Hour" by Ankh-Morpork Radio.
     pub podcast: String,
     /// Its episodes "Episode 1" (10 min), "Episode 2" (15 min) and "Episode 3" (66 min),
@@ -316,6 +324,7 @@ impl Audiobookshelf {
         for (path, seconds) in AUDIO_FILES {
             image = image.with_copy_to(path, silence(seconds));
         }
+        image = image.with_copy_to(EBOOK_FILE, MINIMAL_PDF.to_vec());
         let container = image
             .with_startup_timeout(STARTUP_TIMEOUT)
             .start()
@@ -356,10 +365,13 @@ impl Audiobookshelf {
         let (books, podcasts) = loop {
             let books = self.library_items(&audiobook_library).await;
             let podcasts = self.library_items(&podcast_library).await;
-            let scanned = books.len() == 2
+            // Two audiobooks, and the ebook alone, without audio.
+            let scanned = books.len() == 3
                 && books
                     .iter()
-                    .all(|book| book["media"]["numAudioFiles"].as_u64() > Some(0))
+                    .filter(|book| book["media"]["numAudioFiles"].as_u64() > Some(0))
+                    .count()
+                    == 2
                 && podcasts.len() == 1
                 && podcasts[0]["media"]["numEpisodes"] == 3;
             if scanned {
@@ -379,6 +391,11 @@ impl Audiobookshelf {
             .find(|book| book["media"]["metadata"]["title"] == "The Long Book")
             .map(id)
             .expect("The Long Book");
+        let ebook_only = books
+            .iter()
+            .find(|book| book["media"]["metadata"]["title"] == "Only Words")
+            .map(id)
+            .expect("Only Words");
         let podcast = id(&podcasts[0]);
         self.admin(
             reqwest::Method::PATCH,
@@ -427,6 +444,7 @@ impl Audiobookshelf {
             audiobook_library,
             podcast_library,
             long_book,
+            ebook_only,
             podcast,
             episodes,
         }

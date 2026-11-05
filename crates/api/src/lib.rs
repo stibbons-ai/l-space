@@ -183,7 +183,8 @@ pub struct AudioFile {
     pub id: String,
     /// Seconds into the whole Item where this file starts.
     pub start_offset: f64,
-    pub duration: f64,
+    /// Unknown if the Library Server could not tell.
+    pub duration: Option<f64>,
 }
 
 /// A podcast with those of its episodes a filter picked.
@@ -193,6 +194,9 @@ pub struct Podcast {
     pub id: String,
     pub title: String,
     pub author: Option<String>,
+    /// The filter that picked the episodes: the one asked for, or the one the Bridge applied
+    /// instead of a filter it doesn't know.
+    pub filter: EpisodeFilter,
     /// Newest first; episodes without a publish date last.
     pub episodes: Vec<Episode>,
 }

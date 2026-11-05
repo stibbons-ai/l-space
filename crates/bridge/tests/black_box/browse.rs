@@ -226,7 +226,7 @@ async fn an_audiobook_shows_details_progress_chapters_and_audio_files_at_their_o
                 .map(|((start_offset, duration), id)| AudioFile {
                     id: id.clone(),
                     start_offset,
-                    duration,
+                    duration: Some(duration),
                 })
                 .collect(),
         }
@@ -278,7 +278,7 @@ async fn an_episode_shows_its_podcast_details_and_progress() {
             item.audio_files[0].start_offset,
             item.audio_files[0].duration
         ),
-        (0.0, 600.0)
+        (0.0, Some(600.0))
     );
 }
 
@@ -359,7 +359,10 @@ async fn ids_that_name_nothing_are_not_found() {
             api.get_as_error(
                 &session,
                 "/api/podcast",
-                &[("id", podcast), ("filter", filter_name(EpisodeFilter::All))]
+                &[
+                    ("id", podcast),
+                    ("filter", &filter_name(EpisodeFilter::All))
+                ]
             )
             .await,
             NOT_FOUND,
@@ -387,7 +390,7 @@ async fn browsing_needs_a_session() {
             "/api/podcast",
             &[
                 ("id", &seeded.podcast),
-                ("filter", filter_name(EpisodeFilter::All)),
+                ("filter", &filter_name(EpisodeFilter::All)),
             ],
         ),
     ];
@@ -607,7 +610,7 @@ async fn a_library_the_user_may_not_see_is_not_found() {
             "/api/podcast",
             &[
                 ("id", &seeded.podcast),
-                ("filter", filter_name(EpisodeFilter::All))
+                ("filter", &filter_name(EpisodeFilter::All))
             ]
         )
         .await,
@@ -651,5 +654,30 @@ async fn a_missing_or_unknown_episode_filter_lists_the_unfinished() {
             .map(|episode| episode.title.as_str())
             .collect();
         assert_eq!(titles, ["Episode 3", "Episode 2"], "{query:?}");
+        // The answer says which filter picked them.
+        assert_eq!(listed.filter, EpisodeFilter::Unfinished, "{query:?}");
     }
+}
+
+/// A book with no audio (an ebook alone) is no Item: not listed, and not found by its id.
+#[tokio::test]
+async fn an_ebook_without_audio_is_no_item() {
+    let (bridge, abs, _, session) = logged_in().await;
+    let seeded = abs.seeded();
+
+    let listed: Vec<_> = bridge
+        .api()
+        .library_entries(&session, &seeded.audiobook_library)
+        .await
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
+    assert!(!listed.contains(&seeded.ebook_only), "{listed:?}");
+    assert_eq!(
+        bridge
+            .api()
+            .get_as_error(&session, "/api/item", &item_query(&seeded.ebook_only, None))
+            .await,
+        NOT_FOUND
+    );
 }
