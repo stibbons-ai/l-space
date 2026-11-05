@@ -3,11 +3,11 @@
 
 use std::sync::Arc;
 
-use api::{ApiKey, LibraryServer};
+use api::{ApiKey, EpisodeFilter, Item, Library, LibraryEntry, LibraryServer};
 use dioxus::prelude::*;
 
 use crate::flow::{App, Notice, Screen};
-use crate::i18n::{LanguageChoice, Text};
+use crate::i18n::{self, LanguageChoice, Text};
 use crate::storage::FileStore;
 
 const STYLE: &str = include_str!("../assets/app.css");
@@ -35,6 +35,18 @@ pub fn root() -> Element {
                 },
                 Screen::Login { library_servers, notice } => rsx! {
                     LoginScreen { app, busy, library_servers, notice }
+                },
+                Screen::Libraries { libraries, notice } => rsx! {
+                    LibrariesScreen { app, busy, libraries, notice }
+                },
+                Screen::Library { library, entries, notice } => rsx! {
+                    LibraryScreen { app, busy, library, entries, notice }
+                },
+                Screen::Podcast { podcast, filter, notice } => rsx! {
+                    PodcastScreen { app, busy, podcast, filter, notice }
+                },
+                Screen::Item { item, notice } => rsx! {
+                    ItemScreen { app, busy, item, notice }
                 },
                 Screen::Settings { notice } => rsx! {
                     SettingsScreen { app, busy, notice }
@@ -179,7 +191,7 @@ fn LoginScreen(
                     r#type: "button",
                     disabled: busy(),
                     onclick: move |_| act(app, busy, async |app: &mut App| app.reload_library_servers().await),
-                    {text(Text::LoginRetry)}
+                    {text(Text::Retry)}
                 }
             }
         }
@@ -194,6 +206,226 @@ fn LoginScreen(
                 disabled: busy(),
                 onclick: move |_| app.write().change_bridge_url(),
                 {text(Text::LoginChangeBridge)}
+            }
+        }
+    }
+}
+
+/// A button above the screen's title, to move between screens.
+#[component]
+fn NavButton(busy: Signal<bool>, label: String, onclick: EventHandler<MouseEvent>) -> Element {
+    rsx! {
+        nav {
+            button {
+                r#type: "button",
+                class: "secondary",
+                disabled: busy(),
+                onclick: move |event| onclick.call(event),
+                {label}
+            }
+        }
+    }
+}
+
+/// "Back" to the screen this one was opened from.
+#[component]
+fn BackButton(app: Signal<App>, busy: Signal<bool>) -> Element {
+    rsx! {
+        NavButton {
+            busy,
+            label: app.read().text(Text::Back),
+            onclick: move |_| app.write().go_back(),
+        }
+    }
+}
+
+#[component]
+fn LibrariesScreen(
+    app: Signal<App>,
+    busy: Signal<bool>,
+    libraries: Vec<Library>,
+    notice: Option<Notice>,
+) -> Element {
+    let text = |text| app.read().text(text);
+    // Nothing listed because the listing failed, not because there is nothing.
+    let failed = libraries.is_empty() && matches!(notice, Some(Notice::Api(_)));
+    rsx! {
+        NavButton {
+            busy,
+            label: text(Text::SettingsTitle),
+            onclick: move |_| app.write().open_settings(),
+        }
+        h1 { {text(Text::LibrariesTitle)} }
+        NoticeView { app, notice }
+        if failed {
+            button {
+                r#type: "button",
+                disabled: busy(),
+                onclick: move |_| act(app, busy, async |app: &mut App| app.open_libraries().await),
+                {text(Text::Retry)}
+            }
+        } else if libraries.is_empty() {
+            p { {text(Text::LibrariesNone)} }
+        }
+        ul { class: "entries",
+            for library in libraries {
+                li { key: "{library.id}",
+                    button {
+                        r#type: "button",
+                        class: "entry",
+                        disabled: busy(),
+                        onclick: {
+                            let library = library.clone();
+                            move |_| {
+                                let library = library.clone();
+                                act(app, busy, async move |app: &mut App| app.open_library(library).await);
+                            }
+                        },
+                        span { class: "title", "{library.name}" }
+                        span { class: "detail", {text(library.kind.into())} }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn LibraryScreen(
+    app: Signal<App>,
+    busy: Signal<bool>,
+    library: Library,
+    entries: Vec<LibraryEntry>,
+    notice: Option<Notice>,
+) -> Element {
+    let text = |text| app.read().text(text);
+    rsx! {
+        BackButton { app, busy }
+        h1 { "{library.name}" }
+        NoticeView { app, notice }
+        if entries.is_empty() {
+            p { {text(Text::LibraryEmpty)} }
+        }
+        ul { class: "entries",
+            for entry in entries {
+                li { key: "{entry.id}",
+                    button {
+                        r#type: "button",
+                        class: "entry",
+                        disabled: busy(),
+                        onclick: {
+                            let id = entry.id.clone();
+                            move |_| {
+                                let id = id.clone();
+                                act(app, busy, async move |app: &mut App| app.open_entry(&id).await);
+                            }
+                        },
+                        span { class: "title", "{entry.title}" }
+                        if let Some(author) = &entry.author {
+                            span { class: "detail", "{author}" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn PodcastScreen(
+    app: Signal<App>,
+    busy: Signal<bool>,
+    podcast: api::Podcast,
+    filter: EpisodeFilter,
+    notice: Option<Notice>,
+) -> Element {
+    let text = |text| app.read().text(text);
+    let language = app.read().language();
+    rsx! {
+        BackButton { app, busy }
+        h1 { "{podcast.title}" }
+        if let Some(author) = &podcast.author {
+            p { class: "byline", "{author}" }
+        }
+        div { class: "filters", role: "group",
+            for option in EpisodeFilter::ALL {
+                button {
+                    key: "{option:?}",
+                    r#type: "button",
+                    class: if option == filter { "selected" } else { "" },
+                    aria_pressed: option == filter,
+                    disabled: busy(),
+                    onclick: move |_| act(app, busy, async move |app: &mut App| app.filter_episodes(option).await),
+                    {text(option.into())}
+                }
+            }
+        }
+        NoticeView { app, notice }
+        if podcast.episodes.is_empty() {
+            p { {text(Text::EpisodesNone)} }
+        }
+        ul { class: "entries",
+            for episode in podcast.episodes {
+                li { key: "{episode.id}",
+                    button {
+                        r#type: "button",
+                        class: "entry",
+                        disabled: busy(),
+                        onclick: {
+                            let id = episode.id.clone();
+                            move |_| {
+                                let id = id.clone();
+                                act(app, busy, async move |app: &mut App| app.open_episode(&id).await);
+                            }
+                        },
+                        span { class: "title", "{episode.title}" }
+                        span { class: "detail",
+                            if let Some(published_at) = episode.published_at {
+                                "{i18n::date(language, published_at)} · "
+                            }
+                            {i18n::progress(language, episode.progress.as_ref(), episode.duration)}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ItemScreen(app: Signal<App>, busy: Signal<bool>, item: Item, notice: Option<Notice>) -> Element {
+    let text = |text| app.read().text(text);
+    let language = app.read().language();
+    let by = item.author.as_ref().or(item.podcast.as_ref());
+    rsx! {
+        BackButton { app, busy }
+        h1 { "{item.title}" }
+        if let Some(by) = by {
+            p { class: "byline", "{by}" }
+        }
+        NoticeView { app, notice }
+        dl {
+            dt { {text(Text::ItemProgress)} }
+            dd { {i18n::progress(language, item.progress.as_ref(), item.duration)} }
+            dt { {text(Text::ItemDuration)} }
+            dd { {i18n::duration(language, item.duration)} }
+            if let Some(published_at) = item.published_at {
+                dt { {text(Text::ItemPublished)} }
+                dd { {i18n::date(language, published_at)} }
+            }
+        }
+        if let Some(description) = &item.description {
+            p { class: "description", "{description}" }
+        }
+        if !item.chapters.is_empty() {
+            h2 { {text(Text::ItemChapters)} }
+            ol { class: "chapters",
+                for (index, chapter) in item.chapters.iter().enumerate() {
+                    li { key: "{index}",
+                        span { class: "title", "{chapter.title}" }
+                        span { class: "detail", {i18n::clock(chapter.start)} }
+                    }
+                }
             }
         }
     }
@@ -215,6 +447,11 @@ fn SettingsScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>) 
         )
     };
     rsx! {
+        NavButton {
+            busy,
+            label: text(Text::LibrariesTitle),
+            onclick: move |_| act(app, busy, async |app: &mut App| app.open_libraries().await),
+        }
         h1 { {text(Text::SettingsTitle)} }
         NoticeView { app, notice }
         dl {

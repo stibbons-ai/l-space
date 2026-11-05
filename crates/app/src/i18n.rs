@@ -5,11 +5,15 @@
 //!
 //! The language follows the device unless the person picked one in Settings
 //! ([`LanguageChoice`]); a device language other than German falls back to English.
+//!
+//! Durations, Progress and dates are formatted here too ([`duration`], [`progress`],
+//! [`date`]), with the words and word order from the same Fluent resources.
 
 use std::sync::LazyLock;
 
-use fluent_bundle::FluentResource;
+use api::{EpisodeFilter, LibraryKind, Progress};
 use fluent_bundle::concurrent::FluentBundle;
+use fluent_bundle::{FluentArgs, FluentResource};
 use serde::{Deserialize, Serialize};
 use unic_langid::LanguageIdentifier;
 
@@ -125,9 +129,26 @@ texts! {
     LoginApiKeyHint => "login-api-key-hint",
     LoginSubmit => "login-submit",
     LoginNoLibraryServers => "login-no-library-servers",
-    LoginRetry => "login-retry",
     LoginChangeBridge => "login-change-bridge",
     Bridge => "bridge",
+    Retry => "retry",
+    Back => "back",
+    LibrariesTitle => "libraries-title",
+    LibrariesNone => "libraries-none",
+    LibraryKindAudiobooks => "library-kind-audiobooks",
+    LibraryKindPodcasts => "library-kind-podcasts",
+    LibraryEmpty => "library-empty",
+    EpisodesUnfinished => "episodes-unfinished",
+    EpisodesFinished => "episodes-finished",
+    EpisodesAll => "episodes-all",
+    EpisodesNone => "episodes-none",
+    ItemDuration => "item-duration",
+    ItemPublished => "item-published",
+    ItemProgress => "item-progress",
+    ItemChapters => "item-chapters",
+    ProgressFinished => "progress-finished",
+    ProgressNotStarted => "progress-not-started",
+    DurationUnderMinute => "duration-under-minute",
     SettingsTitle => "settings-title",
     SettingsLibraryServer => "settings-library-server",
     SettingsAccount => "settings-account",
@@ -150,7 +171,49 @@ texts! {
     ErrorLibraryServerNotConfigured => "error-library-server-not-configured",
     ErrorLibraryServerUnreachable => "error-library-server-unreachable",
     ErrorSessionInvalid => "error-session-invalid",
+    ErrorNotFound => "error-not-found",
     ErrorUnknown => "error-unknown",
+}
+
+/// Declares [`Phrase`], the messages with variables, with their Fluent message ids and the
+/// names of their variables.
+macro_rules! phrases {
+    ($($variant:ident => $id:literal ($($variable:literal),*),)*) => {
+        /// A message with variables, by its Fluent id.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Phrase {
+            $($variant,)*
+        }
+
+        impl Phrase {
+            /// Every phrase, so a test can check that each language has all of them.
+            #[cfg(test)]
+            const ALL: &[Phrase] = &[$(Phrase::$variant,)*];
+
+            /// The Fluent message id.
+            fn id(self) -> &'static str {
+                match self {
+                    $(Phrase::$variant => $id,)*
+                }
+            }
+
+            /// The names of its variables.
+            #[cfg(test)]
+            fn variables(self) -> &'static [&'static str] {
+                match self {
+                    $(Phrase::$variant => &[$($variable),*],)*
+                }
+            }
+        }
+    };
+}
+
+phrases! {
+    ProgressLeft => "progress-left" ("duration"),
+    DurationHoursMinutes => "duration-hours-minutes" ("hours", "minutes"),
+    DurationHours => "duration-hours" ("hours"),
+    DurationMinutes => "duration-minutes" ("minutes"),
+    Date => "date" ("day", "month", "year"),
 }
 
 impl From<&api::ApiError> for Text {
@@ -164,7 +227,29 @@ impl From<&api::ApiError> for Text {
             ApiError::LibraryServerNotConfigured => Self::ErrorLibraryServerNotConfigured,
             ApiError::LibraryServerUnreachable => Self::ErrorLibraryServerUnreachable,
             ApiError::SessionInvalid => Self::ErrorSessionInvalid,
+            ApiError::NotFound => Self::ErrorNotFound,
             ApiError::Unknown => Self::ErrorUnknown,
+        }
+    }
+}
+
+/// How a Library's kind is named.
+impl From<LibraryKind> for Text {
+    fn from(kind: LibraryKind) -> Self {
+        match kind {
+            LibraryKind::Audiobooks => Self::LibraryKindAudiobooks,
+            LibraryKind::Podcasts => Self::LibraryKindPodcasts,
+        }
+    }
+}
+
+/// How an episode filter is named.
+impl From<EpisodeFilter> for Text {
+    fn from(filter: EpisodeFilter) -> Self {
+        match filter {
+            EpisodeFilter::Unfinished => Self::EpisodesUnfinished,
+            EpisodeFilter::Finished => Self::EpisodesFinished,
+            EpisodeFilter::All => Self::EpisodesAll,
         }
     }
 }
@@ -189,22 +274,107 @@ fn bundle(language: Language) -> FluentBundle<FluentResource> {
 /// `text` in `language`. A missing or broken message shows its id, which the completeness test
 /// rules out.
 pub fn text(language: Language, text: Text) -> String {
-    format(language, text).unwrap_or_else(|_| text.id().to_owned())
+    format(language, text.id(), None).unwrap_or_else(|_| text.id().to_owned())
 }
 
-/// `text` in `language`, or what is wrong with its message.
-fn format(language: Language, text: Text) -> Result<String, String> {
+/// `phrase` in `language` with `args`; a missing or broken message shows its id, as with
+/// [`text`].
+fn phrase(language: Language, phrase: Phrase, args: &FluentArgs) -> String {
+    format(language, phrase.id(), Some(args)).unwrap_or_else(|_| phrase.id().to_owned())
+}
+
+/// A duration of `seconds` as a person reads it, in whole minutes rounded down: "1 h 12 min",
+/// "45 min", "2 h", or "under 1 min" for less than a minute.
+pub fn duration(language: Language, seconds: f64) -> String {
+    // `as` rounds down, and turns a negative or NaN duration into 0.
+    let minutes = (seconds / 60.0) as u64;
+    let (hours, minutes) = (minutes / 60, minutes % 60);
+    let mut args = FluentArgs::new();
+    args.set("hours", hours);
+    args.set("minutes", minutes);
+    match (hours, minutes) {
+        (0, 0) => text(language, Text::DurationUnderMinute),
+        (0, _) => phrase(language, Phrase::DurationMinutes, &args),
+        (_, 0) => phrase(language, Phrase::DurationHours, &args),
+        _ => phrase(language, Phrase::DurationHoursMinutes, &args),
+    }
+}
+
+/// What a person reads about their `progress` in an Item `duration` seconds long: "Finished",
+/// "1 h 12 min left", or "Not started" without Progress or before the first second.
+pub fn progress(language: Language, progress: Option<&Progress>, duration: f64) -> String {
+    match progress {
+        Some(progress) if progress.finished => text(language, Text::ProgressFinished),
+        Some(progress) if progress.current_time > 0.0 => {
+            let mut args = FluentArgs::new();
+            args.set(
+                "duration",
+                self::duration(language, duration - progress.current_time),
+            );
+            phrase(language, Phrase::ProgressLeft, &args)
+        }
+        _ => text(language, Text::ProgressNotStarted),
+    }
+}
+
+/// The calendar date (in UTC) of `millis` since the Unix epoch: "March 31, 2026" or
+/// "31. März 2026".
+pub fn date(language: Language, millis: i64) -> String {
+    let (year, month, day) = civil_date(millis.div_euclid(86_400_000));
+    let mut args = FluentArgs::new();
+    args.set("year", year);
+    args.set("month", month);
+    args.set("day", day);
+    phrase(language, Phrase::Date, &args)
+}
+
+/// A point `seconds` into an Item as a clock reading, the same in every language the App has:
+/// "1:02:03", or "2:03" under an hour.
+pub fn clock(seconds: f64) -> String {
+    // `as` rounds down, and turns a negative or NaN time into 0.
+    let seconds = seconds as u64;
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// The proleptic Gregorian (year, month, day) of `days` since 1970-01-01 (Howard Hinnant's
+/// `civil_from_days`).
+fn civil_date(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    // Months counted from March, so the leap day comes last.
+    let march_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * march_month + 2) / 5 + 1;
+    let month = if march_month < 10 {
+        march_month + 3
+    } else {
+        march_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month as u32, day as u32)
+}
+
+/// Message `id` in `language` with `args`, or what is wrong with it.
+fn format(language: Language, id: &str, args: Option<&FluentArgs>) -> Result<String, String> {
     let [english, german] = &*BUNDLES;
     let bundle = match language {
         Language::English => english,
         Language::German => german,
     };
     let pattern = bundle
-        .get_message(text.id())
+        .get_message(id)
         .and_then(|message| message.value())
         .ok_or("no message")?;
     let mut errors = Vec::new();
-    let formatted = bundle.format_pattern(pattern, None, &mut errors);
+    let formatted = bundle.format_pattern(pattern, args, &mut errors);
     if errors.is_empty() {
         Ok(formatted.into_owned())
     } else {
@@ -216,16 +386,27 @@ fn format(language: Language, text: Text) -> Result<String, String> {
 mod tests {
     use std::collections::BTreeSet;
 
-    use api::ApiError;
+    use api::{ApiError, Progress};
+    use fluent_bundle::FluentArgs;
 
-    use super::{Language, Text, format};
+    use super::{Language, Phrase, Text, clock, date, duration, format, progress};
 
     #[test]
     fn every_message_exists_in_every_language_without_errors() {
         for language in Language::ALL {
             for &text in Text::ALL {
-                if let Err(error) = format(language, text) {
+                if let Err(error) = format(language, text.id(), None) {
                     panic!("{language:?} {}: {error}", text.id());
+                }
+            }
+            // A message using a variable the App doesn't pass fails here.
+            for &phrase in Phrase::ALL {
+                let mut args = FluentArgs::new();
+                for &variable in phrase.variables() {
+                    args.set(variable, "x");
+                }
+                if let Err(error) = format(language, phrase.id(), Some(&args)) {
+                    panic!("{language:?} {}: {error}", phrase.id());
                 }
             }
         }
@@ -233,7 +414,11 @@ mod tests {
 
     #[test]
     fn no_language_has_messages_the_app_does_not_use() {
-        let used: BTreeSet<_> = Text::ALL.iter().map(|text| text.id()).collect();
+        let used: BTreeSet<_> = Text::ALL
+            .iter()
+            .map(|text| text.id())
+            .chain(Phrase::ALL.iter().map(|phrase| phrase.id()))
+            .collect();
         for language in Language::ALL {
             let resource = fluent_syntax::parser::parse(language.source())
                 .unwrap_or_else(|(_, errors)| panic!("{language:?}: {errors:?}"));
@@ -246,6 +431,116 @@ mod tests {
                 })
                 .collect();
             assert_eq!(defined, used, "{language:?}");
+        }
+    }
+
+    #[test]
+    fn durations_are_whole_hours_and_minutes_rounded_down() {
+        for (seconds, english, german) in [
+            (0.0, "under 1 min", "unter 1 Min."),
+            (59.9, "under 1 min", "unter 1 Min."),
+            (-5.0, "under 1 min", "unter 1 Min."),
+            (f64::NAN, "under 1 min", "unter 1 Min."),
+            (60.0, "1 min", "1 Min."),
+            (3599.0, "59 min", "59 Min."),
+            (3600.0, "1 h", "1 Std."),
+            (3659.0, "1 h", "1 Std."),
+            (4320.0, "1 h 12 min", "1 Std. 12 Min."),
+            (90_000.0, "25 h", "25 Std."),
+            (93_784.0, "26 h 3 min", "26 Std. 3 Min."),
+        ] {
+            assert_eq!(duration(Language::English, seconds), english, "{seconds}");
+            assert_eq!(duration(Language::German, seconds), german, "{seconds}");
+        }
+    }
+
+    #[test]
+    fn progress_reads_as_time_left_finished_or_not_started() {
+        let at = |current_time, finished| Progress {
+            current_time,
+            finished,
+        };
+        for (progress_made, duration, english, german) in [
+            (None, 4320.0, "Not started", "Nicht begonnen"),
+            (
+                Some(at(0.0, false)),
+                4320.0,
+                "Not started",
+                "Nicht begonnen",
+            ),
+            (
+                Some(at(2880.0, false)),
+                7200.0,
+                "1 h 12 min left",
+                "noch 1 Std. 12 Min.",
+            ),
+            (
+                Some(at(3000.0, false)),
+                4320.0,
+                "22 min left",
+                "noch 22 Min.",
+            ),
+            (
+                Some(at(4300.0, false)),
+                4320.0,
+                "under 1 min left",
+                "noch unter 1 Min.",
+            ),
+            // Audiobookshelf may record a time past the end.
+            (
+                Some(at(5000.0, false)),
+                4320.0,
+                "under 1 min left",
+                "noch unter 1 Min.",
+            ),
+            (Some(at(0.0, true)), 4320.0, "Finished", "Beendet"),
+            (Some(at(100.0, true)), 4320.0, "Finished", "Beendet"),
+        ] {
+            assert_eq!(
+                progress(Language::English, progress_made.as_ref(), duration),
+                english,
+                "{progress_made:?}"
+            );
+            assert_eq!(
+                progress(Language::German, progress_made.as_ref(), duration),
+                german,
+                "{progress_made:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dates_follow_the_language() {
+        for (millis, english, german) in [
+            (0, "January 1, 1970", "1. Januar 1970"),
+            (-1, "December 31, 1969", "31. Dezember 1969"),
+            (1_709_164_800_000, "February 29, 2024", "29. Februar 2024"),
+            (1_774_915_200_000, "March 31, 2026", "31. März 2026"),
+            // The last millisecond of the day is still that day.
+            (
+                1_774_915_200_000 + 86_399_999,
+                "March 31, 2026",
+                "31. März 2026",
+            ),
+            (1_798_675_200_000, "December 31, 2026", "31. Dezember 2026"),
+        ] {
+            assert_eq!(date(Language::English, millis), english, "{millis}");
+            assert_eq!(date(Language::German, millis), german, "{millis}");
+        }
+    }
+
+    #[test]
+    fn clock_readings_have_hours_only_from_an_hour_on() {
+        for (seconds, expected) in [
+            (0.0, "0:00"),
+            (59.9, "0:59"),
+            (61.0, "1:01"),
+            (2400.0, "40:00"),
+            (3600.0, "1:00:00"),
+            (4200.0, "1:10:00"),
+            (90_061.0, "25:01:01"),
+        ] {
+            assert_eq!(clock(seconds), expected, "{seconds}");
         }
     }
 
@@ -269,8 +564,8 @@ mod tests {
         for (text, error) in &messages {
             assert_eq!(Text::from(error), *text, "{error:?}");
         }
-        // One message per code (ApiError has 8), each different in every language.
-        assert_eq!(messages.len(), 8, "{messages:?}");
+        // One message per code (ApiError has 9), each different in every language.
+        assert_eq!(messages.len(), 9, "{messages:?}");
         for language in Language::ALL {
             let distinct: BTreeSet<_> = messages
                 .iter()

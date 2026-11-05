@@ -11,7 +11,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use api::{ApiError, ApiKey, LibraryServer, Session, SessionToken};
+use api::{
+    ApiError, ApiKey, EpisodeFilter, Item, ItemId, Library, LibraryEntry, LibraryKind,
+    LibraryServer, Podcast, Session, SessionToken,
+};
 use dioxus::fullstack::http::header::{AUTHORIZATION, HeaderValue};
 use dioxus::fullstack::{HeaderMap, get_server_url, set_request_headers, set_server_url};
 
@@ -19,7 +22,7 @@ use crate::i18n::{self, Language, LanguageChoice, Text};
 use crate::storage::{DeviceStore, LoadError, Stored, StoredSession};
 
 /// What the App shows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Screen {
     /// Checking a stored session with the Bridge.
     Starting,
@@ -30,6 +33,26 @@ pub enum Screen {
         library_servers: Vec<LibraryServer>,
         notice: Option<Notice>,
     },
+    /// Logged in: every Library on the session's Library Server, audiobooks and podcasts.
+    /// Empty, with a notice, when they could not be listed.
+    Libraries {
+        libraries: Vec<Library>,
+        notice: Option<Notice>,
+    },
+    /// The audiobooks or podcasts in one Library.
+    Library {
+        library: Library,
+        entries: Vec<LibraryEntry>,
+        notice: Option<Notice>,
+    },
+    /// A podcast's episodes `filter` picks.
+    Podcast {
+        podcast: Podcast,
+        filter: EpisodeFilter,
+        notice: Option<Notice>,
+    },
+    /// One Item: its details, the person's Progress, and an audiobook's chapters.
+    Item { item: Item, notice: Option<Notice> },
     /// Logged in: the Library Server, the account, the language, and logout.
     Settings { notice: Option<Notice> },
 }
@@ -39,18 +62,26 @@ impl Screen {
     pub fn notice(&self) -> Option<&Notice> {
         match self {
             Self::Starting => None,
-            Self::BridgeUrl { notice } | Self::Login { notice, .. } | Self::Settings { notice } => {
-                notice.as_ref()
-            }
+            Self::BridgeUrl { notice }
+            | Self::Login { notice, .. }
+            | Self::Libraries { notice, .. }
+            | Self::Library { notice, .. }
+            | Self::Podcast { notice, .. }
+            | Self::Item { notice, .. }
+            | Self::Settings { notice } => notice.as_ref(),
         }
     }
 
     fn notice_mut(&mut self) -> Option<&mut Option<Notice>> {
         match self {
             Self::Starting => None,
-            Self::BridgeUrl { notice } | Self::Login { notice, .. } | Self::Settings { notice } => {
-                Some(notice)
-            }
+            Self::BridgeUrl { notice }
+            | Self::Login { notice, .. }
+            | Self::Libraries { notice, .. }
+            | Self::Library { notice, .. }
+            | Self::Podcast { notice, .. }
+            | Self::Item { notice, .. }
+            | Self::Settings { notice } => Some(notice),
         }
     }
 }
@@ -108,6 +139,8 @@ pub struct App {
     stored: Stored,
     device_language: Language,
     screen: Screen,
+    /// The screens to go back to from the one shown, the last one first.
+    back: Vec<Screen>,
     /// Why the stored state could not be loaded, for the first screen.
     load_notice: Option<Notice>,
     /// Set when what was saved could neither be read nor moved aside: saving would destroy it.
@@ -143,6 +176,7 @@ impl App {
             stored,
             device_language: Language::for_locale(device_locale),
             screen: Screen::Starting,
+            back: Vec::new(),
             load_notice,
             read_only,
             call_timeout: CALL_TIMEOUT,
@@ -156,11 +190,11 @@ impl App {
     }
 
     /// Picks the first screen: the Bridge address if there is none, Login if there is no
-    /// session, else Settings once the Bridge confirmed the session. A session whose key the
-    /// Library Server rejected (`api_key_rejected`) is forgotten; so is one the Bridge reports
-    /// as `session_invalid` while its Library Server is still configured. On any other failure
-    /// (the Bridge or Library Server unreachable, the Library Server not configured for now, for
-    /// example) it stays.
+    /// session, else every Library once the Bridge confirmed the session. A session whose key
+    /// the Library Server rejected (`api_key_rejected`) is forgotten; so is one the Bridge
+    /// reports as `session_invalid` while its Library Server is still configured. On any other
+    /// failure (the Bridge or Library Server unreachable, the Library Server not configured for
+    /// now, for example) it stays, and Settings shows why.
     pub async fn start(&mut self) {
         let mut notice = self.load_notice.take();
         if self.stored.bridge_url.is_none() {
@@ -179,18 +213,14 @@ impl App {
                     session.user = user;
                     notice = notice.or(self.save());
                 }
-                self.screen = Screen::Settings { notice };
+                self.show_libraries(notice).await;
             }
-            Err(error @ ApiError::ApiKeyRejected) => {
-                // The revocation matters more than a failed save, which `save` logged.
-                self.forget_session();
-                self.show_login(Some(Notice::Api(error))).await;
-            }
-            Err(ApiError::SessionInvalid) => self.session_invalid().await,
             Err(error) => {
-                self.screen = Screen::Settings {
-                    notice: Some(Notice::Api(error)),
-                };
+                if let Some(error) = self.session_call_failed(error).await {
+                    self.screen = Screen::Settings {
+                        notice: Some(Notice::Api(error)),
+                    };
+                }
             }
         }
     }
@@ -277,9 +307,8 @@ impl App {
                     library_server,
                     user,
                 });
-                self.screen = Screen::Settings {
-                    notice: self.save(),
-                };
+                let notice = self.save();
+                self.show_libraries(notice).await;
             }
             Err(error) => self.set_notice(Notice::Api(error)),
         }
@@ -310,6 +339,111 @@ impl App {
         }
     }
 
+    /// Every Library, listed afresh: from Settings, or to try again after a failure.
+    pub async fn open_libraries(&mut self) {
+        if self.stored.session.is_some() {
+            self.show_libraries(None).await;
+        }
+    }
+
+    /// Opens `library`, listing its audiobooks or podcasts.
+    pub async fn open_library(&mut self, library: Library) {
+        let call = api::library_entries(library.id.clone());
+        self.go(call, |entries| Screen::Library {
+            library,
+            entries,
+            notice: None,
+        })
+        .await;
+    }
+
+    /// Opens entry `id` of the Library shown: an audiobook's Item, or a podcast's episodes.
+    pub async fn open_entry(&mut self, id: &str) {
+        let Screen::Library { library, .. } = &self.screen else {
+            return;
+        };
+        match library.kind {
+            LibraryKind::Audiobooks => {
+                let item = ItemId {
+                    library_item: id.to_owned(),
+                    episode: None,
+                };
+                self.open_item(item).await;
+            }
+            LibraryKind::Podcasts => self.open_podcast(id).await,
+        }
+    }
+
+    /// Opens podcast `id`, listing its unfinished episodes.
+    pub async fn open_podcast(&mut self, id: &str) {
+        let filter = EpisodeFilter::default();
+        self.go(api::podcast(id.to_owned(), filter), |podcast| {
+            Screen::Podcast {
+                podcast,
+                filter,
+                notice: None,
+            }
+        })
+        .await;
+    }
+
+    /// Lists the episodes `filter` picks, on the podcast shown.
+    pub async fn filter_episodes(&mut self, filter: EpisodeFilter) {
+        let Screen::Podcast { podcast, .. } = &self.screen else {
+            return;
+        };
+        match self.call(api::podcast(podcast.id.clone(), filter)).await {
+            Ok(podcast) => {
+                self.screen = Screen::Podcast {
+                    podcast,
+                    filter,
+                    notice: None,
+                }
+            }
+            Err(error) => self.failed(error).await,
+        }
+    }
+
+    /// Opens episode `id` of the podcast shown.
+    pub async fn open_episode(&mut self, id: &str) {
+        let Screen::Podcast { podcast, .. } = &self.screen else {
+            return;
+        };
+        let item = ItemId {
+            library_item: podcast.id.clone(),
+            episode: Some(id.to_owned()),
+        };
+        self.open_item(item).await;
+    }
+
+    /// Opens the Item `id`.
+    pub async fn open_item(&mut self, id: ItemId) {
+        self.go(api::item(id.library_item, id.episode), |item| {
+            Screen::Item { item, notice: None }
+        })
+        .await;
+    }
+
+    /// Opens Settings, from every Library.
+    pub fn open_settings(&mut self) {
+        if self.stored.session.is_some() {
+            self.back.clear();
+            self.screen = Screen::Settings { notice: None };
+        }
+    }
+
+    /// Whether [`App::go_back`] has a screen to go back to.
+    pub fn can_go_back(&self) -> bool {
+        !self.back.is_empty()
+    }
+
+    /// Back to the screen the shown one was opened from, as it was.
+    pub fn go_back(&mut self) {
+        if let Some(screen) = self.back.pop() {
+            self.screen = screen;
+        }
+    }
+
     /// Switches the language now and remembers the choice.
     pub fn set_language(&mut self, choice: LanguageChoice) {
         self.stored.language = choice;
@@ -328,6 +462,71 @@ impl App {
 
     pub fn screen(&self) -> &Screen {
         &self.screen
+    }
+
+    /// Shows every Library with `notice`, or why they could not be listed, which then
+    /// replaces `notice`.
+    async fn show_libraries(&mut self, notice: Option<Notice>) {
+        self.back.clear();
+        match self.call(api::libraries()).await {
+            Ok(libraries) => self.screen = Screen::Libraries { libraries, notice },
+            Err(error) => {
+                if let Some(error) = self.session_call_failed(error).await {
+                    self.screen = Screen::Libraries {
+                        libraries: Vec::new(),
+                        notice: Some(Notice::Api(error)),
+                    };
+                }
+            }
+        }
+    }
+
+    /// While logged in, makes `call` and shows the screen `opened` makes of its answer, to come
+    /// back from to the one shown now; or shows why it failed.
+    async fn go<T>(
+        &mut self,
+        call: impl Future<Output = Result<T, ApiError>>,
+        opened: impl FnOnce(T) -> Screen,
+    ) {
+        if self.stored.session.is_none() {
+            return;
+        }
+        match self.call(call).await {
+            Ok(answer) => {
+                let mut left = std::mem::replace(&mut self.screen, opened(answer));
+                if let Some(notice) = left.notice_mut() {
+                    *notice = None;
+                }
+                self.back.push(left);
+            }
+            Err(error) => self.failed(error).await,
+        }
+    }
+
+    /// Shows why a call failed on the screen shown, unless it ended the session.
+    async fn failed(&mut self, error: ApiError) {
+        if let Some(error) = self.session_call_failed(error).await {
+            self.set_notice(Notice::Api(error));
+        }
+    }
+
+    /// Handles a session call's `error` that concerns the session: a rejected key forgets it
+    /// and shows Login; `session_invalid` goes to [`App::session_invalid`]. Returns any other
+    /// error, for the caller to show.
+    async fn session_call_failed(&mut self, error: ApiError) -> Option<ApiError> {
+        match error {
+            ApiError::ApiKeyRejected => {
+                // The revocation matters more than a failed save, which `save` logged.
+                self.forget_session();
+                self.show_login(Some(Notice::Api(error))).await;
+                None
+            }
+            ApiError::SessionInvalid => {
+                self.session_invalid().await;
+                None
+            }
+            error => Some(error),
+        }
     }
 
     /// The remembered Bridge address.
@@ -401,6 +600,7 @@ impl App {
     /// Forgets the session on the device. Returns a notice if that could not be saved.
     fn forget_session(&mut self) -> Option<Notice> {
         self.stored.session = None;
+        self.back.clear();
         authorize(None);
         self.save()
     }

@@ -2,6 +2,7 @@ app-name = Ook
 starting = Connecting…
 busy = Please wait…
 bridge = Clacks
+retry = Try again
 
 bridge-url-title = Connect to Clacks
 bridge-url-intro = Enter the address of Clacks, for example http://192.168.1.10:8080. You only need to do this once.
@@ -14,7 +15,6 @@ login-api-key = Audiobookshelf API key
 login-api-key-hint = An Audiobookshelf admin creates API keys under Settings → API Keys.
 login-submit = Log in
 login-no-library-servers = Clacks has no Library Servers yet. Ask whoever runs Clacks to add one.
-login-retry = Try again
 login-change-bridge = Change Clacks
 
 settings-title = Settings
@@ -22,6 +22,47 @@ settings-library-server = Library Server
 settings-account = Account
 settings-language = Language
 settings-logout = Log out
+
+libraries-title = Libraries
+libraries-none = There are no Libraries on your Library Server yet.
+library-kind-audiobooks = Audiobooks
+library-kind-podcasts = Podcasts
+library-empty = This Library is empty.
+back = Back
+
+episodes-unfinished = Unfinished
+episodes-finished = Finished
+episodes-all = All
+episodes-none = No episodes here.
+
+item-duration = Duration
+item-published = Published
+item-progress = Progress
+item-chapters = Chapters
+
+progress-finished = Finished
+progress-not-started = Not started
+progress-left = { $duration } left
+
+duration-hours-minutes = { $hours } h { $minutes } min
+duration-hours = { $hours } h
+duration-minutes = { $minutes } min
+duration-under-minute = under 1 min
+
+date = { $month ->
+        [1] January
+        [2] February
+        [3] March
+        [4] April
+        [5] May
+        [6] June
+        [7] July
+        [8] August
+        [9] September
+        [10] October
+        [11] November
+       *[12] December
+    } { $day }, { $year }
 
 language-system = System
 language-english = English
@@ -40,5 +81,6 @@ error-internal = Something went wrong on Clacks. Please try again later.
 error-api-key-rejected = Audiobookshelf rejected this API key: it is wrong, or it was revoked or has expired. Ask your Audiobookshelf admin for a new one.
 error-library-server-not-configured = This Library Server is no longer set up on Clacks. Pick another one, or ask whoever runs Clacks.
 error-library-server-unreachable = Clacks can't reach this Library Server right now. Please try again later.
+error-not-found = This is not on your Library Server (any more).
 error-session-invalid = Your session has ended. Please log in again.
 error-unknown = Something unexpected went wrong. Updating Ook may help.

@@ -98,3 +98,89 @@ dd .url {
 footer {
   margin-top: 32px;
 }
+
+nav {
+  display: flex;
+  justify-content: space-between;
+}
+
+nav button {
+  margin-top: 0;
+  padding: 8px 0;
+  border: none;
+}
+
+h2 {
+  font-size: 20px;
+  margin: 24px 0 8px;
+}
+
+.byline {
+  color: #888;
+  margin: -8px 0 16px;
+}
+
+.description {
+  white-space: pre-line;
+}
+
+ul.entries,
+ol.chapters {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+button.entry {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  background: transparent;
+  color: inherit;
+  border: none;
+  border-bottom: 1px solid #8884;
+  border-radius: 0;
+  margin: 0;
+  font-weight: normal;
+}
+
+.entry .title,
+.chapters .title {
+  font-weight: 600;
+}
+
+.entry .detail,
+.chapters .detail {
+  color: #888;
+  font-size: 15px;
+}
+
+ol.chapters li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid #8884;
+}
+
+.filters {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.filters button {
+  flex: 1;
+  margin: 0;
+  padding: 8px;
+  background: transparent;
+  color: #0a63d8;
+}
+
+.filters button.selected {
+  background: #0a63d8;
+  color: white;
+}

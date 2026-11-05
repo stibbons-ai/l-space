@@ -1,14 +1,17 @@
-//! A real Audiobookshelf in a container, seeded with a one-book Library, that tests share.
+//! A real Audiobookshelf in a container, seeded with an audiobook Library and a podcast
+//! Library ([`Seeded`]), that tests share.
 //!
 //! [`Audiobookshelf::shared`] starts the container on first use and hands every test the same
 //! one while any test holds it; the last holder's drop removes it, so no container outlives
 //! the test run. Tests stay apart by each creating their own users with
-//! [`Audiobookshelf::new_user`] and acting only on those. The seeded Library is shared by all
-//! tests, and users are never deleted while the container runs.
+//! [`Audiobookshelf::new_user`] and acting only on those, Progress included
+//! ([`Audiobookshelf::set_progress`]). The seeded Libraries are shared by all tests, and users
+//! are never deleted while the container runs.
 //!
 //! Setup goes through Audiobookshelf's REST API as its root user, the way an admin would,
-//! never through its database: users are created there, and API keys created, moved and
-//! deleted.
+//! never through its database: users are created there, API keys created, moved and deleted,
+//! and metadata a scan can't find in silent audio files (descriptions, publish dates) set.
+//! The audio is generated silence, so the repository holds no binary.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
@@ -17,7 +20,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
-use testcontainers::{Container, GenericImage, ImageExt};
+use testcontainers::{Container, ContainerRequest, GenericImage, ImageExt};
 
 /// Pinned, so a new Audiobookshelf release changes nothing until we move to it.
 const IMAGE: (&str, &str) = ("ghcr.io/advplyr/audiobookshelf", "2.37.2");
@@ -25,8 +28,53 @@ const IMAGE: (&str, &str) = ("ghcr.io/advplyr/audiobookshelf", "2.37.2");
 /// Image pull and first start can be slow on a cold machine.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// How long the seeded book may take to appear after a scan.
+/// How long the seeded audiobooks and podcast may take to appear after a scan.
 const SCAN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The seeded audio files: path in the container, length in seconds.
+const AUDIO_FILES: [(&str, u32); 7] = [
+    ("/audiobooks/L-Space/Silence/silence.wav", 1),
+    (
+        "/audiobooks/Pratchett/The Long Book/01 - Part One.wav",
+        2400,
+    ),
+    (
+        "/audiobooks/Pratchett/The Long Book/02 - Part Two.wav",
+        1800,
+    ),
+    (
+        "/audiobooks/Pratchett/The Long Book/03 - Part Three.wav",
+        120,
+    ),
+    ("/podcasts/The Clacks Hour/Episode 1.wav", 600),
+    ("/podcasts/The Clacks Hour/Episode 2.wav", 900),
+    ("/podcasts/The Clacks Hour/Episode 3.wav", 3960),
+];
+
+/// The seeded episodes' publish dates, oldest first: 2026-01-01, 2026-02-15 and 2026-03-31,
+/// midnight UTC, in milliseconds since the Unix epoch.
+pub const EPISODE_PUBLISHED_AT: [i64; 3] =
+    [1_767_225_600_000, 1_771_113_600_000, 1_774_915_200_000];
+
+/// What the shared Audiobookshelf holds, by Audiobookshelf id.
+#[derive(Debug, Clone, Default)]
+pub struct Seeded {
+    /// The audiobook Library "Audiobooks": [`Seeded::long_book`] and "Silence" (one second,
+    /// by L-Space).
+    pub audiobook_library: String,
+    /// The podcast Library "Podcasts": [`Seeded::podcast`].
+    pub podcast_library: String,
+    /// "The Long Book" by Pratchett, described as "A book that goes on.": three audio files of
+    /// 40, 30 and 2 minutes, one chapter each ("01 - Part One", "02 - Part Two",
+    /// "03 - Part Three"), 72 minutes in all.
+    pub long_book: String,
+    /// "The Clacks Hour" by Ankh-Morpork Radio.
+    pub podcast: String,
+    /// Its episodes "Episode 1" (10 min), "Episode 2" (15 min) and "Episode 3" (66 min),
+    /// oldest first, published at [`EPISODE_PUBLISHED_AT`]; "Episode 1" is described as
+    /// "The first one.".
+    pub episodes: [String; 3],
+}
 
 const ROOT_PASSWORD: &str = "root-password";
 
@@ -63,6 +111,7 @@ pub struct Audiobookshelf {
     base_url: String,
     root_token: String,
     http: reqwest::Client,
+    seeded: Seeded,
 }
 
 impl std::fmt::Debug for Audiobookshelf {
@@ -93,6 +142,34 @@ impl Audiobookshelf {
     /// Its base URL, as an operator would configure it on the Bridge.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    /// What it was seeded with.
+    pub fn seeded(&self) -> &Seeded {
+        &self.seeded
+    }
+
+    /// Records `user`'s Progress in audiobook `library_item`, or in its episode `episode`, as
+    /// their own player would: `current_time` seconds in, Finished or not.
+    pub async fn set_progress(
+        &self,
+        user: &AbsUser,
+        library_item: &str,
+        episode: Option<&str>,
+        current_time: f64,
+        finished: bool,
+    ) {
+        let path = match episode {
+            Some(episode) => format!("/api/me/progress/{library_item}/{episode}"),
+            None => format!("/api/me/progress/{library_item}"),
+        };
+        self.call(
+            &user.api_key.key,
+            reqwest::Method::PATCH,
+            &path,
+            Some(json!({"currentTime": current_time, "isFinished": finished})),
+        )
+        .await;
     }
 
     /// Its `host:port`, for a forwarder in front of it.
@@ -175,23 +252,27 @@ impl Audiobookshelf {
 
     /// Who `api_key` acts for, according to Audiobookshelf itself.
     pub async fn whose_key(&self, api_key: &IssuedKey) -> Value {
-        self.http
-            .get(format!("{}/api/me", self.base_url))
-            .bearer_auth(&api_key.key)
-            .send()
+        self.call(&api_key.key, reqwest::Method::GET, "/api/me", None)
             .await
-            .and_then(reqwest::Response::error_for_status)
-            .expect("GET /api/me")
-            .json()
-            .await
-            .expect("decode /api/me")
     }
 
+    /// Calls `path` as the root user, as an admin would.
     async fn admin(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Value {
+        self.call(&self.root_token, method, path, body).await
+    }
+
+    /// Calls `path` with `token` and returns the answer; panics unless it succeeds.
+    async fn call(
+        &self,
+        token: &str,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Value {
         let mut request = self
             .http
             .request(method.clone(), format!("{}{path}", self.base_url))
-            .bearer_auth(&self.root_token);
+            .bearer_auth(token);
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -206,10 +287,14 @@ impl Audiobookshelf {
     }
 
     fn start() -> Self {
-        let container = GenericImage::new(IMAGE.0, IMAGE.1)
+        let mut image: ContainerRequest<GenericImage> = GenericImage::new(IMAGE.0, IMAGE.1)
             .with_exposed_port(80.tcp())
             .with_wait_for(WaitFor::message_on_stdout("Listening on port"))
-            .with_copy_to("/audiobooks/L-Space/Silence/silence.wav", silent_wav())
+            .into();
+        for (path, seconds) in AUDIO_FILES {
+            image = image.with_copy_to(path, silence(seconds));
+        }
+        let container = image
             .with_startup_timeout(STARTUP_TIMEOUT)
             .start()
             .expect("start the Audiobookshelf container");
@@ -228,55 +313,138 @@ impl Audiobookshelf {
             .build()
             .expect("HTTP client");
         let root_token = runtime.block_on(root_token(&http, &base_url));
-        let abs = Self {
+        let mut abs = Self {
             container: Some(container),
             base_url,
             root_token,
             http,
+            seeded: Seeded::default(),
         };
-        runtime.block_on(abs.seed_library());
+        abs.seeded = runtime.block_on(abs.seed());
         abs
     }
 
-    /// Creates a book Library holding the copied-in audio file, and waits until a scan has
-    /// found the book.
-    async fn seed_library(&self) {
+    /// Creates the audiobook and the podcast Library over the copied-in audio files, waits
+    /// until a scan has found everything, and sets the metadata a scan can't find.
+    async fn seed(&self) -> Seeded {
+        let audiobook_library = self.new_library("Audiobooks", "/audiobooks", "book").await;
+        let podcast_library = self.new_library("Podcasts", "/podcasts", "podcast").await;
+
+        let deadline = Instant::now() + SCAN_TIMEOUT;
+        let (books, podcasts) = loop {
+            let books = self.library_items(&audiobook_library).await;
+            let podcasts = self.library_items(&podcast_library).await;
+            let scanned = books.len() == 2
+                && books
+                    .iter()
+                    .all(|book| book["media"]["numAudioFiles"].as_u64() > Some(0))
+                && podcasts.len() == 1
+                && podcasts[0]["media"]["numEpisodes"] == 3;
+            if scanned {
+                break (books, podcasts);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the seeded audiobooks and podcast did not appear within {SCAN_TIMEOUT:?}: \
+                 {books:?} {podcasts:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+
+        let id = |item: &Value| item["id"].as_str().expect("library item id").to_owned();
+        let long_book = books
+            .iter()
+            .find(|book| book["media"]["metadata"]["title"] == "The Long Book")
+            .map(id)
+            .expect("The Long Book");
+        let podcast = id(&podcasts[0]);
+        self.admin(
+            reqwest::Method::PATCH,
+            &format!("/api/items/{long_book}/media"),
+            Some(json!({"metadata": {"description": "A book that goes on."}})),
+        )
+        .await;
+        self.admin(
+            reqwest::Method::PATCH,
+            &format!("/api/items/{podcast}/media"),
+            Some(json!({"metadata": {"author": "Ankh-Morpork Radio"}})),
+        )
+        .await;
+
+        let item = self
+            .admin(
+                reqwest::Method::GET,
+                &format!("/api/items/{podcast}?expanded=1"),
+                None,
+            )
+            .await;
+        let episodes: [String; 3] = std::array::from_fn(|n| {
+            let title = format!("Episode {}", n + 1);
+            item["media"]["episodes"]
+                .as_array()
+                .expect("episodes")
+                .iter()
+                .find(|episode| episode["title"] == title.as_str())
+                .map(id)
+                .unwrap_or_else(|| panic!("{title}"))
+        });
+        for (n, (episode, published_at)) in episodes.iter().zip(EPISODE_PUBLISHED_AT).enumerate() {
+            let mut update = json!({"publishedAt": published_at});
+            if n == 0 {
+                update["description"] = "The first one.".into();
+            }
+            self.admin(
+                reqwest::Method::PATCH,
+                &format!("/api/podcasts/{podcast}/episode/{episode}"),
+                Some(update),
+            )
+            .await;
+        }
+
+        Seeded {
+            audiobook_library,
+            podcast_library,
+            long_book,
+            podcast,
+            episodes,
+        }
+    }
+
+    /// Creates a Library of `media_type` over `folder`, starts a scan, and returns its id.
+    async fn new_library(&self, name: &str, folder: &str, media_type: &str) -> String {
         let library = self
             .admin(
                 reqwest::Method::POST,
                 "/api/libraries",
                 Some(json!({
-                    "name": "Audiobooks",
-                    "folders": [{"fullPath": "/audiobooks"}],
-                    "mediaType": "book",
+                    "name": name,
+                    "folders": [{"fullPath": folder}],
+                    "mediaType": media_type,
                 })),
             )
             .await;
-        let library_id = library["id"].as_str().expect("library id");
+        let id = library["id"].as_str().expect("library id").to_owned();
         self.admin(
             reqwest::Method::POST,
-            &format!("/api/libraries/{library_id}/scan"),
+            &format!("/api/libraries/{id}/scan"),
             None,
         )
         .await;
+        id
+    }
 
-        let deadline = Instant::now() + SCAN_TIMEOUT;
-        loop {
-            let items = self
-                .admin(
-                    reqwest::Method::GET,
-                    &format!("/api/libraries/{library_id}/items"),
-                    None,
-                )
-                .await;
-            if items["total"] == 1 {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the seeded book did not appear within {SCAN_TIMEOUT:?}: {items}"
-            );
-            tokio::time::sleep(Duration::from_millis(200)).await;
+    /// Everything in Library `library_id`, as the root user sees it.
+    async fn library_items(&self, library_id: &str) -> Vec<Value> {
+        let mut items = self
+            .admin(
+                reqwest::Method::GET,
+                &format!("/api/libraries/{library_id}/items"),
+                None,
+            )
+            .await;
+        match items["results"].take() {
+            Value::Array(results) => results,
+            results => panic!("library items: {results}"),
         }
     }
 }
@@ -315,11 +483,13 @@ async fn root_token(http: &reqwest::Client, base_url: &str) -> String {
         .to_owned()
 }
 
-/// One second of 8 kHz, 16-bit mono silence as a WAV file: the smallest audio Audiobookshelf
-/// scans as a book, generated so the repository holds no binary.
-fn silent_wav() -> Vec<u8> {
-    const RATE: u32 = 8_000;
-    let data_len = RATE * 2;
+/// `seconds` of silence as a WAV file: 100 Hz, 8-bit mono, so an hour takes only 360 kB. Low
+/// as the rate is, Audiobookshelf scans it as audio of that length.
+fn silence(seconds: u32) -> Vec<u8> {
+    const RATE: u32 = 100;
+    // Unsigned 8-bit samples: 0x80 is silence.
+    const SILENT: u8 = 0x80;
+    let data_len = RATE * seconds;
     let mut wav = Vec::with_capacity(44 + data_len as usize);
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&(36 + data_len).to_le_bytes());
@@ -328,11 +498,11 @@ fn silent_wav() -> Vec<u8> {
     wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
     wav.extend_from_slice(&1u16.to_le_bytes()); // mono
     wav.extend_from_slice(&RATE.to_le_bytes());
-    wav.extend_from_slice(&(RATE * 2).to_le_bytes()); // bytes per second
-    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
-    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(&RATE.to_le_bytes()); // bytes per second
+    wav.extend_from_slice(&1u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&8u16.to_le_bytes()); // bits per sample
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_len.to_le_bytes());
-    wav.resize(44 + data_len as usize, 0);
+    wav.resize(44 + data_len as usize, SILENT);
     wav
 }
