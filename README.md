@@ -11,7 +11,8 @@ Toolchain and tasks come from [mise](https://mise.jdx.dev). In a fresh clone run
 | `mise run build` | builds every crate and target |
 | `mise run test` | runs every test, including the black-box Bridge tests |
 | `mise run lint` | clippy with warnings denied, and `cargo fmt --check` |
-| `mise run check` | all of the above |
+| `mise run check` | build, lint and test |
+| `mise run image` | builds the Clacks image for this machine's platform and smoke-tests it ([scripts/smoke-image.sh](scripts/smoke-image.sh)) |
 
 The black-box Bridge tests start a real Audiobookshelf in a container ([testcontainers](https://crates.io/crates/testcontainers)), so `mise run test` needs a running Docker; the first run pulls the Audiobookshelf image.
 
@@ -51,21 +52,98 @@ The Bridge encrypts the Audiobookshelf API keys it stores with a key you provide
 
 A variable set to the empty string counts as unset. When both are set, the file wins, even if it's missing or unusable (the Bridge never falls back to `BRIDGE_ENCRYPTION_KEY`); once the key has loaded, the Bridge logs one warning naming both variables. Without a usable key (neither variable set, an unreadable file, a blank value or file, not base64, or not 32 bytes) the Bridge exits with code 1 after one `cannot load the encryption key` error event, which names the variable and what is wrong, never the key, the file's contents or its path.
 
+With Docker, the key is a Compose secret that only the container's user can read: see [Run with Docker](#run-with-docker).
+
+Keep the key outside the database's backups, and keep it: with a different key the Bridge still starts, but can't decrypt the stored keys. It removes at once those that no session uses, and logs a warning if others remain. A session whose key it can't decrypt (another encryption key, or a tampered database) ends at its next call with `session_invalid`, and its stored key is removed, so the user logs in again. Switching back to the old key doesn't bring removed keys back.
+
+## Run with Docker
+
+The Bridge ships as the image `ghcr.io/stibbons-ai/clacks`, for `linux/amd64` and `linux/arm64`, built and smoke-tested by GitHub Actions ([image.yml](.github/workflows/image.yml)):
+
+| Tag | Is |
+|---|---|
+| `X.Y.Z`, `X.Y.Z-rc.1` | the release tagged `vX.Y.Z`, the pre-release tagged `vX.Y.Z-rc.1` |
+| `X.Y` | the most recently tagged release `vX.Y.*`, pre-releases excluded |
+| `latest` | the most recently tagged release, pre-releases excluded |
+| `main` | the newest published commit on `main` |
+| `sha-<commit>` | a published commit on `main`, by its 7-character hash; a commit pushed while an earlier publish still runs may be skipped |
+
+The image runs the Bridge as UID and GID 65532, with no shell. It reads the configuration from `/etc/clacks/bridge.toml` (set by `BRIDGE_CONFIG`) and keeps the database in `/var/lib/clacks`, which a fresh named volume takes over, owned by that user and readable only by it.
+
+Next to `compose.yaml`, create the encryption key and make the container's user its owner, so that it alone can read the key, and write `bridge.toml` as in [Run the Bridge](#run-the-bridge), keeping that example's `listen` and `database`:
+
+```sh
+(umask 077; openssl rand -base64 32 > bridge_encryption_key)   # once; keep it, see "Encryption key"
+sudo chown 65532:65532 bridge_encryption_key
+```
+
 ```yaml
-# compose.yaml (excerpt)
+# compose.yaml
 services:
   clacks:
+    image: ghcr.io/stibbons-ai/clacks:main   # or a release tag, such as 0.1.0
+    restart: unless-stopped
+    init: true   # passes `docker stop`'s SIGTERM on; the Bridge has no signal handling yet, so without it, stopping waits 10 s and kills it
+    network_mode: host
     environment:
       BRIDGE_ENCRYPTION_KEY_FILE: /run/secrets/bridge_encryption_key
     secrets: [bridge_encryption_key]
+    volumes:
+      - ./bridge.toml:/etc/clacks/bridge.toml:ro
+      - clacks-data:/var/lib/clacks
+volumes:
+  clacks-data:
 secrets:
   bridge_encryption_key:
-    file: ./bridge_encryption_key   # (umask 077; openssl rand -base64 32 > bridge_encryption_key)
+    file: ./bridge_encryption_key
 ```
 
-The key file must be readable by the user the container runs as, and by no one else: if the container runs as another user than yours, `chown` the file to the container's user id.
+`docker compose up -d` starts it; `docker compose logs clacks` shows a `listening` event once it serves. Instead of the secret, `BRIDGE_ENCRYPTION_KEY` in `environment` works too, but then anyone who can run `docker inspect` on the host sees the key. To upgrade, `docker compose pull && docker compose up -d`; the database stays in the volume. Back up the volume, without the key (see [Encryption key](#encryption-key)).
 
-Keep the key outside the database's backups, and keep it: with a different key the Bridge still starts, but can't decrypt the stored keys. It removes at once those that no session uses, and logs a warning if others remain. A session whose key it can't decrypt (another encryption key, or a tampered database) ends at its next call with `session_invalid`, and its stored key is removed, so the user logs in again. Switching back to the old key doesn't bring removed keys back.
+Each URL in `[[library_servers]]` must be reachable from the host; with host networking, an Audiobookshelf on the same host is reachable at `http://127.0.0.1:<its port>`.
+
+### Why host networking
+
+The container shares the host's network, so the Bridge listens on the host's addresses and needs no `ports:`. Sonos control isn't implemented yet; once it is, the Bridge finds Groups with SSDP multicast and receives GENA event callbacks from the speakers on its own port ([ADR 0005](docs/adr/0005-local-upnp-sonos-control.md)), which needs the host's LAN interface rather than a Docker bridge network. Keep the `listen` port fixed for the same reason.
+
+### HTTPS through Traefik
+
+Once there is an App, it reaches the Bridge over HTTPS at a stable hostname, such as `clacks.home.example.com`, with TLS terminated by Traefik. Traefik's Docker provider routes to a host-network container at `host.docker.internal` ([Traefik docs](https://doc.traefik.io/traefik/reference/install-configuration/providers/docker/#host-networking)), so give the Traefik container `extra_hosts: ["host.docker.internal:host-gateway"]`, and add to the `clacks` service these labels, in Traefik v3 syntax (v2 called the allow list `ipwhitelist`):
+
+```yaml
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.clacks.rule: Host(`clacks.home.example.com`)
+      traefik.http.routers.clacks.entrypoints: websecure   # your HTTPS entry point
+      traefik.http.routers.clacks.tls.certresolver: letsencrypt   # your certificate resolver
+      traefik.http.routers.clacks.middlewares: clacks-private
+      # Your LAN, which with the recommended subnet router on another LAN machine includes
+      # tailnet devices (they arrive with that router's LAN address), and the tailnet's
+      # addresses. Never add the Docker network's subnet.
+      traefik.http.middlewares.clacks-private.ipallowlist.sourcerange: 192.168.1.0/24, 100.64.0.0/10
+      traefik.http.services.clacks.loadbalancer.server.port: "8080"   # the `listen` port
+```
+
+As the hostname is never reachable from the internet, a Let's Encrypt certificate needs the [DNS challenge](https://doc.traefik.io/traefik/reference/install-configuration/tls/certificate-resolvers/acme/). The [IP allow list](https://doc.traefik.io/traefik/reference/routing-configuration/http/middlewares/ipallowlist/) is a second fence in case Traefik's entry point is ever exposed.
+
+The Bridge's own port answers plain HTTP outside Traefik and its allow list: with host networking, `listen = "0.0.0.0:8080"` binds every interface of the host, including `tailscale0` when Tailscale runs on the host. Point the App only at the HTTPS hostname. To keep the plain port off other interfaces, set `listen` to the host's LAN address (say `"192.168.1.10:8080"`) and give Traefik that address instead: `extra_hosts: ["host.docker.internal:192.168.1.10"]`.
+
+### Remote access through Tailscale only
+
+Never forward a port to the Bridge or to its Traefik route: it has no public exposure. Away from home, the App reaches it through the household's [Tailscale](https://tailscale.com), in one of two ways, so the URL entered once works at home and away:
+
+- **Recommended: a [subnet router](https://tailscale.com/kb/1019/subnets) on another LAN machine** advertises the LAN, and you approve the route in the admin console; iOS picks it up automatically. By default the router masquerades tailnet traffic, so it reaches Traefik from the router's LAN address, inside the allow list above. Tailnet devices reach the host's LAN address, so the hostname resolves to that same address everywhere: add the household's DNS server as a restricted nameserver for the hostname's domain ([split DNS](https://tailscale.com/kb/1054/dns)).
+- **Tailscale on the Docker host** (advertising the LAN route or not): tailscaled masquerades the traffic it forwards into Docker, so Traefik sees the Docker network's gateway (`172.x`), which the allow list rejects with a 403. Turn that off with `sudo tailscale set --snat-subnet-routes=false` (Linux only; [subnet routers](https://tailscale.com/kb/1019/subnets), [CLI](https://tailscale.com/kb/1080/cli)), so Traefik sees the device's `100.x.y.z` address. If the host also advertises the LAN route, the other LAN devices then need a return route for `100.64.0.0/10` via the host. Without an advertised route, tailnet devices reach only the host's tailnet address, so the hostname must resolve to that address for them, through a restricted nameserver that answers with it, while the LAN's DNS keeps answering the LAN address.
+
+After setup, make one request from a tailnet device and check the client address in Traefik's [access log](https://doc.traefik.io/traefik/reference/install-configuration/observability/logs-and-accesslogs/) (`ClientHost`): a 403 from the allow list means the source address isn't the one the list expects.
+
+### Sonos: keep UPnP enabled
+
+L-Space will control Sonos over its local UPnP interface once Sonos control lands ([ADR 0005](docs/adr/0005-local-upnp-sonos-control.md)), and Sonos lets you turn that interface off. Keep the UPnP setting in the Sonos app enabled: Account → Privacy & Security → Connection Security → UPnP. It is on by default ([Sonos: Adjust Connection Security settings](https://support.sonos.com/en-us/article/adjust-connection-security-settings)). Leave Authentication on the same screen at its default, off: turned on, it requires third-party integrations that use Sonos's LAN APIs to authenticate.
+
+### Releases
+
+Before each release, run the [release hardware checklist](docs/release-checklist.md) on real speakers and an iPhone.
 
 ## Log in
 

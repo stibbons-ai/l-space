@@ -1,0 +1,5 @@
+# Only what `cargo build --package bridge` needs; keeps keys, databases and build output out.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/

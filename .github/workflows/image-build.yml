@@ -1,0 +1,171 @@
+# Builds the Clacks image natively on one runner per platform, smoke-tests each build, and, when
+# publishing, pushes each platform by digest and joins them into one multi-arch manifest list.
+# Called by image.yml, whose calling job decides the token's permissions: a called workflow can
+# only keep or downgrade its caller's permissions, and this one declares none, so it keeps them.
+name: image-build
+
+on:
+  workflow_call:
+    inputs:
+      publish:
+        description: Push to GHCR after the smoke tests pass
+        type: boolean
+        required: true
+
+env:
+  IMAGE: ghcr.io/stibbons-ai/clacks
+  # Also in the Dockerfile's LABEL, for local builds; metadata-action would replace them with the
+  # repository's name and description.
+  IMAGE_TITLE: Clacks
+  IMAGE_DESCRIPTION: "The L-Space Bridge: Audiobookshelf playback on Sonos or on the phone"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            pair: linux-amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            pair: linux-arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          labels: |
+            org.opencontainers.image.title=${{ env.IMAGE_TITLE }}
+            org.opencontainers.image.description=${{ env.IMAGE_DESCRIPTION }}
+
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          load: true
+          tags: clacks:smoke
+          cache-from: type=gha,scope=${{ matrix.pair }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.pair }}
+
+      - name: Smoke test
+        run: scripts/smoke-image.sh clacks:smoke
+
+      - if: inputs.publish
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The same commit built again from the builder's local cache, pushed by digest: the layers
+      # are the smoke-tested ones, though the image config (and so the digest) may differ.
+      - id: push
+        if: inputs.publish
+        name: Push by digest
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - if: inputs.publish
+        name: Export the digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - if: inputs.publish
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digests-${{ matrix.pair }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          # Lets "Re-run failed jobs" on the merge job work days later; the merge job refuses
+          # to publish unless both platforms' digests are there. Re-run only the newest publish:
+          # an older main run re-run after a newer one succeeded moves `main` backwards.
+          retention-days: 7
+
+  merge:
+    if: inputs.publish
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # main: `main` and `sha-<short>`; a tag vX.Y.Z: `X.Y.Z`, and for a release (no
+      # pre-release suffix) also `X.Y` and `latest`.
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=sha,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          annotations: |
+            org.opencontainers.image.title=${{ env.IMAGE_TITLE }}
+            org.opencontainers.image.description=${{ env.IMAGE_DESCRIPTION }}
+        env:
+          # GHCR shows a multi-arch package's description from the manifest list.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+
+      - name: Create the manifest list and push it
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          digests=(*)
+          if ((${#digests[@]} != 2)); then
+            echo "::error::expected 2 platform digests, found ${#digests[@]}: ${digests[*]}"
+            exit 1
+          fi
+          tags=$(jq -r '.tags[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+          annotations=$(jq -r '.annotations[]' <<<"$DOCKER_METADATA_OUTPUT_JSON")
+          if [[ -z $tags ]]; then
+            echo "::error::docker/metadata-action produced no tags"
+            exit 1
+          fi
+          args=()
+          while IFS= read -r tag; do args+=(--tag "$tag"); done <<<"$tags"
+          if [[ -n $annotations ]]; then
+            while IFS= read -r annotation; do args+=(--annotation "$annotation"); done <<<"$annotations"
+          fi
+          for digest in "${digests[@]}"; do args+=("$IMAGE@sha256:$digest"); done
+          docker buildx imagetools create "${args[@]}"
+
+      - name: Check both platforms were published
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
+          docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' \
+            | jq --exit-status '[.manifests[].platform | "\(.os)/\(.architecture)"] as $published
+                | ["linux/amd64", "linux/arm64"] - $published == []' >/dev/null \
+            || { echo "::error::$IMAGE:$VERSION lacks linux/amd64 or linux/arm64"; exit 1; }
