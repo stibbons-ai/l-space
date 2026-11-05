@@ -152,7 +152,15 @@ fn LoginScreen(
     let text = |text| app.read().text(text);
     let bridge_url = app.read().bridge_url().unwrap_or_default().to_owned();
     let has_servers = !library_servers.is_empty();
+    let (can_go_back, can_change_bridge_url) = {
+        let app = app.read();
+        (app.can_go_back(), app.can_change_bridge_url())
+    };
     rsx! {
+        // Opened from Settings, to log in to another Library Server.
+        if can_go_back {
+            BackButton { app, busy }
+        }
         h1 { {text(Text::LoginTitle)} }
         form {
             onsubmit: move |event| {
@@ -207,17 +215,61 @@ fn LoginScreen(
                 }
             }
         }
+        SwitchList { app, busy }
         footer {
             dl {
                 dt { {text(Text::Bridge)} }
                 dd { "{bridge_url}" }
             }
-            button {
-                r#type: "button",
-                class: "secondary",
-                disabled: busy(),
-                onclick: move |_| app.write().change_bridge_url(),
-                {text(Text::LoginChangeBridge)}
+            if can_change_bridge_url {
+                button {
+                    r#type: "button",
+                    class: "secondary",
+                    disabled: busy(),
+                    onclick: move |_| app.write().change_bridge_url(),
+                    {text(Text::LoginChangeBridge)}
+                }
+            }
+        }
+    }
+}
+
+/// The Library Servers the person has a session on besides the selected one, each to switch
+/// to without a login; nothing without any.
+#[component]
+fn SwitchList(app: Signal<App>, busy: Signal<bool>) -> Element {
+    let sessions: Vec<_> = app
+        .read()
+        .other_sessions()
+        .map(|session| {
+            let server = &session.library_server;
+            (
+                session.library_server_url().to_owned(),
+                server
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| server.base_url.clone()),
+                session.user.username.clone(),
+            )
+        })
+        .collect();
+    if sessions.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        h2 { {app.read().text(Text::SwitchLibraryServer)} }
+        ul { class: "entries",
+            for (url, title, username) in sessions {
+                EntryButton {
+                    key: "{url}",
+                    busy,
+                    title,
+                    detail: username,
+                    onclick: move |_| {
+                        let url = url.clone();
+                        act(app, busy, async move |app: &mut App| app.switch_to(&url).await);
+                    },
+                }
             }
         }
     }
@@ -588,6 +640,14 @@ fn SettingsScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>) 
             dd { "{username}" }
             dt { {text(Text::Bridge)} }
             dd { "{bridge_url}" }
+        }
+        SwitchList { app, busy }
+        button {
+            r#type: "button",
+            class: "secondary",
+            disabled: busy(),
+            onclick: move |_| act(app, busy, async |app: &mut App| app.open_login().await),
+            {text(Text::SettingsLogInElsewhere)}
         }
         label {
             {text(Text::SettingsLanguage)}

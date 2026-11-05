@@ -10,16 +10,132 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::i18n::LanguageChoice;
 
-/// Everything the App remembers. The session token is the only secret; its `Debug` output is
-/// redacted ([`SessionToken`]).
+/// Everything the App remembers. The session tokens are the only secrets; their `Debug`
+/// output is redacted ([`SessionToken`]).
+///
+/// Reads what earlier Apps wrote too: their single `session` becomes the only session, selected.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredFile")]
 pub struct Stored {
     /// The Bridge's base URL, once the person entered one that answered.
     pub bridge_url: Option<String>,
-    pub session: Option<StoredSession>,
+    /// Every session, at most one per Library Server.
+    sessions: Vec<StoredSession>,
+    /// The Library Server (its base URL) of the session the App uses; `None` once that one
+    /// ended, until the person picks another.
+    selected: Option<String>,
+    pub language: LanguageChoice,
+}
+
+impl Stored {
+    /// The session the App uses, if one is selected.
+    pub fn session(&self) -> Option<&StoredSession> {
+        let selected = self.selected.as_deref()?;
+        self.sessions
+            .iter()
+            .find(|session| session.library_server_url() == selected)
+    }
+
+    /// Every session, the selected one among them.
+    pub fn sessions(&self) -> &[StoredSession] {
+        &self.sessions
+    }
+
+    /// Sets the account of the selected session; whether that changed it.
+    pub fn update_user(&mut self, user: CurrentUser) -> bool {
+        let selected = self.selected.as_deref();
+        let session = self
+            .sessions
+            .iter_mut()
+            .find(|session| Some(session.library_server_url()) == selected);
+        match session {
+            Some(session) if session.user != user => {
+                session.user = user;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Selects the session on the Library Server with base URL `library_server`; returns it,
+    /// or `None` (selecting nothing new) if there is none.
+    pub fn select(&mut self, library_server: &str) -> Option<&StoredSession> {
+        let index = self
+            .sessions
+            .iter()
+            .position(|session| session.library_server_url() == library_server)?;
+        self.selected = Some(library_server.to_owned());
+        Some(&self.sessions[index])
+    }
+
+    /// Adds `session` and selects it. Returns the session it replaces: the one on the same
+    /// Library Server, if any.
+    pub fn add(&mut self, session: StoredSession) -> Option<StoredSession> {
+        let library_server = session.library_server_url().to_owned();
+        let replaced = match self
+            .sessions
+            .iter_mut()
+            .find(|stored| stored.library_server_url() == library_server)
+        {
+            Some(stored) => Some(std::mem::replace(stored, session)),
+            None => {
+                self.sessions.push(session);
+                None
+            }
+        };
+        self.selected = Some(library_server);
+        replaced
+    }
+
+    /// Forgets the selected session; the others stay, none selected.
+    pub fn forget_selected(&mut self) {
+        if let Some(selected) = self.selected.take() {
+            self.sessions
+                .retain(|session| session.library_server_url() != selected);
+        }
+    }
+
+    /// Forgets every session.
+    pub fn forget_all(&mut self) {
+        self.sessions.clear();
+        self.selected = None;
+    }
+}
+
+/// [`Stored`] as the file holds it, written by this App or an earlier one.
+#[derive(Deserialize)]
+struct StoredFile {
+    bridge_url: Option<String>,
+    /// The one session of an App from before several sessions.
+    #[serde(default)]
+    session: Option<StoredSession>,
+    #[serde(default)]
+    sessions: Vec<StoredSession>,
+    #[serde(default)]
+    selected: Option<String>,
     /// A value this build doesn't know (from a newer App) reads as [`LanguageChoice::System`].
     #[serde(default, deserialize_with = "language_or_system")]
-    pub language: LanguageChoice,
+    language: LanguageChoice,
+}
+
+impl From<StoredFile> for Stored {
+    fn from(file: StoredFile) -> Self {
+        let mut stored = Self {
+            bridge_url: file.bridge_url,
+            language: file.language,
+            ..Self::default()
+        };
+        // At most one per Library Server, whatever the file holds.
+        for session in file.sessions {
+            stored.add(session);
+        }
+        stored.selected = file.selected;
+        // An earlier App's one session is the one it used.
+        if let Some(session) = file.session {
+            stored.add(session);
+        }
+        stored
+    }
 }
 
 fn language_or_system<'de, D: Deserializer<'de>>(
@@ -37,6 +153,13 @@ pub struct StoredSession {
     pub library_server: LibraryServer,
     /// Who the session acts for, as last confirmed by the Bridge.
     pub user: CurrentUser,
+}
+
+impl StoredSession {
+    /// The base URL of the Library Server the session is bound to, as the Bridge names it.
+    pub fn library_server_url(&self) -> &str {
+        &self.user.library_server
+    }
 }
 
 /// Where the App keeps [`Stored`] on the device.

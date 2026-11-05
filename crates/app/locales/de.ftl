@@ -22,6 +22,8 @@ settings-library-server = Library Server
 settings-account = Konto
 settings-language = Sprache
 settings-logout = Abmelden
+settings-log-in-elsewhere = Bei einem anderen Library Server anmelden
+switch-library-server = Library Server wechseln
 
 libraries-title = Bibliotheken
 libraries-none = Auf deinem Library Server siehst du noch keine Bibliotheken.

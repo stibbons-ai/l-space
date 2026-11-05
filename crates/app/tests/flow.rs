@@ -1376,6 +1376,282 @@ fn settings_stay_reachable_from_the_libraries() {
     });
 }
 
+/// A Bridge with two Library Servers that are both the shared Audiobookshelf: "Home" at its own
+/// address and "Second" behind a [`proxy`], which the Bridge can't tell from another
+/// Audiobookshelf. Returns Second's base URL.
+fn bridge_with_two_library_servers() -> (TestBridge, Arc<Audiobookshelf>, String) {
+    let abs = Audiobookshelf::shared();
+    let (second, _) = proxy(abs.address(), |_, _| false);
+    let config = format!(
+        "{}{}",
+        named_library_server_toml(abs.base_url(), "Home"),
+        named_library_server_toml(&second, "Second"),
+    );
+    (TestBridge::start(&config), abs, second)
+}
+
+/// A user for Home who sees only the audiobooks, and one for Second who sees only the podcasts.
+async fn users_seeing_apart(abs: &Audiobookshelf) -> (AbsUser, AbsUser) {
+    let seeded = abs.seeded();
+    (
+        abs.new_user_seeing(&[&seeded.audiobook_library]).await,
+        abs.new_user_seeing(&[&seeded.podcast_library]).await,
+    )
+}
+
+/// Libraries as listed for the Home user: only the audiobooks.
+fn home_libraries(abs: &Audiobookshelf) -> Screen {
+    Screen::Libraries {
+        libraries: vec![audiobooks(abs)],
+        notice: None,
+    }
+}
+
+/// Libraries as listed for the Second user: only the podcasts.
+fn second_libraries(abs: &Audiobookshelf) -> Screen {
+    Screen::Libraries {
+        libraries: vec![podcasts(abs)],
+        notice: None,
+    }
+}
+
+/// The ids of the entries the Library screen lists.
+fn entry_ids(app: &App) -> Vec<String> {
+    match app.screen() {
+        Screen::Library { entries, .. } => entries.iter().map(|entry| entry.id.clone()).collect(),
+        screen => panic!("{screen:?}"),
+    }
+}
+
+/// The Library Servers (their base URLs) the App offers to switch to.
+fn switchable(app: &App) -> Vec<String> {
+    app.other_sessions()
+        .map(|session| session.library_server_url().to_owned())
+        .collect()
+}
+
+/// The stored session on `library_server` other than the selected one, to check it with the
+/// Bridge.
+fn other_session(app: &App, library_server: &str) -> Session {
+    let stored = app
+        .other_sessions()
+        .find(|session| session.library_server_url() == library_server)
+        .expect("a session on that Library Server");
+    Session {
+        token: stored.token.clone(),
+        user: stored.user.clone(),
+    }
+}
+
+/// From Settings, logs in to `library_server` as `user`, keeping the sessions there are.
+async fn log_in_elsewhere(app: &mut App, library_server: &str, user: &AbsUser) {
+    app.open_settings();
+    app.open_login().await;
+    app.log_in(library_server, ApiKey::new(&user.api_key.key))
+        .await;
+}
+
+#[test]
+fn settings_switch_between_library_servers_without_a_login() {
+    let (bridge, abs, second) = bridge_with_two_library_servers();
+    let device = Device::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let (home_user, second_user) = users_seeing_apart(&abs).await;
+        let mut app = logged_in_behind(&device, &bridge, abs.base_url(), &home_user).await;
+        assert_eq!(app.screen(), &home_libraries(&abs));
+        let home = session(&app);
+
+        // Login from Settings lists every Library Server, and Back returns to Settings.
+        app.open_settings();
+        app.open_login().await;
+        assert!(
+            matches!(app.screen(), Screen::Login { library_servers, notice: None } if library_servers.len() == 2),
+            "{:?}",
+            app.screen()
+        );
+        assert!(app.can_go_back());
+        assert!(!app.can_change_bridge_url());
+        app.go_back();
+        assert_eq!(app.screen(), &Screen::Settings { notice: None });
+
+        // Logging in to the second keeps the first, which the Bridge still accepts.
+        log_in_elsewhere(&mut app, &second, &second_user).await;
+        assert_eq!(app.screen(), &second_libraries(&abs));
+        assert!(!app.can_go_back());
+        let selected = app.session().expect("logged in");
+        assert_eq!(selected.library_server_url(), second);
+        assert_eq!(selected.library_server.name.as_deref(), Some("Second"));
+        assert_eq!(selected.user.username, second_user.username);
+        assert_eq!(switchable(&app), [abs.base_url()]);
+        assert_eq!(other_session(&app, abs.base_url()), home);
+        assert_eq!(bridge.api().current_user(&home).await, home.user);
+        let second_session = session(&app);
+
+        app.open_library(podcasts(&abs)).await;
+        assert_eq!(entry_ids(&app), [seeded.podcast.as_str()]);
+
+        // Switching back needs no key: Home's Libraries and entries, afresh.
+        app.open_settings();
+        app.switch_to(abs.base_url()).await;
+        assert_eq!(app.screen(), &home_libraries(&abs));
+        assert!(!app.can_go_back());
+        assert_eq!(session(&app), home);
+        assert_eq!(switchable(&app), [second.as_str()]);
+        app.open_library(audiobooks(&abs)).await;
+        let books = entry_ids(&app);
+        assert!(
+            !books.is_empty() && !books.contains(&seeded.podcast),
+            "{books:?}"
+        );
+        // Every call now acts on Home's session: its user doesn't see the podcasts.
+        app.go_back();
+        app.open_library(podcasts(&abs)).await;
+        assert_eq!(
+            app.screen(),
+            &Screen::Libraries {
+                libraries: vec![audiobooks(&abs)],
+                notice: Some(Notice::Api(ApiError::NotFound)),
+            }
+        );
+        drop(app);
+
+        // Both stay across launches; the next one starts on the selected Library Server.
+        let mut app = device.launch().await;
+        assert_eq!(app.screen(), &home_libraries(&abs));
+        assert_eq!(session(&app), home);
+        app.open_settings();
+        app.switch_to(&second).await;
+        assert_eq!(app.screen(), &second_libraries(&abs));
+        assert_eq!(session(&app), second_session);
+        drop(app);
+        let app = device.launch().await;
+        assert_eq!(app.screen(), &second_libraries(&abs));
+        assert_eq!(other_session(&app, abs.base_url()), home);
+    });
+}
+
+#[test]
+fn ending_one_session_leaves_the_others_to_switch_to() {
+    let (bridge, abs, second) = bridge_with_two_library_servers();
+    let device = Device::new();
+    run(async || {
+        let (home_user, second_user) = users_seeing_apart(&abs).await;
+        let mut app = logged_in_behind(&device, &bridge, abs.base_url(), &home_user).await;
+        let home = session(&app);
+        log_in_elsewhere(&mut app, &second, &second_user).await;
+        let ended = session(&app);
+
+        // Logout ends only the selected session; Login offers the other, never its data.
+        app.log_out().await;
+        assert!(
+            matches!(app.screen(), Screen::Login { notice: None, .. }),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(app.session(), None);
+        assert_eq!(switchable(&app), [abs.base_url()]);
+        assert!(!app.can_change_bridge_url());
+        assert_eq!(
+            bridge.api().current_user_error(&ended).await.1,
+            ApiError::SessionInvalid
+        );
+        assert_eq!(bridge.api().current_user(&home).await, home.user);
+        // So does the next launch, until the person switches.
+        let mut app = device.launch().await;
+        assert!(matches!(app.screen(), Screen::Login { notice: None, .. }));
+        assert_eq!(switchable(&app), [abs.base_url()]);
+        app.switch_to(abs.base_url()).await;
+        assert_eq!(app.screen(), &home_libraries(&abs));
+        assert_eq!(session(&app), home);
+
+        // A revoked key forgets only its own session.
+        log_in_elsewhere(&mut app, &second, &second_user).await;
+        assert_eq!(app.screen(), &second_libraries(&abs));
+        abs.delete_api_key(&second_user.api_key).await;
+        app.open_libraries().await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::ApiKeyRejected))
+        );
+        assert!(matches!(app.screen(), Screen::Login { .. }));
+        assert_eq!(app.session(), None);
+        assert_eq!(switchable(&app), [abs.base_url()]);
+        let mut app = device.launch().await;
+        assert!(matches!(app.screen(), Screen::Login { notice: None, .. }));
+        app.switch_to(abs.base_url()).await;
+        assert_eq!(app.screen(), &home_libraries(&abs));
+
+        // A session ended elsewhere: the last one, so the Bridge address may change again.
+        bridge.api().logout(&home).await;
+        app.open_libraries().await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::SessionInvalid))
+        );
+        assert_eq!(app.session(), None);
+        assert_eq!(switchable(&app), Vec::<String>::new());
+        assert!(app.can_change_bridge_url());
+    });
+}
+
+#[test]
+fn logging_in_again_replaces_that_library_servers_session() {
+    let (bridge, abs, second) = bridge_with_two_library_servers();
+    let device = Device::new();
+    run(async || {
+        let (home_user, second_user) = users_seeing_apart(&abs).await;
+        let mut app = logged_in_behind(&device, &bridge, abs.base_url(), &home_user).await;
+        log_in_elsewhere(&mut app, &second, &second_user).await;
+        let replaced = session(&app);
+
+        log_in_elsewhere(&mut app, &second, &second_user).await;
+        assert_eq!(app.screen(), &second_libraries(&abs));
+        let current = session(&app);
+        assert_ne!(current.token, replaced.token);
+        // One session per Library Server: the old one ended on the Bridge, Home's untouched.
+        assert_eq!(switchable(&app), [abs.base_url()]);
+        assert_eq!(
+            bridge.api().current_user_error(&replaced).await.1,
+            ApiError::SessionInvalid
+        );
+        assert_eq!(bridge.api().current_user(&current).await, current.user);
+        let relaunched = device.launch().await;
+        assert_eq!(session(&relaunched), current);
+        assert_eq!(switchable(&relaunched), [abs.base_url()]);
+    });
+}
+
+#[test]
+fn a_session_saved_by_an_earlier_app_stays_logged_in() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let before = session(&logged_in(&device, &bridge, &abs, &user).await);
+        // As an App with one session wrote it.
+        device.edit(|json| {
+            let object = json.as_object_mut().unwrap();
+            let sessions = object.remove("sessions").unwrap();
+            object.remove("selected");
+            object.insert("session".into(), sessions[0].clone());
+        });
+
+        let app = device.launch().await;
+        assert_eq!(app.screen(), &libraries(&abs, None));
+        assert_eq!(session(&app), before);
+        assert_eq!(
+            app.session().unwrap().library_server.name.as_deref(),
+            Some("Home")
+        );
+        // Still logged in after the App saved again in its own shape.
+        drop(app);
+        let mut app = device.launch().await;
+        app.set_language(LanguageChoice::German);
+        assert_eq!(session(&device.launch().await), before);
+    });
+}
+
 #[test]
 fn something_no_longer_on_the_library_server_is_named_on_the_screen_shown() {
     let (bridge, abs, _) = bridge_with_abs();
