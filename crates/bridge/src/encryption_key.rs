@@ -8,16 +8,17 @@
 //! put the key itself in [`FILE_VAR`] by mistake).
 //!
 //! Every buffer the key passes through here (the variable's value, the file's contents, the
-//! decoded bytes) is wiped when dropped, on success and error alike. The process environment
-//! keeps its own copy of [`VALUE_VAR`] for as long as the Bridge runs: removing it is `unsafe`
-//! once other threads run, as the Tokio runtime's do by now. Operators who mind that use
-//! [`FILE_VAR`].
+//! decoded bytes) is wiped when dropped, on success and error alike. [`FILE_VAR`]'s path is
+//! not: a key put there by mistake names no file, and the Bridge exits. The process environment
+//! keeps its own copy of [`VALUE_VAR`] for as long as the Bridge runs: removing it is `unsafe`,
+//! and unsound once other threads run, as the Tokio runtime's do by now. Operators who mind that
+//! use [`FILE_VAR`].
 
 use std::ffi::OsString;
 use std::io::Read;
 
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use base64::{DecodeSliceError, Engine};
 use store_sqlite::EncryptionKey;
 use zeroize::Zeroizing;
 
@@ -76,11 +77,15 @@ fn decode(encoded: &[u8]) -> Result<EncryptionKey, Problem> {
     // Decoded into a buffer of our own: the decoder's would be dropped unwiped, holding part of
     // the key, when a later character turns out not to be base64.
     let mut decoded = Zeroizing::new(vec![0; base64::decoded_len_estimate(encoded.len())]);
-    // The decoder's own error would quote the offending character, a piece of the key. The
-    // buffer can't be too small: it is sized by the decoder's own estimate.
+    // The decoder's own error would quote the offending character, a piece of the key.
     let len = STANDARD
         .decode_slice(encoded, &mut decoded)
-        .map_err(|_| Problem::NotBase64)?;
+        .map_err(|error| match error {
+            DecodeSliceError::DecodeError(_) => Problem::NotBase64,
+            DecodeSliceError::OutputSliceTooSmall => {
+                unreachable!("the buffer is sized by the decoder's own estimate")
+            }
+        })?;
     let bytes = <&[u8; EncryptionKey::LEN]>::try_from(&decoded[..len])
         .map_err(|_| Problem::WrongLength(len))?;
     Ok(EncryptionKey::new(bytes))

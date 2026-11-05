@@ -95,9 +95,13 @@ impl<'a> Row<'a> {
 /// Seals and opens API keys, and fingerprints them, under one [`EncryptionKey`].
 ///
 /// Its cipher and HMAC state are wiped when dropped (the RustCrypto crates' `zeroize`
-/// features), as is the per-call state of [`Sealing::seal`], [`Sealing::open`] and
-/// [`Sealing::fingerprint`] (a ChaCha20 core, a Poly1305 MAC, a clone of the HMAC state). A copy
-/// left behind when a `Sealing` is moved by value is not.
+/// features), as are the ChaCha20 core, the Poly1305 MAC and the HMAC clone that
+/// [`Sealing::seal`], [`Sealing::open`] and [`Sealing::fingerprint`] build per call. The
+/// ChaCha20 keystream buffer is wiped only because `digest`'s `zeroize` feature turns on that of
+/// the `block-buffer` it shares with `cipher`, whose own `zeroize` feature is off. Not wiped, as
+/// the crates offer no way to: the per-message XChaCha subkey HChaCha derives in each seal and
+/// open (it decrypts and forges that one sealed key), and a copy left behind when a `Sealing`
+/// is moved by value.
 pub struct Sealing {
     cipher: XChaCha20Poly1305,
     fingerprinter: Hmac<Sha256>,
@@ -120,9 +124,9 @@ impl fmt::Debug for Sealing {
 
 impl Sealing {
     /// The sealing `key` derives. The key, and every intermediate key this holds, is wiped
-    /// before it returns; what the crates keep on the stack inside their own calls (HMAC's
-    /// padded key block, the SHA-256 compression's working state) is not, as they offer no way
-    /// to.
+    /// before it returns. What the crates keep on the stack inside their own calls is not, as
+    /// they offer no way to: HKDF's output blocks (whole copies of the PRK and of each subkey),
+    /// HMAC's padded key block, and the SHA-256 compression's working state.
     pub fn new(key: EncryptionKey) -> Self {
         // `Hkdf::new` would drop the PRK unwiped; the HMAC keyed with it, in `derive`, wipes
         // itself.
@@ -141,7 +145,7 @@ impl Sealing {
                 .expect("HKDF-SHA256 yields up to 8160 bytes");
         }
         Self {
-            // A borrow, not a copy: the cipher's own copy is the only one left.
+            // A borrow, not a copy: the cipher's own copy is the only one this makes.
             cipher: XChaCha20Poly1305::new((&*seal_key).into()),
             fingerprinter: <Hmac<Sha256> as KeyInit>::new_from_slice(&fingerprint_key[..])
                 .expect("HMAC takes a key of any length"),
@@ -303,6 +307,41 @@ mod tests {
         );
         assert_eq!(one.key_id(), under(1).key_id());
         assert_ne!(one.key_id(), two.key_id());
+    }
+
+    /// `hex` as bytes.
+    fn bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Values the scheme produced when it shipped: a change here changes every stored key id
+    /// and fingerprint, and the Bridge would forget every stored key at its next start.
+    #[test]
+    fn derivation_matches_the_shipped_scheme() {
+        let sealing = under(1);
+        let key = ApiKey::new("alice-key");
+        let fingerprint = sealing.fingerprint(&key);
+
+        assert_eq!(
+            sealing.key_id()[..],
+            bytes("3e9fc8c6bb050f5bde55ee4ce6983b9a")
+        );
+        assert_eq!(
+            fingerprint[..],
+            bytes("0eda61118f129c86bf1815102240801ac8646dd193ed499f8b30700514cb2a4b")
+        );
+        let sealed = bytes(
+            "4c5db88d27e926581c237a96856ae7e1b1c5b96c502ab479e7f35a1c077343da13e59d8f19ffcf613bd4e555\
+             8837392954",
+        );
+        let alice = Row {
+            fingerprint: &fingerprint,
+            ..row("https://abs.lan", "alice-id")
+        };
+        assert_eq!(sealing.open(&alice, &sealed), Some(key));
     }
 
     #[test]

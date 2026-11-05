@@ -47,7 +47,7 @@ Logs are JSON on stdout, one event per line. `RUST_LOG` adds to the default leve
 The Bridge encrypts the Audiobookshelf API keys it stores with a key you provide: 32 random bytes, base64-encoded, made with `openssl rand -base64 32`. It comes from the environment, never from the configuration file, which may sit on the same backed-up volume as the database:
 
 1. `BRIDGE_ENCRYPTION_KEY_FILE`: the path of a file holding the key, such as a Docker secret. Whitespace around the key, like a trailing newline, is ignored; a file over 1024 bytes is refused.
-2. `BRIDGE_ENCRYPTION_KEY`: the key itself. It stays in the Bridge's environment for as long as it runs, while the Bridge wipes its own copies of the key from memory once it has used them; prefer the file.
+2. `BRIDGE_ENCRYPTION_KEY`: the key itself. It stays in the Bridge's environment for as long as it runs, while the Bridge wipes the copies it makes while loading the key; prefer the file.
 
 A variable set to the empty string counts as unset. When both are set, the file wins, even if it's missing or unusable (the Bridge never falls back to `BRIDGE_ENCRYPTION_KEY`); once the key has loaded, the Bridge logs one warning naming both variables. Without a usable key (neither variable set, an unreadable file, a blank value or file, not base64, or not 32 bytes) the Bridge exits with code 1 after one `cannot load the encryption key` error event, which names the variable and what is wrong, never the key, the file's contents or its path.
 

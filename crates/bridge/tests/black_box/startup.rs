@@ -321,6 +321,23 @@ fn missing_encryption_key_file() {
     );
 }
 
+/// A directory opens but can't be read: the read fails, not the open.
+#[cfg(unix)]
+#[test]
+fn a_directory_as_the_key_file_is_unreadable() {
+    let error = refused_key(
+        &KeyEnv {
+            file: named_file("."),
+            value: None,
+        },
+        &[],
+    );
+    assert!(
+        error.starts_with("BRIDGE_ENCRYPTION_KEY_FILE: cannot read the file it names: "),
+        "{error}"
+    );
+}
+
 /// Putting the key itself in the file variable by mistake never logs it: the error leaves the
 /// path out.
 #[test]
