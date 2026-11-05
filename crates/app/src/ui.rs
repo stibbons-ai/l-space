@@ -269,21 +269,42 @@ fn LibrariesScreen(
         }
         ul { class: "entries",
             for library in libraries {
-                li { key: "{library.id}",
-                    button {
-                        r#type: "button",
-                        class: "entry",
-                        disabled: busy(),
-                        onclick: {
+                EntryButton {
+                    key: "{library.id}",
+                    busy,
+                    title: library.name.clone(),
+                    detail: text(library.kind.into()),
+                    onclick: {
+                        let library = library.clone();
+                        move |_| {
                             let library = library.clone();
-                            move |_| {
-                                let library = library.clone();
-                                act(app, busy, async move |app: &mut App| app.open_library(library).await);
-                            }
-                        },
-                        span { class: "title", "{library.name}" }
-                        span { class: "detail", {text(library.kind.into())} }
-                    }
+                            act(app, busy, async move |app: &mut App| app.open_library(library).await);
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+/// One row of a list: a Library, an audiobook or podcast, or an episode.
+#[component]
+fn EntryButton(
+    busy: Signal<bool>,
+    title: String,
+    detail: Option<String>,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        li {
+            button {
+                r#type: "button",
+                class: "entry",
+                disabled: busy(),
+                onclick: move |event| onclick.call(event),
+                span { class: "title", "{title}" }
+                if let Some(detail) = detail {
+                    span { class: "detail", "{detail}" }
                 }
             }
         }
@@ -308,23 +329,18 @@ fn LibraryScreen(
         }
         ul { class: "entries",
             for entry in entries {
-                li { key: "{entry.id}",
-                    button {
-                        r#type: "button",
-                        class: "entry",
-                        disabled: busy(),
-                        onclick: {
-                            let id = entry.id.clone();
-                            move |_| {
-                                let id = id.clone();
-                                act(app, busy, async move |app: &mut App| app.open_entry(&id).await);
-                            }
-                        },
-                        span { class: "title", "{entry.title}" }
-                        if let Some(author) = &entry.author {
-                            span { class: "detail", "{author}" }
+                EntryButton {
+                    key: "{entry.id}",
+                    busy,
+                    title: entry.title.clone(),
+                    detail: entry.author.clone(),
+                    onclick: {
+                        let id = entry.id.clone();
+                        move |_| {
+                            let id = id.clone();
+                            act(app, busy, async move |app: &mut App| app.open_entry(&id).await);
                         }
-                    }
+                    },
                 }
             }
         }
@@ -366,26 +382,24 @@ fn PodcastScreen(
         }
         ul { class: "entries",
             for episode in podcast.episodes {
-                li { key: "{episode.id}",
-                    button {
-                        r#type: "button",
-                        class: "entry",
-                        disabled: busy(),
-                        onclick: {
-                            let id = episode.id.clone();
-                            move |_| {
-                                let id = id.clone();
-                                act(app, busy, async move |app: &mut App| app.open_episode(&id).await);
-                            }
-                        },
-                        span { class: "title", "{episode.title}" }
-                        span { class: "detail",
-                            if let Some(published_at) = episode.published_at {
-                                "{i18n::date(language, published_at)} · "
-                            }
-                            {i18n::progress(language, episode.progress.as_ref(), episode.duration)}
+                EntryButton {
+                    key: "{episode.id}",
+                    busy,
+                    title: episode.title.clone(),
+                    detail: {
+                        let progress = i18n::progress(language, episode.progress.as_ref(), episode.duration);
+                        match episode.published_at {
+                            Some(published_at) => format!("{} · {progress}", i18n::date(language, published_at)),
+                            None => progress,
                         }
-                    }
+                    },
+                    onclick: {
+                        let id = episode.id.clone();
+                        move |_| {
+                            let id = id.clone();
+                            act(app, busy, async move |app: &mut App| app.open_episode(&id).await);
+                        }
+                    },
                 }
             }
         }

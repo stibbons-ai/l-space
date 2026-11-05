@@ -42,7 +42,7 @@ pub fn podcast(
     let abs::Media::Podcast(media) = item.media else {
         return Err(ApiError::NotFound);
     };
-    // The first entry per episode, as `abs::User::progress` finds it.
+    // The first entry per episode, as `progress_entry` finds it.
     let mut progress_by_episode = HashMap::new();
     for entry in &user.media_progress {
         if entry.library_item_id == item.id
@@ -75,6 +75,18 @@ pub fn podcast(
     })
 }
 
+/// `user`'s Progress entry for the audiobook `library_item_id`, or for its episode
+/// `episode_id`: the first, should Audiobookshelf hold several.
+fn progress_entry<'a>(
+    user: &'a abs::User,
+    library_item_id: &str,
+    episode_id: Option<&str>,
+) -> Option<&'a abs::MediaProgress> {
+    user.media_progress.iter().find(|entry| {
+        entry.library_item_id == library_item_id && entry.episode_id.as_deref() == episode_id
+    })
+}
+
 /// The Item `id` in `library_item` (an audiobook, or the podcast holding the episode), with
 /// `user`'s Progress; not found if `library_item` has no such Item.
 pub fn item(
@@ -82,9 +94,7 @@ pub fn item(
     library_item: abs::LibraryItem,
     id: ItemId,
 ) -> Result<Item, ApiError> {
-    let progress = user
-        .progress(&library_item.id, id.episode.as_deref())
-        .map(progress);
+    let progress = progress_entry(user, &library_item.id, id.episode.as_deref()).map(progress);
     match (library_item.media, &id.episode) {
         (abs::Media::Book(book), None) => Ok(Item {
             title: book.metadata.title,

@@ -339,7 +339,7 @@ impl AppApi {
 
     /// Asks who `session` acts for, expecting a rejection.
     pub async fn current_user_error(&self, session: &Session) -> (StatusCode, ApiError) {
-        self.get_error("/api/me", &[], Some(&bearer(session))).await
+        self.get_as_error(session, "/api/me", &[]).await
     }
 
     pub async fn logout(&self, session: &Session) {

@@ -57,20 +57,6 @@ pub struct User {
     pub media_progress: Vec<MediaProgress>,
 }
 
-impl User {
-    /// The user's Progress in the audiobook `library_item_id`, or in its episode `episode_id`.
-    pub fn progress(
-        &self,
-        library_item_id: &str,
-        episode_id: Option<&str>,
-    ) -> Option<&MediaProgress> {
-        self.media_progress.iter().find(|progress| {
-            progress.library_item_id == library_item_id
-                && progress.episode_id.as_deref() == episode_id
-        })
-    }
-}
-
 /// A user's Progress in one audiobook or episode.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -151,7 +137,6 @@ pub struct Podcast {
 pub struct PodcastMetadata {
     pub title: String,
     pub author: Option<String>,
-    pub description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
