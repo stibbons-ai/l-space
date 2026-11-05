@@ -23,8 +23,8 @@ pub struct Stored {
     pub bridge_url: Option<String>,
     /// Every session, at most one per Library Server.
     sessions: Vec<StoredSession>,
-    /// The Library Server (its base URL) of the session the App uses; `None` once that one
-    /// ended, until the person picks another.
+    /// The Library Server (its base URL) of the session the App uses; `None` when none is
+    /// selected (it ended, or the file named none), until the person switches or logs in.
     selected: Option<String>,
     pub language: LanguageChoice,
 }
@@ -135,15 +135,37 @@ impl From<StoredFile> for Stored {
         };
         // At most one per Library Server, whatever the file holds: the last one wins.
         for session in file.sessions {
-            stored.add(session);
+            stored.add_loaded(session);
         }
-        stored.selected = file.selected.filter(|url| stored.position(url).is_some());
+        stored.selected = file.selected.filter(|url| {
+            let found = stored.position(url).is_some();
+            if !found {
+                tracing::warn!(
+                    library_server = url.as_str(),
+                    "the saved state selects a Library Server without a session; selecting none"
+                );
+            }
+            found
+        });
         // An earlier App's one session is the one it used; it wins over `sessions` (which such
         // an App never wrote).
         if let Some(session) = file.session {
-            stored.add(session);
+            stored.add_loaded(session);
         }
         stored
+    }
+}
+
+impl Stored {
+    /// [`Stored::add`] while loading, saying when the file held another session on the same
+    /// Library Server (named by its URL only, never a token).
+    fn add_loaded(&mut self, session: StoredSession) {
+        if let Some(dropped) = self.add(session) {
+            tracing::warn!(
+                library_server = dropped.library_server_url(),
+                "the saved state holds two sessions on one Library Server; keeping the later one"
+            );
+        }
     }
 }
 

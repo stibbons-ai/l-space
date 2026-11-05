@@ -6,7 +6,8 @@
 //!
 //! Server functions reach the Bridge at a process-wide base URL and send a process-wide
 //! `Authorization` header (Dioxus fullstack's client); [`App`] sets both, the header to the
-//! selected session's token, so one process runs one [`App`] at a time.
+//! selected session's token (except while ending another session, see `App::end_session`), so
+//! one process runs one [`App`] at a time.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -344,9 +345,10 @@ impl App {
                 authorize_selected(&self.stored);
                 let notice = self.save();
                 // Only once the device no longer holds it: a failed save keeps the replaced
-                // session in the file, which must stay usable then.
+                // session in the file, which must stay usable then. Read-only, the file holds
+                // none of this launch's sessions, so there is nothing to keep.
                 if let Some(replaced) = replaced
-                    && notice.is_none()
+                    && (notice.is_none() || self.read_only)
                 {
                     self.end_session(&replaced.token).await;
                 }
@@ -382,7 +384,7 @@ impl App {
 
     /// Selects the session on the Library Server with base URL `library_server`, without a
     /// login, and lists its Libraries afresh: from Settings or Login. Every later call acts on
-    /// that session; the next launch starts with it.
+    /// that session; once saved, the next launch starts with it.
     pub async fn switch_to(&mut self, library_server: &str) {
         if !self.stored.select(library_server) {
             return;

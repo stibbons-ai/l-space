@@ -1076,6 +1076,14 @@ fn an_unreadable_device_file_that_cannot_be_set_aside_is_left_alone() {
         app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
             .await;
         assert_eq!(app.screen(), &libraries(&abs, Some(Notice::StorageStuck)));
+        // Logging in again replaces the session and ends the old one: the file never held it.
+        let replaced = session(&app);
+        log_in_elsewhere(&mut app, abs.base_url(), &user).await;
+        assert_eq!(app.screen(), &libraries(&abs, Some(Notice::StorageStuck)));
+        assert_eq!(
+            bridge.api().current_user_error(&replaced).await.1,
+            ApiError::SessionInvalid
+        );
         app.log_out().await;
         assert_eq!(app.screen().notice(), Some(&Notice::StorageStuck));
         assert_eq!(notice_texts(&mut app), both(Text::ErrorStorageStuck));
@@ -1735,6 +1743,10 @@ fn a_session_saved_by_an_earlier_app_stays_logged_in() {
         drop(app);
         let mut app = device.launch().await;
         app.set_language(LanguageChoice::German);
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(device.path()).unwrap()).unwrap();
+        assert!(json.get("session").is_none(), "{json}");
+        assert_eq!(json["sessions"].as_array().map(Vec::len), Some(1), "{json}");
         assert_eq!(session(&device.launch().await), before);
     });
 }
