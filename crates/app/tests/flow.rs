@@ -2194,8 +2194,8 @@ fn home_with_a_podcast_library_that_cannot_be_read() {
 }
 
 /// Home merges the newest episodes of every podcast Library the user can see, newest first.
-/// The second podcast Library is made up by the proxy, so the shared Audiobookshelf's
-/// Libraries stay as other tests know them.
+/// The second podcast Library and its podcast are made up by the proxy, so the shared
+/// Audiobookshelf's Libraries stay as other tests know them.
 #[test]
 fn home_lists_the_newest_episodes_of_every_podcast_library() {
     let seeded = Audiobookshelf::shared().seeded().clone();
@@ -2210,11 +2210,15 @@ fn home_lists_the_newest_episodes_of_every_podcast_library() {
         {"libraryItemId": "li-more", "id": "ep-more", "title": "Elsewhere",
          "publishedAt": published_at, "podcast": {"metadata": {"title": "More"}}},
     ]}));
+    let more_podcast = ok_json(&serde_json::json!({"id": "li-more", "mediaType": "podcast",
+        "media": {"metadata": {"title": "More"}}}));
     let (bridge, abs, proxy, _) = bridge_marking_through(move |request, _| {
         if request.starts_with(b"GET /api/libraries ") {
             Some(libraries)
         } else if request.starts_with(b"GET /api/libraries/lib-more/recent-episodes") {
             Some(more)
+        } else if request.starts_with(b"GET /api/items/li-more?") {
+            Some(more_podcast)
         } else {
             None
         }

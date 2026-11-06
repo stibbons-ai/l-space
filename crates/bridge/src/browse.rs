@@ -4,8 +4,8 @@
 use std::cmp::Reverse;
 
 use api::{
-    AudioFile, Chapter, Episode, EpisodeFilter, HOME_ENTRIES, HomeEntry, Item, ItemId, Library,
-    LibraryEntry, LibraryKind, Podcast, Progress,
+    AudioFile, Chapter, Episode, EpisodeFilter, HomeEntry, Item, ItemId, Library, LibraryEntry,
+    LibraryKind, Podcast, Progress,
 };
 
 pub fn library(library: abs::Library) -> Library {
@@ -103,12 +103,12 @@ pub fn item_progress(user: &abs::User, id: &ItemId) -> Option<Progress> {
     progress_in(user, &id.library_item, id.episode.as_deref())
 }
 
-/// Home's "continue listening": the Items in `in_progress` that are in one of `libraries`
-/// (those the user can see), with `user`'s Progress past the start and not Finished; the one
-/// whose Progress changed last first, at most [`HOME_ENTRIES`]. An ebook alone is no Item and
-/// is left out, as is a book Audiobookshelf lists only for its ebook progress (at 0 seconds).
-/// Also how many entries named no Item in a way the Bridge knows (a podcast without its
-/// episode, a book with one), left out too.
+/// Home's "continue listening" candidates: the Items in `in_progress` that are in one of
+/// `libraries` (those the user can see), with `user`'s Progress past the start and not
+/// Finished; the one whose Progress changed last first. An ebook alone is no Item and is left
+/// out, as is a book Audiobookshelf lists only for its ebook progress (at 0 seconds). Also how
+/// many entries named no Item in a way the Bridge knows (a podcast without its episode, a book
+/// with one), left out too.
 pub fn continue_listening(
     user: &abs::User,
     libraries: &[abs::Library],
@@ -138,15 +138,11 @@ pub fn continue_listening(
                 .as_ref()
                 .is_some_and(|progress| progress.current_time > 0.0)
         });
-    let listed = newest_unfinished(entries);
-    (listed, unexpected)
+    (newest_unfinished(entries), unexpected)
 }
 
-/// Home's "latest episodes": `episodes` with `user`'s Progress, unless it is Finished; newest
-/// publish date first (the date the Library Server added one without it), at most
-/// [`HOME_ENTRIES`]. The Library Server picks `episodes` as each Library's newest unfinished by
-/// publish date, so an episode without one shows only when its Library has fewer than
-/// [`HOME_ENTRIES`] unfinished episodes with one.
+/// Home's "latest episodes" candidates: `episodes` with `user`'s Progress, unless it is
+/// Finished; newest publish date first (the date the Library Server added one without it).
 pub fn latest_episodes(user: &abs::User, episodes: Vec<abs::RecentEpisode>) -> Vec<HomeEntry> {
     let entries = episodes.into_iter().map(|recent| {
         let newness = recent.episode.published_at.or(recent.added_at);
@@ -162,13 +158,12 @@ pub fn latest_episodes(user: &abs::User, episodes: Vec<abs::RecentEpisode>) -> V
 }
 
 /// The `entries` whose Progress isn't Finished, the latest time first (those without one
-/// last, otherwise in the order given), at most [`HOME_ENTRIES`].
+/// last, otherwise in the order given).
 fn newest_unfinished(entries: impl Iterator<Item = (Option<i64>, HomeEntry)>) -> Vec<HomeEntry> {
     let mut entries: Vec<_> = entries
         .filter(|(_, entry)| EpisodeFilter::Unfinished.passes(entry.progress.as_ref()))
         .collect();
     entries.sort_by_key(|(time, _)| Reverse(*time));
-    entries.truncate(HOME_ENTRIES);
     entries.into_iter().map(|(_, entry)| entry).collect()
 }
 
@@ -779,22 +774,5 @@ mod tests {
                 finished: false
             })
         );
-    }
-
-    #[test]
-    fn latest_episodes_are_at_most_twenty_the_newest() {
-        let episodes: Vec<abs::RecentEpisode> = decoded(
-            (0..25)
-                .map(|n| {
-                    serde_json::json!({"libraryItemId": "li-p", "id": format!("ep-{n}"),
-                        "title": "Episode", "publishedAt": n,
-                        "podcast": {"metadata": {"title": "Podcast"}}})
-                })
-                .collect(),
-        );
-        let listed = latest_episodes(&user(Vec::new()), episodes);
-        assert_eq!(listed.len(), api::HOME_ENTRIES);
-        assert_eq!(listed[0].id.episode.as_deref(), Some("ep-24"));
-        assert_eq!(listed[19].id.episode.as_deref(), Some("ep-5"));
     }
 }

@@ -4,8 +4,9 @@
 
 use std::time::Duration;
 
-use api::{ApiError, Progress};
+use api::{ApiError, Home, Progress};
 use reqwest::StatusCode;
+use serde_json::json;
 
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
 use test_support::bridge::{
@@ -173,6 +174,153 @@ async fn home_lists_nothing_from_a_library_the_user_may_not_see() {
         .await;
     let home = bridge.api().home(&session).await;
     assert_eq!(home.continue_listening, [episode(&abs, 1, progress(300.0))]);
+    assert_eq!(home.latest_episodes.len(), 3);
+}
+
+/// Logs `user` in on `bridge` and reads their Home.
+async fn home_of(bridge: &TestBridge, abs: &Audiobookshelf, user: &AbsUser) -> Home {
+    let session = bridge.api().login(abs.base_url(), &user.api_key.key).await;
+    bridge.api().home(&session).await
+}
+
+/// Audiobookshelf lists a user's Items in progress also when an admin marked them explicit
+/// and the user may not open explicit content; Home lists only those they may open. The marks
+/// hide nothing from other tests' users, who may open explicit content.
+#[tokio::test]
+async fn home_lists_no_explicit_item_to_a_user_who_may_not_open_one() {
+    let (bridge, abs, _, _) = logged_in().await;
+    let seeded = abs.seeded();
+    let user = abs
+        .new_user_with(json!({"permissions": {"accessExplicitContent": false}}))
+        .await;
+    listen(&abs, &user, None, 3000.0, false).await;
+    listen(&abs, &user, Some(1), 300.0, false).await;
+    let home = home_of(&bridge, &abs, &user).await;
+    assert_eq!(
+        home.continue_listening,
+        [
+            episode(&abs, 1, progress(300.0)),
+            long_book(&abs, progress(3000.0))
+        ]
+    );
+    assert_eq!(home.latest_episodes.len(), 3);
+
+    for library_item in [&seeded.long_book, &seeded.podcast] {
+        abs.mark_explicit(library_item, true).await;
+    }
+    let home = home_of(&bridge, &abs, &user).await;
+    for library_item in [&seeded.long_book, &seeded.podcast] {
+        abs.mark_explicit(library_item, false).await;
+    }
+
+    assert_eq!(home.continue_listening, []);
+    assert_eq!(home.latest_episodes, []);
+}
+
+/// Neither list holds an Item with a tag an admin denied the user; an untagged Item still
+/// shows. The tag hides nothing from other tests' users, who may open every tag.
+#[tokio::test]
+async fn home_lists_no_item_with_a_tag_the_user_may_not_open() {
+    const TAG: &str = "home-denied";
+    let (bridge, abs, _, _) = logged_in().await;
+    let seeded = abs.seeded();
+    let user = abs
+        .new_user_with(json!({
+            "permissions": {"accessAllTags": false, "selectedTagsNotAccessible": true},
+            "itemTagsSelected": [TAG],
+        }))
+        .await;
+    listen(&abs, &user, None, 3000.0, false).await;
+    listen(&abs, &user, Some(1), 300.0, false).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    abs.set_progress(&user, &seeded.silence, None, 0.5, false)
+        .await;
+
+    for library_item in [&seeded.long_book, &seeded.podcast] {
+        abs.set_tags(library_item, &[TAG]).await;
+    }
+    let home = home_of(&bridge, &abs, &user).await;
+    for library_item in [&seeded.long_book, &seeded.podcast] {
+        abs.set_tags(library_item, &[]).await;
+    }
+
+    let listed: Vec<_> = home
+        .continue_listening
+        .iter()
+        .map(|entry| (entry.id.library_item.as_str(), entry.title.as_str()))
+        .collect();
+    assert_eq!(listed, [(seeded.silence.as_str(), "Silence")]);
+    assert_eq!(home.latest_episodes, []);
+}
+
+/// An empty tag allowlist lets the user open no Item at all, so Home lists none, though
+/// Audiobookshelf lists the Items in progress and newest episodes regardless.
+#[tokio::test]
+async fn home_lists_nothing_to_a_user_allowed_no_tag() {
+    let (bridge, abs, user, session) = logged_in().await;
+    listen(&abs, &user, None, 3000.0, false).await;
+    listen(&abs, &user, Some(1), 300.0, false).await;
+    let home = bridge.api().home(&session).await;
+    assert_eq!(home.continue_listening.len(), 2);
+    assert_eq!(home.latest_episodes.len(), 3);
+
+    abs.update_user(
+        &user.id,
+        json!({
+            "permissions": {"accessAllTags": false, "selectedTagsNotAccessible": false},
+            "itemTagsSelected": [],
+        }),
+    )
+    .await;
+
+    let home = bridge.api().home(&session).await;
+    assert_eq!(home.continue_listening, []);
+    assert_eq!(home.latest_episodes, []);
+}
+
+/// However many Items in progress Home leaves out, it lists those it may: here 80 episodes
+/// listened to after the book, in a Library the user then may not see. Each list holds at
+/// most [`api::HOME_ENTRIES`].
+#[tokio::test]
+async fn home_lists_an_item_in_progress_behind_many_left_out() {
+    let abs = Audiobookshelf::shared();
+    let bridge = TestBridge::start(&named_library_server_toml(abs.base_url(), "Home"));
+    let seeded = abs.seeded();
+    let crowded = abs.crowded_podcast().await;
+    let user = abs
+        .new_user_seeing(&[
+            &seeded.audiobook_library,
+            &seeded.podcast_library,
+            &crowded.library,
+        ])
+        .await;
+    listen(&abs, &user, None, 3000.0, false).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    for episode in &crowded.episodes[..80] {
+        abs.set_progress(&user, &crowded.podcast, Some(episode), 0.5, false)
+            .await;
+    }
+    let session = bridge.api().login(abs.base_url(), &user.api_key.key).await;
+    let home = bridge.api().home(&session).await;
+    assert_eq!(home.continue_listening.len(), api::HOME_ENTRIES);
+    assert!(
+        home.continue_listening
+            .iter()
+            .all(|entry| entry.id.library_item == crowded.podcast)
+    );
+    assert_eq!(home.latest_episodes.len(), api::HOME_ENTRIES);
+
+    abs.update_user(
+        &user.id,
+        json!({
+            "permissions": {"accessAllLibraries": false},
+            "librariesAccessible": [seeded.audiobook_library, seeded.podcast_library],
+        }),
+    )
+    .await;
+
+    let home = bridge.api().home(&session).await;
+    assert_eq!(home.continue_listening, [long_book(&abs, progress(3000.0))]);
     assert_eq!(home.latest_episodes.len(), 3);
 }
 

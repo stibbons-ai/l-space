@@ -6,7 +6,10 @@
 //! the test run. Tests stay apart by each creating their own users with
 //! [`Audiobookshelf::new_user`] and acting only on those, Progress included
 //! ([`Audiobookshelf::set_progress`]). The seeded Libraries are shared by all tests, and users
-//! are never deleted while the container runs.
+//! are never deleted while the container runs. A test user sees only the seeded Libraries,
+//! explicit content included, unless the test says otherwise; so a test may add a Library
+//! ([`Audiobookshelf::crowded_podcast`]) or mark a seeded Item explicit or tag it without
+//! hiding or showing anything to other tests' users, as long as it undoes the mark or tags.
 //!
 //! Setup goes through Audiobookshelf's REST API as its root user, the way an admin would,
 //! never through its database: users are created there, API keys created, moved and deleted,
@@ -60,6 +63,21 @@ const EBOOK_FILE: &str = "/audiobooks/Rincewind/Only Words/only.pdf";
 
 /// Enough of a PDF for Audiobookshelf to scan it as an ebook: it reads only the extension.
 const MINIMAL_PDF: &[u8] = b"%PDF-1.4\n%%EOF\n";
+
+/// The folder of [`Audiobookshelf::crowded_podcast`]: a podcast with
+/// [`CROWDED_EPISODES`] one-second episodes, in no Library until a test asks for it.
+const CROWDED_FOLDER: &str = "/crowded";
+
+/// How many episodes [`Audiobookshelf::crowded_podcast`] has.
+const CROWDED_EPISODES: usize = 81;
+
+/// The Library [`Audiobookshelf::crowded_podcast`] created, its podcast and its episodes.
+#[derive(Debug, Clone)]
+pub struct Crowded {
+    pub library: String,
+    pub podcast: String,
+    pub episodes: Vec<String>,
+}
 
 /// The seeded episodes' publish dates, oldest first: 2026-01-01, 2026-02-15 and 2026-03-31,
 /// midnight UTC, in milliseconds since the Unix epoch.
@@ -223,17 +241,99 @@ impl Audiobookshelf {
 
     /// Creates a user with an API key, named uniquely across the test run.
     pub async fn new_user(&self) -> AbsUser {
-        self.create_user(json!({})).await
+        self.new_user_with(json!({})).await
     }
 
     /// Creates a user with an API key who may see only the Libraries `library_ids`, as an
     /// admin restricting them would.
     pub async fn new_user_seeing(&self, library_ids: &[&str]) -> AbsUser {
-        self.create_user(json!({
-            "permissions": {"accessAllLibraries": false},
-            "librariesAccessible": library_ids,
-        }))
-        .await
+        self.new_user_with(json!({"librariesAccessible": library_ids}))
+            .await
+    }
+
+    /// Changes user `user_id`'s settings to `settings` (for example `permissions`,
+    /// `librariesAccessible` or `itemTagsSelected`), as an admin editing them would.
+    /// Audiobookshelf changes `librariesAccessible` and `itemTagsSelected` only alongside
+    /// `permissions`.
+    pub async fn update_user(&self, user_id: &str, settings: Value) {
+        self.admin(
+            reqwest::Method::PATCH,
+            &format!("/api/users/{user_id}"),
+            Some(settings),
+        )
+        .await;
+    }
+
+    /// Marks the audiobook or podcast `library_item` explicit or not, as an admin editing
+    /// its details would.
+    pub async fn mark_explicit(&self, library_item: &str, explicit: bool) {
+        self.edit_media(library_item, json!({"metadata": {"explicit": explicit}}))
+            .await;
+    }
+
+    /// Gives the audiobook or podcast `library_item` exactly the tags `tags`, as an admin
+    /// editing its details would.
+    pub async fn set_tags(&self, library_item: &str, tags: &[&str]) {
+        self.edit_media(library_item, json!({"tags": tags})).await;
+    }
+
+    /// Changes the audiobook or podcast `library_item`'s details by `update`, as an admin
+    /// editing them would.
+    async fn edit_media(&self, library_item: &str, update: Value) {
+        self.admin(
+            reqwest::Method::PATCH,
+            &format!("/api/items/{library_item}/media"),
+            Some(update),
+        )
+        .await;
+    }
+
+    /// The episodes of `podcast`, as the root user sees them.
+    async fn podcast_episodes(&self, podcast: &str) -> Vec<Value> {
+        let mut item = self
+            .admin(
+                reqwest::Method::GET,
+                &format!("/api/items/{podcast}?expanded=1"),
+                None,
+            )
+            .await;
+        match item["media"]["episodes"].take() {
+            Value::Array(episodes) => episodes,
+            episodes => panic!("episodes: {episodes}"),
+        }
+    }
+
+    /// Creates the podcast Library "Crowded", holding one podcast of [`CROWDED_EPISODES`]
+    /// episodes without publish dates, and waits until a scan has found them all. No test
+    /// user sees it unless created to ([`Audiobookshelf::new_user_seeing`]). At most one test
+    /// per test run may call this: the folder takes one Library.
+    pub async fn crowded_podcast(&self) -> Crowded {
+        let library = self.new_library("Crowded", CROWDED_FOLDER, "podcast").await;
+        let deadline = Instant::now() + SCAN_TIMEOUT;
+        let podcast = loop {
+            let podcasts = self.library_items(&library).await;
+            if let [podcast] = podcasts.as_slice()
+                && podcast["media"]["numEpisodes"] == CROWDED_EPISODES
+            {
+                break podcast["id"].as_str().expect("podcast id").to_owned();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the crowded podcast did not appear within {SCAN_TIMEOUT:?}: {podcasts:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        let episodes = self
+            .podcast_episodes(&podcast)
+            .await
+            .iter()
+            .map(|episode| episode["id"].as_str().expect("episode id").to_owned())
+            .collect();
+        Crowded {
+            library,
+            podcast,
+            episodes,
+        }
     }
 
     /// Calls `path` as `user`, with their API key, as their own player would; panics unless
@@ -265,16 +365,36 @@ impl Audiobookshelf {
             .to_vec()
     }
 
-    /// Creates a user with the settings in `extra`, and an API key for them.
-    async fn create_user(&self, mut extra: Value) -> AbsUser {
+    /// Creates a user with an API key and the Audiobookshelf user settings `extra` (for
+    /// example `permissions` or `itemTagsSelected`) over the test defaults (only the seeded
+    /// Libraries, explicit content allowed), as an admin would; `permissions` it doesn't name
+    /// keep the default.
+    pub async fn new_user_with(&self, extra: Value) -> AbsUser {
         static USERS: AtomicUsize = AtomicUsize::new(0);
         let username = format!("listener-{}", USERS.fetch_add(1, Ordering::Relaxed));
-        extra["username"] = username.clone().into();
-        extra["password"] = "password".into();
-        extra["type"] = "user".into();
-        extra["isActive"] = true.into();
+        let mut user = json!({
+            "username": username,
+            "password": "password",
+            "type": "user",
+            "isActive": true,
+            "permissions": {"accessAllLibraries": false, "accessExplicitContent": true},
+            "librariesAccessible": [self.seeded.audiobook_library, self.seeded.podcast_library],
+        });
+        let Value::Object(extra) = extra else {
+            panic!("user settings must be an object: {extra}");
+        };
+        for (key, value) in extra {
+            match value {
+                Value::Object(permissions) if key == "permissions" => {
+                    for (permission, value) in permissions {
+                        user["permissions"][permission] = value;
+                    }
+                }
+                value => user[key] = value,
+            }
+        }
         let created = self
-            .admin(reqwest::Method::POST, "/api/users", Some(extra))
+            .admin(reqwest::Method::POST, "/api/users", Some(user))
             .await;
         let id = created["user"]["id"].as_str().expect("user id").to_owned();
         let api_key = self.new_api_key(&id).await;
@@ -378,6 +498,12 @@ impl Audiobookshelf {
             image = image.with_copy_to(path, silence(seconds));
         }
         image = image.with_copy_to(EBOOK_FILE, MINIMAL_PDF.to_vec());
+        for n in 1..=CROWDED_EPISODES {
+            image = image.with_copy_to(
+                format!("{CROWDED_FOLDER}/The Long Wait/Episode {n}.wav"),
+                silence(1),
+            );
+        }
         let container = image
             .with_startup_timeout(STARTUP_TIMEOUT)
             .start()
@@ -455,31 +581,21 @@ impl Audiobookshelf {
             .map(id)
             .expect("Only Words");
         let podcast = id(&podcasts[0]);
-        self.admin(
-            reqwest::Method::PATCH,
-            &format!("/api/items/{long_book}/media"),
-            Some(json!({"metadata": {"description": "A book that goes on."}})),
+        self.edit_media(
+            &long_book,
+            json!({"metadata": {"description": "A book that goes on."}}),
         )
         .await;
-        self.admin(
-            reqwest::Method::PATCH,
-            &format!("/api/items/{podcast}/media"),
-            Some(json!({"metadata": {"author": "Ankh-Morpork Radio"}})),
+        self.edit_media(
+            &podcast,
+            json!({"metadata": {"author": "Ankh-Morpork Radio"}}),
         )
         .await;
 
-        let item = self
-            .admin(
-                reqwest::Method::GET,
-                &format!("/api/items/{podcast}?expanded=1"),
-                None,
-            )
-            .await;
+        let found = self.podcast_episodes(&podcast).await;
         let episodes: [String; 3] = std::array::from_fn(|n| {
             let title = format!("Episode {}", n + 1);
-            item["media"]["episodes"]
-                .as_array()
-                .expect("episodes")
+            found
                 .iter()
                 .find(|episode| episode["title"] == title.as_str())
                 .map(id)
