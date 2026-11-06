@@ -9,6 +9,7 @@ mod finished;
 mod forwarder;
 mod groups;
 mod handoff;
+mod home;
 mod library_servers;
 mod logging;
 mod login;

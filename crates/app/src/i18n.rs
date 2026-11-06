@@ -8,14 +8,15 @@
 //!
 //! What the screens say about Items is composed here too, with the words and word order from
 //! the same Fluent resources: [`duration`], [`progress`], [`date`], an episode's row
-//! ([`episode_summary`]), an Item's facts ([`item_facts`]) and its chapters with their start
+//! ([`episode_summary`]), a row on Home ([`home_entry_summary`]), an Item's facts
+//! ([`item_facts`]) and its chapters with their start
 //! times ([`chapter_rows`], [`clock`]). So is what the Groups screen says about a Group's
 //! playback ([`group_playback`]), and the notice that an Item now plays on a Group
 //! ([`playing_on`]).
 
 use std::sync::LazyLock;
 
-use api::{Episode, EpisodeFilter, Group, Item, LibraryKind, Progress, TransportState};
+use api::{Episode, EpisodeFilter, Group, HomeEntry, Item, LibraryKind, Progress, TransportState};
 use fluent_bundle::concurrent::FluentBundle;
 use fluent_bundle::{FluentArgs, FluentResource};
 use serde::{Deserialize, Serialize};
@@ -137,6 +138,11 @@ texts! {
     Bridge => "bridge",
     Retry => "retry",
     Back => "back",
+    HomeTitle => "home-title",
+    HomeContinueListening => "home-continue-listening",
+    HomeContinueListeningNone => "home-continue-listening-none",
+    HomeLatestEpisodes => "home-latest-episodes",
+    HomeLatestEpisodesNone => "home-latest-episodes-none",
     LibrariesTitle => "libraries-title",
     LibrariesNone => "libraries-none",
     LibraryKindAudiobooks => "library-kind-audiobooks",
@@ -385,6 +391,15 @@ pub fn episode_summary(language: Language, episode: &Episode) -> String {
     }
 }
 
+/// What a row on Home says under its Item's title: the author or podcast, an episode's publish
+/// date, and the person's Progress, such as "The Clacks Hour · March 31, 2026 · 10 min left".
+pub fn home_entry_summary(language: Language, entry: &HomeEntry) -> String {
+    let mut parts: Vec<String> = entry.author.iter().chain(&entry.podcast).cloned().collect();
+    parts.extend(entry.published_at.map(|at| date(language, at)));
+    parts.push(progress(language, entry.progress.as_ref(), entry.duration));
+    parts.join(" · ")
+}
+
 /// The facts the Item screen lists, each with its label: the person's Progress, the duration
 /// if known, and an episode's publish date.
 pub fn item_facts(language: Language, item: &Item) -> Vec<(Text, String)> {
@@ -488,12 +503,12 @@ fn format(language: Language, id: &str, args: Option<&FluentArgs>) -> Result<Str
 mod tests {
     use std::collections::BTreeSet;
 
-    use api::{ApiError, Episode, Item, ItemId, Progress};
+    use api::{ApiError, Episode, HomeEntry, Item, ItemId, Progress};
     use fluent_bundle::FluentArgs;
 
     use super::{
-        Language, Phrase, Text, clock, date, duration, episode_summary, format, item_facts,
-        progress,
+        Language, Phrase, Text, clock, date, duration, episode_summary, format, home_entry_summary,
+        item_facts, progress,
     };
 
     #[test]
@@ -642,6 +657,48 @@ mod tests {
         ] {
             assert_eq!(episode_summary(Language::English, &episode), english);
             assert_eq!(episode_summary(Language::German, &episode), german);
+        }
+    }
+
+    #[test]
+    fn a_home_row_reads_author_or_podcast_date_and_progress() {
+        let entry = |author: Option<&str>, podcast: Option<&str>, published_at| HomeEntry {
+            id: ItemId {
+                library_item: "li".into(),
+                episode: None,
+            },
+            title: "Title".into(),
+            author: author.map(Into::into),
+            podcast: podcast.map(Into::into),
+            duration: Some(4320.0),
+            published_at,
+            progress: Some(Progress {
+                current_time: 3000.0,
+                finished: false,
+            }),
+        };
+        for (entry, english, german) in [
+            (
+                entry(Some("Pratchett"), None, None),
+                "Pratchett · 22 min left",
+                "Pratchett · noch 22 Min.",
+            ),
+            (
+                entry(None, Some("The Clacks Hour"), Some(1_774_915_200_000)),
+                "The Clacks Hour · March 31, 2026 · 22 min left",
+                "The Clacks Hour · 31. März 2026 · noch 22 Min.",
+            ),
+            (
+                HomeEntry {
+                    progress: None,
+                    ..entry(None, None, None)
+                },
+                "Not started",
+                "Nicht begonnen",
+            ),
+        ] {
+            assert_eq!(home_entry_summary(Language::English, &entry), english);
+            assert_eq!(home_entry_summary(Language::German, &entry), german);
         }
     }
 

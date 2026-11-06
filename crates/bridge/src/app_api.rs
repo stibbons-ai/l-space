@@ -10,8 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::server::{BoxFuture, Bridge};
 use api::{
-    ApiError, CurrentUser, EpisodeFilter, Group, GroupMember, Handoff, Item, ItemId, Library,
-    LibraryEntry, LibraryServer, NowPlaying, Podcast, Session, SessionToken, TransportState,
+    ApiError, CurrentUser, EpisodeFilter, Group, GroupMember, HOME_ENTRIES, Handoff, Home, Item,
+    ItemId, Library, LibraryEntry, LibraryServer, NowPlaying, Podcast, Session, SessionToken,
+    TransportState,
 };
 use sonos::Sonos;
 use store::{ActiveHandoff, HandoffFile, LibraryUser, SessionId, Store};
@@ -226,6 +227,88 @@ impl<S: Store> AppApi<S> {
             .await?;
         browse::podcast(&user, item, filter)
             .map_err(|reason| missing(library_server, request, None, reason))
+    }
+
+    /// Home for the session's user: the Items they are in the middle of, and the newest
+    /// episodes they haven't Finished in every podcast Library they can see. A podcast Library
+    /// gone or hidden from them since the Libraries were listed adds no episodes.
+    async fn home(&self, token: SessionToken) -> Result<Home, ApiError> {
+        let request = Request {
+            operation: "list the Libraries and the Items in progress",
+            id: None,
+        };
+        let Browsed {
+            library_server,
+            session,
+            user,
+            fetched: (libraries, in_progress),
+        } = self
+            .browse(token, request, async |server, key| {
+                tokio::try_join!(
+                    self.abs.libraries(server, key),
+                    self.abs
+                        .items_in_progress(server, key, browse::IN_PROGRESS_ASKED),
+                )
+            })
+            .await?;
+        warn_dropped(library_server, None, "Libraries", libraries.dropped);
+        warn_dropped(
+            library_server,
+            Some(&user.id),
+            "Items in progress",
+            in_progress.dropped,
+        );
+
+        let api_key = &session.api_key;
+        let newest = futures::future::join_all(
+            libraries
+                .entries
+                .iter()
+                .filter(|library| library.media_type == abs::MediaType::Podcast)
+                .map(|library| async move {
+                    let newest = self
+                        .abs
+                        .recent_episodes(library_server, api_key, &library.id, HOME_ENTRIES)
+                        .await;
+                    (library, newest)
+                }),
+        )
+        .await;
+        let mut episodes = Vec::new();
+        for (library, newest) in newest {
+            match newest {
+                Ok(newest) => {
+                    warn_dropped(
+                        library_server,
+                        Some(&user.id),
+                        "newest episodes",
+                        newest.dropped,
+                    );
+                    episodes.extend(newest.entries);
+                }
+                Err(abs::Error::NotFound(cause)) => tracing::info!(
+                    library_server,
+                    library = library.id,
+                    cause = ?cause,
+                    "a podcast Library went out of sight while listing Home"
+                ),
+                Err(error) => {
+                    let request = Request {
+                        operation: "list a podcast Library's newest episodes",
+                        id: Some(&library.id),
+                    };
+                    return Err(self.failure(library_server, &session, request, error).await);
+                }
+            }
+        }
+        Ok(Home {
+            continue_listening: browse::continue_listening(
+                &user,
+                &libraries.entries,
+                in_progress.entries,
+            ),
+            latest_episodes: browse::latest_episodes(&user, episodes),
+        })
     }
 
     async fn item(&self, token: SessionToken, id: ItemId) -> Result<Item, ApiError> {
@@ -673,6 +756,10 @@ impl<S: Store> Bridge for AppApi<S> {
         filter: EpisodeFilter,
     ) -> BoxFuture<'_, Result<Podcast, ApiError>> {
         Box::pin(self.podcast(token, podcast, filter))
+    }
+
+    fn home(&self, token: SessionToken) -> BoxFuture<'_, Result<Home, ApiError>> {
+        Box::pin(self.home(token))
     }
 
     fn groups(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Group>, ApiError>> {

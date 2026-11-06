@@ -2,9 +2,11 @@
 //!
 //! It covers the "who am I" check (`GET /api/me`) that proves an API key (ADR 0011) and also
 //! brings the user's Progress, read-only browsing: the user's Libraries, a Library's
-//! audiobooks or podcasts, and one audiobook or podcast with its chapters, audio files and
-//! episodes; marking an audiobook or episode Finished or unfinished for the user; and an
-//! audio file's bytes, by byte range, for the Bridge's streams (ADR 0010).
+//! audiobooks or podcasts, one audiobook or podcast with its chapters, audio files and
+//! episodes, the audiobooks and episodes the user is in the middle of, and a podcast Library's
+//! newest episodes the user hasn't Finished; marking an audiobook or episode Finished or
+//! unfinished for the user; and an audio file's bytes, by byte range, for the Bridge's streams
+//! (ADR 0010).
 //! Every request authenticates with `Authorization: Bearer <api key>`.
 //!
 //! Ids a caller passes go into request paths only if they are plain Audiobookshelf ids (ASCII
@@ -212,6 +214,10 @@ pub struct Episode {
     #[serde(default, deserialize_with = "known_seconds")]
     pub duration: Option<f64>,
     pub audio_track: Option<Track>,
+    /// The audio file as Audiobookshelf keeps it: the only one an episode in
+    /// [`Client::items_in_progress`] comes with (without `duration` and `audioTrack`).
+    #[serde(default)]
+    pub audio_file: Option<Track>,
 }
 
 /// A chapter; times in seconds into the whole audiobook.
@@ -247,6 +253,41 @@ pub struct FileMetadata {
     /// Its name, with its extension, without its directory.
     #[serde(default, deserialize_with = "null_as_default")]
     pub filename: String,
+}
+
+/// An audiobook or episode the user has unfinished Progress in, as
+/// [`Client::items_in_progress`] lists it: its library item (only the metadata, a book's
+/// `numTracks` and `duration` filled in), with the episode for a podcast's.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InProgress {
+    /// The Library holding it.
+    pub library_id: String,
+    #[serde(flatten)]
+    pub library_item: LibraryItem,
+    /// The episode the Progress is in, for a podcast.
+    pub recent_episode: Option<Episode>,
+    /// When the user's Progress in it last changed, in milliseconds since the Unix epoch.
+    pub progress_last_update: Option<i64>,
+}
+
+/// An episode as [`Client::recent_episodes`] lists it, with its podcast.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentEpisode {
+    /// The podcast (its library item).
+    pub library_item_id: String,
+    #[serde(flatten)]
+    pub episode: Episode,
+    /// When Audiobookshelf added it, in milliseconds since the Unix epoch.
+    pub added_at: Option<i64>,
+    pub podcast: EpisodePodcast,
+}
+
+/// The podcast a [`RecentEpisode`] belongs to.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct EpisodePodcast {
+    pub metadata: PodcastMetadata,
 }
 
 /// A duration in seconds, unless Audiobookshelf doesn't know it: it then sends 0 (or null).
@@ -500,6 +541,54 @@ impl Client {
         });
         self.send(request, api_key, Names::One).await?;
         Ok(())
+    }
+
+    /// The audiobooks and episodes the user has unfinished Progress in, most recently
+    /// listened to first, at most `limit`: `GET /api/me/items-in-progress`. One in a shape
+    /// this client doesn't know is left out and counted.
+    ///
+    /// As Audiobookshelf 2.37.2 answers (`MeController.getAllLibraryItemsInProgress`): one
+    /// entry per audiobook or episode whose Progress isn't Finished and is past 0 seconds, or
+    /// has ebook progress (so an ebook alone may be listed), ordered by when that Progress last
+    /// changed; from every Library, also those the user may not see; "hide from continue
+    /// listening" is not honoured.
+    pub async fn items_in_progress(
+        &self,
+        base_url: &str,
+        api_key: &ApiKey,
+        limit: usize,
+    ) -> Result<Known<InProgress>, Error> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct InProgressItems {
+            library_items: Known<InProgress>,
+        }
+        let path = format!("/api/me/items-in-progress?limit={limit}");
+        let items: InProgressItems = self.get(base_url, api_key, &path, Names::Nothing).await?;
+        Ok(items.library_items)
+    }
+
+    /// The newest episodes in podcast Library `library_id` that the user hasn't Finished, at
+    /// most `limit`: `GET /api/libraries/<id>/recent-episodes`. One in a shape this client
+    /// doesn't know is left out and counted.
+    ///
+    /// As Audiobookshelf 2.37.2 answers (`LibraryController.getRecentEpisodes`): by publish
+    /// date, newest first; only this user's Progress counts.
+    pub async fn recent_episodes(
+        &self,
+        base_url: &str,
+        api_key: &ApiKey,
+        library_id: &str,
+        limit: usize,
+    ) -> Result<Known<RecentEpisode>, Error> {
+        #[derive(Deserialize)]
+        struct RecentEpisodes {
+            episodes: Known<RecentEpisode>,
+        }
+        let library_id = id_segment(library_id)?;
+        let path = format!("/api/libraries/{library_id}/recent-episodes?limit={limit}");
+        let episodes: RecentEpisodes = self.get(base_url, api_key, &path, Names::One).await?;
+        Ok(episodes.episodes)
     }
 
     /// GETs `path_and_query`, which `names` a Library or library item or not, and decodes the
@@ -1057,8 +1146,10 @@ mod tests {
     type Requests =
         std::sync::Arc<std::sync::Mutex<Vec<(String, String, String, serde_json::Value)>>>;
 
-    /// A stand-in that records every request and answers each with `status`.
-    async fn recording(status: StatusCode) -> (String, Requests) {
+    /// A stand-in that records every request and answers each with `answer`.
+    async fn recording(
+        answer: impl IntoResponse + Clone + Send + Sync + 'static,
+    ) -> (String, Requests) {
         let requests = Requests::default();
         let recorded = requests.clone();
         let base_url = serve(Router::new().fallback(
@@ -1076,7 +1167,7 @@ mod tests {
                     authorization,
                     serde_json::from_str(&body).unwrap_or_default(),
                 ));
-                status
+                answer
             },
         ))
         .await;
@@ -1162,6 +1253,180 @@ mod tests {
                     Err(Error::NotFound(NotFound::InvalidId))
                 ),
                 "{item:?} {episode:?}"
+            );
+        }
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    /// What Audiobookshelf 2.37.2 answers for `/api/me/items-in-progress`, trimmed: an
+    /// audiobook, an episode with its podcast, and an entry of a kind this client doesn't know.
+    fn items_in_progress_answer() -> serde_json::Value {
+        json!({"libraryItems": [
+            {"id": "li-book", "libraryId": "lib-books", "mediaType": "book",
+             "media": {"metadata": {"title": "The Long Book", "authorName": "Pratchett"},
+                       "numTracks": 3, "duration": 4320},
+             "progressLastUpdate": 1_793_967_063_333_i64},
+            {"id": "li-pod", "libraryId": "lib-pods", "mediaType": "podcast",
+             "media": {"metadata": {"title": "The Clacks Hour", "author": "Radio"}},
+             "recentEpisode": {"id": "ep-2", "title": "Episode 2", "publishedAt": 1_771_113_600_000_i64,
+                               "description": null,
+                               "audioFile": {"ino": "7", "duration": 900}},
+             "progressLastUpdate": 1_793_967_063_320_i64},
+            {"id": "li-comic", "libraryId": "lib-x", "mediaType": "comic", "media": {}},
+        ]})
+    }
+
+    #[tokio::test]
+    async fn items_in_progress_are_asked_for_with_the_key_and_a_limit() {
+        let (base_url, requests) =
+            recording((StatusCode::OK, axum::Json(items_in_progress_answer()))).await;
+        let in_progress = Client::new()
+            .items_in_progress(&base_url, &ApiKey::new("s3cret"), 40)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [(
+                "GET".to_owned(),
+                "/api/me/items-in-progress?limit=40".to_owned(),
+                "Bearer s3cret".to_owned(),
+                serde_json::Value::Null,
+            )]
+        );
+        assert_eq!(in_progress.dropped, 1);
+        let [book, episode] = &in_progress.entries[..] else {
+            panic!("{in_progress:?}");
+        };
+        assert_eq!(
+            (book.library_id.as_str(), book.library_item.id.as_str()),
+            ("lib-books", "li-book")
+        );
+        assert_eq!(book.progress_last_update, Some(1_793_967_063_333));
+        assert_eq!(book.recent_episode, None);
+        let Media::Book(media) = &book.library_item.media else {
+            panic!("{book:?}");
+        };
+        assert_eq!(
+            (
+                media.metadata.author_name.as_deref(),
+                media.duration,
+                media.num_tracks
+            ),
+            (Some("Pratchett"), Some(4320.0), Some(3))
+        );
+        let Media::Podcast(podcast) = &episode.library_item.media else {
+            panic!("{episode:?}");
+        };
+        assert_eq!(podcast.metadata.title, "The Clacks Hour");
+        let recent = episode.recent_episode.as_ref().expect("its episode");
+        assert_eq!(
+            (
+                recent.id.as_str(),
+                recent.title.as_str(),
+                recent.published_at,
+                recent.duration,
+                recent.audio_file.as_ref().and_then(|file| file.duration),
+            ),
+            (
+                "ep-2",
+                "Episode 2",
+                Some(1_771_113_600_000),
+                None,
+                Some(900.0)
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn recent_episodes_are_asked_for_by_library_with_the_key_and_a_limit() {
+        let answer = json!({"episodes": [
+            {"libraryItemId": "li-pod", "id": "ep-3", "title": "Episode 3",
+             "publishedAt": null, "addedAt": 1_793_967_063_014_i64, "duration": 3960,
+             "podcast": {"metadata": {"title": "The Clacks Hour", "author": "Radio"}}},
+            {"libraryItemId": "li-pod", "id": "ep-x", "title": "No podcast"},
+        ]});
+        let (base_url, requests) = recording((StatusCode::OK, axum::Json(answer))).await;
+        let episodes = Client::new()
+            .recent_episodes(&base_url, &ApiKey::new("s3cret"), "lib-pods", 20)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [(
+                "GET".to_owned(),
+                "/api/libraries/lib-pods/recent-episodes?limit=20".to_owned(),
+                "Bearer s3cret".to_owned(),
+                serde_json::Value::Null,
+            )]
+        );
+        assert_eq!(episodes.dropped, 1);
+        let [episode] = &episodes.entries[..] else {
+            panic!("{episodes:?}");
+        };
+        assert_eq!(episode.library_item_id, "li-pod");
+        assert_eq!(
+            (episode.episode.id.as_str(), episode.episode.published_at),
+            ("ep-3", None)
+        );
+        assert_eq!(episode.added_at, Some(1_793_967_063_014));
+        assert_eq!(episode.episode.duration, Some(3960.0));
+        assert_eq!(episode.podcast.metadata.title, "The Clacks Hour");
+    }
+
+    /// Every Audiobookshelf answers `/api/me/items-in-progress`, so a 403 or 404 there comes
+    /// from something in front of it; on a Library's newest episodes it means the user may not
+    /// see that Library, or it is gone.
+    #[tokio::test]
+    async fn home_calls_fail_like_the_calls_they_resemble() {
+        let cases = [
+            (StatusCode::UNAUTHORIZED, "Rejected", "Rejected"),
+            (
+                StatusCode::FORBIDDEN,
+                "Unavailable(\"HTTP 403 Forbidden\")",
+                "NotFound(Forbidden)",
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                "Unavailable(\"HTTP 404 Not Found\")",
+                "NotFound(Missing)",
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unavailable(\"HTTP 500 Internal Server Error\")",
+                "Unavailable(\"HTTP 500 Internal Server Error\")",
+            ),
+        ];
+        let key = ApiKey::new("key");
+        for (status, in_progress, recent) in cases {
+            let (base_url, _) = recording(status).await;
+            let client = Client::new();
+            let error = client
+                .items_in_progress(&base_url, &key, 40)
+                .await
+                .unwrap_err();
+            assert_eq!(format!("{error:?}"), in_progress, "{status}");
+            let error = client
+                .recent_episodes(&base_url, &key, "lib-1", 20)
+                .await
+                .unwrap_err();
+            assert_eq!(format!("{error:?}"), recent, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_episodes_of_a_library_id_that_is_not_an_audiobookshelf_id_send_nothing() {
+        let (base_url, requests) = recording(StatusCode::OK).await;
+        for id in ["", "../me", "lib?limit=1"] {
+            assert!(
+                matches!(
+                    Client::new()
+                        .recent_episodes(&base_url, &ApiKey::new("key"), id, 20)
+                        .await,
+                    Err(Error::NotFound(NotFound::InvalidId))
+                ),
+                "{id:?}"
             );
         }
         assert!(requests.lock().unwrap().is_empty());

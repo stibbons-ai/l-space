@@ -25,6 +25,12 @@ settings-logout = Log out
 settings-log-in-elsewhere = Log in to another Library Server
 switch-library-server = Switch Library Server
 
+home-title = Home
+home-continue-listening = Continue listening
+home-continue-listening-none = Nothing in progress. What you have started and not finished shows here.
+home-latest-episodes = Latest episodes
+home-latest-episodes-none = No new episodes you haven't finished.
+
 libraries-title = Libraries
 libraries-none = You can't see any Libraries on your Library Server yet.
 library-kind-audiobooks = Audiobooks

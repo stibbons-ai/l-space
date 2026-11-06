@@ -45,8 +45,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use api::{
-    ApiError, CurrentUser, EpisodeFilter, Group, Handoff, Item, ItemId, Library, LibraryEntry,
-    Podcast, Session,
+    ApiError, CurrentUser, EpisodeFilter, Group, Handoff, Home, Item, ItemId, Library,
+    LibraryEntry, Podcast, Session,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -434,6 +434,16 @@ impl AppApi {
             &[("id", id), ("filter", &filter_name(filter))],
         )
         .await
+    }
+
+    /// Home as `session` sees it.
+    pub async fn home(&self, session: &Session) -> Home {
+        self.get_as(session, "/api/home", &[]).await
+    }
+
+    /// Asks for Home as `session`, expecting a rejection.
+    pub async fn home_error(&self, session: &Session) -> (StatusCode, ApiError) {
+        self.get_as_error(session, "/api/home", &[]).await
     }
 
     /// Marks Item `item` Finished (`finished`) or unfinished as `session`, panicking unless

@@ -12,7 +12,8 @@
 //! its token as `Authorization: Bearer <token>`; on the App's side, set it for every server
 //! function with `dioxus::fullstack::set_request_headers`.
 //!
-//! A session browses its Library Server as its user: [`libraries`] lists the Libraries,
+//! A session browses its Library Server as its user: [`home`] lists what the user is in the
+//! middle of and the newest episodes they haven't Finished, [`libraries`] the Libraries,
 //! [`library_entries`] a Library's audiobooks or podcasts, [`podcast`] a podcast's episodes
 //! filtered by the user's Progress, and [`item`] one Item with that Progress, its chapters and
 //! its audio files; [`mark_finished`] marks an Item Finished or unfinished for the user. Ids
@@ -242,6 +243,40 @@ impl Episode {
     pub fn order(&self) -> Reverse<Option<i64>> {
         Reverse(self.published_at)
     }
+}
+
+/// How many Items each of Home's lists has at most.
+pub const HOME_ENTRIES: usize = 20;
+
+/// What Home lists for the session user, each list at most [`HOME_ENTRIES`] Items, across
+/// every Library they can see on the session's Library Server.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Home {
+    /// Audiobooks and episodes the user has Progress in past the start and hasn't Finished,
+    /// the one whose Progress changed last first.
+    pub continue_listening: Vec<HomeEntry>,
+    /// The newest episodes the user hasn't Finished, of every podcast they can see: newest
+    /// publish date first (the date the Library Server added an episode without one).
+    pub latest_episodes: Vec<HomeEntry>,
+}
+
+/// An Item as Home lists it. Times are seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HomeEntry {
+    /// Opens the Item's screen.
+    pub id: ItemId,
+    pub title: String,
+    /// An audiobook's author.
+    pub author: Option<String>,
+    /// An episode's podcast, by title.
+    pub podcast: Option<String>,
+    /// Unknown if the Library Server doesn't know it.
+    pub duration: Option<f64>,
+    /// When an episode was published, in milliseconds since the Unix epoch.
+    pub published_at: Option<i64>,
+    /// The session user's Progress; none if the Library Server holds no Progress of theirs
+    /// for the Item.
+    pub progress: Option<Progress>,
 }
 
 /// Which of a podcast's episodes to list, by the session user's Progress. A filter this
@@ -560,6 +595,17 @@ pub async fn podcast(id: String, filter: Option<EpisodeFilter>) -> Result<Podcas
         .await
 }
 
+/// Home for the session user: what they are in the middle of, and the newest episodes they
+/// haven't Finished.
+#[get(
+    "/api/home",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn home() -> Result<Home, ApiError> {
+    bridge.home(server::session_token(&headers)?).await
+}
+
 /// Every Sonos Group in the Bridge's household, exactly as grouped in the Sonos app, with
 /// what each plays; by name. None when the Bridge has found no Sonos player.
 #[get(
@@ -610,7 +656,7 @@ pub mod server {
     use dioxus::server::{DioxusRouterExt, FullstackState};
 
     use crate::{
-        ApiError, ApiKey, CurrentUser, EpisodeFilter, Group, Handoff, Item, ItemId, Library,
+        ApiError, ApiKey, CurrentUser, EpisodeFilter, Group, Handoff, Home, Item, ItemId, Library,
         LibraryEntry, LibraryServer, Podcast, Session, SessionToken,
     };
 
@@ -656,6 +702,9 @@ pub mod server {
             item: ItemId,
             finished: bool,
         ) -> BoxFuture<'_, Result<Item, ApiError>>;
+
+        /// See [`crate::home`].
+        fn home(&self, token: SessionToken) -> BoxFuture<'_, Result<Home, ApiError>>;
 
         /// See [`crate::podcast`].
         fn podcast(
