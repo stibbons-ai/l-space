@@ -597,6 +597,207 @@ fn an_address_that_is_not_a_bridge_is_named_as_such_and_not_remembered() {
     });
 }
 
+/// The redirects a reverse proxy sends, say from `http` to `https`.
+const REDIRECTS: [&str; 4] = [
+    "301 Moved Permanently",
+    "302 Found",
+    "307 Temporary Redirect",
+    "308 Permanent Redirect",
+];
+
+/// An answer redirecting `request` with `status` to its path at `target` (a base URL; empty
+/// for the same address), as a reverse proxy does.
+fn redirect(status: &str, target: &str, request: &[u8]) -> &'static [u8] {
+    let request = String::from_utf8_lossy(request);
+    let path = request.split(' ').nth(1).expect("a request line");
+    format!(
+        "HTTP/1.1 {status}\r\nlocation: {target}{path}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    )
+    .into_bytes()
+    .leak()
+}
+
+/// A loopback server redirecting every request with `status` to its path at `target`, and the
+/// request lines it got.
+fn redirecting_to(status: &'static str, target: &str) -> (String, ProxyLog) {
+    let target = target.to_owned();
+    // Answers every request itself, so nothing is passed on to the upstream.
+    proxy_answering("", move |_, request| {
+        Some(redirect(status, &target, request))
+    })
+}
+
+// Loopback TLS with a trusted certificate isn't available (the App trusts only the webpki
+// roots), so these redirect from one loopback origin to another (another port), not from
+// `http` to `https`: for the App, both are a redirect to another origin.
+
+#[test]
+fn an_address_that_redirects_to_a_bridge_is_remembered_as_the_bridges() {
+    let (bridge, abs, _) = bridge_with_abs();
+    run(async || {
+        let user = abs.new_user().await;
+        for status in REDIRECTS {
+            let (entered, log) = redirecting_to(status, bridge.url());
+            let device = Device::new();
+            let mut app = device.launch().await;
+            app.submit_bridge_url(&entered).await;
+            assert!(
+                matches!(app.screen(), Screen::Login { notice: None, .. }),
+                "{status}: {:?}",
+                app.screen()
+            );
+            assert_eq!(app.bridge_url(), Some(bridge.url()), "{status}");
+
+            // Login is a `POST`, which a 301 or 302 would have turned into a `GET`.
+            app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
+                .await;
+            assert_on_home(&app);
+            let before = session(&app);
+            drop(app);
+
+            let relaunched = device.launch().await;
+            assert_on_home(&relaunched);
+            assert_eq!(session(&relaunched), before, "{status}");
+            assert_eq!(relaunched.bridge_url(), Some(bridge.url()), "{status}");
+            // The entered address saw asking for the Library Servers only (the probe, then the
+            // `GET` that follows its redirect): no login, no token.
+            assert_eq!(
+                log.lock().unwrap().as_slice(),
+                ["GET /api/library-servers HTTP/1.1"; 2],
+                "{status}"
+            );
+        }
+    });
+}
+
+#[test]
+fn an_address_that_redirects_elsewhere_is_named_as_no_bridge_and_not_remembered() {
+    let abs = Audiobookshelf::shared();
+    let html = html_page_server();
+    let not_found = web_server("404 Not Found", "text/plain", "Not Found");
+    let device = Device::with_locale("de-DE");
+    run(async || {
+        let mut app = device.launch().await;
+        for status in REDIRECTS {
+            // Empty: back to the same address, a loop.
+            for target in [abs.base_url(), &html, &not_found, ""] {
+                let (entered, _) = redirecting_to(status, target);
+                app.submit_bridge_url(&entered).await;
+                assert_eq!(
+                    app.screen(),
+                    &Screen::BridgeUrl {
+                        notice: Some(Notice::Api(ApiError::NotABridge))
+                    },
+                    "{status} to {target:?}"
+                );
+                assert_eq!(notice_texts(&mut app), both(Text::ErrorNotABridge));
+                assert_eq!(device.launch().await.bridge_url(), None, "{status}");
+            }
+        }
+        // A redirect to another page, such as a login, where no Bridge could be.
+        let (login_page, _) = proxy_answering("", |_, _| {
+            Some(
+                b"HTTP/1.1 302 Found\r\nlocation: /login\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+        });
+        app.submit_bridge_url(&login_page).await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::NotABridge))
+        );
+        assert_eq!(device.launch().await.bridge_url(), None);
+    });
+}
+
+#[test]
+fn an_address_that_redirects_where_nothing_answers_is_named_as_unreachable_and_not_remembered() {
+    let closed = format!("http://{}", closed_port());
+    let silent = format!("http://{}", silent_server());
+    let device = Device::with_locale("de-DE");
+    let limit = SHORT_CALL_TIMEOUT * 10;
+    run(async || {
+        // Short call timeout: the silent target holds the redirect's `GET` until it applies.
+        let mut app = device.launch_impatient().await;
+        for status in REDIRECTS {
+            for target in [&closed, &silent] {
+                let (entered, _) = redirecting_to(status, target);
+                within(limit, app.submit_bridge_url(&entered)).await;
+                assert_eq!(
+                    app.screen(),
+                    &Screen::BridgeUrl {
+                        notice: Some(Notice::BridgeUrlUnreachable)
+                    },
+                    "{status} to {target:?}"
+                );
+                assert_eq!(
+                    notice_texts(&mut app),
+                    both(Text::ErrorBridgeUrlUnreachable)
+                );
+                assert_eq!(device.launch().await.bridge_url(), None, "{status}");
+            }
+        }
+    });
+}
+
+#[test]
+fn a_stored_address_that_starts_redirecting_gets_no_token_and_keeps_the_session() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let bridge_address = bridge.url().strip_prefix("http://").unwrap().to_owned();
+    run(async || {
+        let user = abs.new_user().await;
+        for status in REDIRECTS {
+            // Where the redirects lead: the same Bridge, behind another port.
+            let (target, target_log) = proxy(&bridge_address, |_, _| false);
+            let redirecting = Arc::new(AtomicBool::new(false));
+            let (stored, _) = proxy_answering(&bridge_address, {
+                let redirecting = Arc::clone(&redirecting);
+                move |_, request| {
+                    redirecting
+                        .load(Ordering::SeqCst)
+                        .then(|| redirect(status, &target, request))
+                }
+            });
+            let device = Device::new();
+            let mut app = device.launch().await;
+            app.submit_bridge_url(&stored).await;
+            app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
+                .await;
+            assert_on_home(&app);
+            let before = session(&app);
+
+            redirecting.store(true, Ordering::SeqCst);
+            app.open_home().await;
+            assert_eq!(
+                app.screen(),
+                &Screen::Home {
+                    home: None,
+                    notice: Some(Notice::Api(ApiError::BridgeUnreachable))
+                },
+                "{status}"
+            );
+            drop(app);
+
+            let mut relaunched = device.launch().await;
+            assert_eq!(
+                relaunched.screen(),
+                &Screen::Settings {
+                    notice: Some(Notice::Api(ApiError::BridgeUnreachable))
+                },
+                "{status}"
+            );
+            assert_eq!(
+                notice_texts(&mut relaunched),
+                both(Text::ErrorBridgeUnreachable)
+            );
+            assert_eq!(session(&relaunched), before, "{status}");
+            // The redirects weren't followed: the token went nowhere else, and the session
+            // still holds on the Bridge.
+            assert!(target_log.lock().unwrap().is_empty(), "{status}");
+            assert_eq!(bridge.api().current_user(&before).await, before.user);
+        }
+    });
+}
+
 #[test]
 fn login_with_an_api_key_opens_a_session_and_shows_home() {
     let (bridge, abs, _) = bridge_with_abs();

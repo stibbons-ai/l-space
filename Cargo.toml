@@ -37,6 +37,11 @@ poly1305 = { version = "0.9.1", features = ["zeroize"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json"] }
 roxmltree = "0.21.2"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
+# The App's server function client, built like dioxus-fullstack's own; see
+# `crates/app/src/client.rs`. rustls and webpki-roots must stay at fullstack's versions:
+# reqwest's `tls_backend_preconfigured` downcasts the config to its own `rustls::ClientConfig`,
+# so with another rustls `build()` fails and `App::open` panics.
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = { version = "0.11.1", features = ["zeroize"] }
@@ -50,6 +55,8 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 unic-langid = "0.9.6"
 url = "2.5.8"
+# At dioxus-fullstack's version, so the App's client trusts the same roots; see `rustls` above.
+webpki-roots = "1.0.11"
 zeroize = "1.9.1"
 
 [workspace.lints.rust]

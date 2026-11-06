@@ -145,6 +145,7 @@ dependencies = [
  "dirs",
  "fluent-bundle",
  "fluent-syntax",
+ "rustls",
  "serde",
  "serde_json",
  "sonos-fake",
@@ -156,6 +157,7 @@ dependencies = [
  "tracing",
  "unic-langid",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]

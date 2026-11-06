@@ -5,9 +5,10 @@
 //! a real Bridge.
 //!
 //! Server functions reach the Bridge at a process-wide base URL and send a process-wide
-//! `Authorization` header (Dioxus fullstack's client); [`App`] sets both, the header to the
-//! selected session's token (except while ending another session, see `App::end_session`), so
-//! one process runs one [`App`] at a time.
+//! `Authorization` header (through the App's client, installed in Dioxus fullstack's slot,
+//! which follows no redirect: a call reaches the stored address only); [`App`] sets both, the
+//! header to the selected session's token (except while ending another session, see
+//! `App::end_session`), so one process runs one [`App`] at a time.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,6 +20,7 @@ use api::{
 use dioxus::fullstack::http::header::{AUTHORIZATION, HeaderValue};
 use dioxus::fullstack::{HeaderMap, get_server_url, set_request_headers, set_server_url};
 
+use crate::client;
 use crate::i18n::{self, Language, LanguageChoice, Text};
 use crate::storage::{DeviceStore, LoadError, Stored, StoredSession};
 
@@ -199,6 +201,7 @@ impl App {
     /// The App as it launches: what `store` remembers, on [`Screen::Starting`] until
     /// [`App::start`]. `device_locale` is the device's language (a BCP 47 tag such as `de-DE`).
     pub fn open(store: Arc<dyn DeviceStore>, device_locale: Option<&str>) -> Self {
+        client::install();
         let (mut stored, load_notice, read_only) = match store.load() {
             Ok(stored) => (stored, None, false),
             Err(error @ LoadError::SetAside { .. }) => {
@@ -270,12 +273,15 @@ impl App {
     }
 
     /// Connects to the Bridge at `input` and remembers it if it answers with its Library
-    /// Servers. Only while no session is stored: a session belongs to its Bridge.
+    /// Servers. An address that redirects to a Bridge, keeping the path it was asked for, is
+    /// remembered as the Bridge's address, so later calls (which follow no redirect) go there
+    /// directly; one that redirects elsewhere (say to a bare `https://host/`) is rejected. Only
+    /// while no session is stored: a session belongs to its Bridge.
     pub async fn submit_bridge_url(&mut self, input: &str) {
         if !self.can_change_bridge_url() {
             return;
         }
-        let Some(url) = bridge_url(input) else {
+        let Some(mut url) = bridge_url(input) else {
             self.screen = Screen::BridgeUrl {
                 notice: Some(Notice::BridgeUrlInvalid),
             };
@@ -284,7 +290,20 @@ impl App {
         let previous = get_server_url();
         point_at(&url);
         // Unlike other calls, the person can fix an address that isn't a Bridge right here.
-        match self.probe(api::library_servers()).await {
+        let mut answer = self.probe(api::library_servers()).await;
+        // A redirect answers as something other than a Bridge.
+        if matches!(answer, Err(ApiError::NotABridge)) {
+            match self.redirected_bridge_url(&url).await {
+                Ok(Some(redirected)) => {
+                    url = redirected;
+                    point_at(&url);
+                    answer = self.probe(api::library_servers()).await;
+                }
+                Ok(None) => {}
+                Err(client::Unreachable) => answer = Err(ApiError::BridgeUnreachable),
+            }
+        }
+        match answer {
             Ok(library_servers) => {
                 self.stored.bridge_url = Some(url);
                 self.screen = Screen::Login {
@@ -303,6 +322,25 @@ impl App {
                 };
             }
         }
+    }
+
+    /// The Bridge address the address `url` redirects to, if it does: where asking `url` for
+    /// its Library Servers lands, without their path. Bounded by the call timeout; a redirect
+    /// target that can't be reached in time is [`client::Unreachable`].
+    async fn redirected_bridge_url(
+        &self,
+        url: &str,
+    ) -> Result<Option<String>, client::Unreachable> {
+        let Ok(asked) = url::Url::parse(&format!("{url}{LIBRARY_SERVERS_PATH}")) else {
+            return Ok(None);
+        };
+        let target = tokio::time::timeout(self.call_timeout, client::redirect_target(asked))
+            .await
+            .map_err(|_| {
+                tracing::debug!("following the address's redirects timed out");
+                client::Unreachable
+            })??;
+        Ok(target.as_ref().and_then(bridge_url_at))
     }
 
     /// Back to the Bridge address, to enter another one. Only while no session is stored.
@@ -992,6 +1030,16 @@ fn bridge_url(input: &str) -> Option<String> {
     acceptable.then(|| url.as_str().trim_end_matches('/').to_owned())
 }
 
+/// The path of [`api::library_servers`], which the App asks an entered address for.
+const LIBRARY_SERVERS_PATH: &str = "/api/library-servers";
+
+/// The Bridge base URL a request for the Library Servers was redirected to, `target`: the
+/// same URL without that path. `None` if `target` asks for something else (a login page, a
+/// query) or isn't a Bridge base URL then.
+fn bridge_url_at(target: &url::Url) -> Option<String> {
+    bridge_url(target.as_str().strip_suffix(LIBRARY_SERVERS_PATH)?)
+}
+
 /// Sends every server function call to the Bridge at `url`.
 fn point_at(url: &str) {
     // The client keeps a `&'static str`. The App points at a new Bridge only when the person
@@ -1023,7 +1071,7 @@ fn authorize(token: Option<&SessionToken>) {
 
 #[cfg(test)]
 mod tests {
-    use super::bridge_url;
+    use super::{bridge_url, bridge_url_at};
 
     #[test]
     fn bridge_urls_are_http_or_https_without_trailing_slash() {
@@ -1047,6 +1095,38 @@ mod tests {
             ("http://", None),
         ] {
             assert_eq!(bridge_url(input).as_deref(), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn a_redirected_bridge_url_is_the_target_without_the_library_servers_path() {
+        for (target, expected) in [
+            (
+                "https://bridge.example.com/api/library-servers",
+                Some("https://bridge.example.com"),
+            ),
+            (
+                "https://example.com:8443/clacks/api/library-servers",
+                Some("https://example.com:8443/clacks"),
+            ),
+            (
+                "http://127.0.0.1:9/api/library-servers",
+                Some("http://127.0.0.1:9"),
+            ),
+            ("https://bridge.example.com/login", None),
+            ("https://bridge.example.com/api/library-servers/", None),
+            (
+                "https://bridge.example.com/api/library-servers?next=1",
+                None,
+            ),
+            (
+                "https://user:pw@bridge.example.com/api/library-servers",
+                None,
+            ),
+            ("ftp://bridge.example.com/api/library-servers", None),
+        ] {
+            let target = url::Url::parse(target).unwrap();
+            assert_eq!(bridge_url_at(&target).as_deref(), expected, "{target}");
         }
     }
 }

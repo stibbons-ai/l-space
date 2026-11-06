@@ -2,7 +2,11 @@
 //!
 //! [`flow`] holds the App's state and actions apart from rendering, [`ui`] renders it,
 //! [`storage`] is what the App keeps on the device, and [`i18n`] every string it shows (except
-//! the Info.plist strings, which stay English).
+//! the Info.plist strings, which stay English). `client` is the HTTP client its calls to the
+//! Bridge go through, plus the one request that follows redirects (to find where an entered
+//! address leads).
+
+mod client;
 
 pub mod flow;
 pub mod i18n;
