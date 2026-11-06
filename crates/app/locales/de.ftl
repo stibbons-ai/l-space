@@ -25,6 +25,12 @@ settings-logout = Abmelden
 settings-log-in-elsewhere = Bei einem anderen Library Server anmelden
 switch-library-server = Library Server wechseln
 
+home-title = Start
+home-continue-listening = Weiterhören
+home-continue-listening-none = Nichts angefangen. Was du begonnen und nicht beendet hast, erscheint hier.
+home-latest-episodes = Neueste Folgen
+home-latest-episodes-none = Keine neuen Folgen, die du noch nicht beendet hast.
+
 libraries-title = Bibliotheken
 libraries-none = Auf deinem Library Server siehst du noch keine Bibliotheken.
 library-kind-audiobooks = Hörbücher

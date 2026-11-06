@@ -45,14 +45,14 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use api::{
-    ApiError, CurrentUser, EpisodeFilter, Group, Handoff, Item, ItemId, Library, LibraryEntry,
-    Podcast, Session,
+    ApiError, CurrentUser, EpisodeFilter, Group, Handoff, Home, HomeEntry, Item, ItemId, Library,
+    LibraryEntry, Podcast, Progress, Session,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use crate::audiobookshelf::{AbsUser, Audiobookshelf};
+use crate::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_DURATIONS, EPISODE_PUBLISHED_AT};
 
 /// Generous: the Bridge is up within milliseconds, but CI machines can be slow.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -359,6 +359,39 @@ pub fn acting_on(library_server: &str, user: &AbsUser) -> CurrentUser {
     }
 }
 
+/// The seeded "The Long Book" as Home lists it, with `progress`.
+pub fn home_long_book(abs: &Audiobookshelf, progress: Option<Progress>) -> HomeEntry {
+    HomeEntry {
+        id: ItemId {
+            library_item: abs.seeded().long_book.clone(),
+            episode: None,
+        },
+        title: "The Long Book".into(),
+        author: Some("Pratchett".into()),
+        podcast: None,
+        duration: Some(4320.0),
+        published_at: None,
+        progress,
+    }
+}
+
+/// The seeded episode `n` (0 is the oldest) as Home lists it, with `progress`.
+pub fn home_episode(abs: &Audiobookshelf, n: usize, progress: Option<Progress>) -> HomeEntry {
+    let seeded = abs.seeded();
+    HomeEntry {
+        id: ItemId {
+            library_item: seeded.podcast.clone(),
+            episode: Some(seeded.episodes[n].clone()),
+        },
+        title: format!("Episode {}", n + 1),
+        author: None,
+        podcast: Some("The Clacks Hour".into()),
+        duration: Some(EPISODE_DURATIONS[n]),
+        published_at: Some(EPISODE_PUBLISHED_AT[n]),
+        progress,
+    }
+}
+
 /// The App API as the App calls it, over HTTP. Paths and payloads follow the `api` crate's
 /// server functions; responses decode into its types.
 #[derive(Debug)]
@@ -434,6 +467,16 @@ impl AppApi {
             &[("id", id), ("filter", &filter_name(filter))],
         )
         .await
+    }
+
+    /// Home as `session` sees it.
+    pub async fn home(&self, session: &Session) -> Home {
+        self.get_as(session, "/api/home", &[]).await
+    }
+
+    /// Asks for Home as `session`, expecting a rejection.
+    pub async fn home_error(&self, session: &Session) -> (StatusCode, ApiError) {
+        self.get_as_error(session, "/api/home", &[]).await
     }
 
     /// Marks Item `item` Finished (`finished`) or unfinished as `session`, panicking unless

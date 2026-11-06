@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use api::{ApiKey, EpisodeFilter, Group, Item, Library, LibraryEntry, LibraryServer};
+use api::{
+    ApiKey, EpisodeFilter, Group, Home, HomeEntry, Item, Library, LibraryEntry, LibraryServer,
+};
 use dioxus::prelude::*;
 
 use crate::flow::{App, Notice, Screen};
@@ -35,6 +37,9 @@ pub fn root() -> Element {
                 },
                 Screen::Login { library_servers, notice } => rsx! {
                     LoginScreen { app, busy, library_servers, notice }
+                },
+                Screen::Home { home, notice } => rsx! {
+                    HomeScreen { app, busy, home, notice }
                 },
                 Screen::Libraries { libraries, notice } => rsx! {
                     LibrariesScreen { app, busy, libraries, notice }
@@ -305,17 +310,20 @@ fn BackButton(app: Signal<App>, busy: Signal<bool>) -> Element {
 }
 
 #[component]
-fn LibrariesScreen(
+fn HomeScreen(
     app: Signal<App>,
     busy: Signal<bool>,
-    libraries: Vec<Library>,
+    home: Option<Home>,
     notice: Option<Notice>,
 ) -> Element {
     let text = |text| app.read().text(text);
-    // Nothing listed because the listing failed, not because there is nothing.
-    let failed = libraries.is_empty() && matches!(notice, Some(Notice::Api(_)));
     rsx! {
         nav {
+            NavButton {
+                busy,
+                label: text(Text::LibrariesTitle),
+                onclick: move |_| act(app, busy, async |app: &mut App| app.open_libraries().await),
+            }
             NavButton {
                 busy,
                 label: text(Text::GroupsTitle),
@@ -327,16 +335,84 @@ fn LibrariesScreen(
                 onclick: move |_| app.write().open_settings(),
             }
         }
-        h1 { {text(Text::LibrariesTitle)} }
+        h1 { {text(Text::HomeTitle)} }
         NoticeView { app, notice }
-        if failed {
+        if let Some(home) = home {
+            HomeList {
+                app,
+                busy,
+                title: text(Text::HomeContinueListening),
+                none: text(Text::HomeContinueListeningNone),
+                entries: home.continue_listening,
+            }
+            HomeList {
+                app,
+                busy,
+                title: text(Text::HomeLatestEpisodes),
+                none: text(Text::HomeLatestEpisodesNone),
+                entries: home.latest_episodes,
+            }
+        } else {
+            // Home could not be read.
             button {
                 r#type: "button",
                 disabled: busy(),
-                onclick: move |_| act(app, busy, async |app: &mut App| app.open_libraries().await),
+                onclick: move |_| act(app, busy, async |app: &mut App| app.open_home().await),
                 {text(Text::Retry)}
             }
-        } else if libraries.is_empty() {
+        }
+    }
+}
+
+/// One of Home's lists under its `title`, or `none` when it is empty; each row opens its
+/// Item.
+#[component]
+fn HomeList(
+    app: Signal<App>,
+    busy: Signal<bool>,
+    title: String,
+    none: String,
+    entries: Vec<HomeEntry>,
+) -> Element {
+    let language = app.read().language();
+    rsx! {
+        h2 { "{title}" }
+        if entries.is_empty() {
+            p { "{none}" }
+        }
+        ul { class: "entries",
+            for entry in entries {
+                EntryButton {
+                    key: "{entry.id.library_item}/{entry.id.episode.as_deref().unwrap_or_default()}",
+                    busy,
+                    title: entry.title.clone(),
+                    detail: i18n::home_entry_summary(language, &entry),
+                    onclick: {
+                        let id = entry.id.clone();
+                        move |_| {
+                            let id = id.clone();
+                            act(app, busy, async move |app: &mut App| app.open_item(id).await);
+                        }
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn LibrariesScreen(
+    app: Signal<App>,
+    busy: Signal<bool>,
+    libraries: Vec<Library>,
+    notice: Option<Notice>,
+) -> Element {
+    let text = |text| app.read().text(text);
+    rsx! {
+        BackButton { app, busy }
+        h1 { {text(Text::LibrariesTitle)} }
+        NoticeView { app, notice }
+        if libraries.is_empty() {
             p { {text(Text::LibrariesNone)} }
         }
         ul { class: "entries",
@@ -580,8 +656,8 @@ fn GroupsScreen(
         nav {
             NavButton {
                 busy,
-                label: text(Text::LibrariesTitle),
-                onclick: move |_| act(app, busy, async |app: &mut App| app.open_libraries().await),
+                label: text(Text::HomeTitle),
+                onclick: move |_| act(app, busy, async |app: &mut App| app.open_home().await),
             }
             NavButton {
                 busy,
@@ -635,8 +711,8 @@ fn SettingsScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>) 
         nav {
             NavButton {
                 busy,
-                label: text(Text::LibrariesTitle),
-                onclick: move |_| act(app, busy, async |app: &mut App| app.open_libraries().await),
+                label: text(Text::HomeTitle),
+                onclick: move |_| act(app, busy, async |app: &mut App| app.open_home().await),
             }
         }
         h1 { {text(Text::SettingsTitle)} }

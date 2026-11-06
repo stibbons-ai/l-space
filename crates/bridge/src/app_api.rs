@@ -10,8 +10,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::server::{BoxFuture, Bridge};
 use api::{
-    ApiError, CurrentUser, EpisodeFilter, Group, GroupMember, Handoff, Item, ItemId, Library,
-    LibraryEntry, LibraryServer, NowPlaying, Podcast, Session, SessionToken, TransportState,
+    ApiError, CurrentUser, EpisodeFilter, Group, GroupMember, HOME_ENTRIES, Handoff, Home,
+    HomeEntry, Item, ItemId, Library, LibraryEntry, LibraryServer, NowPlaying, Podcast, Session,
+    SessionToken, TransportState,
 };
 use sonos::Sonos;
 use store::{ActiveHandoff, HandoffFile, LibraryUser, SessionId, Store};
@@ -19,6 +20,13 @@ use store::{ActiveHandoff, HandoffFile, LibraryUser, SessionId, Store};
 use crate::browse::{self, NoSingleFile};
 use crate::config::{LibraryServerConfig, LibraryServerUrl};
 use crate::stream::StreamToken;
+
+/// How many more Items in progress than the user has Progress records the Bridge asks the
+/// Library Server for, for Home. Audiobookshelf 2.37.2 lists one entry per Progress record
+/// at most, so the records `/api/me` showed bound the list; the margin covers Progress first
+/// recorded (by another of the user's players) between that read and the list's, which
+/// would otherwise push the user's oldest entries out of it.
+const IN_PROGRESS_MARGIN: usize = 10;
 
 /// Serves the App API from the configured Library Servers, the [`Store`] and [`Sonos`]; and,
 /// for the same Handoffs, the media streams (`crate::stream`).
@@ -226,6 +234,199 @@ impl<S: Store> AppApi<S> {
             .await?;
         browse::podcast(&user, item, filter)
             .map_err(|reason| missing(library_server, request, None, reason))
+    }
+
+    /// Home for the session's user: the Items they are in the middle of, and the newest
+    /// episodes they haven't Finished in every podcast Library they can see; in each list, at
+    /// most [`HOME_ENTRIES`] the Library Server lets the user open.
+    async fn home(&self, token: SessionToken) -> Result<Home, ApiError> {
+        let request = Request {
+            operation: "list the Libraries",
+            id: None,
+        };
+        let Browsed {
+            library_server,
+            session,
+            user,
+            fetched: libraries,
+        } = self
+            .browse(token, request, async |server, key| {
+                self.abs.libraries(server, key).await
+            })
+            .await?;
+        warn_dropped(library_server, None, "Libraries", libraries.dropped);
+        let records = user.media_progress.entries.len() + user.media_progress.dropped;
+        let (in_progress, episodes) = tokio::join!(
+            self.abs.items_in_progress(
+                library_server,
+                &session.api_key,
+                records + IN_PROGRESS_MARGIN
+            ),
+            self.newest_episodes(library_server, &session, &user.id, &libraries.entries),
+        );
+        let in_progress = match in_progress {
+            Ok(in_progress) => in_progress,
+            Err(error) => {
+                let request = Request {
+                    operation: "list the Items in progress",
+                    id: None,
+                };
+                return Err(self.failure(library_server, &session, request, error).await);
+            }
+        };
+        let episodes = episodes?;
+        warn_dropped(
+            library_server,
+            Some(&user.id),
+            "Items in progress",
+            in_progress.dropped,
+        );
+        let (continue_listening, unexpected) =
+            browse::continue_listening(&user, &libraries.entries, in_progress.entries);
+        warn_dropped(
+            library_server,
+            Some(&user.id),
+            "Items in progress naming no Item",
+            unexpected,
+        );
+        let mut may_open = HashMap::new();
+        Ok(Home {
+            continue_listening: self
+                .openable(library_server, &session, continue_listening, &mut may_open)
+                .await?,
+            latest_episodes: self
+                .openable(
+                    library_server,
+                    &session,
+                    browse::latest_episodes(&user, episodes),
+                    &mut may_open,
+                )
+                .await?,
+        })
+    }
+
+    /// The first [`HOME_ENTRIES`] of `candidates` whose library item the session's user may
+    /// open. Only the Library Server knows that (Libraries, explicit content, tags), so each
+    /// candidate's library item is read with the user's key, in order, up to [`HOME_ENTRIES`]
+    /// reads at a time, until enough are found or none are left. `may_open` remembers each
+    /// answer, so a library item is read at most once per Home. A refusal (not found or
+    /// forbidden) leaves the entry out; any other failure fails Home.
+    async fn openable(
+        &self,
+        library_server: &str,
+        session: &store::Session,
+        candidates: Vec<HomeEntry>,
+        may_open: &mut HashMap<String, bool>,
+    ) -> Result<Vec<HomeEntry>, ApiError> {
+        let mut listed = Vec::new();
+        let mut candidates = candidates.into_iter();
+        while listed.len() < HOME_ENTRIES {
+            let next: Vec<_> = candidates
+                .by_ref()
+                .take(HOME_ENTRIES - listed.len())
+                .collect();
+            if next.is_empty() {
+                break;
+            }
+            let mut unknown: Vec<&str> = next
+                .iter()
+                .map(|entry| entry.id.library_item.as_str())
+                .filter(|id| !may_open.contains_key(*id))
+                .collect();
+            unknown.sort_unstable();
+            unknown.dedup();
+            let read = futures::future::join_all(unknown.into_iter().map(|id| async move {
+                (
+                    id,
+                    self.abs
+                        .library_item(library_server, &session.api_key, id)
+                        .await,
+                )
+            }))
+            .await;
+            for (id, read) in read {
+                let open = match read {
+                    Ok(_) => true,
+                    Err(abs::Error::NotFound(cause)) => {
+                        tracing::info!(
+                            library_server,
+                            library_item = id,
+                            cause = ?cause,
+                            "an Item the user may not open was left out of Home"
+                        );
+                        false
+                    }
+                    Err(error) => {
+                        let request = Request {
+                            operation: "check the user may open an Item on Home",
+                            id: Some(id),
+                        };
+                        return Err(self.failure(library_server, session, request, error).await);
+                    }
+                };
+                may_open.insert(id.to_owned(), open);
+            }
+            listed.extend(
+                next.into_iter()
+                    .filter(|entry| may_open[&entry.id.library_item]),
+            );
+        }
+        Ok(listed)
+    }
+
+    /// The newest episodes the session's user (`user_id`) hasn't Finished in each podcast
+    /// Library of `libraries`, at most [`HOME_ENTRIES`] of each by publish date (the Library
+    /// Server's order, episodes without one last). A podcast Library gone or hidden from the
+    /// user since `libraries` were listed adds none.
+    async fn newest_episodes(
+        &self,
+        library_server: &str,
+        session: &store::Session,
+        user_id: &str,
+        libraries: &[abs::Library],
+    ) -> Result<Vec<abs::RecentEpisode>, ApiError> {
+        let api_key = &session.api_key;
+        let newest = futures::future::join_all(
+            libraries
+                .iter()
+                .filter(|library| library.media_type == abs::MediaType::Podcast)
+                .map(|library| async move {
+                    let newest = self
+                        .abs
+                        .recent_episodes(library_server, api_key, &library.id, HOME_ENTRIES)
+                        .await;
+                    (library, newest)
+                }),
+        )
+        .await;
+        let mut episodes = Vec::new();
+        for (library, newest) in newest {
+            match newest {
+                Ok(newest) => {
+                    warn_dropped(
+                        library_server,
+                        Some(user_id),
+                        "newest episodes",
+                        newest.dropped,
+                    );
+                    episodes.extend(newest.entries);
+                }
+                Err(abs::Error::NotFound(cause)) => tracing::info!(
+                    library_server,
+                    library = library.id,
+                    cause = ?cause,
+                    "a podcast Library went out of sight while listing Home"
+                ),
+                Err(error) => {
+                    let request = Request {
+                        operation: "list a podcast Library's newest episodes",
+                        id: Some(&library.id),
+                    };
+                    return Err(self.failure(library_server, session, request, error).await);
+                }
+            }
+        }
+        Ok(episodes)
     }
 
     async fn item(&self, token: SessionToken, id: ItemId) -> Result<Item, ApiError> {
@@ -673,6 +874,10 @@ impl<S: Store> Bridge for AppApi<S> {
         filter: EpisodeFilter,
     ) -> BoxFuture<'_, Result<Podcast, ApiError>> {
         Box::pin(self.podcast(token, podcast, filter))
+    }
+
+    fn home(&self, token: SessionToken) -> BoxFuture<'_, Result<Home, ApiError>> {
+        Box::pin(self.home(token))
     }
 
     fn groups(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Group>, ApiError>> {

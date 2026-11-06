@@ -379,7 +379,8 @@ async fn browsing_needs_a_session() {
     let seeded = abs.seeded();
     let api = bridge.api();
     let item = item_query(&seeded.long_book, None);
-    let calls: [(&str, &[(&str, &str)]); 4] = [
+    let calls: [(&str, &[(&str, &str)]); 5] = [
+        ("/api/home", &[]),
         ("/api/libraries", &[]),
         (
             "/api/library-entries",

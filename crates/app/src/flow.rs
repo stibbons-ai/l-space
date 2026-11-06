@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::{
-    ApiError, ApiKey, Episode, EpisodeFilter, Group, Item, ItemId, Library, LibraryEntry,
+    ApiError, ApiKey, Episode, EpisodeFilter, Group, Home, Item, ItemId, Library, LibraryEntry,
     LibraryKind, LibraryServer, Podcast, Session, SessionToken,
 };
 use dioxus::fullstack::http::header::{AUTHORIZATION, HeaderValue};
@@ -35,8 +35,16 @@ pub enum Screen {
         library_servers: Vec<LibraryServer>,
         notice: Option<Notice>,
     },
-    /// Logged in: every Library the user can see on the session's Library Server,
-    /// audiobooks and podcasts. Empty, with a notice, when they could not be listed.
+    /// Logged in, where a login lands: the Items the user is in the middle of and the newest
+    /// episodes they haven't Finished, on the session's Library Server. `home` is `None` when
+    /// Home could not be read (Try again offered); the notice saying why goes once the screen
+    /// is left, as on any screen.
+    Home {
+        home: Option<Home>,
+        notice: Option<Notice>,
+    },
+    /// Every Library the user can see on the session's Library Server, audiobooks and
+    /// podcasts; opened from Home.
     Libraries {
         libraries: Vec<Library>,
         notice: Option<Notice>,
@@ -87,6 +95,7 @@ impl Screen {
             Self::Starting => None,
             Self::BridgeUrl { notice }
             | Self::Login { notice, .. }
+            | Self::Home { notice, .. }
             | Self::Libraries { notice, .. }
             | Self::Library { notice, .. }
             | Self::Podcast { notice, .. }
@@ -102,6 +111,7 @@ impl Screen {
             Self::Starting => None,
             Self::BridgeUrl { notice }
             | Self::Login { notice, .. }
+            | Self::Home { notice, .. }
             | Self::Libraries { notice, .. }
             | Self::Library { notice, .. }
             | Self::Podcast { notice, .. }
@@ -227,7 +237,7 @@ impl App {
     }
 
     /// Picks the first screen: the Bridge address if there is none, Login if no session is
-    /// selected, else every Library once the Bridge confirmed the selected session (only that
+    /// selected, else Home once the Bridge confirmed the selected session (only that
     /// one is checked). A session whose key the Library Server rejected (`api_key_rejected`) is
     /// forgotten; so is one the Bridge reports as `session_invalid` while its Library Server is
     /// still configured. On any other failure (the Bridge or Library Server unreachable, the
@@ -247,7 +257,7 @@ impl App {
                 if self.stored.update_user(user) {
                     notice = notice.or(self.save());
                 }
-                self.show_libraries(notice).await;
+                self.show_home(notice).await;
             }
             Err(error) => {
                 if let Some(error) = self.session_call_failed(error).await {
@@ -352,7 +362,7 @@ impl App {
                 {
                     self.end_session(&replaced.token).await;
                 }
-                self.show_libraries(notice).await;
+                self.show_home(notice).await;
             }
             Err(error) => self.set_notice(Notice::Api(error)),
         }
@@ -375,15 +385,25 @@ impl App {
         }
     }
 
-    /// Every Library, listed afresh: from Settings, or to try again after a failure.
-    pub async fn open_libraries(&mut self) {
+    /// Home, read afresh: from Groups or Settings, or to try again after a failure. The
+    /// screens to go back to are dropped.
+    pub async fn open_home(&mut self) {
         if self.stored.session().is_some() {
-            self.show_libraries(None).await;
+            self.show_home(None).await;
         }
     }
 
+    /// From Home, every Library the user can see; Back returns to Home.
+    pub async fn open_libraries(&mut self) {
+        self.go(api::libraries(), |libraries| Screen::Libraries {
+            libraries,
+            notice: None,
+        })
+        .await;
+    }
+
     /// Selects the session on the Library Server with base URL `library_server`, without a
-    /// login, and lists its Libraries afresh: from Settings or Login. Every later call acts on
+    /// login, and shows its Home: from Settings or Login. Every later call acts on
     /// that session; once saved, the next launch starts with it.
     pub async fn switch_to(&mut self, library_server: &str) {
         if !self.stored.select(library_server) {
@@ -391,7 +411,7 @@ impl App {
         }
         authorize_selected(&self.stored);
         let notice = self.save();
-        self.show_libraries(notice).await;
+        self.show_home(notice).await;
     }
 
     /// From Settings, Login with the Bridge's Library Servers, to log in to another one; Back
@@ -480,12 +500,13 @@ impl App {
 
     /// On the Item screen, marks its Item Finished (`finished`) or unfinished on the Library
     /// Server, and shows the Item as the Bridge then answers; the podcast screen to go back to
-    /// lists the episode by its new state. When the Library Server can't be reached, the Bridge
-    /// may have written before reading the Progress back failed: the Item and its podcast's
-    /// episodes are read again, as far as that works. On any other failure that keeps the
-    /// session the screen stays as shown. Either way it says why; a mark whose answer was lost
-    /// (the App gave up waiting, for example) may still land on the Library Server, which
-    /// opening the Item again shows.
+    /// lists the episode by its new state, and Home to go back to is read again (if that read
+    /// fails without ending the session, Home stays as it was, saying nothing of it). When the
+    /// Library Server can't be reached, the Bridge may have written before reading the Progress
+    /// back failed: the Item, its podcast's episodes and Home are read again, as far as that
+    /// works. On any other failure that keeps the session the screen stays as shown. Either way
+    /// it says why; a mark whose answer was lost (the App gave up waiting, for example) may
+    /// still land on the Library Server, which opening the Item again shows.
     pub async fn mark_finished(&mut self, finished: bool) {
         let Screen::Item { item, .. } = &self.screen else {
             return;
@@ -499,6 +520,7 @@ impl App {
                     }
                 }
                 self.screen = Screen::Item { item, notice: None };
+                self.reread_home().await;
             }
             Err(error @ ApiError::LibraryServerUnreachable) => {
                 if self.reread(&id).await {
@@ -510,8 +532,8 @@ impl App {
     }
 
     /// Shows Item `id` on its screen as the Library Server holds it now, then (once that
-    /// worked) its podcast's episodes on the screens to go back to; whatever can't be read
-    /// again stays as shown. Returns whether the session goes on: if not, the screen shown
+    /// worked) its podcast's episodes and Home on the screens to go back to; whatever can't be
+    /// read again stays as shown. Returns whether the session goes on: if not, the screen shown
     /// says why.
     async fn reread(&mut self, id: &ItemId) -> bool {
         match self
@@ -520,9 +542,6 @@ impl App {
         {
             Ok(item) => self.screen = Screen::Item { item, notice: None },
             Err(error) => return self.reread_failed(error).await,
-        }
-        if id.episode.is_none() {
-            return true;
         }
         for at in 0..self.back.len() {
             let Screen::Podcast { podcast, .. } = &self.back[at] else {
@@ -543,16 +562,39 @@ impl App {
                 Err(error) => return self.reread_failed(error).await,
             }
         }
-        true
+        self.reread_home().await
     }
 
-    /// Handles a failure to read again after a failed mark: one that concerns the session goes
-    /// to [`App::session_call_failed`]; any other is only logged. Returns whether the session
+    /// Reads Home again on the screens to go back to, if it is one of them, after a mark
+    /// changed what it lists; if that read fails, Home stays as it was. Returns whether the
+    /// session goes on: if not, the screen shown says why.
+    async fn reread_home(&mut self) -> bool {
+        let Some(at) = self
+            .back
+            .iter()
+            .position(|screen| matches!(screen, Screen::Home { .. }))
+        else {
+            return true;
+        };
+        match self.call(api::home()).await {
+            Ok(home) => {
+                self.back[at] = Screen::Home {
+                    home: Some(home),
+                    notice: None,
+                };
+                true
+            }
+            Err(error) => self.reread_failed(error).await,
+        }
+    }
+
+    /// Handles a failure to read again after a mark: one that concerns the session goes to
+    /// [`App::session_call_failed`]; any other is only logged. Returns whether the session
     /// goes on.
     async fn reread_failed(&mut self, error: ApiError) -> bool {
         match self.session_call_failed(error).await {
             Some(error) => {
-                tracing::debug!(%error, "cannot read again after a failed mark");
+                tracing::debug!(%error, "cannot read again after a mark");
                 true
             }
             None => false,
@@ -608,7 +650,7 @@ impl App {
     }
 
     /// Opens Settings, from any logged-in screen; the screens to go back to are dropped (the
-    /// UI offers it on the Libraries screen).
+    /// UI offers it on Home).
     pub fn open_settings(&mut self) {
         if self.stored.session().is_some() {
             self.back.clear();
@@ -617,7 +659,7 @@ impl App {
     }
 
     /// Lists every Sonos Group with what it plays, afresh: from any logged-in screen (the UI
-    /// offers it on the Libraries screen), or to refresh the list. The screens to go back to
+    /// offers it on Home), or to refresh the list. The screens to go back to
     /// are dropped.
     pub async fn open_groups(&mut self) {
         if self.stored.session().is_none() {
@@ -648,7 +690,8 @@ impl App {
     }
 
     /// Back to the screen the shown one was opened from, as it was apart from its notice,
-    /// which was cleared on leaving it.
+    /// which was cleared on leaving it, and apart from a mark since, which may have updated it
+    /// or read it again ([`App::mark_finished`]).
     pub fn go_back(&mut self) {
         if let Some(screen) = self.back.pop() {
             self.screen = screen;
@@ -675,16 +718,21 @@ impl App {
         &self.screen
     }
 
-    /// Shows every Library with `notice`, or why they could not be listed, which then
-    /// replaces `notice`.
-    async fn show_libraries(&mut self, notice: Option<Notice>) {
+    /// Shows Home with `notice`, or why it could not be read, which then replaces `notice`.
+    /// The screens to go back to are dropped.
+    async fn show_home(&mut self, notice: Option<Notice>) {
         self.back.clear();
-        match self.call(api::libraries()).await {
-            Ok(libraries) => self.screen = Screen::Libraries { libraries, notice },
+        match self.call(api::home()).await {
+            Ok(home) => {
+                self.screen = Screen::Home {
+                    home: Some(home),
+                    notice,
+                }
+            }
             Err(error) => {
                 if let Some(error) = self.session_call_failed(error).await {
-                    self.screen = Screen::Libraries {
-                        libraries: Vec::new(),
+                    self.screen = Screen::Home {
+                        home: None,
                         notice: Some(Notice::Api(error)),
                     };
                 }
