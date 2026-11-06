@@ -144,8 +144,9 @@ pub fn continue_listening(
 
 /// Home's "latest episodes": `episodes` with `user`'s Progress, unless it is Finished; newest
 /// publish date first (the date the Library Server added one without it), at most
-/// [`HOME_ENTRIES`]. The Library Server picks `episodes` by publish date alone, so an episode
-/// without one is only placed among those it sent.
+/// [`HOME_ENTRIES`]. The Library Server picks `episodes` as each Library's newest unfinished by
+/// publish date, so an episode without one shows only when its Library has fewer than
+/// [`HOME_ENTRIES`] unfinished episodes with one.
 pub fn latest_episodes(user: &abs::User, episodes: Vec<abs::RecentEpisode>) -> Vec<HomeEntry> {
     let entries = episodes.into_iter().map(|recent| {
         let newness = recent.episode.published_at.or(recent.added_at);
@@ -652,7 +653,8 @@ mod tests {
 
     /// Audiobookshelf already leaves out Finished Items; one it lists while the user's own
     /// Progress says Finished is left out too, and so is one at 0 seconds (a book read only
-    /// as an ebook). Entries that name no Item as the Bridge knows them are counted.
+    /// as an ebook) or without the user's Progress. Entries that name no Item as the Bridge
+    /// knows them are counted.
     #[test]
     fn continue_listening_lists_unfinished_items_the_user_can_see_last_listened_first() {
         let book = |id: &str, library: &str, num_tracks: u64, last: Option<i64>| {

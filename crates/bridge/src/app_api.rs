@@ -22,9 +22,10 @@ use crate::config::{LibraryServerConfig, LibraryServerUrl};
 use crate::stream::StreamToken;
 
 /// How many Items in progress the Bridge asks the Library Server for, for Home: more than Home
-/// lists, as some are left out (an ebook alone, an Item in a Library the user may not see, one
-/// at 0 seconds). Should more than `IN_PROGRESS_ASKED - HOME_ENTRIES` of them be left out,
-/// Home lists fewer than [`HOME_ENTRIES`], even if the user has more in progress.
+/// lists, as some are left out (for example an ebook alone, an Item in a Library the user may
+/// not see, one at 0 seconds, one without the user's Progress or Finished by it, or one in a
+/// shape the Bridge doesn't know). Should more than `IN_PROGRESS_ASKED - HOME_ENTRIES` of them
+/// be left out, Home lists fewer than [`HOME_ENTRIES`], even if the user has more in progress.
 const IN_PROGRESS_ASKED: usize = 4 * HOME_ENTRIES;
 
 /// Serves the App API from the configured Library Servers, the [`Store`] and [`Sonos`]; and,
@@ -270,7 +271,7 @@ impl<S: Store> AppApi<S> {
         warn_dropped(
             library_server,
             Some(&user.id),
-            "Items in progress",
+            "Items in progress naming no Item",
             unexpected,
         );
         Ok(Home {

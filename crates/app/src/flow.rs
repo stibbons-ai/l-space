@@ -36,8 +36,9 @@ pub enum Screen {
         notice: Option<Notice>,
     },
     /// Logged in, where a login lands: the Items the user is in the middle of and the newest
-    /// episodes they haven't Finished, on the session's Library Server. `home` is `None`, with
-    /// a notice, when Home could not be read.
+    /// episodes they haven't Finished, on the session's Library Server. `home` is `None` when
+    /// Home could not be read (Try again offered); the notice saying why goes once the screen
+    /// is left, as on any screen.
     Home {
         home: Option<Home>,
         notice: Option<Notice>,
@@ -500,12 +501,12 @@ impl App {
     /// On the Item screen, marks its Item Finished (`finished`) or unfinished on the Library
     /// Server, and shows the Item as the Bridge then answers; the podcast screen to go back to
     /// lists the episode by its new state, and Home to go back to is read again (if that read
-    /// fails, Home stays as it was, saying nothing of it). When the Library Server can't be
-    /// reached, the Bridge may have written before reading the Progress back failed: the Item,
-    /// its podcast's episodes and Home are read again, as far as that works. On any other
-    /// failure that keeps the session the screen stays as shown. Either way it says why; a mark
-    /// whose answer was lost (the App gave up waiting, for example) may still land on the
-    /// Library Server, which opening the Item again shows.
+    /// fails without ending the session, Home stays as it was, saying nothing of it). When the
+    /// Library Server can't be reached, the Bridge may have written before reading the Progress
+    /// back failed: the Item, its podcast's episodes and Home are read again, as far as that
+    /// works. On any other failure that keeps the session the screen stays as shown. Either way
+    /// it says why; a mark whose answer was lost (the App gave up waiting, for example) may
+    /// still land on the Library Server, which opening the Item again shows.
     pub async fn mark_finished(&mut self, finished: bool) {
         let Screen::Item { item, .. } = &self.screen else {
             return;
@@ -689,8 +690,8 @@ impl App {
     }
 
     /// Back to the screen the shown one was opened from, as it was apart from its notice,
-    /// which was cleared on leaving it, and apart from a mark since, which may have read it
-    /// again ([`App::mark_finished`]).
+    /// which was cleared on leaving it, and apart from a mark since, which may have updated it
+    /// or read it again ([`App::mark_finished`]).
     pub fn go_back(&mut self) {
         if let Some(screen) = self.back.pop() {
             self.screen = screen;

@@ -257,8 +257,9 @@ pub struct Home {
     pub continue_listening: Vec<HomeEntry>,
     /// The newest episodes the user hasn't Finished, of every podcast they can see: newest
     /// publish date first (the date the Library Server added an episode without one). Each
-    /// podcast Library contributes its [`HOME_ENTRIES`] newest by publish date, so an episode
-    /// without one is placed by its added date only among those.
+    /// podcast Library contributes its [`HOME_ENTRIES`] newest unfinished by publish date, so
+    /// an episode without one shows only when its Library has fewer than [`HOME_ENTRIES`]
+    /// unfinished episodes with one.
     pub latest_episodes: Vec<HomeEntry>,
 }
 
