@@ -271,19 +271,19 @@ fn notice_text(app: &App) -> String {
 }
 
 /// The screen's text in English and in German, by `read` from the App.
-fn texts_of<T>(app: &mut App, read: impl Fn(&App) -> T) -> (T, T) {
+async fn texts_of<T>(app: &mut App, read: impl Fn(&App) -> T) -> (T, T) {
     let choice = app.language_choice();
-    app.set_language(LanguageChoice::English);
+    app.set_language(LanguageChoice::English).await;
     let english = read(app);
-    app.set_language(LanguageChoice::German);
+    app.set_language(LanguageChoice::German).await;
     let german = read(app);
-    app.set_language(choice);
+    app.set_language(choice).await;
     (english, german)
 }
 
 /// The notice on screen in English and in German.
-fn notice_texts(app: &mut App) -> (String, String) {
-    texts_of(app, notice_text)
+async fn notice_texts(app: &mut App) -> (String, String) {
+    texts_of(app, notice_text).await
 }
 
 fn both(text: Text) -> (String, String) {
@@ -526,7 +526,7 @@ fn the_bridge_url_is_entered_once_and_remembered() {
         );
         // Here the address can be changed, so the message says to check it.
         assert_eq!(
-            notice_texts(&mut app),
+            notice_texts(&mut app).await,
             both(Text::ErrorBridgeUrlUnreachable)
         );
         // An address that didn't answer isn't remembered.
@@ -576,7 +576,7 @@ fn an_address_that_is_not_a_bridge_is_named_as_such_and_not_remembered() {
                 },
                 "{address}"
             );
-            assert_eq!(notice_texts(&mut app), both(Text::ErrorNotABridge));
+            assert_eq!(notice_texts(&mut app).await, both(Text::ErrorNotABridge));
             assert_eq!(device.launch().await.bridge_url(), None, "{address}");
         }
 
@@ -690,7 +690,7 @@ fn an_address_that_redirects_elsewhere_is_named_as_no_bridge_and_not_remembered(
                     },
                     "{status} to {target:?}"
                 );
-                assert_eq!(notice_texts(&mut app), both(Text::ErrorNotABridge));
+                assert_eq!(notice_texts(&mut app).await, both(Text::ErrorNotABridge));
                 assert_eq!(device.launch().await.bridge_url(), None, "{status}");
             }
         }
@@ -730,7 +730,7 @@ fn an_address_that_redirects_where_nothing_answers_is_named_as_unreachable_and_n
                     "{status} to {target:?}"
                 );
                 assert_eq!(
-                    notice_texts(&mut app),
+                    notice_texts(&mut app).await,
                     both(Text::ErrorBridgeUrlUnreachable)
                 );
                 assert_eq!(device.launch().await.bridge_url(), None, "{status}");
@@ -786,7 +786,7 @@ fn a_stored_address_that_starts_redirecting_gets_no_token_and_keeps_the_session(
                 "{status}"
             );
             assert_eq!(
-                notice_texts(&mut relaunched),
+                notice_texts(&mut relaunched).await,
                 both(Text::ErrorBridgeUnreachable)
             );
             assert_eq!(session(&relaunched), before, "{status}");
@@ -857,7 +857,10 @@ fn a_rejected_key_or_unreachable_library_server_shows_a_translated_message() {
             Some(&Notice::Api(ApiError::ApiKeyRejected))
         );
         assert_eq!(app.session(), None);
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorApiKeyRejected));
+        assert_eq!(
+            notice_texts(&mut app).await,
+            both(Text::ErrorApiKeyRejected)
+        );
 
         app.log_in(&unreachable, ApiKey::new(&user.api_key.key))
             .await;
@@ -921,7 +924,10 @@ fn a_revoked_key_ends_the_session_at_the_next_launch_with_a_translated_message()
         );
         assert_eq!(app.session(), None);
         assert_eq!(app.language(), Language::German);
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorApiKeyRejected));
+        assert_eq!(
+            notice_texts(&mut app).await,
+            both(Text::ErrorApiKeyRejected)
+        );
 
         // Forgotten on the device, so the next launch asks for a key without a message.
         let relaunched = device.launch().await;
@@ -954,7 +960,10 @@ fn a_session_the_bridge_ended_is_forgotten_at_the_next_launch() {
             app.screen()
         );
         assert_eq!(app.session(), None);
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorSessionInvalid));
+        assert_eq!(
+            notice_texts(&mut app).await,
+            both(Text::ErrorSessionInvalid)
+        );
 
         let relaunched = device.launch().await;
         assert!(matches!(
@@ -984,7 +993,7 @@ fn a_session_whose_library_server_is_unconfigured_for_a_while_stays() {
         );
         assert_eq!(session(&app), before);
         assert_eq!(
-            notice_texts(&mut app),
+            notice_texts(&mut app).await,
             both(Text::ErrorSessionLibraryServerNotConfigured)
         );
 
@@ -1128,7 +1137,10 @@ fn a_captive_portal_at_the_stored_address_keeps_the_session() {
         );
         assert_eq!(app.session().map(|stored| &stored.user), Some(&before.user));
         // Settings can't change the address, so the message doesn't say to check it.
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorBridgeUnreachable));
+        assert_eq!(
+            notice_texts(&mut app).await,
+            both(Text::ErrorBridgeUnreachable)
+        );
     });
 }
 
@@ -1207,14 +1219,14 @@ fn failed_saves_are_reported_until_a_save_succeeds() {
         // Picking a language: a working save clears the notice; a failing one, from a clean
         // screen, shows it again.
         device.fail_saves.store(false, Ordering::SeqCst);
-        app.set_language(LanguageChoice::English);
+        app.set_language(LanguageChoice::English).await;
         assert_eq!(app.screen().notice(), None);
         device.fail_saves.store(true, Ordering::SeqCst);
-        app.set_language(LanguageChoice::German);
+        app.set_language(LanguageChoice::German).await;
         assert_eq!(app.screen().notice(), Some(&Notice::StorageSave));
         assert_eq!(app.language(), Language::German);
         device.fail_saves.store(false, Ordering::SeqCst);
-        app.set_language(LanguageChoice::English);
+        app.set_language(LanguageChoice::English).await;
         assert_eq!(app.screen().notice(), None);
 
         // Logging out with the Bridge gone and the device failing.
@@ -1229,7 +1241,7 @@ fn failed_saves_are_reported_until_a_save_succeeds() {
         );
         // Saving the logged-out state later clears it.
         device.fail_saves.store(false, Ordering::SeqCst);
-        app.set_language(LanguageChoice::German);
+        app.set_language(LanguageChoice::German).await;
         assert_eq!(app.screen().notice(), None);
         assert_eq!(device.launch_impatient().await.session(), None);
     });
@@ -1278,7 +1290,7 @@ fn an_unreadable_device_file_is_set_aside_and_reported() {
                 notice: Some(Notice::StorageLoad)
             }
         );
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorStorageLoad));
+        assert_eq!(notice_texts(&mut app).await, both(Text::ErrorStorageLoad));
         let dir = device.dir.path();
         assert_eq!(std::fs::read(dir.join("app.json.bad")).unwrap(), b"earlier");
         assert_eq!(
@@ -1340,7 +1352,7 @@ fn an_unreadable_device_file_that_cannot_be_set_aside_is_left_alone() {
                 notice: Some(Notice::StorageStuck)
             }
         );
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorStorageStuck));
+        assert_eq!(notice_texts(&mut app).await, both(Text::ErrorStorageStuck));
         // Usable for this launch, without touching the file, and every change says it won't
         // be kept.
         app.submit_bridge_url(bridge.url()).await;
@@ -1366,7 +1378,7 @@ fn an_unreadable_device_file_that_cannot_be_set_aside_is_left_alone() {
         );
         app.log_out().await;
         assert_eq!(app.screen().notice(), Some(&Notice::StorageStuck));
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorStorageStuck));
+        assert_eq!(notice_texts(&mut app).await, both(Text::ErrorStorageStuck));
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(std::fs::read(device.path()).unwrap(), b"{ not json");
         assert_eq!(device.files(), ["app.json"]);
@@ -1410,7 +1422,7 @@ fn the_language_follows_the_device_unless_settings_overrides_it() {
         let other = Device::with_locale("fr-FR");
         assert_eq!(other.launch().await.language(), Language::English);
 
-        app.set_language(LanguageChoice::English);
+        app.set_language(LanguageChoice::English).await;
         assert_eq!(app.language(), Language::English);
         assert_eq!(
             app.text(Text::BridgeUrlTitle),
@@ -1420,7 +1432,7 @@ fn the_language_follows_the_device_unless_settings_overrides_it() {
         assert_eq!(relaunched.language_choice(), LanguageChoice::English);
         assert_eq!(relaunched.language(), Language::English);
 
-        app.set_language(LanguageChoice::System);
+        app.set_language(LanguageChoice::System).await;
         assert_eq!(german.launch().await.language(), Language::German);
     });
 }
@@ -1500,7 +1512,7 @@ fn a_podcasts_episodes_are_filtered_by_the_persons_progress() {
             screen => panic!("{screen:?}"),
         };
         assert_eq!(
-            texts_of(&mut app, rows),
+            texts_of(&mut app, rows).await,
             (
                 vec![
                     "March 31, 2026 · Not started".to_owned(),
@@ -1576,7 +1588,7 @@ fn an_audiobook_shows_its_details_progress_and_chapters_in_english_and_german() 
         let item = item.clone();
         let facts = |app: &App| i18n::item_facts(app.language(), &item);
         assert_eq!(
-            texts_of(&mut app, facts),
+            texts_of(&mut app, facts).await,
             (
                 vec![
                     (Text::ItemProgress, "1 h 2 min left".to_owned()),
@@ -1626,7 +1638,7 @@ fn an_episode_shows_its_podcast_publish_date_and_progress() {
         let item = item.clone();
         let facts = |app: &App| i18n::item_facts(app.language(), &item);
         assert_eq!(
-            texts_of(&mut app, facts),
+            texts_of(&mut app, facts).await,
             (
                 vec![
                     (Text::ItemProgress, "Not started".to_owned()),
@@ -1743,7 +1755,7 @@ fn home_lists_what_the_person_is_in_the_middle_of_and_the_latest_episodes() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            texts_of(&mut app, rows),
+            texts_of(&mut app, rows).await,
             (
                 vec![
                     "The Clacks Hour · February 15, 2026 · 10 min left".to_owned(),
@@ -2175,6 +2187,142 @@ fn logging_in_again_replaces_that_library_servers_session() {
 }
 
 #[test]
+fn a_replacement_saved_later_ends_the_replaced_session() {
+    let (bridge, abs, second) = bridge_with_two_library_servers();
+    let device = Device::new();
+    run(async || {
+        let (home_user, second_user) = users_seeing_apart(&abs).await;
+        let mut app = logged_in_behind(&device, &bridge, abs.base_url(), &home_user).await;
+        log_in_elsewhere(&mut app, &second, &second_user).await;
+        let replaced = session(&app);
+
+        // The file still holds the replaced session: it stays usable.
+        device.fail_saves.store(true, Ordering::SeqCst);
+        log_in_elsewhere(&mut app, &second, &second_user).await;
+        let current = session(&app);
+        assert_ne!(current.token, replaced.token);
+        assert_eq!(bridge.api().current_user(&replaced).await, replaced.user);
+        app.set_language(LanguageChoice::German).await;
+        assert_eq!(app.screen().notice(), Some(&Notice::StorageSave));
+        assert_eq!(bridge.api().current_user(&replaced).await, replaced.user);
+
+        // Saved by another action, the replacement ends it.
+        device.fail_saves.store(false, Ordering::SeqCst);
+        app.set_language(LanguageChoice::English).await;
+        assert_eq!(app.screen().notice(), None);
+        assert_eq!(
+            bridge.api().current_user_error(&replaced).await.1,
+            ApiError::SessionInvalid
+        );
+        assert_eq!(bridge.api().current_user(&current).await, current.user);
+        // Ending it left the App calling with the current session.
+        app.open_home().await;
+        assert_eq!(app.screen(), &home_seeing(&abs, podcasts(&abs), None));
+        assert_eq!(session(&device.launch().await), current);
+    });
+}
+
+#[test]
+fn a_replaced_session_not_yet_ended_never_reaches_another_bridge() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let other_bridge = TestBridge::start(&named_library_server_toml(abs.base_url(), "Home"));
+    let other_address = other_bridge
+        .url()
+        .strip_prefix("http://")
+        .expect("an http:// Bridge URL");
+    let (other_url, other_log) = proxy(other_address, |_, _| false);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        let replaced = session(&app);
+
+        // Neither the replacement nor the logout after it is saved: the replaced session is
+        // kept, and with no session left the Bridge address can change.
+        device.fail_saves.store(true, Ordering::SeqCst);
+        log_in_elsewhere(&mut app, abs.base_url(), &user).await;
+        app.log_out().await;
+        assert_eq!(app.screen().notice(), Some(&Notice::LogoutNotSaved));
+        assert!(app.can_change_bridge_url());
+
+        device.fail_saves.store(false, Ordering::SeqCst);
+        app.change_bridge_url();
+        app.submit_bridge_url(&other_url).await;
+        assert!(matches!(app.screen(), Screen::Login { notice: None, .. }));
+        assert_eq!(app.bridge_url(), Some(other_url.as_str()));
+        // Saved, but the replaced session went nowhere: not to the new Bridge, and it is still
+        // open on the one that issued it.
+        assert_eq!(requests(&other_log, "POST /api/logout"), 0);
+        assert_eq!(bridge.api().current_user(&replaced).await, replaced.user);
+    });
+}
+
+#[test]
+fn a_replaced_session_kept_past_a_bridge_change_not_saved_never_reaches_the_new_bridge() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let other_bridge = TestBridge::start(&named_library_server_toml(abs.base_url(), "Home"));
+    let other_address = other_bridge
+        .url()
+        .strip_prefix("http://")
+        .expect("an http:// Bridge URL");
+    let (other_url, other_log) = proxy(other_address, |_, _| false);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        let replaced = session(&app);
+
+        // Nothing is saved, the new Bridge address included: the replaced session is kept.
+        device.fail_saves.store(true, Ordering::SeqCst);
+        log_in_elsewhere(&mut app, abs.base_url(), &user).await;
+        app.log_out().await;
+        app.change_bridge_url();
+        app.submit_bridge_url(&other_url).await;
+        assert!(matches!(
+            app.screen(),
+            Screen::Login {
+                notice: Some(Notice::StorageSave),
+                ..
+            }
+        ));
+        assert_eq!(app.bridge_url(), Some(other_url.as_str()));
+
+        // The next save that succeeds comes from another action, at the new address.
+        device.fail_saves.store(false, Ordering::SeqCst);
+        app.set_language(LanguageChoice::German).await;
+        assert_eq!(app.screen().notice(), None);
+        assert_eq!(requests(&other_log, "POST /api/logout"), 0);
+        assert_eq!(bridge.api().current_user(&replaced).await, replaced.user);
+    });
+}
+
+#[test]
+fn a_replaced_session_not_yet_ended_ends_when_the_same_bridge_address_is_entered() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        let replaced = session(&app);
+        let url = app.bridge_url().expect("a Bridge address").to_owned();
+
+        device.fail_saves.store(true, Ordering::SeqCst);
+        log_in_elsewhere(&mut app, abs.base_url(), &user).await;
+        app.log_out().await;
+        assert_eq!(bridge.api().current_user(&replaced).await, replaced.user);
+
+        device.fail_saves.store(false, Ordering::SeqCst);
+        app.change_bridge_url();
+        app.submit_bridge_url(&url).await;
+        assert!(matches!(app.screen(), Screen::Login { notice: None, .. }));
+        assert_eq!(
+            bridge.api().current_user_error(&replaced).await.1,
+            ApiError::SessionInvalid
+        );
+    });
+}
+
+#[test]
 fn a_session_saved_by_an_earlier_app_stays_logged_in() {
     let (bridge, abs, _) = bridge_with_abs();
     let device = Device::new();
@@ -2199,7 +2347,7 @@ fn a_session_saved_by_an_earlier_app_stays_logged_in() {
         // Still logged in after the App saved again in its own shape.
         drop(app);
         let mut app = device.launch().await;
-        app.set_language(LanguageChoice::German);
+        app.set_language(LanguageChoice::German).await;
         let json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(device.path()).unwrap()).unwrap();
         assert!(json.get("session").is_none(), "{json}");
@@ -2225,7 +2373,7 @@ fn something_no_longer_on_the_library_server_is_named_on_the_screen_shown() {
             app.screen(),
             &fresh_home(&abs, Some(Notice::Api(ApiError::NotFound)))
         );
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorNotFound));
+        assert_eq!(notice_texts(&mut app).await, both(Text::ErrorNotFound));
         assert!(app.session().is_some());
     });
 }
@@ -2274,7 +2422,7 @@ fn home_or_libraries_that_cannot_be_read_are_explained_and_read_on_retry() {
         let mut app = logged_in_behind(&device, &bridge, &proxy, &user).await;
         assert_eq!(app.screen(), &failed);
         assert_eq!(
-            notice_texts(&mut app),
+            notice_texts(&mut app).await,
             both(Text::ErrorLibraryServerUnreachable)
         );
         assert!(app.session().is_some());
@@ -2653,7 +2801,7 @@ fn marking_an_episode_shows_on_the_item_and_in_the_episodes_under_each_filter() 
             })
         );
         assert_eq!(
-            texts_of(&mut app, shown_progress),
+            texts_of(&mut app, shown_progress).await,
             ("Finished".to_owned(), "Beendet".to_owned())
         );
         assert_eq!(
@@ -2753,7 +2901,7 @@ fn marking_an_audiobook_finished_and_unfinished_shows_on_its_item_screen() {
         app.mark_finished(true).await;
         assert_eq!(app.screen().notice(), None);
         assert_eq!(
-            texts_of(&mut app, shown_progress),
+            texts_of(&mut app, shown_progress).await,
             ("Finished".to_owned(), "Beendet".to_owned())
         );
         assert_eq!(
@@ -2763,7 +2911,7 @@ fn marking_an_audiobook_finished_and_unfinished_shows_on_its_item_screen() {
 
         app.mark_finished(false).await;
         assert_eq!(
-            texts_of(&mut app, shown_progress),
+            texts_of(&mut app, shown_progress).await,
             ("Not started".to_owned(), "Nicht begonnen".to_owned())
         );
         assert_eq!(
@@ -2806,7 +2954,7 @@ fn a_mark_that_fails_keeps_the_item_shown_and_says_why() {
             }
         );
         assert_eq!(
-            notice_texts(&mut app),
+            notice_texts(&mut app).await,
             both(Text::ErrorLibraryServerUnreachable)
         );
         assert_eq!(
@@ -3169,7 +3317,7 @@ fn the_groups_screen_shows_each_group_and_what_it_plays() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            texts_of(&mut app, playback),
+            texts_of(&mut app, playback).await,
             (
                 vec![
                     "Playing · Moby Dick · Herman Melville".to_owned(),
@@ -3243,7 +3391,7 @@ fn every_playback_state_reads_as_such_in_english_and_german() {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            texts_of(&mut app, playback),
+            texts_of(&mut app, playback).await,
             (
                 vec![
                     "Starting…".to_owned(),
@@ -3301,7 +3449,10 @@ fn groups_that_cannot_be_listed_are_explained_and_listed_on_refresh() {
                 notice: Some(Notice::Api(ApiError::SonosUnreachable)),
             }
         );
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorSonosUnreachable));
+        assert_eq!(
+            notice_texts(&mut app).await,
+            both(Text::ErrorSonosUnreachable)
+        );
         assert!(app.session().is_some());
 
         household.set_fault(&kitchen, Fault::None);
@@ -3394,7 +3545,7 @@ fn play_on_lists_every_group_and_plays_the_episode_on_the_one_chosen() {
             }
         );
         assert_eq!(
-            notice_texts(&mut app),
+            notice_texts(&mut app).await,
             (
                 "Playing on Office".to_owned(),
                 "Spielt auf Office".to_owned()
@@ -3446,7 +3597,7 @@ fn a_start_that_fails_is_explained_on_the_picker() {
             app.screen().notice(),
             Some(&Notice::Api(ApiError::GroupFailed))
         );
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorGroupFailed));
+        assert_eq!(notice_texts(&mut app).await, both(Text::ErrorGroupFailed));
 
         // A Group unplugged since the list was shown is gone; the picker lists the Groups
         // afresh, keeping the notice.
@@ -3456,7 +3607,7 @@ fn a_start_that_fails_is_explained_on_the_picker() {
             app.screen().notice(),
             Some(&Notice::Api(ApiError::GroupNotFound))
         );
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorGroupNotFound));
+        assert_eq!(notice_texts(&mut app).await, both(Text::ErrorGroupNotFound));
         assert_eq!(picker_names(&app), ["Kitchen"]);
         assert_eq!(bridge.api().handoffs(&session(&app)).await, []);
     });
@@ -3487,7 +3638,10 @@ fn an_item_in_several_files_is_not_offered_and_cannot_play_on_a_group() {
             app.screen().notice(),
             Some(&Notice::Api(ApiError::ItemNotPlayable))
         );
-        assert_eq!(notice_texts(&mut app), both(Text::ErrorItemNotPlayable));
+        assert_eq!(
+            notice_texts(&mut app).await,
+            both(Text::ErrorItemNotPlayable)
+        );
         assert_eq!(household.uri(&kitchen), None);
     });
 }

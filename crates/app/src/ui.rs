@@ -741,14 +741,14 @@ fn SettingsScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>) 
         label {
             {text(Text::SettingsLanguage)}
             select {
-                // A change during logout would be lost when the logout's result replaces the App.
+                // One action at a time: a second `act` would work on a stale copy of the App.
                 disabled: busy(),
                 onchange: move |event| {
                     let picked = LanguageChoice::ALL
                         .into_iter()
                         .find(|choice| choice_value(*choice) == event.value());
                     if let Some(picked) = picked {
-                        app.write().set_language(picked);
+                        act(app, busy, async move |app: &mut App| app.set_language(picked).await);
                     }
                 },
                 for option_choice in LanguageChoice::ALL {
