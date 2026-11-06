@@ -194,6 +194,10 @@ pub struct App {
     load_notice: Option<Notice>,
     /// Set when what was saved could neither be read nor moved aside: saving would destroy it.
     read_only: bool,
+    /// Tokens of sessions `log_in` replaced while the device still held them: a failed save
+    /// leaves them in the file, which must stay usable. Ended on the Bridge after the next
+    /// successful save, which no longer holds them (read-only, after any); never saved.
+    replaced: Vec<SessionToken>,
     call_timeout: Duration,
 }
 
@@ -229,6 +233,7 @@ impl App {
             back: Vec::new(),
             load_notice,
             read_only,
+            replaced: Vec::new(),
             call_timeout: CALL_TIMEOUT,
         }
     }
@@ -258,7 +263,7 @@ impl App {
         match self.call(api::current_user()).await {
             Ok(user) => {
                 if self.stored.update_user(user) {
-                    notice = notice.or(self.save());
+                    notice = notice.or(self.save().await);
                 }
                 self.show_home(notice).await;
             }
@@ -305,10 +310,16 @@ impl App {
         }
         match answer {
             Ok(library_servers) => {
+                // A session belongs to the Bridge that issued it: one replaced but not yet
+                // ended can't be ended at another.
+                if self.stored.bridge_url.as_ref() != Some(&url) && !self.replaced.is_empty() {
+                    tracing::debug!("another Bridge: dropping the replaced sessions not yet ended");
+                    self.replaced.clear();
+                }
                 self.stored.bridge_url = Some(url);
                 self.screen = Screen::Login {
                     library_servers,
-                    notice: self.save(),
+                    notice: self.save().await,
                 };
             }
             Err(error) => {
@@ -359,8 +370,9 @@ impl App {
 
     /// Logs in to the Library Server with base URL `library_server`, adding its session and
     /// selecting it; the other sessions stay. A session already on that Library Server is
-    /// replaced, and once that is saved, ended on the Bridge as far as it can. The key is sent
-    /// to the Bridge and not kept.
+    /// replaced, and ended on the Bridge as far as it can once the device no longer holds it:
+    /// after this save or, if that fails, the next one that succeeds. The key is sent to the
+    /// Bridge and not kept.
     pub async fn log_in(&mut self, library_server: &str, api_key: ApiKey) {
         if !matches!(self.screen, Screen::Login { .. }) {
             return;
@@ -391,15 +403,11 @@ impl App {
                     user,
                 });
                 authorize_selected(&self.stored);
-                let notice = self.save();
-                // Only once the device no longer holds it: a failed save keeps the replaced
-                // session in the file, which must stay usable then. Read-only, the file holds
-                // none of this launch's sessions, so there is nothing to keep.
-                if let Some(replaced) = replaced
-                    && (notice.is_none() || self.read_only)
-                {
-                    self.end_session(&replaced.token).await;
+                if let Some(replaced) = replaced {
+                    // `save` ends it once the device no longer holds it.
+                    self.replaced.push(replaced.token);
                 }
+                let notice = self.save().await;
                 self.show_home(notice).await;
             }
             Err(error) => self.set_notice(Notice::Api(error)),
@@ -413,7 +421,7 @@ impl App {
             return;
         };
         self.end_session(&session.token).await;
-        let not_saved = self.forget_session();
+        let not_saved = self.forget_session().await;
         self.show_login(None).await;
         match not_saved {
             // The token is still on the device: the next launch may be logged in again.
@@ -448,7 +456,7 @@ impl App {
             return;
         }
         authorize_selected(&self.stored);
-        let notice = self.save();
+        let notice = self.save().await;
         self.show_home(notice).await;
     }
 
@@ -737,9 +745,9 @@ impl App {
     }
 
     /// Switches the language now and remembers the choice.
-    pub fn set_language(&mut self, choice: LanguageChoice) {
+    pub async fn set_language(&mut self, choice: LanguageChoice) {
         self.stored.language = choice;
-        match self.save() {
+        match self.save().await {
             Some(notice) => self.set_notice(notice),
             // Everything is saved now, so an earlier failure no longer matters.
             None => {
@@ -814,7 +822,7 @@ impl App {
         match error {
             ApiError::ApiKeyRejected => {
                 // The revocation matters more than a failed save, which `save` logged.
-                self.forget_session();
+                self.forget_session().await;
                 self.show_login(Some(Notice::Api(error))).await;
                 None
             }
@@ -881,7 +889,7 @@ impl App {
         let notice = match self.call(api::library_servers()).await {
             Ok(library_servers) if self.lists_session_library_server(&library_servers) => {
                 // The ended session matters more than a failed save, which `save` logged.
-                self.forget_session();
+                self.forget_session().await;
                 self.screen = Screen::Login {
                     library_servers,
                     notice: Some(Notice::Api(ApiError::SessionInvalid)),
@@ -907,11 +915,11 @@ impl App {
 
     /// Forgets the selected session on the device; the others stay. Returns a notice if that
     /// could not be saved.
-    fn forget_session(&mut self) -> Option<Notice> {
+    async fn forget_session(&mut self) -> Option<Notice> {
         self.stored.forget_selected();
         self.back.clear();
         authorize_selected(&self.stored);
-        self.save()
+        self.save().await
     }
 
     /// Ends the session with `token` on the Bridge, as far as it can; callers forget it on the
@@ -933,16 +941,25 @@ impl App {
         authorize_selected(&self.stored);
     }
 
-    /// Saves what the App remembers. Returns a notice if that failed.
-    fn save(&self) -> Option<Notice> {
-        if self.read_only {
+    /// Saves what the App remembers, then ends the sessions `log_in` replaced, which the device
+    /// no longer holds. Returns a notice if saving failed; the replaced sessions stay then,
+    /// unless the App is read-only.
+    async fn save(&mut self) -> Option<Notice> {
+        let notice = if self.read_only {
             // Not kept after a restart: the person needs to know with every change.
             tracing::debug!("not saving: the unreadable saved state stays untouched");
-            return Some(Notice::StorageStuck);
+            // The file holds none of this launch's sessions, the replaced ones included.
+            Some(Notice::StorageStuck)
+        } else if let Err(error) = self.store.save(&self.stored) {
+            tracing::warn!(%error, "cannot save the App's state on the device");
+            return Some(Notice::StorageSave);
+        } else {
+            None
+        };
+        for token in std::mem::take(&mut self.replaced) {
+            self.end_session(&token).await;
         }
-        let error = self.store.save(&self.stored).err()?;
-        tracing::warn!(%error, "cannot save the App's state on the device");
-        Some(Notice::StorageSave)
+        notice
     }
 
     /// `call` to the Bridge, or `bridge_unreachable` if it takes longer than the call timeout.

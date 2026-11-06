@@ -748,7 +748,7 @@ fn SettingsScreen(app: Signal<App>, busy: Signal<bool>, notice: Option<Notice>) 
                         .into_iter()
                         .find(|choice| choice_value(*choice) == event.value());
                     if let Some(picked) = picked {
-                        app.write().set_language(picked);
+                        act(app, busy, async move |app: &mut App| app.set_language(picked).await);
                     }
                 },
                 for option_choice in LanguageChoice::ALL {
