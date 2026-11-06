@@ -436,6 +436,35 @@ impl AppApi {
         .await
     }
 
+    /// Marks Item `item` Finished (`finished`) or unfinished as `session`, panicking unless
+    /// that succeeds; the Item as the Bridge answers.
+    pub async fn mark_finished(&self, session: &Session, item: &ItemId, finished: bool) -> Item {
+        let response = self
+            .post(
+                "/api/item/finished",
+                Some(&bearer(session)),
+                mark_finished_body(item, finished),
+            )
+            .await;
+        decode(response).await
+    }
+
+    /// Marks Item `item` Finished (`finished`) or unfinished as `session`, expecting a
+    /// rejection.
+    pub async fn mark_finished_error(
+        &self,
+        session: &Session,
+        item: &ItemId,
+        finished: bool,
+    ) -> (StatusCode, ApiError) {
+        self.post_error(
+            "/api/item/finished",
+            Some(&bearer(session)),
+            mark_finished_body(item, finished),
+        )
+        .await
+    }
+
     /// The Sonos Groups `session` sees.
     pub async fn groups(&self, session: &Session) -> Vec<Group> {
         self.get_as(session, "/api/groups", &[]).await
@@ -601,6 +630,11 @@ pub fn filter_name(filter: EpisodeFilter) -> String {
 
 fn handoff_body(item: &ItemId, group: &str) -> Value {
     json!({"item": item, "group": group})
+}
+
+/// The body that marks Item `item` Finished (`finished`) or unfinished.
+pub fn mark_finished_body(item: &ItemId, finished: bool) -> Value {
+    json!({"item": item, "finished": finished})
 }
 
 fn login_body(library_server: &str, api_key: &str) -> Value {

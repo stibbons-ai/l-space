@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::{
-    ApiError, ApiKey, EpisodeFilter, Group, Item, ItemId, Library, LibraryEntry, LibraryKind,
-    LibraryServer, Podcast, Session, SessionToken,
+    ApiError, ApiKey, Episode, EpisodeFilter, Group, Item, ItemId, Library, LibraryEntry,
+    LibraryKind, LibraryServer, Podcast, Session, SessionToken,
 };
 use dioxus::fullstack::http::header::{AUTHORIZATION, HeaderValue};
 use dioxus::fullstack::{HeaderMap, get_server_url, set_request_headers, set_server_url};
@@ -478,6 +478,87 @@ impl App {
         matches!(&self.screen, Screen::Item { item, .. } if item.audio_files.len() == 1)
     }
 
+    /// On the Item screen, marks its Item Finished (`finished`) or unfinished on the Library
+    /// Server, and shows the Item as the Bridge then answers; the podcast screen to go back to
+    /// lists the episode by its new state. When the Library Server can't be reached, the Bridge
+    /// may have written before reading the Progress back failed: the Item and its podcast's
+    /// episodes are read again, as far as that works. On any other failure that keeps the
+    /// session the screen stays as shown. Either way it says why; a mark whose answer was lost
+    /// (the App gave up waiting, for example) may still land on the Library Server, which
+    /// opening the Item again shows.
+    pub async fn mark_finished(&mut self, finished: bool) {
+        let Screen::Item { item, .. } = &self.screen else {
+            return;
+        };
+        let id = item.id.clone();
+        match self.call(api::mark_finished(id.clone(), finished)).await {
+            Ok(item) => {
+                for screen in &mut self.back {
+                    if let Screen::Podcast { podcast, .. } = screen {
+                        relist_episode(podcast, &item);
+                    }
+                }
+                self.screen = Screen::Item { item, notice: None };
+            }
+            Err(error @ ApiError::LibraryServerUnreachable) => {
+                if self.reread(&id).await {
+                    self.set_notice(Notice::Api(error));
+                }
+            }
+            Err(error) => self.failed(error).await,
+        }
+    }
+
+    /// Shows Item `id` on its screen as the Library Server holds it now, then (once that
+    /// worked) its podcast's episodes on the screens to go back to; whatever can't be read
+    /// again stays as shown. Returns whether the session goes on: if not, the screen shown
+    /// says why.
+    async fn reread(&mut self, id: &ItemId) -> bool {
+        match self
+            .call(api::item(id.library_item.clone(), id.episode.clone()))
+            .await
+        {
+            Ok(item) => self.screen = Screen::Item { item, notice: None },
+            Err(error) => return self.reread_failed(error).await,
+        }
+        if id.episode.is_none() {
+            return true;
+        }
+        for at in 0..self.back.len() {
+            let Screen::Podcast { podcast, .. } = &self.back[at] else {
+                continue;
+            };
+            if podcast.id != id.library_item {
+                continue;
+            }
+            match self
+                .call(api::podcast(podcast.id.clone(), Some(podcast.filter)))
+                .await
+            {
+                Ok(listed) => {
+                    if let Screen::Podcast { podcast, .. } = &mut self.back[at] {
+                        *podcast = listed;
+                    }
+                }
+                Err(error) => return self.reread_failed(error).await,
+            }
+        }
+        true
+    }
+
+    /// Handles a failure to read again after a failed mark: one that concerns the session goes
+    /// to [`App::session_call_failed`]; any other is only logged. Returns whether the session
+    /// goes on.
+    async fn reread_failed(&mut self, error: ApiError) -> bool {
+        match self.session_call_failed(error).await {
+            Some(error) => {
+                tracing::debug!(%error, "cannot read again after a failed mark");
+                true
+            }
+            None => false,
+        }
+    }
+
     /// From the Item screen, lists every Group to play the Item on.
     pub async fn open_play_on(&mut self) {
         let Screen::Item { item, .. } = &self.screen else {
@@ -808,6 +889,38 @@ impl App {
         if let Some(notice) = self.screen.notice_mut() {
             *notice = Some(new);
         }
+    }
+}
+
+/// Lists episode `item` on `podcast` (if it is one of its episodes) as the podcast's filter
+/// picks it by the Item's Progress: in its place where it was listed, at its place by date if
+/// it newly passes, or left out. Among episodes with the same publish date (or none) a newly
+/// listed one goes last, where the Bridge keeps the Library Server's order; cosmetic, and
+/// listing the episodes afresh restores the Bridge's order.
+fn relist_episode(podcast: &mut Podcast, item: &Item) {
+    let Some(episode) = Episode::of(item) else {
+        return;
+    };
+    if podcast.id != item.id.library_item {
+        return;
+    }
+    let passes = podcast.filter.passes(episode.progress.as_ref());
+    let listed = podcast
+        .episodes
+        .iter()
+        .position(|listed| listed.id == episode.id);
+    match (listed, passes) {
+        (Some(at), true) => podcast.episodes[at] = episode,
+        (Some(at), false) => {
+            podcast.episodes.remove(at);
+        }
+        (None, true) => {
+            let at = podcast
+                .episodes
+                .partition_point(|listed| listed.order() <= episode.order());
+            podcast.episodes.insert(at, episode);
+        }
+        (None, false) => {}
     }
 }
 

@@ -18,7 +18,7 @@ use test_support::bridge::{
 
 /// A Bridge with the shared Audiobookshelf as its one Library Server, and a new user logged in
 /// on it.
-async fn logged_in() -> (TestBridge, Arc<Audiobookshelf>, AbsUser, Session) {
+pub(crate) async fn logged_in() -> (TestBridge, Arc<Audiobookshelf>, AbsUser, Session) {
     let abs = Audiobookshelf::shared();
     let bridge = TestBridge::start(&named_library_server_toml(abs.base_url(), "Home"));
     let user = abs.new_user().await;
@@ -27,7 +27,7 @@ async fn logged_in() -> (TestBridge, Arc<Audiobookshelf>, AbsUser, Session) {
 }
 
 /// The titles of `podcast`'s episodes `filter` picks for `session`, as listed.
-async fn episode_titles(
+pub(crate) async fn episode_titles(
     api: &AppApi,
     session: &Session,
     podcast: &str,

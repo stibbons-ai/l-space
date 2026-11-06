@@ -150,6 +150,8 @@ texts! {
     ItemPublished => "item-published",
     ItemProgress => "item-progress",
     ItemChapters => "item-chapters",
+    ItemMarkFinished => "item-mark-finished",
+    ItemMarkUnfinished => "item-mark-unfinished",
     ProgressFinished => "progress-finished",
     ProgressNotStarted => "progress-not-started",
     ProgressStarted => "progress-started",
