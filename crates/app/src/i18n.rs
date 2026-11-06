@@ -394,9 +394,14 @@ pub fn episode_summary(language: Language, episode: &Episode) -> String {
 /// What a row on Home says under its Item's title: the author or podcast, an episode's publish
 /// date, and the person's Progress, such as "The Clacks Hour · March 31, 2026 · 10 min left".
 pub fn home_entry_summary(language: Language, entry: &HomeEntry) -> String {
-    let mut parts: Vec<String> = entry.author.iter().chain(&entry.podcast).cloned().collect();
-    parts.extend(entry.published_at.map(|at| date(language, at)));
-    parts.push(progress(language, entry.progress.as_ref(), entry.duration));
+    let by = entry.author.as_deref().or(entry.podcast.as_deref());
+    let date = entry.published_at.map(|at| date(language, at));
+    let progress = progress(language, entry.progress.as_ref(), entry.duration);
+    let parts: Vec<&str> = by
+        .into_iter()
+        .chain(date.as_deref())
+        .chain([progress.as_str()])
+        .collect();
     parts.join(" · ")
 }
 

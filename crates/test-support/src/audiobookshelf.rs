@@ -66,6 +66,9 @@ const MINIMAL_PDF: &[u8] = b"%PDF-1.4\n%%EOF\n";
 pub const EPISODE_PUBLISHED_AT: [i64; 3] =
     [1_767_225_600_000, 1_771_113_600_000, 1_774_915_200_000];
 
+/// The seeded episodes' durations in seconds, oldest first.
+pub const EPISODE_DURATIONS: [f64; 3] = [600.0, 900.0, 3960.0];
+
 /// What the shared Audiobookshelf holds, by Audiobookshelf id.
 #[derive(Debug, Clone, Default)]
 pub struct Seeded {

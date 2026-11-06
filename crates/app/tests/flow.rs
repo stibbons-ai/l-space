@@ -25,7 +25,8 @@ use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 use tempfile::TempDir;
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_PUBLISHED_AT};
 use test_support::bridge::{
-    TestBridge, home_with_sonos_toml, library_server_toml, named_library_server_toml,
+    TestBridge, home_episode, home_long_book, home_with_sonos_toml, library_server_toml,
+    named_library_server_toml,
 };
 use test_support::closed_port;
 
@@ -47,31 +48,11 @@ fn podcasts(abs: &Audiobookshelf) -> Library {
     }
 }
 
-/// The Libraries screen listing every seeded Library, with `notice`.
-fn libraries(abs: &Audiobookshelf, notice: Option<Notice>) -> Screen {
+/// The Libraries screen listing every seeded Library.
+fn libraries(abs: &Audiobookshelf) -> Screen {
     Screen::Libraries {
         libraries: vec![audiobooks(abs), podcasts(abs)],
-        notice,
-    }
-}
-
-/// The seeded episodes' durations, oldest first.
-const EPISODE_DURATIONS: [f64; 3] = [600.0, 900.0, 3960.0];
-
-/// Seeded episode `n` (0 is the oldest) as Home lists it, with `progress`.
-fn home_episode(abs: &Audiobookshelf, n: usize, progress: Option<Progress>) -> HomeEntry {
-    let seeded = abs.seeded();
-    HomeEntry {
-        id: ItemId {
-            library_item: seeded.podcast.clone(),
-            episode: Some(seeded.episodes[n].clone()),
-        },
-        title: format!("Episode {}", n + 1),
-        author: None,
-        podcast: Some("The Clacks Hour".into()),
-        duration: Some(EPISODE_DURATIONS[n]),
-        published_at: Some(EPISODE_PUBLISHED_AT[n]),
-        progress,
+        notice: None,
     }
 }
 
@@ -1466,7 +1447,7 @@ fn home_is_the_root_the_libraries_and_settings_lead_back_to() {
         assert!(!app.can_go_back());
 
         app.open_libraries().await;
-        assert_eq!(app.screen(), &libraries(&abs, None));
+        assert_eq!(app.screen(), &libraries(&abs));
         assert!(app.can_go_back());
         app.go_back();
         assert_eq!(app.screen(), &fresh_home(&abs, None));
@@ -1478,22 +1459,6 @@ fn home_is_the_root_the_libraries_and_settings_lead_back_to() {
         assert_eq!(app.screen(), &fresh_home(&abs, None));
         assert!(!app.can_go_back());
     });
-}
-
-/// "The Long Book" as Home lists it, with `progress`.
-fn home_long_book(abs: &Audiobookshelf, progress: Option<Progress>) -> HomeEntry {
-    HomeEntry {
-        id: ItemId {
-            library_item: abs.seeded().long_book.clone(),
-            episode: None,
-        },
-        title: "The Long Book".into(),
-        author: Some("Pratchett".into()),
-        podcast: None,
-        duration: Some(4320.0),
-        published_at: None,
-        progress,
-    }
 }
 
 /// Progress `current_time` seconds in, not Finished.
@@ -1535,17 +1500,16 @@ fn home_lists_what_the_person_is_in_the_middle_of_and_the_latest_episodes() {
         )
         .await;
         let mut app = logged_in(&device, &bridge, &abs, &user).await;
-        let home = home_listing(
-            vec![
-                home_episode(&abs, 1, started(300.0)),
-                home_long_book(&abs, started(3000.0)),
-            ],
-            vec![
-                home_episode(&abs, 2, None),
-                home_episode(&abs, 1, started(300.0)),
-                home_episode(&abs, 0, None),
-            ],
-        );
+        let continue_listening = vec![
+            home_episode(&abs, 1, started(300.0)),
+            home_long_book(&abs, started(3000.0)),
+        ];
+        let latest_episodes = vec![
+            home_episode(&abs, 2, None),
+            home_episode(&abs, 1, started(300.0)),
+            home_episode(&abs, 0, None),
+        ];
+        let home = home_listing(continue_listening.clone(), latest_episodes.clone());
         assert_eq!(app.screen(), &home);
 
         // What each row says under its title, in both languages: both lists, in order.
@@ -1580,14 +1544,7 @@ fn home_lists_what_the_person_is_in_the_middle_of_and_the_latest_episodes() {
         );
 
         // Each row opens its Item's screen; Back returns to Home as it was.
-        let Screen::Home { home: listed, .. } = home.clone() else {
-            unreachable!()
-        };
-        for entry in listed
-            .continue_listening
-            .iter()
-            .chain(&listed.latest_episodes)
-        {
+        for entry in continue_listening.iter().chain(&latest_episodes) {
             app.open_item(entry.id.clone()).await;
             let item = shown_item(&app);
             assert_eq!((&item.id, &item.title), (&entry.id, &entry.title));
@@ -2119,7 +2076,7 @@ fn home_or_libraries_that_cannot_be_read_are_explained_and_read_on_retry() {
         assert!(!app.can_go_back());
         *failing.lock().unwrap() = None;
         app.open_libraries().await;
-        assert_eq!(app.screen(), &libraries(&abs, None));
+        assert_eq!(app.screen(), &libraries(&abs));
     });
 }
 

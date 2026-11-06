@@ -538,9 +538,6 @@ impl App {
             Ok(item) => self.screen = Screen::Item { item, notice: None },
             Err(error) => return self.reread_failed(error).await,
         }
-        if id.episode.is_none() {
-            return self.reread_home().await;
-        }
         for at in 0..self.back.len() {
             let Screen::Podcast { podcast, .. } = &self.back[at] else {
                 continue;

@@ -21,6 +21,10 @@ use crate::browse::{self, NoSingleFile};
 use crate::config::{LibraryServerConfig, LibraryServerUrl};
 use crate::stream::StreamToken;
 
+/// How many Items in progress the Bridge asks the Library Server for, for Home: more than Home
+/// lists, as some are left out (an ebook alone, an Item in a Library the user may not see).
+const IN_PROGRESS_ASKED: usize = 4 * HOME_ENTRIES;
+
 /// Serves the App API from the configured Library Servers, the [`Store`] and [`Sonos`]; and,
 /// for the same Handoffs, the media streams (`crate::stream`).
 #[derive(Debug)]
@@ -230,8 +234,7 @@ impl<S: Store> AppApi<S> {
     }
 
     /// Home for the session's user: the Items they are in the middle of, and the newest
-    /// episodes they haven't Finished in every podcast Library they can see. A podcast Library
-    /// gone or hidden from them since the Libraries were listed adds no episodes.
+    /// episodes they haven't Finished in every podcast Library they can see.
     async fn home(&self, token: SessionToken) -> Result<Home, ApiError> {
         let request = Request {
             operation: "list the Libraries and the Items in progress",
@@ -246,8 +249,7 @@ impl<S: Store> AppApi<S> {
             .browse(token, request, async |server, key| {
                 tokio::try_join!(
                     self.abs.libraries(server, key),
-                    self.abs
-                        .items_in_progress(server, key, browse::IN_PROGRESS_ASKED),
+                    self.abs.items_in_progress(server, key, IN_PROGRESS_ASKED),
                 )
             })
             .await?;
@@ -258,11 +260,32 @@ impl<S: Store> AppApi<S> {
             "Items in progress",
             in_progress.dropped,
         );
+        let episodes = self
+            .newest_episodes(library_server, &session, &user.id, &libraries.entries)
+            .await?;
+        Ok(Home {
+            continue_listening: browse::continue_listening(
+                &user,
+                &libraries.entries,
+                in_progress.entries,
+            ),
+            latest_episodes: browse::latest_episodes(&user, episodes),
+        })
+    }
 
+    /// The newest episodes the session's user (`user_id`) hasn't Finished in each podcast
+    /// Library of `libraries`, at most [`HOME_ENTRIES`] of each. A podcast Library gone or
+    /// hidden from the user since `libraries` were listed adds none.
+    async fn newest_episodes(
+        &self,
+        library_server: &str,
+        session: &store::Session,
+        user_id: &str,
+        libraries: &[abs::Library],
+    ) -> Result<Vec<abs::RecentEpisode>, ApiError> {
         let api_key = &session.api_key;
         let newest = futures::future::join_all(
             libraries
-                .entries
                 .iter()
                 .filter(|library| library.media_type == abs::MediaType::Podcast)
                 .map(|library| async move {
@@ -280,7 +303,7 @@ impl<S: Store> AppApi<S> {
                 Ok(newest) => {
                     warn_dropped(
                         library_server,
-                        Some(&user.id),
+                        Some(user_id),
                         "newest episodes",
                         newest.dropped,
                     );
@@ -297,18 +320,11 @@ impl<S: Store> AppApi<S> {
                         operation: "list a podcast Library's newest episodes",
                         id: Some(&library.id),
                     };
-                    return Err(self.failure(library_server, &session, request, error).await);
+                    return Err(self.failure(library_server, session, request, error).await);
                 }
             }
         }
-        Ok(Home {
-            continue_listening: browse::continue_listening(
-                &user,
-                &libraries.entries,
-                in_progress.entries,
-            ),
-            latest_episodes: browse::latest_episodes(&user, episodes),
-        })
+        Ok(episodes)
     }
 
     async fn item(&self, token: SessionToken, id: ItemId) -> Result<Item, ApiError> {

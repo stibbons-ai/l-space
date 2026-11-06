@@ -45,14 +45,14 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use api::{
-    ApiError, CurrentUser, EpisodeFilter, Group, Handoff, Home, Item, ItemId, Library,
-    LibraryEntry, Podcast, Session,
+    ApiError, CurrentUser, EpisodeFilter, Group, Handoff, Home, HomeEntry, Item, ItemId, Library,
+    LibraryEntry, Podcast, Progress, Session,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use crate::audiobookshelf::{AbsUser, Audiobookshelf};
+use crate::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_DURATIONS, EPISODE_PUBLISHED_AT};
 
 /// Generous: the Bridge is up within milliseconds, but CI machines can be slow.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -356,6 +356,39 @@ pub fn acting_on(library_server: &str, user: &AbsUser) -> CurrentUser {
         library_server: library_server.to_owned(),
         user_id: user.id.clone(),
         username: user.username.clone(),
+    }
+}
+
+/// The seeded "The Long Book" as Home lists it, with `progress`.
+pub fn home_long_book(abs: &Audiobookshelf, progress: Option<Progress>) -> HomeEntry {
+    HomeEntry {
+        id: ItemId {
+            library_item: abs.seeded().long_book.clone(),
+            episode: None,
+        },
+        title: "The Long Book".into(),
+        author: Some("Pratchett".into()),
+        podcast: None,
+        duration: Some(4320.0),
+        published_at: None,
+        progress,
+    }
+}
+
+/// The seeded episode `n` (0 is the oldest) as Home lists it, with `progress`.
+pub fn home_episode(abs: &Audiobookshelf, n: usize, progress: Option<Progress>) -> HomeEntry {
+    let seeded = abs.seeded();
+    HomeEntry {
+        id: ItemId {
+            library_item: seeded.podcast.clone(),
+            episode: Some(seeded.episodes[n].clone()),
+        },
+        title: format!("Episode {}", n + 1),
+        author: None,
+        podcast: Some("The Clacks Hour".into()),
+        duration: Some(EPISODE_DURATIONS[n]),
+        published_at: Some(EPISODE_PUBLISHED_AT[n]),
+        progress,
     }
 }
 

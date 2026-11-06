@@ -937,6 +937,15 @@ mod tests {
                 ),
                 "{id:?}"
             );
+            assert!(
+                matches!(
+                    client
+                        .recent_episodes("http://127.0.0.1:9", &key, id, 20)
+                        .await,
+                    Err(Error::NotFound(NotFound::InvalidId))
+                ),
+                "{id:?}"
+            );
         }
     }
 
@@ -1413,22 +1422,5 @@ mod tests {
                 .unwrap_err();
             assert_eq!(format!("{error:?}"), recent, "{status}");
         }
-    }
-
-    #[tokio::test]
-    async fn recent_episodes_of_a_library_id_that_is_not_an_audiobookshelf_id_send_nothing() {
-        let (base_url, requests) = recording(StatusCode::OK).await;
-        for id in ["", "../me", "lib?limit=1"] {
-            assert!(
-                matches!(
-                    Client::new()
-                        .recent_episodes(&base_url, &ApiKey::new("key"), id, 20)
-                        .await,
-                    Err(Error::NotFound(NotFound::InvalidId))
-                ),
-                "{id:?}"
-            );
-        }
-        assert!(requests.lock().unwrap().is_empty());
     }
 }

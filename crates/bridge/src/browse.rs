@@ -8,10 +8,6 @@ use api::{
     LibraryEntry, LibraryKind, Podcast, Progress,
 };
 
-/// How many Items in progress the Bridge asks the Library Server for: more than Home lists, as
-/// some are left out (an ebook alone, an Item in a Library the user may not see).
-pub const IN_PROGRESS_ASKED: usize = 4 * HOME_ENTRIES;
-
 pub fn library(library: abs::Library) -> Library {
     Library {
         id: library.id,
@@ -151,11 +147,8 @@ fn newest_unfinished(entries: impl Iterator<Item = (Option<i64>, HomeEntry)>) ->
         .filter(|(_, entry)| EpisodeFilter::Unfinished.passes(entry.progress.as_ref()))
         .collect();
     entries.sort_by_key(|(time, _)| Reverse(*time));
-    entries
-        .into_iter()
-        .take(HOME_ENTRIES)
-        .map(|(_, entry)| entry)
-        .collect()
+    entries.truncate(HOME_ENTRIES);
+    entries.into_iter().map(|(_, entry)| entry).collect()
 }
 
 /// How Home lists the audiobook or episode `entry`, with `user`'s Progress; nothing for an
@@ -163,18 +156,21 @@ fn newest_unfinished(entries: impl Iterator<Item = (Option<i64>, HomeEntry)>) ->
 fn in_progress_entry(user: &abs::User, entry: abs::InProgress) -> Option<HomeEntry> {
     let library_item = entry.library_item.id;
     match (entry.library_item.media, entry.recent_episode) {
-        (abs::Media::Book(book), None) if is_audiobook(&book) => Some(HomeEntry {
-            progress: progress_in(user, &library_item, None),
-            title: book.metadata.title,
-            author: non_empty(book.metadata.author_name),
-            podcast: None,
-            duration: book_duration(&book.tracks, book.duration),
-            published_at: None,
-            id: ItemId {
+        (abs::Media::Book(book), None) if is_audiobook(&book) => {
+            let id = ItemId {
                 library_item,
                 episode: None,
-            },
-        }),
+            };
+            Some(HomeEntry {
+                progress: item_progress(user, &id),
+                id,
+                title: book.metadata.title,
+                author: non_empty(book.metadata.author_name),
+                podcast: None,
+                duration: book_duration(&book.tracks, book.duration),
+                published_at: None,
+            })
+        }
         (abs::Media::Podcast(podcast), Some(episode)) => {
             Some(episode_entry(user, library_item, podcast.metadata, episode))
         }
@@ -190,17 +186,19 @@ fn episode_entry(
     podcast: abs::PodcastMetadata,
     episode: abs::Episode,
 ) -> HomeEntry {
+    let duration = episode_duration(&episode);
+    let id = ItemId {
+        library_item,
+        episode: Some(episode.id),
+    };
     HomeEntry {
-        progress: progress_in(user, &library_item, Some(&episode.id)),
-        duration: episode_duration(&episode),
+        progress: item_progress(user, &id),
+        id,
         title: episode.title,
         author: None,
         podcast: Some(podcast.title),
+        duration,
         published_at: episode.published_at,
-        id: ItemId {
-            library_item,
-            episode: Some(episode.id),
-        },
     }
 }
 
@@ -464,8 +462,8 @@ mod tests {
         );
     }
 
-    fn decoded(item: serde_json::Value) -> abs::LibraryItem {
-        serde_json::from_value(item).unwrap()
+    fn decoded<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+        serde_json::from_value(value).unwrap()
     }
 
     fn audiobook_id() -> api::ItemId {
@@ -639,15 +637,14 @@ mod tests {
                                   "audioFile": {"ino": "1", "duration": 900}},
                 "progressLastUpdate": last})
         };
-        let in_progress: Vec<abs::InProgress> = serde_json::from_value(serde_json::json!([
+        let in_progress: Vec<abs::InProgress> = decoded(serde_json::json!([
             book("li-a", "lib-1", 1, Some(10)),
             episode("ep-1", 30),
             episode("ep-2", 40),
             book("li-ebook", "lib-1", 0, Some(50)),
             book("li-hidden", "lib-hidden", 1, Some(60)),
             book("li-undated", "lib-1", 1, None),
-        ]))
-        .unwrap();
+        ]));
         let user = user(vec![
             progress_entry("li-a", None, 100.0, false),
             progress_entry("li-p", Some("ep-1"), 50.0, false),
@@ -694,14 +691,13 @@ mod tests {
                 "publishedAt": published_at, "addedAt": added_at,
                 "podcast": {"metadata": {"title": "Podcast"}}})
         };
-        let episodes: Vec<abs::RecentEpisode> = serde_json::from_value(serde_json::json!([
+        let episodes: Vec<abs::RecentEpisode> = decoded(serde_json::json!([
             recent("old", Some(1), Some(9)),
             recent("undated", None, Some(2)),
             recent("new", Some(3), Some(9)),
             recent("finished", Some(4), Some(9)),
             recent("no-date", None, None),
-        ]))
-        .unwrap();
+        ]));
         let user = user(vec![
             progress_entry("li-p", Some("finished"), 0.0, true),
             progress_entry("li-p", Some("old"), 60.0, false),
@@ -731,7 +727,7 @@ mod tests {
 
     #[test]
     fn each_home_list_has_at_most_twenty_entries_the_newest() {
-        let episodes: Vec<abs::RecentEpisode> = serde_json::from_value(
+        let episodes: Vec<abs::RecentEpisode> = decoded(
             (0..25)
                 .map(|n| {
                     serde_json::json!({"libraryItemId": "li-p", "id": format!("ep-{n}"),
@@ -739,8 +735,7 @@ mod tests {
                         "podcast": {"metadata": {"title": "Podcast"}}})
                 })
                 .collect(),
-        )
-        .unwrap();
+        );
         let listed = latest_episodes(&user(Vec::new()), episodes);
         assert_eq!(listed.len(), api::HOME_ENTRIES);
         assert_eq!(listed[0].id.episode.as_deref(), Some("ep-24"));

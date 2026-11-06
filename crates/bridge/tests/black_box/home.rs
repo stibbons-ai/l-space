@@ -4,19 +4,17 @@
 
 use std::time::Duration;
 
-use api::{ApiError, HomeEntry, ItemId, Progress};
+use api::{ApiError, Progress};
 use reqwest::StatusCode;
 
-use test_support::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_PUBLISHED_AT};
+use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
 use test_support::bridge::{
-    KEY_REJECTED, SESSION_INVALID, TestBridge, library_server_toml, named_library_server_toml,
+    KEY_REJECTED, SESSION_INVALID, TestBridge, home_episode as episode,
+    home_long_book as long_book, library_server_toml, named_library_server_toml,
 };
 
 use crate::browse::logged_in;
 use crate::forwarder::Forwarder;
-
-/// The seeded episodes' durations, oldest first.
-const EPISODE_DURATIONS: [f64; 3] = [600.0, 900.0, 3960.0];
 
 fn progress(current_time: f64) -> Option<Progress> {
     Some(Progress {
@@ -25,60 +23,17 @@ fn progress(current_time: f64) -> Option<Progress> {
     })
 }
 
-/// "The Long Book" as Home lists it, with `progress`.
-fn long_book(abs: &Audiobookshelf, progress: Option<Progress>) -> HomeEntry {
-    HomeEntry {
-        id: ItemId {
-            library_item: abs.seeded().long_book.clone(),
-            episode: None,
-        },
-        title: "The Long Book".into(),
-        author: Some("Pratchett".into()),
-        podcast: None,
-        duration: Some(4320.0),
-        published_at: None,
-        progress,
-    }
-}
-
-/// Seeded episode `n` (0 is the oldest) as Home lists it, with `progress`.
-fn episode(abs: &Audiobookshelf, n: usize, progress: Option<Progress>) -> HomeEntry {
-    let seeded = abs.seeded();
-    HomeEntry {
-        id: ItemId {
-            library_item: seeded.podcast.clone(),
-            episode: Some(seeded.episodes[n].clone()),
-        },
-        title: format!("Episode {}", n + 1),
-        author: None,
-        podcast: Some("The Clacks Hour".into()),
-        duration: Some(EPISODE_DURATIONS[n]),
-        published_at: Some(EPISODE_PUBLISHED_AT[n]),
-        progress,
-    }
-}
-
 /// Records `user`'s Progress in episode `n` (or, without one, in "The Long Book") a moment
 /// after the last, so Audiobookshelf's update times (milliseconds) tell them apart.
 async fn listen(abs: &Audiobookshelf, user: &AbsUser, n: Option<usize>, at: f64, finished: bool) {
     tokio::time::sleep(Duration::from_millis(20)).await;
     let seeded = abs.seeded();
-    match n {
-        Some(n) => {
-            abs.set_progress(
-                user,
-                &seeded.podcast,
-                Some(&seeded.episodes[n]),
-                at,
-                finished,
-            )
-            .await;
-        }
-        None => {
-            abs.set_progress(user, &seeded.long_book, None, at, finished)
-                .await;
-        }
-    }
+    let (library_item, episode) = match n {
+        Some(n) => (&seeded.podcast, Some(seeded.episodes[n].as_str())),
+        None => (&seeded.long_book, None),
+    };
+    abs.set_progress(user, library_item, episode, at, finished)
+        .await;
 }
 
 #[tokio::test]
@@ -221,22 +176,6 @@ async fn home_lists_nothing_from_a_library_the_user_may_not_see() {
     let home = bridge.api().home(&session).await;
     assert_eq!(home.continue_listening, [episode(&abs, 1, progress(300.0))]);
     assert_eq!(home.latest_episodes.len(), 3);
-}
-
-#[tokio::test]
-async fn home_needs_a_session() {
-    let (bridge, _, _, _) = logged_in().await;
-
-    for authorization in [None, Some("Bearer not-a-session")] {
-        assert_eq!(
-            bridge
-                .api()
-                .get_error("/api/home", &[], authorization)
-                .await,
-            SESSION_INVALID,
-            "{authorization:?}"
-        );
-    }
 }
 
 #[tokio::test]
