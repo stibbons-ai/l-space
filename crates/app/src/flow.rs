@@ -294,9 +294,9 @@ impl App {
         if matches!(answer, Err(ApiError::NotABridge))
             && let Some(redirected) = self.redirected_bridge_url(&url).await
         {
-            point_at(&redirected);
-            answer = self.probe(api::library_servers()).await;
             url = redirected;
+            point_at(&url);
+            answer = self.probe(api::library_servers()).await;
         }
         match answer {
             Ok(library_servers) => {
@@ -325,7 +325,8 @@ impl App {
         let asked = url::Url::parse(&format!("{url}{LIBRARY_SERVERS_PATH}")).ok()?;
         let target = tokio::time::timeout(self.call_timeout, client::redirect_target(asked))
             .await
-            .ok()??;
+            .ok()
+            .flatten()?;
         bridge_url_at(&target)
     }
 

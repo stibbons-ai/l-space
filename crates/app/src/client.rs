@@ -10,12 +10,9 @@
 use std::sync::{Arc, LazyLock, Once};
 
 use dioxus::fullstack::GLOBAL_REQUEST_CLIENT;
-use reqwest_fullstack::Client;
-use reqwest_fullstack::redirect::Policy;
+use dioxus::fullstack::reqwest::Client;
+use dioxus::fullstack::reqwest::redirect::Policy;
 use url::Url;
-
-/// How many redirects [`redirect_target`] follows, as reqwest does by default.
-const MAX_REDIRECTS: usize = 10;
 
 /// Sends every server function call through a client that follows no redirect. Must run before
 /// the first call: fullstack otherwise installs its own client for the rest of the process.
@@ -30,18 +27,19 @@ pub(crate) fn install() {
     });
 }
 
-/// Where a `GET` of `url` ends up after following its redirects, if it is redirected and the
-/// last hop answers. `None` for no redirect, too many, or a hop that fails. Sends none of the
-/// server function calls' headers, so no session token.
+/// Where a `GET` of `url` ends up after following its redirects (at most 10, reqwest's
+/// default), if it is redirected and the last hop answers. `None` for no redirect, too many, or
+/// a hop that fails. Sends none of the server function calls' headers, so no session token.
 pub(crate) async fn redirect_target(url: Url) -> Option<Url> {
-    static FOLLOWING: LazyLock<Client> = LazyLock::new(|| client(Policy::limited(MAX_REDIRECTS)));
+    static FOLLOWING: LazyLock<Client> = LazyLock::new(|| client(Policy::default()));
     let response = FOLLOWING
         .get(url.clone())
         .send()
         .await
         .inspect_err(|error| tracing::debug!(%error, "following the address's redirects failed"))
         .ok()?;
-    (response.url() != &url).then(|| response.url().clone())
+    let target = response.url();
+    (target != &url).then(|| target.clone())
 }
 
 /// A client set up like fullstack's (`ClientRequest::new_reqwest_client`), redirects as `policy`

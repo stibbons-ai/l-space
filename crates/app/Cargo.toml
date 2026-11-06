@@ -14,7 +14,6 @@ api.workspace = true
 dioxus = { workspace = true, features = ["mobile", "launch", "lib", "logger"] }
 dirs.workspace = true
 fluent-bundle.workspace = true
-reqwest-fullstack.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
