@@ -5,10 +5,10 @@
 //! a real Bridge.
 //!
 //! Server functions reach the Bridge at a process-wide base URL and send a process-wide
-//! `Authorization` header (Dioxus fullstack's client, installed by the App so that it follows no
-//! redirect: a call reaches the stored address only); [`App`] sets both, the header to the
-//! selected session's token (except while ending another session, see `App::end_session`), so
-//! one process runs one [`App`] at a time.
+//! `Authorization` header (through the App's client, installed in Dioxus fullstack's slot,
+//! which follows no redirect: a call reaches the stored address only); [`App`] sets both, the
+//! header to the selected session's token (except while ending another session, see
+//! `App::end_session`), so one process runs one [`App`] at a time.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -273,9 +273,10 @@ impl App {
     }
 
     /// Connects to the Bridge at `input` and remembers it if it answers with its Library
-    /// Servers. An address that redirects to a Bridge is remembered as the Bridge's address,
-    /// so later calls (which follow no redirect) go there directly. Only while no session is
-    /// stored: a session belongs to its Bridge.
+    /// Servers. An address that redirects to a Bridge, keeping the path it was asked for, is
+    /// remembered as the Bridge's address, so later calls (which follow no redirect) go there
+    /// directly; one that redirects elsewhere (say to a bare `https://host/`) is rejected. Only
+    /// while no session is stored: a session belongs to its Bridge.
     pub async fn submit_bridge_url(&mut self, input: &str) {
         if !self.can_change_bridge_url() {
             return;
@@ -291,12 +292,16 @@ impl App {
         // Unlike other calls, the person can fix an address that isn't a Bridge right here.
         let mut answer = self.probe(api::library_servers()).await;
         // A redirect answers as something other than a Bridge.
-        if matches!(answer, Err(ApiError::NotABridge))
-            && let Some(redirected) = self.redirected_bridge_url(&url).await
-        {
-            url = redirected;
-            point_at(&url);
-            answer = self.probe(api::library_servers()).await;
+        if matches!(answer, Err(ApiError::NotABridge)) {
+            match self.redirected_bridge_url(&url).await {
+                Ok(Some(redirected)) => {
+                    url = redirected;
+                    point_at(&url);
+                    answer = self.probe(api::library_servers()).await;
+                }
+                Ok(None) => {}
+                Err(client::Unreachable) => answer = Err(ApiError::BridgeUnreachable),
+            }
         }
         match answer {
             Ok(library_servers) => {
@@ -320,14 +325,22 @@ impl App {
     }
 
     /// The Bridge address the address `url` redirects to, if it does: where asking `url` for
-    /// its Library Servers lands, without their path. Bounded by the call timeout.
-    async fn redirected_bridge_url(&self, url: &str) -> Option<String> {
-        let asked = url::Url::parse(&format!("{url}{LIBRARY_SERVERS_PATH}")).ok()?;
+    /// its Library Servers lands, without their path. Bounded by the call timeout; a redirect
+    /// target that can't be reached in time is [`client::Unreachable`].
+    async fn redirected_bridge_url(
+        &self,
+        url: &str,
+    ) -> Result<Option<String>, client::Unreachable> {
+        let Ok(asked) = url::Url::parse(&format!("{url}{LIBRARY_SERVERS_PATH}")) else {
+            return Ok(None);
+        };
         let target = tokio::time::timeout(self.call_timeout, client::redirect_target(asked))
             .await
-            .ok()
-            .flatten()?;
-        bridge_url_at(&target)
+            .map_err(|_| {
+                tracing::debug!("following the address's redirects timed out");
+                client::Unreachable
+            })??;
+        Ok(target.as_ref().and_then(bridge_url_at))
     }
 
     /// Back to the Bridge address, to enter another one. Only while no session is stored.

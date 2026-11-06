@@ -621,7 +621,7 @@ fn redirect(status: &str, target: &str, request: &[u8]) -> &'static [u8] {
 /// request lines it got.
 fn redirecting_to(status: &'static str, target: &str) -> (String, ProxyLog) {
     let target = target.to_owned();
-    // Answers every request itself, so nothing is passed on to the (unused) target.
+    // Answers every request itself, so nothing is passed on to the upstream.
     proxy_answering("", move |_, request| {
         Some(redirect(status, &target, request))
     })
@@ -659,7 +659,8 @@ fn an_address_that_redirects_to_a_bridge_is_remembered_as_the_bridges() {
             assert_on_home(&relaunched);
             assert_eq!(session(&relaunched), before, "{status}");
             assert_eq!(relaunched.bridge_url(), Some(bridge.url()), "{status}");
-            // The entered address saw asking for the Library Servers only: no login, no token.
+            // The entered address saw asking for the Library Servers only (the probe, then the
+            // `GET` that follows its redirect): no login, no token.
             assert_eq!(
                 log.lock().unwrap().as_slice(),
                 ["GET /api/library-servers HTTP/1.1"; 2],
@@ -674,13 +675,12 @@ fn an_address_that_redirects_elsewhere_is_named_as_no_bridge_and_not_remembered(
     let abs = Audiobookshelf::shared();
     let html = html_page_server();
     let not_found = web_server("404 Not Found", "text/plain", "Not Found");
-    let unreachable = format!("http://{}", closed_port());
     let device = Device::with_locale("de-DE");
     run(async || {
         let mut app = device.launch().await;
         for status in REDIRECTS {
             // Empty: back to the same address, a loop.
-            for target in [abs.base_url(), &html, &not_found, &unreachable, ""] {
+            for target in [abs.base_url(), &html, &not_found, ""] {
                 let (entered, _) = redirecting_to(status, target);
                 app.submit_bridge_url(&entered).await;
                 assert_eq!(
@@ -706,6 +706,36 @@ fn an_address_that_redirects_elsewhere_is_named_as_no_bridge_and_not_remembered(
             Some(&Notice::Api(ApiError::NotABridge))
         );
         assert_eq!(device.launch().await.bridge_url(), None);
+    });
+}
+
+#[test]
+fn an_address_that_redirects_where_nothing_answers_is_named_as_unreachable_and_not_remembered() {
+    let closed = format!("http://{}", closed_port());
+    let silent = format!("http://{}", silent_server());
+    let device = Device::with_locale("de-DE");
+    let limit = SHORT_CALL_TIMEOUT * 10;
+    run(async || {
+        // Short call timeout: the silent target holds the redirect's `GET` until it applies.
+        let mut app = device.launch_impatient().await;
+        for status in REDIRECTS {
+            for target in [&closed, &silent] {
+                let (entered, _) = redirecting_to(status, target);
+                within(limit, app.submit_bridge_url(&entered)).await;
+                assert_eq!(
+                    app.screen(),
+                    &Screen::BridgeUrl {
+                        notice: Some(Notice::BridgeUrlUnreachable)
+                    },
+                    "{status} to {target:?}"
+                );
+                assert_eq!(
+                    notice_texts(&mut app),
+                    both(Text::ErrorBridgeUrlUnreachable)
+                );
+                assert_eq!(device.launch().await.bridge_url(), None, "{status}");
+            }
+        }
     });
 }
 

@@ -392,10 +392,10 @@ pub enum ApiError {
     /// of a server function; the Bridge never sends it.
     #[error("bridge_unreachable")]
     BridgeUnreachable,
-    /// Something answered at the Bridge's address, but not as a Bridge: an HTTP error or a
-    /// redirect (the App follows none) without an App API error code (other than 502, 503 and
-    /// 504, which count as [`ApiError::BridgeUnreachable`]), or a body the App cannot decode.
-    /// Produced only on the App's side; the Bridge never sends it.
+    /// Something answered at the Bridge's address, but not as a Bridge: an HTTP error without an
+    /// App API error code (502, 503 and 504 count as [`ApiError::BridgeUnreachable`] instead), a
+    /// redirect (server function calls follow none), or a body the App cannot decode. Produced
+    /// only on the App's side; the Bridge never sends it.
     #[error("not_a_bridge")]
     NotABridge,
     /// The Bridge failed in a way the user cannot fix.
