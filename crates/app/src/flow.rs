@@ -197,7 +197,7 @@ pub struct App {
     /// Sessions `log_in` replaced, each with the Bridge address that issued it, kept while the
     /// file may still hold them: a failed save leaves them there, usable. Ended on that Bridge
     /// after the next successful save (read-only: after the next save attempt); dropped unsent
-    /// if the Bridge address has changed by then. Never saved.
+    /// if the stored Bridge address differs at that save. Never saved.
     replaced: Vec<(String, SessionToken)>,
     call_timeout: Duration,
 }
@@ -366,9 +366,9 @@ impl App {
     /// Logs in to the Library Server with base URL `library_server`, adding its session and
     /// selecting it; the other sessions stay. A session already on that Library Server is
     /// replaced, and ended on the Bridge as far as it can once the device no longer holds it:
-    /// after this save or, if that fails, the next one that succeeds (read-only: at once). If
-    /// the Bridge address changes first, it is dropped unsent. The key is sent to the Bridge
-    /// and not kept.
+    /// after this save or, if that fails, the next one that succeeds (read-only: at once). It
+    /// only ever reaches the Bridge that issued it: dropped unsent if the stored address
+    /// differs when that save comes. The key is sent to the Bridge and not kept.
     pub async fn log_in(&mut self, library_server: &str, api_key: ApiKey) {
         if !matches!(self.screen, Screen::Login { .. }) {
             return;
@@ -941,8 +941,9 @@ impl App {
     }
 
     /// Saves what the App remembers, then ends the sessions `log_in` replaced, which the device
-    /// no longer holds, on the Bridge that issued them. Returns a notice if saving failed; the
-    /// replaced sessions stay then, unless the App is read-only.
+    /// no longer holds, on the Bridge that issued them; those of another Bridge are dropped
+    /// unsent. Returns a notice if saving failed; the replaced sessions stay then, unless the
+    /// App is read-only.
     async fn save(&mut self) -> Option<Notice> {
         let notice = if self.read_only {
             // Not kept after a restart: the person needs to know with every change.
@@ -957,6 +958,7 @@ impl App {
         };
         for (bridge_url, token) in std::mem::take(&mut self.replaced) {
             // A session belongs to the Bridge that issued it: never send it to another.
+            // `stored.bridge_url` is where calls go (`point_at`).
             if self.stored.bridge_url.as_ref() == Some(&bridge_url) {
                 self.end_session(&token).await;
             } else {

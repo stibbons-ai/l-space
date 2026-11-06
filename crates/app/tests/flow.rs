@@ -2258,6 +2258,45 @@ fn a_replaced_session_not_yet_ended_never_reaches_another_bridge() {
 }
 
 #[test]
+fn a_replaced_session_kept_past_a_bridge_change_not_saved_never_reaches_the_new_bridge() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let other_bridge = TestBridge::start(&named_library_server_toml(abs.base_url(), "Home"));
+    let other_address = other_bridge
+        .url()
+        .strip_prefix("http://")
+        .expect("an http:// Bridge URL");
+    let (other_url, other_log) = proxy(other_address, |_, _| false);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        let replaced = session(&app);
+
+        // Nothing is saved, the new Bridge address included: the replaced session is kept.
+        device.fail_saves.store(true, Ordering::SeqCst);
+        log_in_elsewhere(&mut app, abs.base_url(), &user).await;
+        app.log_out().await;
+        app.change_bridge_url();
+        app.submit_bridge_url(&other_url).await;
+        assert!(matches!(
+            app.screen(),
+            Screen::Login {
+                notice: Some(Notice::StorageSave),
+                ..
+            }
+        ));
+        assert_eq!(app.bridge_url(), Some(other_url.as_str()));
+
+        // The next save that succeeds comes from another action, at the new address.
+        device.fail_saves.store(false, Ordering::SeqCst);
+        app.set_language(LanguageChoice::German).await;
+        assert_eq!(app.screen().notice(), None);
+        assert_eq!(requests(&other_log, "POST /api/logout"), 0);
+        assert_eq!(bridge.api().current_user(&replaced).await, replaced.user);
+    });
+}
+
+#[test]
 fn a_replaced_session_not_yet_ended_ends_when_the_same_bridge_address_is_entered() {
     let (bridge, abs, _) = bridge_with_abs();
     let device = Device::new();
