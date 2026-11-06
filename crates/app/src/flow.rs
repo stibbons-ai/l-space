@@ -194,10 +194,11 @@ pub struct App {
     load_notice: Option<Notice>,
     /// Set when what was saved could neither be read nor moved aside: saving would destroy it.
     read_only: bool,
-    /// Tokens of sessions `log_in` replaced while the device still held them: a failed save
-    /// leaves them in the file, which must stay usable. Ended on the Bridge after the next
-    /// successful save, which no longer holds them (read-only, after any); never saved.
-    replaced: Vec<SessionToken>,
+    /// Sessions `log_in` replaced, each with the Bridge address that issued it, kept while the
+    /// file may still hold them: a failed save leaves them there, usable. Ended on that Bridge
+    /// after the next successful save (read-only: after the next save attempt); dropped unsent
+    /// if the Bridge address has changed by then. Never saved.
+    replaced: Vec<(String, SessionToken)>,
     call_timeout: Duration,
 }
 
@@ -310,12 +311,6 @@ impl App {
         }
         match answer {
             Ok(library_servers) => {
-                // A session belongs to the Bridge that issued it: one replaced but not yet
-                // ended can't be ended at another.
-                if self.stored.bridge_url.as_ref() != Some(&url) && !self.replaced.is_empty() {
-                    tracing::debug!("another Bridge: dropping the replaced sessions not yet ended");
-                    self.replaced.clear();
-                }
                 self.stored.bridge_url = Some(url);
                 self.screen = Screen::Login {
                     library_servers,
@@ -371,8 +366,9 @@ impl App {
     /// Logs in to the Library Server with base URL `library_server`, adding its session and
     /// selecting it; the other sessions stay. A session already on that Library Server is
     /// replaced, and ended on the Bridge as far as it can once the device no longer holds it:
-    /// after this save or, if that fails, the next one that succeeds. The key is sent to the
-    /// Bridge and not kept.
+    /// after this save or, if that fails, the next one that succeeds (read-only: at once). If
+    /// the Bridge address changes first, it is dropped unsent. The key is sent to the Bridge
+    /// and not kept.
     pub async fn log_in(&mut self, library_server: &str, api_key: ApiKey) {
         if !matches!(self.screen, Screen::Login { .. }) {
             return;
@@ -403,9 +399,11 @@ impl App {
                     user,
                 });
                 authorize_selected(&self.stored);
-                if let Some(replaced) = replaced {
+                if let Some(replaced) = replaced
+                    && let Some(bridge_url) = &self.stored.bridge_url
+                {
                     // `save` ends it once the device no longer holds it.
-                    self.replaced.push(replaced.token);
+                    self.replaced.push((bridge_url.clone(), replaced.token));
                 }
                 let notice = self.save().await;
                 self.show_home(notice).await;
@@ -744,7 +742,8 @@ impl App {
         }
     }
 
-    /// Switches the language now and remembers the choice.
+    /// Switches the language now and remembers the choice. Saving may first end sessions
+    /// `log_in` replaced earlier on the Bridge.
     pub async fn set_language(&mut self, choice: LanguageChoice) {
         self.stored.language = choice;
         match self.save().await {
@@ -922,12 +921,12 @@ impl App {
         self.save().await
     }
 
-    /// Ends the session with `token` on the Bridge, as far as it can; callers forget it on the
-    /// device either way. Later calls send the selected session's token again.
+    /// Ends the session with `token` on the Bridge, as far as it can; callers forget it either
+    /// way. Later calls send the selected session's token again.
     async fn end_session(&self, token: &SessionToken) {
         // The process-wide header carries `token` until the restore below. No guard restores
-        // it if this future is dropped midway: safe while `act` runs every action to its end
-        // on the root component, which lives as long as the App.
+        // it if this future is dropped midway: safe while `act` runs every action to its end,
+        // as the screen that started it stays until `act` sets the result.
         authorize(Some(token));
         match self.call(api::logout()).await {
             Ok(()) => {}
@@ -942,8 +941,8 @@ impl App {
     }
 
     /// Saves what the App remembers, then ends the sessions `log_in` replaced, which the device
-    /// no longer holds. Returns a notice if saving failed; the replaced sessions stay then,
-    /// unless the App is read-only.
+    /// no longer holds, on the Bridge that issued them. Returns a notice if saving failed; the
+    /// replaced sessions stay then, unless the App is read-only.
     async fn save(&mut self) -> Option<Notice> {
         let notice = if self.read_only {
             // Not kept after a restart: the person needs to know with every change.
@@ -956,8 +955,13 @@ impl App {
         } else {
             None
         };
-        for token in std::mem::take(&mut self.replaced) {
-            self.end_session(&token).await;
+        for (bridge_url, token) in std::mem::take(&mut self.replaced) {
+            // A session belongs to the Bridge that issued it: never send it to another.
+            if self.stored.bridge_url.as_ref() == Some(&bridge_url) {
+                self.end_session(&token).await;
+            } else {
+                tracing::debug!("another Bridge: dropping a replaced session unsent");
+            }
         }
         notice
     }

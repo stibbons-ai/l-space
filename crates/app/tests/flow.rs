@@ -2215,6 +2215,9 @@ fn a_replacement_saved_later_ends_the_replaced_session() {
             ApiError::SessionInvalid
         );
         assert_eq!(bridge.api().current_user(&current).await, current.user);
+        // Ending it left the App calling with the current session.
+        app.open_home().await;
+        assert_eq!(app.screen(), &home_seeing(&abs, podcasts(&abs), None));
         assert_eq!(session(&device.launch().await), current);
     });
 }
@@ -2251,6 +2254,32 @@ fn a_replaced_session_not_yet_ended_never_reaches_another_bridge() {
         // open on the one that issued it.
         assert_eq!(requests(&other_log, "POST /api/logout"), 0);
         assert_eq!(bridge.api().current_user(&replaced).await, replaced.user);
+    });
+}
+
+#[test]
+fn a_replaced_session_not_yet_ended_ends_when_the_same_bridge_address_is_entered() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        let replaced = session(&app);
+        let url = app.bridge_url().expect("a Bridge address").to_owned();
+
+        device.fail_saves.store(true, Ordering::SeqCst);
+        log_in_elsewhere(&mut app, abs.base_url(), &user).await;
+        app.log_out().await;
+        assert_eq!(bridge.api().current_user(&replaced).await, replaced.user);
+
+        device.fail_saves.store(false, Ordering::SeqCst);
+        app.change_bridge_url();
+        app.submit_bridge_url(&url).await;
+        assert!(matches!(app.screen(), Screen::Login { notice: None, .. }));
+        assert_eq!(
+            bridge.api().current_user_error(&replaced).await.1,
+            ApiError::SessionInvalid
+        );
     });
 }
 
