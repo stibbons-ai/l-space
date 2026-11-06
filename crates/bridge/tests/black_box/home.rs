@@ -183,6 +183,36 @@ async fn home_of(bridge: &TestBridge, abs: &Audiobookshelf, user: &AbsUser) -> H
     bridge.api().home(&session).await
 }
 
+/// Undoes an admin's edit of the shared seeded Items when dropped, also when the test panics
+/// before (made before the edit, so a half-done edit is undone too), so the edit never
+/// outlives the test that made it.
+struct Undo<F: Future<Output = ()> + Send>(Option<F>);
+
+impl<F: Future<Output = ()> + Send> Drop for Undo<F> {
+    fn drop(&mut self) {
+        let Some(undo) = self.0.take() else {
+            return;
+        };
+        // A test's runtime can't be blocked on from its own thread: undo on another.
+        std::thread::scope(|scope| {
+            let undone = scope
+                .spawn(|| {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("undo runtime")
+                        .block_on(undo);
+                })
+                .join();
+            if let Err(panic) = undone
+                && !std::thread::panicking()
+            {
+                std::panic::resume_unwind(panic);
+            }
+        });
+    }
+}
+
 /// Audiobookshelf lists a user's Items in progress also when an admin marked them explicit
 /// and the user may not open explicit content; Home lists only those they may open. The marks
 /// hide nothing from other tests' users, who may open explicit content.
@@ -205,13 +235,16 @@ async fn home_lists_no_explicit_item_to_a_user_who_may_not_open_one() {
     );
     assert_eq!(home.latest_episodes.len(), 3);
 
+    let unmark = Undo(Some(async {
+        for library_item in [&seeded.long_book, &seeded.podcast] {
+            abs.mark_explicit(library_item, false).await;
+        }
+    }));
     for library_item in [&seeded.long_book, &seeded.podcast] {
         abs.mark_explicit(library_item, true).await;
     }
     let home = home_of(&bridge, &abs, &user).await;
-    for library_item in [&seeded.long_book, &seeded.podcast] {
-        abs.mark_explicit(library_item, false).await;
-    }
+    drop(unmark);
 
     assert_eq!(home.continue_listening, []);
     assert_eq!(home.latest_episodes, []);
@@ -236,13 +269,16 @@ async fn home_lists_no_item_with_a_tag_the_user_may_not_open() {
     abs.set_progress(&user, &seeded.silence, None, 0.5, false)
         .await;
 
+    let untag = Undo(Some(async {
+        for library_item in [&seeded.long_book, &seeded.podcast] {
+            abs.set_tags(library_item, &[]).await;
+        }
+    }));
     for library_item in [&seeded.long_book, &seeded.podcast] {
         abs.set_tags(library_item, &[TAG]).await;
     }
     let home = home_of(&bridge, &abs, &user).await;
-    for library_item in [&seeded.long_book, &seeded.podcast] {
-        abs.set_tags(library_item, &[]).await;
-    }
+    drop(untag);
 
     let listed: Vec<_> = home
         .continue_listening
@@ -279,8 +315,9 @@ async fn home_lists_nothing_to_a_user_allowed_no_tag() {
 }
 
 /// However many Items in progress Home leaves out, it lists those it may: here 80 episodes
-/// listened to after the book, in a Library the user then may not see. Each list holds at
-/// most [`api::HOME_ENTRIES`].
+/// listened to after the book, first in a Library the user then may not see, then in one
+/// they see again but in a podcast they may not open (explicit), so Home reads past the
+/// first [`api::HOME_ENTRIES`] candidates. Each list holds at most [`api::HOME_ENTRIES`].
 #[tokio::test]
 async fn home_lists_an_item_in_progress_behind_many_left_out() {
     let abs = Audiobookshelf::shared();
@@ -315,6 +352,25 @@ async fn home_lists_an_item_in_progress_behind_many_left_out() {
         json!({
             "permissions": {"accessAllLibraries": false},
             "librariesAccessible": [seeded.audiobook_library, seeded.podcast_library],
+        }),
+    )
+    .await;
+
+    let home = bridge.api().home(&session).await;
+    assert_eq!(home.continue_listening, [long_book(&abs, progress(3000.0))]);
+    assert_eq!(home.latest_episodes.len(), 3);
+
+    // Only this test's user sees Crowded, so marking it explicit hides nothing from others.
+    abs.mark_explicit(&crowded.podcast, true).await;
+    abs.update_user(
+        &user.id,
+        json!({
+            "permissions": {"accessAllLibraries": false, "accessExplicitContent": false},
+            "librariesAccessible": [
+                seeded.audiobook_library,
+                seeded.podcast_library,
+                crowded.library,
+            ],
         }),
     )
     .await;

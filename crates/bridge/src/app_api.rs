@@ -22,10 +22,10 @@ use crate::config::{LibraryServerConfig, LibraryServerUrl};
 use crate::stream::StreamToken;
 
 /// How many more Items in progress than the user has Progress records the Bridge asks the
-/// Library Server for, for Home. It lists one entry per Progress record at most, so the
-/// records `/api/me` showed bound the list; the margin covers Progress first recorded (by
-/// another of the user's players) between that read and the list's, which would otherwise
-/// push the user's oldest entries out of it.
+/// Library Server for, for Home. Audiobookshelf 2.37.2 lists one entry per Progress record
+/// at most, so the records `/api/me` showed bound the list; the margin covers Progress first
+/// recorded (by another of the user's players) between that read and the list's, which
+/// would otherwise push the user's oldest entries out of it.
 const IN_PROGRESS_MARGIN: usize = 10;
 
 /// Serves the App API from the configured Library Servers, the [`Store`] and [`Sonos`]; and,
@@ -306,10 +306,11 @@ impl<S: Store> AppApi<S> {
     }
 
     /// The first [`HOME_ENTRIES`] of `candidates` whose library item the session's user may
-    /// open. The Library Server alone knows that (Libraries, explicit content, tags): each
-    /// library item is read with the user's key, once per Home (`may_open` remembers the
-    /// answers), the next candidates' at the same time, never more than [`HOME_ENTRIES`] at
-    /// once.
+    /// open. Only the Library Server knows that (Libraries, explicit content, tags), so each
+    /// candidate's library item is read with the user's key, in order, up to [`HOME_ENTRIES`]
+    /// reads at a time, until enough are found or none are left. `may_open` remembers each
+    /// answer, so a library item is read at most once per Home. A refusal (not found or
+    /// forbidden) leaves the entry out; any other failure fails Home.
     async fn openable(
         &self,
         library_server: &str,

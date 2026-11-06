@@ -2193,6 +2193,72 @@ fn home_with_a_podcast_library_that_cannot_be_read() {
     });
 }
 
+/// Home's own reads of the Items in progress and of each listed library item, failing: an
+/// outage fails Home, keeping the session; a rejected key ends the session.
+#[test]
+fn home_whose_items_in_progress_or_items_cannot_be_read() {
+    // The request to fail, by its start, and the answer to fail it with.
+    type FailedWith = Option<(String, &'static [u8])>;
+    let failing: Arc<Mutex<FailedWith>> = Arc::default();
+    let (bridge, abs, proxy, _) = bridge_marking_through({
+        let failing = Arc::clone(&failing);
+        move |request, _| {
+            let failing = failing.lock().unwrap();
+            let (failed, answer) = failing.as_ref()?;
+            request.starts_with(failed.as_bytes()).then_some(*answer)
+        }
+    });
+    let device = Device::new();
+    run(async || {
+        let long_book = &abs.seeded().long_book;
+        for failed in [
+            "GET /api/me/items-in-progress".to_owned(),
+            format!("GET /api/items/{long_book}?"),
+        ] {
+            *failing.lock().unwrap() = None;
+            let user = abs.new_user().await;
+            abs.set_progress(&user, long_book, None, 3000.0, false)
+                .await;
+            let mut app = logged_in_behind(&device, &bridge, &proxy, &user).await;
+            assert_eq!(
+                app.screen(),
+                &home_listing(
+                    vec![home_long_book(&abs, started(3000.0))],
+                    (0..3).rev().map(|n| home_episode(&abs, n, None)).collect()
+                ),
+                "{failed}"
+            );
+
+            *failing.lock().unwrap() = Some((failed.clone(), UNAVAILABLE));
+            app.open_home().await;
+            assert_eq!(
+                app.screen(),
+                &Screen::Home {
+                    home: None,
+                    notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
+                },
+                "{failed}"
+            );
+            assert!(app.session().is_some(), "{failed}");
+
+            *failing.lock().unwrap() = Some((failed.clone(), UNAUTHORIZED));
+            app.open_home().await;
+            assert!(
+                matches!(
+                    app.screen(),
+                    Screen::Login {
+                        notice: Some(Notice::Api(ApiError::ApiKeyRejected)),
+                        ..
+                    }
+                ),
+                "{failed}: {:?}",
+                app.screen()
+            );
+            assert_eq!(app.session(), None, "{failed}");
+        }
+    });
+}
+
 /// Home merges the newest episodes of every podcast Library the user can see, newest first.
 /// The second podcast Library and its podcast are made up by the proxy, so the shared
 /// Audiobookshelf's Libraries stay as other tests know them.
