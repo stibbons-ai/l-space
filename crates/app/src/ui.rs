@@ -310,10 +310,13 @@ fn BackButton(app: Signal<App>, busy: Signal<bool>) -> Element {
 }
 
 #[component]
-fn HomeScreen(app: Signal<App>, busy: Signal<bool>, home: Home, notice: Option<Notice>) -> Element {
+fn HomeScreen(
+    app: Signal<App>,
+    busy: Signal<bool>,
+    home: Option<Home>,
+    notice: Option<Notice>,
+) -> Element {
     let text = |text| app.read().text(text);
-    // Nothing listed because Home could not be read, not because there is nothing.
-    let failed = home == Home::default() && matches!(notice, Some(Notice::Api(_)));
     rsx! {
         nav {
             NavButton {
@@ -334,14 +337,7 @@ fn HomeScreen(app: Signal<App>, busy: Signal<bool>, home: Home, notice: Option<N
         }
         h1 { {text(Text::HomeTitle)} }
         NoticeView { app, notice }
-        if failed {
-            button {
-                r#type: "button",
-                disabled: busy(),
-                onclick: move |_| act(app, busy, async |app: &mut App| app.open_home().await),
-                {text(Text::Retry)}
-            }
-        } else {
+        if let Some(home) = home {
             HomeList {
                 app,
                 busy,
@@ -355,6 +351,14 @@ fn HomeScreen(app: Signal<App>, busy: Signal<bool>, home: Home, notice: Option<N
                 title: text(Text::HomeLatestEpisodes),
                 none: text(Text::HomeLatestEpisodesNone),
                 entries: home.latest_episodes,
+            }
+        } else {
+            // Home could not be read.
+            button {
+                r#type: "button",
+                disabled: busy(),
+                onclick: move |_| act(app, busy, async |app: &mut App| app.open_home().await),
+                {text(Text::Retry)}
             }
         }
     }

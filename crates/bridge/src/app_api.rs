@@ -22,7 +22,9 @@ use crate::config::{LibraryServerConfig, LibraryServerUrl};
 use crate::stream::StreamToken;
 
 /// How many Items in progress the Bridge asks the Library Server for, for Home: more than Home
-/// lists, as some are left out (an ebook alone, an Item in a Library the user may not see).
+/// lists, as some are left out (an ebook alone, an Item in a Library the user may not see, one
+/// at 0 seconds). Should more than `IN_PROGRESS_ASKED - HOME_ENTRIES` of them be left out,
+/// Home lists fewer than [`HOME_ENTRIES`], even if the user has more in progress.
 const IN_PROGRESS_ASKED: usize = 4 * HOME_ENTRIES;
 
 /// Serves the App API from the configured Library Servers, the [`Store`] and [`Sonos`]; and,
@@ -263,19 +265,24 @@ impl<S: Store> AppApi<S> {
         let episodes = self
             .newest_episodes(library_server, &session, &user.id, &libraries.entries)
             .await?;
+        let (continue_listening, unexpected) =
+            browse::continue_listening(&user, &libraries.entries, in_progress.entries);
+        warn_dropped(
+            library_server,
+            Some(&user.id),
+            "Items in progress",
+            unexpected,
+        );
         Ok(Home {
-            continue_listening: browse::continue_listening(
-                &user,
-                &libraries.entries,
-                in_progress.entries,
-            ),
+            continue_listening,
             latest_episodes: browse::latest_episodes(&user, episodes),
         })
     }
 
     /// The newest episodes the session's user (`user_id`) hasn't Finished in each podcast
-    /// Library of `libraries`, at most [`HOME_ENTRIES`] of each. A podcast Library gone or
-    /// hidden from the user since `libraries` were listed adds none.
+    /// Library of `libraries`, at most [`HOME_ENTRIES`] of each by publish date (the Library
+    /// Server's order, episodes without one last). A podcast Library gone or hidden from the
+    /// user since `libraries` were listed adds none.
     async fn newest_episodes(
         &self,
         library_server: &str,

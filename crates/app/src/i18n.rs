@@ -9,10 +9,9 @@
 //! What the screens say about Items is composed here too, with the words and word order from
 //! the same Fluent resources: [`duration`], [`progress`], [`date`], an episode's row
 //! ([`episode_summary`]), a row on Home ([`home_entry_summary`]), an Item's facts
-//! ([`item_facts`]) and its chapters with their start
-//! times ([`chapter_rows`], [`clock`]). So is what the Groups screen says about a Group's
-//! playback ([`group_playback`]), and the notice that an Item now plays on a Group
-//! ([`playing_on`]).
+//! ([`item_facts`]) and its chapters with their start times ([`chapter_rows`], [`clock`]). So
+//! is what the Groups screen says about a Group's playback ([`group_playback`]), and the
+//! notice that an Item now plays on a Group ([`playing_on`]).
 
 use std::sync::LazyLock;
 

@@ -111,7 +111,7 @@ async fn finished_items_are_in_neither_list() {
 }
 
 /// Another user's Progress, Finished included, neither shows in a user's Home nor hides
-/// anything from it, and theirs doesn't reach the other's.
+/// anything from it, both ways round.
 #[tokio::test]
 async fn home_shows_only_the_session_users_progress() {
     let (bridge, abs, alice, alices) = logged_in().await;
@@ -121,16 +121,14 @@ async fn home_shows_only_the_session_users_progress() {
     listen(&abs, &bob, Some(0), 60.0, false).await;
     listen(&abs, &bob, Some(2), 0.0, true).await;
     listen(&abs, &alice, Some(1), 30.0, false).await;
+    listen(&abs, &alice, None, 3000.0, true).await;
+    listen(&abs, &alice, Some(0), 0.0, true).await;
 
     let home = bridge.api().home(&alices).await;
     assert_eq!(home.continue_listening, [episode(&abs, 1, progress(30.0))]);
     assert_eq!(
         home.latest_episodes,
-        [
-            episode(&abs, 2, None),
-            episode(&abs, 1, progress(30.0)),
-            episode(&abs, 0, None)
-        ]
+        [episode(&abs, 2, None), episode(&abs, 1, progress(30.0))]
     );
 
     let home = bridge.api().home(&bobs).await;

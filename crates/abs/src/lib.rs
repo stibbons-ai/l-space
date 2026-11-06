@@ -88,7 +88,10 @@ where
 }
 
 /// The entries of a list Audiobookshelf sent that decode as `T`, and how many others it left
-/// out: one entry in a shape this client doesn't know must not fail the whole answer.
+/// out: one entry in a shape this client doesn't know must not fail the whole answer. A
+/// `null` list is empty; a field of this type that must be in the answer needs
+/// `#[serde(deserialize_with = "Known::deserialize")]`, as serde otherwise decodes it missing
+/// as empty too.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Known<T> {
     pub entries: Vec<T>,
@@ -395,6 +398,7 @@ impl Client {
     ) -> Result<Known<Library>, Error> {
         #[derive(Deserialize)]
         struct Libraries {
+            #[serde(deserialize_with = "Known::deserialize")]
             libraries: Known<Library>,
         }
         let libraries: Libraries = self
@@ -561,6 +565,7 @@ impl Client {
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct InProgressItems {
+            #[serde(deserialize_with = "Known::deserialize")]
             library_items: Known<InProgress>,
         }
         let path = format!("/api/me/items-in-progress?limit={limit}");
@@ -583,6 +588,7 @@ impl Client {
     ) -> Result<Known<RecentEpisode>, Error> {
         #[derive(Deserialize)]
         struct RecentEpisodes {
+            #[serde(deserialize_with = "Known::deserialize")]
             episodes: Known<RecentEpisode>,
         }
         let library_id = id_segment(library_id)?;
@@ -1267,8 +1273,9 @@ mod tests {
         assert!(requests.lock().unwrap().is_empty());
     }
 
-    /// What Audiobookshelf 2.37.2 answers for `/api/me/items-in-progress`, trimmed: an
-    /// audiobook, an episode with its podcast, and an entry of a kind this client doesn't know.
+    /// Shaped like what Audiobookshelf 2.37.2 answers for `/api/me/items-in-progress`, trimmed:
+    /// an audiobook and an episode with its podcast; plus a made-up entry of a kind this client
+    /// doesn't know.
     fn items_in_progress_answer() -> serde_json::Value {
         json!({"libraryItems": [
             {"id": "li-book", "libraryId": "lib-books", "mediaType": "book",
@@ -1422,5 +1429,25 @@ mod tests {
                 .unwrap_err();
             assert_eq!(format!("{error:?}"), recent, "{status}");
         }
+    }
+
+    /// An answer without the list a call asks for is no answer from Audiobookshelf, not an
+    /// empty list.
+    #[tokio::test]
+    async fn an_answer_without_its_list_fails() {
+        let (base_url, _) = recording((StatusCode::OK, axum::Json(json!({})))).await;
+        let (client, key) = (Client::new(), ApiKey::new("key"));
+        assert!(matches!(
+            client.libraries(&base_url, &key).await,
+            Err(Error::Unavailable(_))
+        ));
+        assert!(matches!(
+            client.items_in_progress(&base_url, &key, 40).await,
+            Err(Error::Unavailable(_))
+        ));
+        assert!(matches!(
+            client.recent_episodes(&base_url, &key, "lib-1", 20).await,
+            Err(Error::Unavailable(_))
+        ));
     }
 }

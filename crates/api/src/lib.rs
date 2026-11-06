@@ -250,13 +250,15 @@ pub const HOME_ENTRIES: usize = 20;
 
 /// What Home lists for the session user, each list at most [`HOME_ENTRIES`] Items, across
 /// every Library they can see on the session's Library Server.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Home {
     /// Audiobooks and episodes the user has Progress in past the start and hasn't Finished,
     /// the one whose Progress changed last first.
     pub continue_listening: Vec<HomeEntry>,
     /// The newest episodes the user hasn't Finished, of every podcast they can see: newest
-    /// publish date first (the date the Library Server added an episode without one).
+    /// publish date first (the date the Library Server added an episode without one). Each
+    /// podcast Library contributes its [`HOME_ENTRIES`] newest by publish date, so an episode
+    /// without one is placed by its added date only among those.
     pub latest_episodes: Vec<HomeEntry>,
 }
 

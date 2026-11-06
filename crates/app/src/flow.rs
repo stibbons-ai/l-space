@@ -36,9 +36,12 @@ pub enum Screen {
         notice: Option<Notice>,
     },
     /// Logged in, where a login lands: the Items the user is in the middle of and the newest
-    /// episodes they haven't Finished, on the session's Library Server. Both lists empty,
-    /// with a notice, when Home could not be read.
-    Home { home: Home, notice: Option<Notice> },
+    /// episodes they haven't Finished, on the session's Library Server. `home` is `None`, with
+    /// a notice, when Home could not be read.
+    Home {
+        home: Option<Home>,
+        notice: Option<Notice>,
+    },
     /// Every Library the user can see on the session's Library Server, audiobooks and
     /// podcasts; opened from Home.
     Libraries {
@@ -496,12 +499,13 @@ impl App {
 
     /// On the Item screen, marks its Item Finished (`finished`) or unfinished on the Library
     /// Server, and shows the Item as the Bridge then answers; the podcast screen to go back to
-    /// lists the episode by its new state, and Home to go back to is read again. When the
-    /// Library Server can't be reached, the Bridge may have written before reading the Progress
-    /// back failed: the Item, its podcast's episodes and Home are read again, as far as that
-    /// works. On any other failure that keeps the session the screen stays as shown. Either way
-    /// it says why; a mark whose answer was lost (the App gave up waiting, for example) may
-    /// still land on the Library Server, which opening the Item again shows.
+    /// lists the episode by its new state, and Home to go back to is read again (if that read
+    /// fails, Home stays as it was, saying nothing of it). When the Library Server can't be
+    /// reached, the Bridge may have written before reading the Progress back failed: the Item,
+    /// its podcast's episodes and Home are read again, as far as that works. On any other
+    /// failure that keeps the session the screen stays as shown. Either way it says why; a mark
+    /// whose answer was lost (the App gave up waiting, for example) may still land on the
+    /// Library Server, which opening the Item again shows.
     pub async fn mark_finished(&mut self, finished: bool) {
         let Screen::Item { item, .. } = &self.screen else {
             return;
@@ -561,8 +565,8 @@ impl App {
     }
 
     /// Reads Home again on the screens to go back to, if it is one of them, after a mark
-    /// changed what it lists; if that fails, it stays as shown. Returns whether the session
-    /// goes on: if not, the screen shown says why.
+    /// changed what it lists; if that read fails, Home stays as it was. Returns whether the
+    /// session goes on: if not, the screen shown says why.
     async fn reread_home(&mut self) -> bool {
         let Some(at) = self
             .back
@@ -573,7 +577,10 @@ impl App {
         };
         match self.call(api::home()).await {
             Ok(home) => {
-                self.back[at] = Screen::Home { home, notice: None };
+                self.back[at] = Screen::Home {
+                    home: Some(home),
+                    notice: None,
+                };
                 true
             }
             Err(error) => self.reread_failed(error).await,
@@ -682,7 +689,8 @@ impl App {
     }
 
     /// Back to the screen the shown one was opened from, as it was apart from its notice,
-    /// which was cleared on leaving it.
+    /// which was cleared on leaving it, and apart from a mark since, which may have read it
+    /// again ([`App::mark_finished`]).
     pub fn go_back(&mut self) {
         if let Some(screen) = self.back.pop() {
             self.screen = screen;
@@ -714,11 +722,16 @@ impl App {
     async fn show_home(&mut self, notice: Option<Notice>) {
         self.back.clear();
         match self.call(api::home()).await {
-            Ok(home) => self.screen = Screen::Home { home, notice },
+            Ok(home) => {
+                self.screen = Screen::Home {
+                    home: Some(home),
+                    notice,
+                }
+            }
             Err(error) => {
                 if let Some(error) = self.session_call_failed(error).await {
                     self.screen = Screen::Home {
-                        home: Home::default(),
+                        home: None,
                         notice: Some(Notice::Api(error)),
                     };
                 }

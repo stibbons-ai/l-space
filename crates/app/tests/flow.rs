@@ -64,10 +64,10 @@ fn home_seeing(abs: &Audiobookshelf, library: Library, notice: Option<Notice>) -
         LibraryKind::Audiobooks => Vec::new(),
     };
     Screen::Home {
-        home: Home {
+        home: Some(Home {
             continue_listening: Vec::new(),
             latest_episodes,
-        },
+        }),
         notice,
     }
 }
@@ -383,6 +383,21 @@ const NOT_FOUND: &[u8] =
 const UNAUTHORIZED: &[u8] =
     b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
 
+/// What Audiobookshelf answers for a Library the user may not see.
+const FORBIDDEN: &[u8] =
+    b"HTTP/1.1 403 Forbidden\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+/// A `200 OK` answer with `body` as JSON, as a proxy hands it out.
+fn ok_json(body: &serde_json::Value) -> &'static [u8] {
+    let body = body.to_string();
+    let answer = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+         connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    answer.into_bytes().leak()
+}
+
 /// Sends `request` (which closes its connection) to `target` (`host:port`) and returns the
 /// whole response.
 fn forward(target: &str, request: &[u8]) -> Vec<u8> {
@@ -583,7 +598,7 @@ fn an_address_that_is_not_a_bridge_is_named_as_such_and_not_remembered() {
 }
 
 #[test]
-fn login_with_an_api_key_opens_a_session_and_lists_the_libraries() {
+fn login_with_an_api_key_opens_a_session_and_shows_home() {
     let (bridge, abs, _) = bridge_with_abs();
     let device = Device::new();
     run(async || {
@@ -1472,10 +1487,10 @@ fn started(current_time: f64) -> Option<Progress> {
 /// Home with `continue_listening` and `latest_episodes`, without a notice.
 fn home_listing(continue_listening: Vec<HomeEntry>, latest_episodes: Vec<HomeEntry>) -> Screen {
     Screen::Home {
-        home: Home {
+        home: Some(Home {
             continue_listening,
             latest_episodes,
-        },
+        }),
         notice: None,
     }
 }
@@ -1514,7 +1529,10 @@ fn home_lists_what_the_person_is_in_the_middle_of_and_the_latest_episodes() {
 
         // What each row says under its title, in both languages: both lists, in order.
         let rows = |app: &App| {
-            let Screen::Home { home, .. } = app.screen() else {
+            let Screen::Home {
+                home: Some(home), ..
+            } = app.screen()
+            else {
                 panic!("{:?}", app.screen());
             };
             home.continue_listening
@@ -1557,7 +1575,7 @@ fn home_lists_what_the_person_is_in_the_middle_of_and_the_latest_episodes() {
 }
 
 /// A user who sees only the audiobooks and has listened to nothing gets Home with both lists
-/// empty, which the screen says.
+/// empty.
 #[test]
 fn home_without_anything_to_list_is_empty() {
     let (bridge, abs, _) = bridge_with_abs();
@@ -1729,7 +1747,7 @@ fn settings_switch_between_library_servers_without_a_login() {
         app.open_library(podcasts(&abs)).await;
         assert_eq!(entry_ids(&app), [seeded.podcast.as_str()]);
 
-        // Switching back needs no key: Home's Libraries and entries, afresh.
+        // Switching back needs no key: the first Library Server's Home, afresh.
         app.open_settings();
         app.switch_to(abs.base_url()).await;
         assert_eq!(app.screen(), &home_seeing(&abs, audiobooks(&abs), None));
@@ -1742,7 +1760,8 @@ fn settings_switch_between_library_servers_without_a_login() {
             !books.is_empty() && !books.contains(&seeded.podcast),
             "{books:?}"
         );
-        // Every call now acts on Home's session: its user doesn't see the podcasts.
+        // Every call now acts on the first Library Server's session: its user doesn't see the
+        // podcasts.
         app.go_back();
         app.open_library(podcasts(&abs)).await;
         assert_eq!(
@@ -1869,8 +1888,8 @@ fn switching_to_a_session_that_ended_meanwhile_forgets_only_it() {
         let ended = session(&app);
         app.switch_to(abs.base_url()).await;
 
-        // Ended on the Bridge while not selected: found when switched to, never showing Home's
-        // Libraries under Second.
+        // Ended on the Bridge while not selected: found when switched to, never showing the
+        // first Library Server's Libraries under Second.
         bridge.api().logout(&ended).await;
         app.switch_to(&second).await;
         assert!(
@@ -1928,7 +1947,8 @@ fn logging_in_again_replaces_that_library_servers_session() {
         assert_eq!(app.screen(), &home_seeing(&abs, podcasts(&abs), None));
         let current = session(&app);
         assert_ne!(current.token, replaced.token);
-        // One session per Library Server: the old one ended on the Bridge, Home's untouched.
+        // One session per Library Server: the old one ended on the Bridge, the first Library
+        // Server's untouched.
         assert_eq!(switchable(&app), [abs.base_url()]);
         assert_eq!(
             bridge.api().current_user_error(&replaced).await.1,
@@ -2042,10 +2062,10 @@ fn home_or_libraries_that_cannot_be_read_are_explained_and_read_on_retry() {
     let device = Device::new();
     run(async || {
         let user = abs.new_user().await;
-        // Home lists the Libraries too.
+        // Reading Home lists the Libraries too.
         *failing.lock().unwrap() = Some("GET /api/libraries ");
         let failed = Screen::Home {
-            home: Home::default(),
+            home: None,
             notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
         };
 
@@ -2077,6 +2097,156 @@ fn home_or_libraries_that_cannot_be_read_are_explained_and_read_on_retry() {
         *failing.lock().unwrap() = None;
         app.open_libraries().await;
         assert_eq!(app.screen(), &libraries(&abs));
+    });
+}
+
+/// Libraries that can't be listed from a Home that was read but lists nothing keep its empty
+/// lists shown, with the notice: Home itself was read, so it offers no reading it again.
+#[test]
+fn libraries_that_cannot_be_listed_from_an_empty_home_keep_it_read() {
+    let (bridge, abs, proxy, failing) = bridge_behind_proxy();
+    let device = Device::new();
+    run(async || {
+        let user = abs
+            .new_user_seeing(&[&abs.seeded().audiobook_library])
+            .await;
+        let mut app = logged_in_behind(&device, &bridge, &proxy, &user).await;
+        assert_eq!(app.screen(), &home_listing(Vec::new(), Vec::new()));
+
+        *failing.lock().unwrap() = Some("GET /api/libraries ");
+        app.open_libraries().await;
+        assert_eq!(
+            app.screen(),
+            &Screen::Home {
+                home: Some(Home {
+                    continue_listening: Vec::new(),
+                    latest_episodes: Vec::new(),
+                }),
+                notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
+            }
+        );
+        assert!(!app.can_go_back());
+    });
+}
+
+/// A podcast Library whose newest episodes can't be read while Home is: one gone or hidden
+/// from the user meanwhile (403, 404) lists none of them, the rest of Home stays; an outage
+/// fails Home, keeping the session; a rejected key ends the session.
+#[test]
+fn home_with_a_podcast_library_that_cannot_be_read() {
+    let answer: Arc<Mutex<Option<&'static [u8]>>> = Arc::default();
+    let newest = format!(
+        "GET /api/libraries/{}/recent-episodes",
+        Audiobookshelf::shared().seeded().podcast_library
+    );
+    let (bridge, abs, proxy, _) = bridge_marking_through({
+        let answer = Arc::clone(&answer);
+        move |request, _| {
+            if request.starts_with(newest.as_bytes()) {
+                *answer.lock().unwrap()
+            } else {
+                None
+            }
+        }
+    });
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        abs.set_progress(&user, &abs.seeded().long_book, None, 3000.0, false)
+            .await;
+        let mut app = logged_in_behind(&device, &bridge, &proxy, &user).await;
+
+        for gone in [FORBIDDEN, NOT_FOUND] {
+            *answer.lock().unwrap() = Some(gone);
+            app.open_home().await;
+            assert_eq!(
+                app.screen(),
+                &home_listing(vec![home_long_book(&abs, started(3000.0))], Vec::new())
+            );
+        }
+
+        *answer.lock().unwrap() = Some(UNAVAILABLE);
+        app.open_home().await;
+        assert_eq!(
+            app.screen(),
+            &Screen::Home {
+                home: None,
+                notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
+            }
+        );
+        assert!(app.session().is_some());
+
+        *answer.lock().unwrap() = Some(UNAUTHORIZED);
+        app.open_home().await;
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Login {
+                    notice: Some(Notice::Api(ApiError::ApiKeyRejected)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(app.session(), None);
+    });
+}
+
+/// Home merges the newest episodes of every podcast Library the user can see, newest first.
+/// The second podcast Library is made up by the proxy, so the shared Audiobookshelf's
+/// Libraries stay as other tests know them.
+#[test]
+fn home_lists_the_newest_episodes_of_every_podcast_library() {
+    let seeded = Audiobookshelf::shared().seeded().clone();
+    // Published between the seeded Episodes 2 and 3.
+    let published_at = EPISODE_PUBLISHED_AT[1] + 1;
+    let libraries = ok_json(&serde_json::json!({"libraries": [
+        {"id": seeded.audiobook_library, "name": "Audiobooks", "mediaType": "book"},
+        {"id": seeded.podcast_library, "name": "Podcasts", "mediaType": "podcast"},
+        {"id": "lib-more", "name": "More Podcasts", "mediaType": "podcast"},
+    ]}));
+    let more = ok_json(&serde_json::json!({"episodes": [
+        {"libraryItemId": "li-more", "id": "ep-more", "title": "Elsewhere",
+         "publishedAt": published_at, "podcast": {"metadata": {"title": "More"}}},
+    ]}));
+    let (bridge, abs, proxy, _) = bridge_marking_through(move |request, _| {
+        if request.starts_with(b"GET /api/libraries ") {
+            Some(libraries)
+        } else if request.starts_with(b"GET /api/libraries/lib-more/recent-episodes") {
+            Some(more)
+        } else {
+            None
+        }
+    });
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let app = logged_in_behind(&device, &bridge, &proxy, &user).await;
+        let elsewhere = HomeEntry {
+            id: ItemId {
+                library_item: "li-more".into(),
+                episode: Some("ep-more".into()),
+            },
+            title: "Elsewhere".into(),
+            author: None,
+            podcast: Some("More".into()),
+            duration: None,
+            published_at: Some(published_at),
+            progress: None,
+        };
+        assert_eq!(
+            app.screen(),
+            &home_listing(
+                Vec::new(),
+                vec![
+                    home_episode(&abs, 2, None),
+                    elsewhere,
+                    home_episode(&abs, 1, None),
+                    home_episode(&abs, 0, None),
+                ]
+            )
+        );
     });
 }
 
@@ -2332,7 +2502,8 @@ fn marking_an_audiobook_finished_and_unfinished_shows_on_its_item_screen() {
 
         app.go_back();
         app.go_back();
-        // Home, read again after the marks: nothing in progress, as before.
+        // Home, read again after the marks: the book, listed before them, is back at the start
+        // and no longer in progress.
         assert_eq!(app.screen(), &fresh_home(&abs, None));
     });
 }
@@ -2421,8 +2592,8 @@ async fn on_episode_2(
 }
 
 /// A mark the Library Server takes, whose Progress the Bridge then can't read back: the
-/// screen says why, and shows the Item and the podcast's episodes (under the filter they were
-/// listed by) as the Library Server now holds them, the write included.
+/// screen says why, and shows the Item, the podcast's episodes (under the filter they were
+/// listed by) and Home as the Library Server now holds them, the write included.
 #[test]
 fn a_mark_that_lands_but_cant_be_read_back_shows_what_the_library_server_holds() {
     // Fails the first `GET /api/me` after the mark: the Bridge's readback.
@@ -2474,6 +2645,15 @@ fn a_mark_that_lands_but_cant_be_read_back_shows_what_the_library_server_holds()
                 .await
         );
         assert_eq!(shown_titles(&app), ["Episode 2"]);
+        app.go_back();
+        app.go_back();
+        assert_eq!(
+            app.screen(),
+            &home_listing(
+                Vec::new(),
+                vec![home_episode(&abs, 2, None), home_episode(&abs, 0, None)]
+            )
+        );
         assert!(app.session().is_some());
     });
 }
@@ -2891,8 +3071,8 @@ fn a_session_ended_elsewhere_leads_from_the_groups_to_login() {
     });
 }
 
-/// Opens episode `n` (0-based) of the seeded podcast through its Library from Home, which offers
-/// "Play on…": an episode is one audio file.
+/// Opens episode `n` (0-based) of the seeded podcast through its Library from Home; its Item
+/// screen offers "Play on…": an episode is one audio file.
 async fn open_episode(app: &mut App, abs: &Audiobookshelf, n: usize) {
     let seeded = abs.seeded();
     app.open_library(podcasts(abs)).await;

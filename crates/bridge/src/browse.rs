@@ -104,14 +104,17 @@ pub fn item_progress(user: &abs::User, id: &ItemId) -> Option<Progress> {
 }
 
 /// Home's "continue listening": the Items in `in_progress` that are in one of `libraries`
-/// (those the user can see), with `user`'s Progress, unless it is Finished; the one whose
-/// Progress changed last first, at most [`HOME_ENTRIES`]. An ebook alone is no Item and is
-/// left out.
+/// (those the user can see), with `user`'s Progress past the start and not Finished; the one
+/// whose Progress changed last first, at most [`HOME_ENTRIES`]. An ebook alone is no Item and
+/// is left out, as is a book Audiobookshelf lists only for its ebook progress (at 0 seconds).
+/// Also how many entries named no Item in a way the Bridge knows (a podcast without its
+/// episode, a book with one), left out too.
 pub fn continue_listening(
     user: &abs::User,
     libraries: &[abs::Library],
     in_progress: Vec<abs::InProgress>,
-) -> Vec<HomeEntry> {
+) -> (Vec<HomeEntry>, usize) {
+    let mut unexpected = 0;
     let entries = in_progress
         .into_iter()
         .filter(|entry| {
@@ -119,13 +122,30 @@ pub fn continue_listening(
                 .iter()
                 .any(|library| library.id == entry.library_id)
         })
-        .filter_map(|entry| Some((entry.progress_last_update, in_progress_entry(user, entry)?)));
-    newest_unfinished(entries)
+        .filter_map(|entry| {
+            let last_update = entry.progress_last_update;
+            match in_progress_entry(user, entry) {
+                Ok(entry) => Some((last_update, entry?)),
+                Err(UnexpectedShape) => {
+                    unexpected += 1;
+                    None
+                }
+            }
+        })
+        .filter(|(_, entry)| {
+            entry
+                .progress
+                .as_ref()
+                .is_some_and(|progress| progress.current_time > 0.0)
+        });
+    let listed = newest_unfinished(entries);
+    (listed, unexpected)
 }
 
 /// Home's "latest episodes": `episodes` with `user`'s Progress, unless it is Finished; newest
 /// publish date first (the date the Library Server added one without it), at most
-/// [`HOME_ENTRIES`].
+/// [`HOME_ENTRIES`]. The Library Server picks `episodes` by publish date alone, so an episode
+/// without one is only placed among those it sent.
 pub fn latest_episodes(user: &abs::User, episodes: Vec<abs::RecentEpisode>) -> Vec<HomeEntry> {
     let entries = episodes.into_iter().map(|recent| {
         let newness = recent.episode.published_at.or(recent.added_at);
@@ -151,9 +171,15 @@ fn newest_unfinished(entries: impl Iterator<Item = (Option<i64>, HomeEntry)>) ->
     entries.into_iter().map(|(_, entry)| entry).collect()
 }
 
+/// An Item in progress that names no Item in a way the Bridge knows.
+struct UnexpectedShape;
+
 /// How Home lists the audiobook or episode `entry`, with `user`'s Progress; nothing for an
-/// ebook alone, or an answer that names no Item.
-fn in_progress_entry(user: &abs::User, entry: abs::InProgress) -> Option<HomeEntry> {
+/// ebook alone.
+fn in_progress_entry(
+    user: &abs::User,
+    entry: abs::InProgress,
+) -> Result<Option<HomeEntry>, UnexpectedShape> {
     let library_item = entry.library_item.id;
     match (entry.library_item.media, entry.recent_episode) {
         (abs::Media::Book(book), None) if is_audiobook(&book) => {
@@ -161,7 +187,7 @@ fn in_progress_entry(user: &abs::User, entry: abs::InProgress) -> Option<HomeEnt
                 library_item,
                 episode: None,
             };
-            Some(HomeEntry {
+            Ok(Some(HomeEntry {
                 progress: item_progress(user, &id),
                 id,
                 title: book.metadata.title,
@@ -169,12 +195,16 @@ fn in_progress_entry(user: &abs::User, entry: abs::InProgress) -> Option<HomeEnt
                 podcast: None,
                 duration: book_duration(&book.tracks, book.duration),
                 published_at: None,
-            })
+            }))
         }
-        (abs::Media::Podcast(podcast), Some(episode)) => {
-            Some(episode_entry(user, library_item, podcast.metadata, episode))
-        }
-        _ => None,
+        (abs::Media::Book(_), None) => Ok(None),
+        (abs::Media::Podcast(podcast), Some(episode)) => Ok(Some(episode_entry(
+            user,
+            library_item,
+            podcast.metadata,
+            episode,
+        ))),
+        (abs::Media::Book(_), Some(_)) | (abs::Media::Podcast(_), None) => Err(UnexpectedShape),
     }
 }
 
@@ -196,7 +226,7 @@ fn episode_entry(
         id,
         title: episode.title,
         author: None,
-        podcast: Some(podcast.title),
+        podcast: non_empty(Some(podcast.title)),
         duration,
         published_at: episode.published_at,
     }
@@ -621,7 +651,8 @@ mod tests {
     }
 
     /// Audiobookshelf already leaves out Finished Items; one it lists while the user's own
-    /// Progress says Finished is left out too.
+    /// Progress says Finished is left out too, and so is one at 0 seconds (a book read only
+    /// as an ebook). Entries that name no Item as the Bridge knows them are counted.
     #[test]
     fn continue_listening_lists_unfinished_items_the_user_can_see_last_listened_first() {
         let book = |id: &str, library: &str, num_tracks: u64, last: Option<i64>| {
@@ -637,6 +668,10 @@ mod tests {
                                   "audioFile": {"ino": "1", "duration": 900}},
                 "progressLastUpdate": last})
         };
+        let mut book_with_episode = book("li-odd-book", "lib-1", 1, Some(90));
+        book_with_episode["recentEpisode"] = episode("ep-odd", 90)["recentEpisode"].clone();
+        let mut podcast_without_episode = episode("ep-none", 95);
+        podcast_without_episode["recentEpisode"] = serde_json::Value::Null;
         let in_progress: Vec<abs::InProgress> = decoded(serde_json::json!([
             book("li-a", "lib-1", 1, Some(10)),
             episode("ep-1", 30),
@@ -644,19 +679,27 @@ mod tests {
             book("li-ebook", "lib-1", 0, Some(50)),
             book("li-hidden", "lib-hidden", 1, Some(60)),
             book("li-undated", "lib-1", 1, None),
+            book("li-ebook-read", "lib-1", 1, Some(70)),
+            book("li-no-progress", "lib-1", 1, Some(80)),
+            book_with_episode,
+            podcast_without_episode,
         ]));
         let user = user(vec![
             progress_entry("li-a", None, 100.0, false),
             progress_entry("li-p", Some("ep-1"), 50.0, false),
             progress_entry("li-p", Some("ep-2"), 900.0, true),
+            progress_entry("li-undated", None, 20.0, false),
+            progress_entry("li-ebook-read", None, 0.0, false),
         ]);
 
-        let listed = continue_listening(&user, &[library("lib-1"), library("lib-2")], in_progress);
+        let (listed, unexpected) =
+            continue_listening(&user, &[library("lib-1"), library("lib-2")], in_progress);
 
         assert_eq!(
             ids(&listed),
             [("li-p", Some("ep-1")), ("li-a", None), ("li-undated", None)]
         );
+        assert_eq!(unexpected, 2);
         let (episode, book) = (&listed[0], &listed[1]);
         assert_eq!(
             (episode.podcast.as_deref(), episode.author.as_deref()),
@@ -681,7 +724,13 @@ mod tests {
             ),
             (Some("Author"), None, Some(600.0))
         );
-        assert_eq!(listed[2].progress, None);
+        assert_eq!(
+            listed[2].progress,
+            Some(Progress {
+                current_time: 20.0,
+                finished: false
+            })
+        );
     }
 
     #[test]
@@ -697,6 +746,8 @@ mod tests {
             recent("new", Some(3), Some(9)),
             recent("finished", Some(4), Some(9)),
             recent("no-date", None, None),
+            {"libraryItemId": "li-q", "id": "untitled", "title": "untitled", "publishedAt": 0,
+             "podcast": {"metadata": {"title": null}}},
         ]));
         let user = user(vec![
             progress_entry("li-p", Some("finished"), 0.0, true),
@@ -711,11 +762,14 @@ mod tests {
                 ("li-p", Some("new")),
                 ("li-p", Some("undated")),
                 ("li-p", Some("old")),
+                ("li-q", Some("untitled")),
                 ("li-p", Some("no-date")),
             ]
         );
         assert_eq!(listed[1].published_at, None);
         assert_eq!(listed[2].podcast.as_deref(), Some("Podcast"));
+        // A podcast without a title names none, rather than an empty one.
+        assert_eq!(listed[3].podcast, None);
         assert_eq!(
             listed[2].progress,
             Some(Progress {
@@ -726,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn each_home_list_has_at_most_twenty_entries_the_newest() {
+    fn latest_episodes_are_at_most_twenty_the_newest() {
         let episodes: Vec<abs::RecentEpisode> = decoded(
             (0..25)
                 .map(|n| {
