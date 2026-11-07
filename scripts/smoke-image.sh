@@ -134,10 +134,19 @@ stop_cleanly() {
   local stopped_in=$SECONDS
   # Errexit is off in here (a command substitution): stop on `exit_code`'s own failure.
   status=$(exit_code "$1" 1) || exit 1
-  ((stopped_in <= 5)) || fail "docker stop of $1 took ${stopped_in} s"
-  [[ $status == 0 ]] || fail "exit code $status after docker stop of $1, expected 0"
+  if ((stopped_in > 5)); then
+    docker logs "$name" >&2
+    fail "docker stop of $1 took ${stopped_in} s"
+  fi
+  if [[ $status != 0 ]]; then
+    docker logs "$name" >&2
+    fail "exit code $status after docker stop of $1, expected 0"
+  fi
   events=$(docker logs "$name" 2>/dev/null | jq -r 'select(.message == "shutting down" or .message == "stopped") | .message')
-  [[ $events == $'shutting down\nstopped' ]] || fail "$1 logged, of shutting down and stopped: ${events:-nothing}"
+  if [[ $events != $'shutting down\nstopped' ]]; then
+    docker logs "$name" >&2
+    fail "$1 logged, of shutting down and stopped: ${events:-nothing}"
+  fi
   echo "$stopped_in"
 }
 

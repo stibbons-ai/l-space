@@ -130,6 +130,9 @@ async fn a_request_held_past_the_drain_does_not_keep_the_bridge_running() {
     bridge.signal(Signal::Terminate);
     bridge.wait_for_event(is_shutting_down);
     assert_refuses_connections(bridge.url());
+    // A second signal during the drain has no effect: still one `shutting down`, exit 0, and
+    // the full drain.
+    bridge.signal(Signal::Interrupt);
     let exited = bridge.wait_for_exit();
 
     assert_stopped_cleanly(&exited);

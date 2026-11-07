@@ -59,7 +59,8 @@ fn main() -> ExitCode {
     let served = runtime.block_on(run(args));
     // Cancels the tasks left (connections still open after the drain, detached Handoff starts)
     // and gives an SQLite transaction already on a blocking thread up to
-    // `shutdown::RUNTIME_SHUTDOWN` to commit; the store closes with the last `Arc`.
+    // `shutdown::RUNTIME_SHUTDOWN` to commit; the store closes with the last `Arc`, unless a
+    // transaction outlives that wait (see `shutdown::stop_runtime`).
     shutdown::stop_runtime(runtime);
     match served {
         Ok(()) => {
@@ -76,6 +77,14 @@ fn main() -> ExitCode {
 /// (final Progress, for example) keeps an `Arc<AppApi>` clone before building the router and
 /// runs its teardown after `shutdown::serve` returns; `main` then stops the runtime.
 async fn run(args: Args) -> Result<(), ExitCode> {
+    let signals = match shutdown::Signals::install() {
+        Ok(signals) => signals,
+        Err(error) => {
+            tracing::error!(%error, "cannot handle signals");
+            return Err(ExitCode::FAILURE);
+        }
+    };
+
     let config = match Config::load(&args.config) {
         Ok(config) => config,
         Err(error) => {
@@ -105,13 +114,6 @@ async fn run(args: Args) -> Result<(), ExitCode> {
         Ok(bound) => bound,
         Err(error) => {
             tracing::error!(listen = %config.listen, %error, "cannot listen");
-            return Err(ExitCode::FAILURE);
-        }
-    };
-    let signals = match shutdown::Signals::install() {
-        Ok(signals) => signals,
-        Err(error) => {
-            tracing::error!(%error, "cannot handle signals");
             return Err(ExitCode::FAILURE);
         }
     };
