@@ -197,6 +197,11 @@ impl TestBridge {
         self.restart();
     }
 
+    /// The path of the Bridge's database file, for a test that opens it alongside the Bridge.
+    pub fn database_path(&self) -> PathBuf {
+        self.dir.path().join("bridge.db")
+    }
+
     /// The name and raw bytes of the database file and each of its side files (journal, WAL,
     /// shared memory) that exists.
     pub fn database_files(&self) -> Vec<(String, Vec<u8>)> {

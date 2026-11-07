@@ -1,12 +1,13 @@
 //! How the Bridge stops when the operator asks it to (`docker stop`'s SIGTERM, or Ctrl-C's
 //! SIGINT): it stops accepting connections, lets the requests in flight finish for at most
 //! [`DRAIN`], and leaves whatever is still open after that (a Group's media stream can stay
-//! open for hours) for [`stop_runtime`] to cancel.
+//! open for hours) to [`teardown`], which closes the store and cancels the rest.
 
 use std::io;
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use store_sqlite::{Closer, Closing};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -17,9 +18,9 @@ use tokio::sync::oneshot;
 /// the Bridge.
 pub const DRAIN: Duration = Duration::from_secs(5);
 
-/// How long [`stop_runtime`] waits for blocking work already running (an SQLite transaction, a
-/// DNS lookup for a Library Server configured by hostname) after the drain. `DRAIN` plus this
-/// stays well under `docker stop`'s 10 s.
+/// How long [`teardown`] waits, after the drain, for work already running: an SQLite
+/// transaction to commit, then other blocking work (a DNS lookup for a Library Server configured
+/// by hostname). `DRAIN` plus this stays well under `docker stop`'s 10 s.
 pub const RUNTIME_SHUTDOWN: Duration = Duration::from_secs(2);
 
 /// The signals that ask the Bridge to stop. Installed first thing at startup: a signal that
@@ -52,7 +53,7 @@ impl Signals {
 
 /// Serves `router` on `listener` until `signals` asks the Bridge to stop, then lets the requests
 /// in flight finish for at most [`DRAIN`]. A second signal during the drain has no effect.
-/// Connections still open after that stay behind; [`stop_runtime`] cancels them.
+/// Connections still open after that stay behind; [`teardown`] cancels them.
 pub async fn serve(listener: TcpListener, router: Router, signals: Signals) -> io::Result<()> {
     let (stop, stopping) = oneshot::channel::<()>();
     let server = axum::serve(listener, router)
@@ -76,21 +77,49 @@ pub async fn serve(listener: TcpListener, router: Router, signals: Signals) -> i
     }
 }
 
+/// Tears the Bridge down once [`serve`] has returned (or startup failed): closes the store
+/// (`store`; `None` if the Bridge never opened it), then stops the runtime with what is left of
+/// [`RUNTIME_SHUTDOWN`]. The store is closed first because App API handlers don't run on
+/// `runtime`: Dioxus runs each on a local runtime of its own, so stopping `runtime` doesn't wait
+/// for their transactions; closing the store does, whichever runtime they run on.
+pub fn teardown(runtime: Runtime, store: Option<&Closer>) {
+    let started = Instant::now();
+    if let Some(store) = store {
+        close_store(store, RUNTIME_SHUTDOWN);
+    }
+    stop_runtime(runtime, RUNTIME_SHUTDOWN.saturating_sub(started.elapsed()));
+}
+
+/// Closes the store, letting a transaction already running commit for at most `bound`, and
+/// logs the outcome. A transaction still running then is abandoned: its hot journal is rolled
+/// back when the Bridge next opens the database, so the database stays consistent.
+fn close_store(store: &Closer, bound: Duration) {
+    match store.close(bound) {
+        Closing::Closed => tracing::debug!("database closed"),
+        Closing::Failed(error) => {
+            let error = crate::error_chain(&error);
+            tracing::warn!(%error, "cannot close the database");
+        }
+        Closing::TransactionStillRunning => tracing::warn!(
+            ?bound,
+            "database transaction still running at exit: abandoned, rolled back when the database is next opened"
+        ),
+    }
+}
+
 /// Shuts the runtime down: cancels every task left (connections still open after the drain,
-/// detached Handoff starts) and waits at most [`RUNTIME_SHUTDOWN`] for blocking work already
-/// running, logging a warning when that wait runs out. The store closes when the last task
-/// holding its `Arc` is dropped; a transaction still running at exit keeps its `Arc`, so the
-/// process exits with the store open and the transaction cut off. Its hot journal is rolled back
-/// when the Bridge next opens the database, so the database stays consistent. A detached Handoff
-/// start cut between storing the Handoff and asking Sonos to play it stays stored but unplayed
-/// until restart recovery (#22) exists.
-pub fn stop_runtime(runtime: Runtime) {
+/// detached Handoff starts) and waits at most `bound` for blocking work already running,
+/// logging a warning when that wait runs out. The store is closed, or its last transaction
+/// abandoned, by then. A detached Handoff start cut between storing the Handoff and asking
+/// Sonos to play it stays stored but unplayed until restart recovery (#22) exists.
+fn stop_runtime(runtime: Runtime, bound: Duration) {
     let asked = Instant::now();
-    runtime.shutdown_timeout(RUNTIME_SHUTDOWN);
+    runtime.shutdown_timeout(bound);
     // Tokio doesn't report whether the wait ran out; it returns before the bound only once
-    // every blocking thread has finished.
-    if asked.elapsed() >= RUNTIME_SHUTDOWN {
-        tracing::warn!(bound = ?RUNTIME_SHUTDOWN, "blocking work still running at exit: abandoned");
+    // every blocking thread has finished. No bound left means closing the store used it up,
+    // and warned.
+    if !bound.is_zero() && asked.elapsed() >= bound {
+        tracing::warn!(?bound, "blocking work still running at exit: abandoned");
     }
 }
 
@@ -127,7 +156,7 @@ mod tests {
         }
 
         let asked = Instant::now();
-        stop_runtime(runtime);
+        stop_runtime(runtime, RUNTIME_SHUTDOWN);
 
         let took = asked.elapsed();
         assert!(

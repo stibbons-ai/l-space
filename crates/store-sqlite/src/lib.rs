@@ -15,7 +15,9 @@ mod sealing;
 
 use std::fmt;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::time::Duration;
 
 use abs::ApiKey;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -34,11 +36,26 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0003_handoffs.sql"),
 ];
 
-/// A [`Store`] in one SQLite database file.
+/// A [`Store`] in one SQLite database file. It stays open until it is dropped, or until a
+/// [`Closer`] taken from it closes it; from then on its transactions fail.
 pub struct SqliteStore {
-    connection: Arc<Mutex<Connection>>,
+    connection: Arc<SharedConnection>,
     sealing: Arc<Sealing>,
 }
+
+/// The connection a store shares with its [`Closer`]s and its transactions on blocking threads.
+struct SharedConnection {
+    /// `None` once closed.
+    connection: Mutex<Option<Connection>>,
+    /// Set when closing starts: a transaction that gets the connection after that refuses to
+    /// run, also before the closer has taken it.
+    closing: AtomicBool,
+}
+
+/// A transaction asked of a store that is closed or closing.
+#[derive(Debug, thiserror::Error)]
+#[error("the database is closed")]
+struct ClosedError;
 
 impl fmt::Debug for SqliteStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -79,29 +96,100 @@ impl SqliteStore {
         forget_keys_sealed_under_another_key(&connection, &sealing)
             .map_err(step("forget keys sealed under another encryption key"))?;
         Ok(Self {
-            connection: Arc::new(Mutex::new(connection)),
+            connection: Arc::new(SharedConnection {
+                connection: Mutex::new(Some(connection)),
+                closing: AtomicBool::new(false),
+            }),
             sealing: Arc::new(sealing),
         })
     }
 
-    /// Runs `work` in one transaction on a blocking thread, committing if it succeeds.
+    /// A handle that closes this store, also once the store itself has been handed on.
+    pub fn closer(&self) -> Closer {
+        Closer(Arc::clone(&self.connection))
+    }
+
+    /// Runs `work` in one transaction on a blocking thread, committing if it succeeds. Fails if
+    /// the store is closed or closing.
     async fn transaction<T: Send + 'static>(
         &self,
         work: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<T> + Send + 'static,
     ) -> Result<T, Error> {
-        let connection = Arc::clone(&self.connection);
-        tokio::task::spawn_blocking(move || -> rusqlite::Result<T> {
+        let shared = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || -> Result<T, Error> {
             // A panic mid-transaction rolled it back when the transaction dropped, so the
             // connection is still consistent.
-            let mut connection = connection.lock().unwrap_or_else(PoisonError::into_inner);
-            let transaction = connection.transaction()?;
-            let result = work(&transaction)?;
-            transaction.commit()?;
-            Ok(result)
+            let mut connection = shared
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let connection = match connection.as_mut() {
+                Some(connection) if !shared.closing.load(Ordering::SeqCst) => connection,
+                _ => return Err(Error::new(ClosedError)),
+            };
+            let run = || -> rusqlite::Result<T> {
+                let transaction = connection.transaction()?;
+                let result = work(&transaction)?;
+                transaction.commit()?;
+                Ok(result)
+            };
+            run().map_err(Error::new)
         })
         .await
         .map_err(Error::new)?
-        .map_err(Error::new)
+    }
+}
+
+/// Closes a [`SqliteStore`] from outside it, e.g. once the server holding it has stopped.
+/// Cloning it is cheap.
+#[derive(Clone)]
+pub struct Closer(Arc<SharedConnection>);
+
+impl fmt::Debug for Closer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Closer").finish_non_exhaustive()
+    }
+}
+
+/// How [`Closer::close`] ended.
+#[derive(Debug)]
+pub enum Closing {
+    /// The database is closed, or already was.
+    Closed,
+    /// Closing the database failed; it is dropped regardless.
+    Failed(Error),
+    /// A transaction was still running when the bound ran out. The database closes once it
+    /// ends, unless the process exits first: its journal is then rolled back the next time the
+    /// database is opened.
+    TransactionStillRunning,
+}
+
+impl Closer {
+    /// Closes the store: transactions not yet running fail from now on, and a transaction
+    /// already running gets at most `bound` to commit or roll back before the database closes.
+    /// Transactions run on blocking threads of whichever runtime asked for them, so this covers
+    /// them all, whichever runtime that is.
+    pub fn close(&self, bound: Duration) -> Closing {
+        self.0.closing.store(true, Ordering::SeqCst);
+        let shared = Arc::clone(&self.0);
+        let (done, closed) = mpsc::channel();
+        // A std `Mutex` has no timed lock: wait for the connection on a thread of its own.
+        std::thread::spawn(move || {
+            let connection = shared
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let closed =
+                connection.map(|connection| connection.close().map_err(|(_, error)| error));
+            // The closer stops listening once its bound has run out.
+            let _ = done.send(closed);
+        });
+        match closed.recv_timeout(bound) {
+            Ok(None | Some(Ok(()))) => Closing::Closed,
+            Ok(Some(Err(error))) => Closing::Failed(Error::new(error)),
+            Err(_) => Closing::TransactionStillRunning,
+        }
     }
 }
 
@@ -959,6 +1047,115 @@ mod tests {
             cause.contains(&format!("schema version {newer}")),
             "{cause}"
         );
+    }
+
+    mod close {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        use super::TempDatabase;
+        use crate::Closing;
+
+        fn has_probe_table(database: &TempDatabase) -> bool {
+            database
+                .raw()
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name = 'probe'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                == 1
+        }
+
+        fn journal_exists(database: &TempDatabase) -> bool {
+            database.path.with_file_name("bridge.db-journal").exists()
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn close_lets_a_running_transaction_commit_first() {
+            let database = TempDatabase::new();
+            let store = database.open_with(1);
+            let closer = store.closer();
+            let (started, running) = mpsc::channel();
+            let transaction = tokio::spawn(async move {
+                store
+                    .transaction(move |tx| {
+                        started.send(()).unwrap();
+                        std::thread::sleep(Duration::from_millis(300));
+                        tx.execute("CREATE TABLE probe (x)", [])?;
+                        Ok(())
+                    })
+                    .await
+            });
+            running.recv().unwrap();
+
+            let closed = closer.close(Duration::from_secs(5));
+
+            assert!(matches!(closed, Closing::Closed), "{closed:?}");
+            transaction.await.unwrap().expect("the transaction commits");
+            assert!(has_probe_table(&database));
+            assert!(!journal_exists(&database));
+        }
+
+        #[tokio::test]
+        async fn a_transaction_after_close_fails() {
+            let database = TempDatabase::new();
+            let store = database.open_with(1);
+
+            let closed = store.closer().close(Duration::from_secs(1));
+
+            assert!(matches!(closed, Closing::Closed), "{closed:?}");
+            let error = store
+                .transaction(|tx| tx.execute("CREATE TABLE probe (x)", []))
+                .await
+                .unwrap_err();
+            assert_eq!(error.to_string(), "the database is closed");
+            assert!(!has_probe_table(&database));
+            // Closing again finds nothing left to close.
+            assert!(matches!(
+                store.closer().close(Duration::from_secs(1)),
+                Closing::Closed
+            ));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn close_gives_up_at_its_bound_on_a_transaction_still_running() {
+            let database = TempDatabase::new();
+            let store = database.open_with(1);
+            let closer = store.closer();
+            // Another connection's lock keeps the store's write waiting (for SQLite's busy
+            // timeout, 5 s) far longer than the bound.
+            let other = database.raw();
+            other.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+            let (started, running) = mpsc::channel();
+            let transaction = tokio::spawn(async move {
+                store
+                    .transaction(move |tx| {
+                        started.send(()).unwrap();
+                        tx.execute("CREATE TABLE probe (x)", [])
+                    })
+                    .await
+            });
+            running.recv().unwrap();
+
+            let bound = Duration::from_millis(300);
+            let asked = Instant::now();
+            let closed = closer.close(bound);
+            let took = asked.elapsed();
+
+            assert!(
+                matches!(closed, Closing::TransactionStillRunning),
+                "{closed:?}"
+            );
+            assert!(took >= bound, "gave up after {took:?}");
+            assert!(took < bound + Duration::from_secs(1), "took {took:?}");
+            other.execute_batch("ROLLBACK;").unwrap();
+            transaction
+                .await
+                .unwrap()
+                .expect("the transaction commits once the lock is gone");
+        }
     }
 
     #[cfg(unix)]
