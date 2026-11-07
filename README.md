@@ -14,6 +14,8 @@ Toolchain and tasks come from [mise](https://mise.jdx.dev). In a fresh clone run
 | `mise run check` | build, lint and test |
 | `mise run image` | builds the Clacks image for this machine's platform and smoke-tests it ([scripts/smoke-image.sh](scripts/smoke-image.sh)) |
 
+CI runs `mise run check` on every pull request and every push to `main` ([check.yml](.github/workflows/check.yml)).
+
 The black-box Bridge tests start a real Audiobookshelf in a container ([testcontainers](https://crates.io/crates/testcontainers)), so `mise run test` needs a running Docker; the first run pulls the Audiobookshelf image. The App's flow tests (`crates/app/tests`) drive the App's state and actions, without rendering, against a real Bridge and Audiobookshelf; they start the `bridge` binary from the same target directory, so run them through `mise run test` (or `cargo build -p bridge` before `cargo test -p app`). They run apart from the rest of the workspace: built together with the Bridge, `api` gets its `server` feature, and the App's server function calls would run in-process instead of over HTTP.
 
 Crates live in `crates/`: `api` (the App API contract), `bridge` (the Bridge binary), `app` (the App), `abs` (the Audiobookshelf client), `sonos` (Sonos control behind one trait, over local UPnP), `clock` (the time the Bridge and `sonos-fake` share, which tests advance by hand), `store` (the storage traits and their contract test suite), `store-sqlite` (their SQLite implementation), `test-support` (the test harness the Bridge's and the App's tests share) and `sonos-fake` (a fake Sonos household on loopback for those tests).

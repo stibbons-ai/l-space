@@ -1,0 +1,44 @@
+# Runs `mise run check`, the same command contributors run locally, on every pull request and
+# every push to main.
+name: check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  # A newer push to a pull request cancels its running check. Runs on main are never
+  # cancelled mid-run, but a newer push skips a still-pending older one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The App's desktop side (Dioxus → wry, tao) links the Linux webview stack even though only
+      # its mobile build ships. The webkit2gtk package brings the GTK, libsoup, JavaScriptCore and
+      # D-Bus headers with it; OpenSSL's and pkg-config are already on the runner.
+      - name: Install the App's system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libwebkit2gtk-4.1-dev
+
+      # Rust, its components and targets from mise.toml.
+      - uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+
+      # Keyed on the rustc version and every Cargo.toml and Cargo.lock, so it needs the
+      # toolchain mise installed above.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: mise run check
+        run: mise run check
