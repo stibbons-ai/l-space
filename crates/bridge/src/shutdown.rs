@@ -80,8 +80,8 @@ pub async fn serve(listener: TcpListener, router: Router, signals: Signals) -> i
 /// Tears the Bridge down once [`serve`] has returned (or startup failed): closes the store
 /// (`store`; `None` if the Bridge never opened it), then stops the runtime with what is left of
 /// [`RUNTIME_SHUTDOWN`]. The store is closed first because App API handlers don't run on
-/// `runtime`: Dioxus runs each on a local runtime of its own, so stopping `runtime` doesn't wait
-/// for their transactions; closing the store does, whichever runtime they run on.
+/// `runtime`: Dioxus runs them on its own pool of single-thread runtimes, so stopping `runtime`
+/// doesn't wait for their transactions; closing the store does, whichever runtime they run on.
 pub fn teardown(runtime: Runtime, store: Option<&Closer>) {
     let started = Instant::now();
     if let Some(store) = store {
@@ -91,8 +91,9 @@ pub fn teardown(runtime: Runtime, store: Option<&Closer>) {
 }
 
 /// Closes the store, letting a transaction already running commit for at most `bound`, and
-/// logs the outcome. A transaction still running then is abandoned: its hot journal is rolled
-/// back when the Bridge next opens the database, so the database stays consistent.
+/// logs the outcome. A transaction still running then is abandoned: whatever it already wrote to
+/// the database file is rolled back from its journal when the database is next opened, so the
+/// database stays consistent.
 fn close_store(store: &Closer, bound: Duration) {
     match store.close(bound) {
         Closing::Closed => tracing::debug!("database closed"),
@@ -116,8 +117,11 @@ fn stop_runtime(runtime: Runtime, bound: Duration) {
     let asked = Instant::now();
     runtime.shutdown_timeout(bound);
     // Tokio doesn't report whether the wait ran out; it returns before the bound only once
-    // every blocking thread has finished. No bound left means closing the store used it up,
-    // and warned.
+    // every blocking thread has finished, so a wait that lasts the bound is taken as having run
+    // out (with a bound of a few µs it may warn with nothing abandoned). No bound left means
+    // closing the store used all of it: no wait, no warning. The close warned if a transaction
+    // was still running; if it closed (or failed) right at the bound, blocking work abandoned
+    // here goes unlogged.
     if !bound.is_zero() && asked.elapsed() >= bound {
         tracing::warn!(?bound, "blocking work still running at exit: abandoned");
     }

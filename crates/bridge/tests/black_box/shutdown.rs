@@ -140,15 +140,7 @@ async fn a_request_held_past_the_drain_does_not_keep_the_bridge_running() {
     let exited = bridge.wait_for_exit();
 
     assert_stopped_cleanly(&exited);
-    assert_eq!(
-        count(
-            &exited,
-            "connections still open after the drain: dropping them"
-        ),
-        1,
-        "{:#?}",
-        exited.events
-    );
+    assert_eq!(count(&exited, DRAIN_ENDED), 1, "{:#?}", exited.events);
     let took = asked.elapsed();
     assert!(
         took >= DRAIN,
@@ -157,40 +149,87 @@ async fn a_request_held_past_the_drain_does_not_keep_the_bridge_running() {
     assert!(took < DRAIN + MARGIN, "took {took:?}");
 }
 
+/// What the drain's end logs when connections are still open.
+const DRAIN_ENDED: &str = "connections still open after the drain: dropping them";
+
+fn is_drain_ended(event: &Value) -> bool {
+    event["message"] == DRAIN_ENDED
+}
+
+/// A Bridge with a login in flight whose Library Server request is held (`held`), and another
+/// connection (`reader`) holding a read lock on the Bridge's database: once the Library Server
+/// answers, the login's commit waits for the lock (SQLite's busy timeout is 5 s) until the test
+/// lets go. The login's own connection is dropped at the end of the drain: no answer to wait for.
+struct LoginBehindALock {
+    bridge: TestBridge,
+    reader: rusqlite::Connection,
+    held: TcpStream,
+    _library_server: HeldLibraryServer,
+}
+
+impl LoginBehindALock {
+    async fn start() -> Self {
+        let library_server = HeldLibraryServer::start().await;
+        let bridge = TestBridge::start(&library_server_toml(&library_server.url));
+        let reader = rusqlite::Connection::open(bridge.database_path()).expect("open the database");
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM sessions;")
+            .expect("hold a read lock");
+        let api = bridge.api().clone();
+        let url = library_server.url.clone();
+        tokio::spawn(async move { api.login(&url, "held-key").await });
+        let held = library_server.next_request().await;
+        Self {
+            bridge,
+            reader,
+            held,
+            _library_server: library_server,
+        }
+    }
+}
+
+fn count_sessions(connection: &rusqlite::Connection) -> i64 {
+    connection
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .expect("count sessions")
+}
+
+fn database_file_names(bridge: &TestBridge) -> Vec<String> {
+    let mut names: Vec<String> = bridge
+        .database_files()
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    names.sort();
+    names
+}
+
 /// App API handlers run on runtimes of their own (Dioxus's), which stopping the Bridge's
 /// runtime doesn't wait for: the store's close does. Here a login's write is still waiting for
 /// a lock when the drain ends; the Bridge waits for it to commit before it exits.
 #[tokio::test]
 async fn a_write_still_running_when_the_drain_ends_commits_before_the_bridge_exits() {
-    let library_server = HeldLibraryServer::start().await;
-    let mut bridge = TestBridge::start(&library_server_toml(&library_server.url));
-    // Another connection reading the database keeps the login's commit waiting (SQLite's
-    // busy timeout is 5 s) until the test lets go.
-    let reader = rusqlite::Connection::open(bridge.database_path()).expect("open the database");
-    reader
-        .execute_batch("BEGIN; SELECT count(*) FROM sessions;")
-        .expect("hold a read lock");
-    let api = bridge.api().clone();
-    let url = library_server.url.clone();
-    // Its connection is dropped at the end of the drain: no answer to wait for.
-    let _login = tokio::spawn(async move { api.login(&url, "held-key").await });
-    let held = library_server.next_request().await;
+    let LoginBehindALock {
+        mut bridge,
+        reader,
+        held,
+        ..
+    } = LoginBehindALock::start().await;
 
     let asked = Instant::now();
     bridge.signal(Signal::Terminate);
     bridge.wait_for_event(is_shutting_down);
-    tokio::time::sleep_until((asked + DRAIN - Duration::from_millis(600)).into()).await;
+    // Well before the drain ends, so the login's transaction runs before the store closes; its
+    // commit then waits on the lock past the drain's end (the busy timeout outlasts it).
+    tokio::time::sleep_until((asked + Duration::from_millis(2500)).into()).await;
     answer_me(held, "held-user").await;
-    let release_at = asked + DRAIN + Duration::from_millis(300);
-    let releasing = std::thread::spawn(move || {
-        std::thread::sleep(release_at.saturating_duration_since(Instant::now()));
-        reader
-            .execute_batch("ROLLBACK;")
-            .expect("release the read lock");
-    });
+    bridge.wait_for_event(is_drain_ended);
+    // The store's close waits for the commit, which now gets the lock.
+    reader
+        .execute_batch("ROLLBACK;")
+        .expect("release the read lock");
     let exited = bridge.wait_for_exit();
     let took = asked.elapsed();
-    releasing.join().expect("lock released");
 
     assert_stopped_cleanly(&exited);
     assert_eq!(
@@ -200,17 +239,81 @@ async fn a_write_still_running_when_the_drain_ends_commits_before_the_bridge_exi
         exited.events
     );
     assert!(took < DRAIN + RUNTIME_SHUTDOWN + MARGIN, "took {took:?}");
-    let files: Vec<String> = bridge
-        .database_files()
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    assert_eq!(files, ["bridge.db"], "a transaction was cut off");
-    let sessions: i64 = rusqlite::Connection::open(bridge.database_path())
-        .expect("reopen the database")
-        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
-        .expect("count sessions");
-    assert_eq!(sessions, 1, "the login's session was not stored");
+    assert_eq!(
+        database_file_names(&bridge),
+        ["bridge.db"],
+        "a transaction was cut off"
+    );
+    let reopened = rusqlite::Connection::open(bridge.database_path()).expect("reopen");
+    assert_eq!(
+        count_sessions(&reopened),
+        1,
+        "the login's session was not stored"
+    );
+}
+
+/// A write still waiting for a lock when [`RUNTIME_SHUTDOWN`] runs out after the drain doesn't
+/// keep the Bridge running: it exits 0 with the transaction abandoned, and the database, opened
+/// again, holds none of it and is intact.
+#[tokio::test]
+async fn a_write_still_running_after_the_drain_and_the_close_bound_is_abandoned() {
+    let LoginBehindALock {
+        mut bridge,
+        reader,
+        held,
+        ..
+    } = LoginBehindALock::start().await;
+
+    let asked = Instant::now();
+    bridge.signal(Signal::Terminate);
+    bridge.wait_for_event(is_shutting_down);
+    // Late enough that the commit's 5 s busy timeout runs past `DRAIN + RUNTIME_SHUTDOWN + 1 s`
+    // (a close not bounded by `RUNTIME_SHUTDOWN` waits for that and fails the timing below),
+    // early enough that the login's transaction starts before the drain ends and the store
+    // closes.
+    tokio::time::sleep_until((asked + Duration::from_millis(3500)).into()).await;
+    answer_me(held, "held-user").await;
+    // The read lock stays until after the Bridge has exited.
+    let exited = bridge.wait_for_exit();
+    let took = asked.elapsed();
+    let files_at_exit = database_file_names(&bridge);
+    drop(reader);
+
+    assert_stopped_cleanly(&exited);
+    assert_eq!(count(&exited, DRAIN_ENDED), 1, "{:#?}", exited.events);
+    assert_eq!(
+        exited
+            .events
+            .iter()
+            .filter(|event| event["message"].as_str().is_some_and(
+                |message| message.starts_with("database transaction still running at exit")
+            ))
+            .count(),
+        1,
+        "{:#?}",
+        exited.events
+    );
+    assert!(
+        took < DRAIN + RUNTIME_SHUTDOWN + Duration::from_secs(1),
+        "took {took:?}"
+    );
+    assert_eq!(
+        files_at_exit,
+        ["bridge.db", "bridge.db-journal"],
+        "the abandoned transaction left no journal"
+    );
+    // The commit never got its lock, so the database file is untouched; the journal it leaves
+    // isn't hot (never synced), and SQLite ignores it until the next write replaces it.
+    let reopened = rusqlite::Connection::open(bridge.database_path()).expect("reopen");
+    assert_eq!(
+        count_sessions(&reopened),
+        0,
+        "the abandoned login's session was stored"
+    );
+    let integrity: String = reopened
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("check integrity");
+    assert_eq!(integrity, "ok");
 }
 
 /// The Bridge at `url` no longer accepts connections, at the latest shortly after it logged

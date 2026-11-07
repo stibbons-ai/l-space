@@ -36,8 +36,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0003_handoffs.sql"),
 ];
 
-/// A [`Store`] in one SQLite database file. It stays open until it is dropped, or until a
-/// [`Closer`] taken from it closes it; from then on its transactions fail.
+/// A [`Store`] in one SQLite database file. It stays open until it, its [`Closer`]s and its
+/// running transactions are all dropped, or a Closer closes it; from then on its transactions
+/// fail.
 pub struct SqliteStore {
     connection: Arc<SharedConnection>,
     sealing: Arc<Sealing>,
@@ -156,7 +157,8 @@ impl fmt::Debug for Closer {
 pub enum Closing {
     /// The database is closed, or already was.
     Closed,
-    /// Closing the database failed; it is dropped regardless.
+    /// Closing the database failed; dropping it retries once; if that fails too, the handle
+    /// stays open until the process exits.
     Failed(Error),
     /// A transaction was still running when the bound ran out. The database closes once it
     /// ends, unless the process exits first: its journal is then rolled back the next time the
@@ -166,7 +168,8 @@ pub enum Closing {
 
 impl Closer {
     /// Closes the store: transactions not yet running fail from now on, and a transaction
-    /// already running gets at most `bound` to commit or roll back before the database closes.
+    /// already running gets up to `bound` to finish; `close` returns then, closed or not (see
+    /// [`Closing`]).
     /// Transactions run on blocking threads of whichever runtime asked for them, so this covers
     /// them all, whichever runtime that is.
     pub fn close(&self, bound: Duration) -> Closing {
@@ -188,10 +191,16 @@ impl Closer {
         match closed.recv_timeout(bound) {
             Ok(None | Some(Ok(()))) => Closing::Closed,
             Ok(Some(Err(error))) => Closing::Failed(Error::new(error)),
-            Err(_) => Closing::TransactionStillRunning,
+            Err(mpsc::RecvTimeoutError::Timeout) => Closing::TransactionStillRunning,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Closing::Failed(Error::new(ClosePanicked)),
         }
     }
 }
+
+/// The thread closing the database panicked.
+#[derive(Debug, thiserror::Error)]
+#[error("closing the database panicked")]
+struct ClosePanicked;
 
 /// Opening the database failed at `step`.
 #[derive(Debug, thiserror::Error)]
@@ -1155,6 +1164,63 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("the transaction commits once the lock is gone");
+        }
+
+        /// A transaction queued for the connection behind a running one when the close starts
+        /// fails, even if it gets the connection before the closer does (a std `Mutex` isn't
+        /// fair): the running one commits, the queued one doesn't run.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_transaction_queued_behind_a_running_one_at_close_fails() {
+            let database = TempDatabase::new();
+            let store = std::sync::Arc::new(database.open_with(1));
+            let closer = store.closer();
+            let (started, running) = mpsc::channel();
+            let (finish, finishing) = mpsc::channel::<()>();
+            let first = tokio::spawn({
+                let store = std::sync::Arc::clone(&store);
+                async move {
+                    store
+                        .transaction(move |tx| {
+                            started.send(()).unwrap();
+                            finishing.recv().unwrap();
+                            tx.execute("CREATE TABLE probe (x)", [])?;
+                            Ok(())
+                        })
+                        .await
+                }
+            });
+            running.recv().unwrap();
+            let second = tokio::spawn({
+                let store = std::sync::Arc::clone(&store);
+                async move {
+                    store
+                        .transaction(|tx| tx.execute("CREATE TABLE queued (x)", []))
+                        .await
+                }
+            });
+            // Nothing marks a thread as waiting for a lock. This pause doesn't decide the
+            // outcome; it lets the second transaction queue on the connection before the
+            // closer does, so that it, not the closer, most likely gets the connection next.
+            std::thread::sleep(Duration::from_millis(100));
+
+            let closing = std::thread::spawn({
+                let closer = closer.clone();
+                move || closer.close(Duration::from_secs(5))
+            });
+            while !closer.0.closing.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::yield_now();
+            }
+            finish.send(()).unwrap();
+            let closed = closing.join().unwrap();
+
+            assert!(matches!(closed, Closing::Closed), "{closed:?}");
+            first
+                .await
+                .unwrap()
+                .expect("the running transaction commits");
+            let error = second.await.unwrap().unwrap_err();
+            assert_eq!(error.to_string(), "the database is closed");
+            assert!(has_probe_table(&database));
         }
     }
 
