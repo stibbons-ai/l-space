@@ -13,4 +13,5 @@ mod home;
 mod library_servers;
 mod logging;
 mod login;
+mod shutdown;
 mod startup;

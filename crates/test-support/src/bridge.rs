@@ -29,6 +29,9 @@
 //!   key and database; [`TestBridge::restart_with`] and [`TestBridge::restart_with_key`]
 //!   change the configuration or the key. Dropping the [`TestBridge`] kills the process.
 //! - [`TestBridge::database_files`] reads the database file and its side files raw.
+//! - [`TestBridge::signal`] sends the Bridge a [`Signal`] as an operator would;
+//!   [`TestBridge::wait_for_event`] waits for a log event, and [`TestBridge::wait_for_exit`]
+//!   for the Bridge to exit, returning its exit status and output as [`run_until_exit`] does.
 //! - [`run_until_exit`] is for a Bridge that must not start: it returns the exit status and
 //!   every output line, stdout and stderr. JSON lines (log events) are objects; any other line
 //!   becomes a [`Value::String`]. [`run_until_exit_with_key`] passes other key variables.
@@ -132,6 +135,17 @@ struct Running {
     output: Receiver<Value>,
     api: AppApi,
     startup: Vec<Value>,
+    /// What [`TestBridge::wait_for_event`] received after `startup`.
+    seen: Vec<Value>,
+}
+
+/// A signal asking the Bridge to stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signal {
+    /// SIGTERM, as `docker stop` sends.
+    Terminate,
+    /// SIGINT, as Ctrl-C in a terminal sends.
+    Interrupt,
 }
 
 impl TestBridge {
@@ -204,8 +218,65 @@ impl TestBridge {
     pub fn stop(mut self) -> Vec<Value> {
         stop(&mut self.running.child);
         let mut output = std::mem::take(&mut self.running.startup);
+        output.append(&mut self.running.seen);
         output.extend(self.running.output.iter());
         output
+    }
+
+    /// Sends the Bridge `signal`.
+    pub fn signal(&self, signal: Signal) {
+        let name = match signal {
+            Signal::Terminate => "-TERM",
+            Signal::Interrupt => "-INT",
+        };
+        let status = Command::new("kill")
+            .arg(name)
+            .arg(self.running.child.id().to_string())
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill {name} failed: {status}");
+    }
+
+    /// Waits for the Bridge to log an event that `matches` accepts. Panics if the Bridge exits
+    /// first or doesn't log one in time.
+    pub fn wait_for_event(&mut self, matches: impl Fn(&Value) -> bool) {
+        let running = &mut self.running;
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            match running
+                .output
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok(event) => {
+                    let found = matches(&event);
+                    running.seen.push(event);
+                    if found {
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => panic!(
+                    "Bridge exited before the event: {:?}; output: {:#?}",
+                    running.child.wait(),
+                    running.seen
+                ),
+                Err(RecvTimeoutError::Timeout) => {
+                    panic!(
+                        "no such event within {TIMEOUT:?}; output: {:#?}",
+                        running.seen
+                    )
+                }
+            }
+        }
+    }
+
+    /// Waits for the Bridge to exit; returns its exit status and everything it wrote since it
+    /// last started. Panics if it is still running after the timeout. [`TestBridge::restart`]
+    /// starts it again.
+    pub fn wait_for_exit(&mut self) -> Exited {
+        let running = &mut self.running;
+        let mut events = running.startup.clone();
+        events.append(&mut running.seen);
+        until_exit(&mut running.child, &running.output, events)
     }
 
     /// A client for this Bridge's App API.
@@ -273,6 +344,7 @@ fn launch(config: &Path, rust_log: &str, key: &KeyEnv) -> Running {
                     output,
                     api,
                     startup,
+                    seen: Vec::new(),
                 };
             }
             Ok(event) => startup.push(event),
@@ -394,7 +466,7 @@ pub fn home_episode(abs: &Audiobookshelf, n: usize, progress: Option<Progress>) 
 
 /// The App API as the App calls it, over HTTP. Paths and payloads follow the `api` crate's
 /// server functions; responses decode into its types.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AppApi {
     http: reqwest::Client,
     base_url: String,
@@ -745,14 +817,19 @@ pub fn run_until_exit(config: &Path, rust_log: &str) -> Exited {
 /// [`run_until_exit`] with the encryption key variables `key`.
 pub fn run_until_exit_with_key(config: &Path, rust_log: &str, key: &KeyEnv) -> Exited {
     let (mut child, output) = spawn(config, rust_log, key);
+    until_exit(&mut child, &output, Vec::new())
+}
+
+/// Collects `child`'s `output` after `events` until it exits, then returns how it ended. Kills
+/// it and panics if it is still running after the timeout.
+fn until_exit(child: &mut Child, output: &Receiver<Value>, mut events: Vec<Value>) -> Exited {
     let deadline = Instant::now() + TIMEOUT;
-    let mut events = Vec::new();
     loop {
         match output.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(event) => events.push(event),
             Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {
-                stop(&mut child);
+                stop(child);
                 panic!("Bridge still running after {TIMEOUT:?}; events: {events:#?}");
             }
         }

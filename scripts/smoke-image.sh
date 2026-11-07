@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Smoke-tests a Clacks (Bridge) image the way the README's compose file runs it: host
 # networking, an init process, a named data volume, the configuration file mounted read-only,
-# and the encryption key as a secret file.
+# and the encryption key as a secret file. The restarted container runs without an init
+# process, as the Bridge's own PID 1, to check it still stops on `docker stop`'s SIGTERM.
 #
 #   scripts/smoke-image.sh <image>
 #
@@ -48,12 +49,13 @@ else
 fi
 chmod 0644 "$work/bridge.toml"
 
-# Starts a Bridge container on the shared volume; extra `docker run` arguments follow the name.
+# Starts a Bridge container on the shared volume; extra `docker run` arguments (such as
+# `--init`) follow the name.
 start() {
   local name="$run_id-$1"
   shift
   containers+=("$name")
-  docker run --detach --name "$name" --network host --init \
+  docker run --detach --name "$name" --network host \
     --volume "$volume:/var/lib/clacks" \
     --mount "type=bind,source=$work/bridge.toml,target=/etc/clacks/bridge.toml,readonly" \
     "$@" "$image" >/dev/null
@@ -122,22 +124,31 @@ exit_code() {
   fail "$1 still running after $2 s"
 }
 
+# Stops container `$1` with `docker stop`, checks the Bridge shut down on SIGTERM well within
+# the 10 s grace period (exit 0, one `shutting down` and one `stopped` event), and prints how
+# many seconds it took.
+stop_cleanly() {
+  local name="$run_id-$1" status events
+  SECONDS=0
+  docker stop "$name" >/dev/null
+  local stopped_in=$SECONDS
+  status=$(exit_code "$1" 1)
+  ((stopped_in <= 5)) || fail "docker stop of $1 took ${stopped_in} s"
+  [[ $status == 0 ]] || fail "exit code $status after docker stop of $1, expected 0"
+  events=$(docker logs "$name" 2>/dev/null | jq -r 'select(.message == "shutting down" or .message == "stopped") | .message')
+  [[ $events == $'shutting down\nstopped' ]] || fail "$1 logged, of shutting down and stopped: ${events:-nothing}"
+  echo "$stopped_in"
+}
+
 echo "== $image: first start on a fresh volume"
-start first "${with_key[@]}"
+start first --init "${with_key[@]}"
 addr=$(listening_addr first)
 check_library_servers "$addr"
 check_database first >/dev/null
 echo "ok: listening on $addr, Library Server listed, database created in the volume"
 
-echo "== restart: a new container on the same volume"
-# The init process passes `docker stop`'s SIGTERM to the Bridge, which has no handler for it
-# yet, so it ends at once (exit 143) instead of after the 10 s grace period and a SIGKILL.
-SECONDS=0
-docker stop "$run_id-first" >/dev/null
-stopped_in=$SECONDS
-status=$(exit_code first 1)
-((stopped_in <= 5)) || fail "docker stop took ${stopped_in} s"
-[[ $status == 143 ]] || fail "exit code $status after docker stop, expected 143 (SIGTERM)"
+echo "== restart without an init process: a new container on the same volume"
+stopped_in=$(stop_cleanly first)
 # A marker the second container must see, proving it runs on the first one's volume.
 touch "$work/volume-marker"
 COPYFILE_DISABLE=1 tar -cf - -C "$work" volume-marker | docker cp - "$run_id-first:/var/lib/clacks/" \
@@ -147,10 +158,12 @@ addr=$(listening_addr second)
 check_library_servers "$addr"
 listing=$(check_database second)
 grep -qE ' clacks/volume-marker$' <<<"$listing" || fail "second container has another volume: $listing"
-echo "ok: stopped in ${stopped_in} s (exit $status); back up on $addr on the same volume and database"
+echo "ok: stopped in ${stopped_in} s (exit 0); back up on $addr on the same volume and database"
+stopped_in=$(stop_cleanly second)
+echo "ok: without an init process, stopped in ${stopped_in} s (exit 0)"
 
 echo "== no encryption key: exits 1"
-start no-key
+start no-key --init
 status=$(exit_code no-key 30)
 [[ $status == 1 ]] || fail "exit code $status without a key, expected 1"
 docker logs "$run_id-no-key" | jq --exit-status 'select(.message == "cannot load the encryption key")' >/dev/null \

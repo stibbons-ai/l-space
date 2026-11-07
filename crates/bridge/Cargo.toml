@@ -21,7 +21,7 @@ sonos.workspace = true
 store.workspace = true
 store-sqlite.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal", "time"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
