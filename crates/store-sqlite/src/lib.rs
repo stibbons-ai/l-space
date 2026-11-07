@@ -161,8 +161,8 @@ pub enum Closing {
     /// stays open until the process exits.
     Failed(Error),
     /// A transaction was still running when the bound ran out. The database closes once it
-    /// ends, unless the process exits first: its journal is then rolled back the next time the
-    /// database is opened.
+    /// ends, unless the process exits first: whatever it already wrote to the database file is
+    /// then rolled back from its journal the next time the database is read.
     TransactionStillRunning,
 }
 
@@ -1221,6 +1221,28 @@ mod tests {
             let error = second.await.unwrap().unwrap_err();
             assert_eq!(error.to_string(), "the database is closed");
             assert!(has_probe_table(&database));
+        }
+
+        /// Once a close has started, a transaction that gets the connection before the closer
+        /// does fails: the closing flag decides, not whether the connection is gone yet.
+        #[tokio::test]
+        async fn a_transaction_that_gets_the_connection_while_closing_fails() {
+            let database = TempDatabase::new();
+            let store = database.open_with(1);
+            // A close has begun but hasn't taken the connection yet.
+            store
+                .closer()
+                .0
+                .closing
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+
+            let error = store
+                .transaction(|tx| tx.execute("CREATE TABLE probe (x)", []))
+                .await
+                .unwrap_err();
+
+            assert_eq!(error.to_string(), "the database is closed");
+            assert!(!has_probe_table(&database));
         }
     }
 

@@ -78,10 +78,11 @@ pub async fn serve(listener: TcpListener, router: Router, signals: Signals) -> i
 }
 
 /// Tears the Bridge down once [`serve`] has returned (or startup failed): closes the store
-/// (`store`; `None` if the Bridge never opened it), then stops the runtime with what is left of
-/// [`RUNTIME_SHUTDOWN`]. The store is closed first because App API handlers don't run on
-/// `runtime`: Dioxus runs them on its own pool of single-thread runtimes, so stopping `runtime`
-/// doesn't wait for their transactions; closing the store does, whichever runtime they run on.
+/// (`store`; `None` unless the Bridge got as far as serving), then stops the runtime with what
+/// is left of [`RUNTIME_SHUTDOWN`]. The store is closed first because App API handlers don't
+/// run on `runtime`: Dioxus runs them on its own pool of single-thread runtimes, so stopping
+/// `runtime` doesn't wait for their transactions; closing the store does, whichever runtime
+/// they run on.
 pub fn teardown(runtime: Runtime, store: Option<&Closer>) {
     let started = Instant::now();
     if let Some(store) = store {
@@ -92,7 +93,7 @@ pub fn teardown(runtime: Runtime, store: Option<&Closer>) {
 
 /// Closes the store, letting a transaction already running commit for at most `bound`, and
 /// logs the outcome. A transaction still running then is abandoned: whatever it already wrote to
-/// the database file is rolled back from its journal when the database is next opened, so the
+/// the database file is rolled back from its journal the next time the database is read, so the
 /// database stays consistent.
 fn close_store(store: &Closer, bound: Duration) {
     match store.close(bound) {
@@ -103,7 +104,7 @@ fn close_store(store: &Closer, bound: Duration) {
         }
         Closing::TransactionStillRunning => tracing::warn!(
             ?bound,
-            "database transaction still running at exit: abandoned, rolled back when the database is next opened"
+            "database transaction still running at exit: abandoned; anything it wrote is rolled back when the database is next opened"
         ),
     }
 }

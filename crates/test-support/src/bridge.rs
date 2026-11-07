@@ -224,7 +224,7 @@ impl TestBridge {
         stop(&mut self.running.child);
         let mut output = std::mem::take(&mut self.running.startup);
         output.append(&mut self.running.seen);
-        output.extend(self.running.output.iter());
+        collect_after_exit(&self.running.output, &mut output);
         output
     }
 
@@ -789,6 +789,8 @@ async fn api_error(response: reqwest::Response) -> (StatusCode, ApiError) {
 #[derive(Debug)]
 pub struct Exited {
     pub status: ExitStatus,
+    /// When the process was seen to have exited (within a few milliseconds), for timing a stop.
+    pub at: Instant,
     /// Every line the Bridge wrote, stdout and stderr interleaved as they arrived.
     pub events: Vec<Value>,
 }
@@ -827,20 +829,47 @@ pub fn run_until_exit_with_key(config: &Path, rust_log: &str, key: &KeyEnv) -> E
 
 /// Collects `child`'s `output` after `events` until it exits, then returns how it ended. Kills
 /// it and panics if it is still running after the timeout.
+///
+/// Exit is the process's, not end of file on its pipes: a child spawned concurrently elsewhere
+/// in the test process can inherit a pipe's write end (on macOS std sets close-on-exec on a new
+/// pipe only after creating it) and hold end of file back for as long as it runs. Output that
+/// arrives within [`OUTPUT_AFTER_EXIT`] of the exit is kept.
 fn until_exit(child: &mut Child, output: &Receiver<Value>, mut events: Vec<Value>) -> Exited {
     let deadline = Instant::now() + TIMEOUT;
-    loop {
-        match output.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-            Ok(event) => events.push(event),
-            Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {
-                stop(child);
-                panic!("Bridge still running after {TIMEOUT:?}; events: {events:#?}");
-            }
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("check whether the Bridge exited") {
+            break status;
         }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            stop(child);
+            panic!("Bridge still running after {TIMEOUT:?}; events: {events:#?}");
+        }
+        match output.recv_timeout(left.min(EXIT_POLL)) {
+            Ok(event) => events.push(event),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break child.wait().expect("wait for Bridge"),
+        }
+    };
+    let at = Instant::now();
+    collect_after_exit(output, &mut events);
+    Exited { status, at, events }
+}
+
+/// How often [`until_exit`] checks whether the Bridge has exited.
+const EXIT_POLL: Duration = Duration::from_millis(5);
+
+/// How long output is still collected once the Bridge has exited: everything it wrote is
+/// already in its pipes, so this only bounds the wait for end of file (see [`until_exit`]).
+const OUTPUT_AFTER_EXIT: Duration = Duration::from_secs(1);
+
+/// Appends to `events` what an exited Bridge's `output` still holds, until end of file or
+/// [`OUTPUT_AFTER_EXIT`].
+fn collect_after_exit(output: &Receiver<Value>, events: &mut Vec<Value>) {
+    let deadline = Instant::now() + OUTPUT_AFTER_EXIT;
+    while let Ok(event) = output.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        events.push(event);
     }
-    let status = child.wait().expect("wait for Bridge");
-    Exited { status, events }
 }
 
 /// A temporary directory holding `contents` as the config file `bridge.toml`.

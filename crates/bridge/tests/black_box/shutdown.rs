@@ -91,7 +91,8 @@ fn sigint_stops_the_bridge_at_once_with_exit_code_0() {
     let exited = bridge.wait_for_exit();
 
     assert_stopped_cleanly(&exited);
-    assert!(asked.elapsed() < MARGIN, "took {:?}", asked.elapsed());
+    let took = exited.at - asked;
+    assert!(took < MARGIN, "took {took:?}: {:#?}", exited.events);
 }
 
 #[tokio::test]
@@ -112,7 +113,8 @@ async fn a_request_in_flight_at_sigterm_completes_and_its_write_lasts() {
 
     assert_eq!(session.user.user_id, "held-user");
     assert_stopped_cleanly(&exited);
-    assert!(asked.elapsed() < MARGIN, "took {:?}", asked.elapsed());
+    let took = exited.at - asked;
+    assert!(took < MARGIN, "took {took:?}: {:#?}", exited.events);
     // The session the login opened while the Bridge was stopping was stored: after a restart,
     // logging out finds it (and needs no Library Server).
     bridge.restart();
@@ -141,12 +143,13 @@ async fn a_request_held_past_the_drain_does_not_keep_the_bridge_running() {
 
     assert_stopped_cleanly(&exited);
     assert_eq!(count(&exited, DRAIN_ENDED), 1, "{:#?}", exited.events);
-    let took = asked.elapsed();
+    let took = exited.at - asked;
     assert!(
         took >= DRAIN,
-        "stopped after {took:?}, before the drain ended"
+        "stopped after {took:?}, before the drain ended: {:#?}",
+        exited.events
     );
-    assert!(took < DRAIN + MARGIN, "took {took:?}");
+    assert!(took < DRAIN + MARGIN, "took {took:?}: {:#?}", exited.events);
 }
 
 /// What the drain's end logs when connections are still open.
@@ -159,7 +162,8 @@ fn is_drain_ended(event: &Value) -> bool {
 /// A Bridge with a login in flight whose Library Server request is held (`held`), and another
 /// connection (`reader`) holding a read lock on the Bridge's database: once the Library Server
 /// answers, the login's commit waits for the lock (SQLite's busy timeout is 5 s) until the test
-/// lets go. The login's own connection is dropped at the end of the drain: no answer to wait for.
+/// lets go. The login's own connection is dropped when the Bridge stops its runtime, after the
+/// drain: no answer to wait for.
 struct LoginBehindALock {
     bridge: TestBridge,
     reader: rusqlite::Connection,
@@ -229,7 +233,7 @@ async fn a_write_still_running_when_the_drain_ends_commits_before_the_bridge_exi
         .execute_batch("ROLLBACK;")
         .expect("release the read lock");
     let exited = bridge.wait_for_exit();
-    let took = asked.elapsed();
+    let took = exited.at - asked;
 
     assert_stopped_cleanly(&exited);
     assert_eq!(
@@ -238,7 +242,11 @@ async fn a_write_still_running_when_the_drain_ends_commits_before_the_bridge_exi
         "{:#?}",
         exited.events
     );
-    assert!(took < DRAIN + RUNTIME_SHUTDOWN + MARGIN, "took {took:?}");
+    assert!(
+        took < DRAIN + RUNTIME_SHUTDOWN + MARGIN,
+        "took {took:?}: {:#?}",
+        exited.events
+    );
     assert_eq!(
         database_file_names(&bridge),
         ["bridge.db"],
@@ -275,7 +283,7 @@ async fn a_write_still_running_after_the_drain_and_the_close_bound_is_abandoned(
     answer_me(held, "held-user").await;
     // The read lock stays until after the Bridge has exited.
     let exited = bridge.wait_for_exit();
-    let took = asked.elapsed();
+    let took = exited.at - asked;
     let files_at_exit = database_file_names(&bridge);
     drop(reader);
 
@@ -295,7 +303,8 @@ async fn a_write_still_running_after_the_drain_and_the_close_bound_is_abandoned(
     );
     assert!(
         took < DRAIN + RUNTIME_SHUTDOWN + Duration::from_secs(1),
-        "took {took:?}"
+        "took {took:?}: {:#?}",
+        exited.events
     );
     assert_eq!(
         files_at_exit,
