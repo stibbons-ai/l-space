@@ -9,7 +9,8 @@ use tokio::net::{TcpListener, TcpStream};
 
 use test_support::bridge::{Exited, Signal, TestBridge, library_server_toml};
 
-/// How long the Bridge lets requests in flight finish once asked to stop.
+/// How long the Bridge lets requests in flight finish once asked to stop. Mirrors `DRAIN` in
+/// `crates/bridge/src/shutdown.rs`.
 const DRAIN: Duration = Duration::from_secs(5);
 
 /// Room for a slow machine on top of an expected stop time.
@@ -120,20 +121,45 @@ async fn a_request_held_past_the_drain_does_not_keep_the_bridge_running() {
     let mut bridge = TestBridge::start(&library_server_toml(&library_server.url));
     let api = bridge.api().clone();
     let url = library_server.url.clone();
-    // Never answered: the Bridge's request to the Library Server would wait longer than the
-    // drain allows.
+    // Never answered: the Bridge's request to the Library Server waits for the ABS client's
+    // 10 s `TIMEOUT` (`crates/abs/src/lib.rs`), longer than the drain allows.
     let _login = tokio::spawn(async move { api.login_error(&url, "held-key").await });
     let _held = library_server.next_request().await;
 
     let asked = Instant::now();
     bridge.signal(Signal::Terminate);
+    bridge.wait_for_event(is_shutting_down);
+    assert_refuses_connections(bridge.url());
     let exited = bridge.wait_for_exit();
 
     assert_stopped_cleanly(&exited);
+    assert_eq!(
+        count(
+            &exited,
+            "connections still open after the drain: dropping them"
+        ),
+        1,
+        "{:#?}",
+        exited.events
+    );
     let took = asked.elapsed();
     assert!(
         took >= DRAIN,
         "stopped after {took:?}, before the drain ended"
     );
     assert!(took < DRAIN + MARGIN, "took {took:?}");
+}
+
+/// The Bridge at `url` no longer accepts connections, at the latest shortly after it logged
+/// `shutting down`.
+fn assert_refuses_connections(url: &str) {
+    let addr = url.strip_prefix("http://").expect("an http URL");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while std::net::TcpStream::connect(addr).is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "{addr} still accepts connections while draining"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }

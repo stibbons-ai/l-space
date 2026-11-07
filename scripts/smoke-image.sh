@@ -130,9 +130,10 @@ exit_code() {
 stop_cleanly() {
   local name="$run_id-$1" status events
   SECONDS=0
-  docker stop "$name" >/dev/null
+  docker stop "$name" >/dev/null || fail "docker stop of $1 failed"
   local stopped_in=$SECONDS
-  status=$(exit_code "$1" 1)
+  # Errexit is off in here (a command substitution): stop on `exit_code`'s own failure.
+  status=$(exit_code "$1" 1) || exit 1
   ((stopped_in <= 5)) || fail "docker stop of $1 took ${stopped_in} s"
   [[ $status == 0 ]] || fail "exit code $status after docker stop of $1, expected 0"
   events=$(docker logs "$name" 2>/dev/null | jq -r 'select(.message == "shutting down" or .message == "stopped") | .message')
@@ -147,8 +148,11 @@ check_library_servers "$addr"
 check_database first >/dev/null
 echo "ok: listening on $addr, Library Server listed, database created in the volume"
 
-echo "== restart without an init process: a new container on the same volume"
+echo "== stop with an init process"
 stopped_in=$(stop_cleanly first)
+echo "ok: with an init process, stopped in ${stopped_in} s (exit 0)"
+
+echo "== restart without an init process: a new container on the same volume"
 # A marker the second container must see, proving it runs on the first one's volume.
 touch "$work/volume-marker"
 COPYFILE_DISABLE=1 tar -cf - -C "$work" volume-marker | docker cp - "$run_id-first:/var/lib/clacks/" \
@@ -158,7 +162,9 @@ addr=$(listening_addr second)
 check_library_servers "$addr"
 listing=$(check_database second)
 grep -qE ' clacks/volume-marker$' <<<"$listing" || fail "second container has another volume: $listing"
-echo "ok: stopped in ${stopped_in} s (exit 0); back up on $addr on the same volume and database"
+echo "ok: back up on $addr on the same volume and database"
+
+echo "== stop without an init process (the Bridge is PID 1)"
 stopped_in=$(stop_cleanly second)
 echo "ok: without an init process, stopped in ${stopped_in} s (exit 0)"
 

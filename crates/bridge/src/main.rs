@@ -57,9 +57,10 @@ fn main() -> ExitCode {
         .build()
         .expect("the Tokio runtime builds");
     let served = runtime.block_on(run(args));
-    // Drops every task still holding the App API (connections left open after the drain, the
-    // Sonos search), which closes the store, after waiting for the SQLite writes in flight.
-    drop(runtime);
+    // Cancels the tasks left (connections still open after the drain, detached Handoff starts)
+    // and gives an SQLite transaction already on a blocking thread up to
+    // `shutdown::RUNTIME_SHUTDOWN` to commit; the store closes with the last `Arc`.
+    shutdown::stop_runtime(runtime);
     match served {
         Ok(()) => {
             tracing::info!("stopped");
@@ -70,8 +71,10 @@ fn main() -> ExitCode {
 }
 
 /// Starts the Bridge and serves until a signal asks it to stop. Fails with the exit code when
-/// it cannot start or stops serving on its own. Teardown that needs the App API (final
-/// Progress, for example) goes after `shutdown::serve` returns; `main` then drops the runtime.
+/// it cannot start, or if the server fails while serving (axum 0.8's graceful server never does;
+/// the path guards against a change there). A later slice whose teardown needs the App API
+/// (final Progress, for example) keeps an `Arc<AppApi>` clone before building the router and
+/// runs its teardown after `shutdown::serve` returns; `main` then stops the runtime.
 async fn run(args: Args) -> Result<(), ExitCode> {
     let config = match Config::load(&args.config) {
         Ok(config) => config,
