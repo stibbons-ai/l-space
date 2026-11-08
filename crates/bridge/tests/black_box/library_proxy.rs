@@ -9,13 +9,16 @@
 //!   rejected key.
 //! - [`LibraryProxy::hang_identity`]: every `GET /api/me` never.
 //! - [`LibraryProxy::reject_progress_writes`]: every `PATCH /api/me/progress/...` at once with
-//!   401, as for a rejected key, while the key stays valid.
+//!   401, as for a rejected key, while the key stays valid, until
+//!   [`LibraryProxy::pass_progress_writes`].
+//! - [`LibraryProxy::fail_progress_writes`]: the next few of them with 500, as a Library
+//!   Server failing for a moment would.
 //!
 //! Everything else, also every deeper path under an Item (its files, its cover), passes as it
 //! is.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -41,6 +44,10 @@ struct Faults {
     reject_item_lookups: AtomicBool,
     hang_identity: AtomicBool,
     reject_progress_writes: AtomicBool,
+    /// How many Progress writes are still to fail.
+    fail_progress_writes: AtomicUsize,
+    /// How many failed so far.
+    progress_writes_failed: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -104,6 +111,25 @@ impl LibraryProxy {
             .reject_progress_writes
             .store(true, Ordering::SeqCst);
     }
+
+    /// From now on, Progress writes pass again.
+    pub fn pass_progress_writes(&self) {
+        self.faults
+            .reject_progress_writes
+            .store(false, Ordering::SeqCst);
+    }
+
+    /// The next `times` Progress writes fail with 500, without reaching the Library Server.
+    pub fn fail_progress_writes(&self, times: usize) {
+        self.faults
+            .fail_progress_writes
+            .store(times, Ordering::SeqCst);
+    }
+
+    /// How many Progress writes failed with 500 so far ([`Self::fail_progress_writes`]).
+    pub fn progress_writes_failed(&self) -> usize {
+        self.faults.progress_writes_failed.load(Ordering::SeqCst)
+    }
 }
 
 impl Drop for LibraryProxy {
@@ -126,12 +152,23 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
             .path()
             .strip_prefix("/api/items/")
             .is_some_and(|id| !id.is_empty() && !id.contains('/'));
+    let progress_write =
+        parts.method == Method::PATCH && parts.uri.path().starts_with("/api/me/progress/");
     let rejected = (item_lookup && faults.reject_item_lookups.load(Ordering::SeqCst))
-        || (parts.method == Method::PATCH
-            && parts.uri.path().starts_with("/api/me/progress/")
-            && faults.reject_progress_writes.load(Ordering::SeqCst));
+        || (progress_write && faults.reject_progress_writes.load(Ordering::SeqCst));
     if rejected {
         let response = Response::builder().status(StatusCode::UNAUTHORIZED);
+        return response.body(Body::empty()).expect("response");
+    }
+    let failing = |left: usize| left.checked_sub(1);
+    if progress_write
+        && faults
+            .fail_progress_writes
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, failing)
+            .is_ok()
+    {
+        faults.progress_writes_failed.fetch_add(1, Ordering::SeqCst);
+        let response = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR);
         return response.body(Body::empty()).expect("response");
     }
     if parts.method == Method::GET

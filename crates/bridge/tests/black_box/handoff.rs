@@ -15,6 +15,7 @@ use test_support::bridge::{
     KeyEnv, OTHER_KEY, SESSION_INVALID, TestBridge, acting_as, home_with_sonos_toml,
     output_contains,
 };
+use test_support::{WITHIN, eventually};
 
 use crate::forwarder::Forwarder;
 
@@ -224,15 +225,6 @@ fn assert_quiet(output: &[serde_json::Value], key: &str, stream_ids: &[&str]) {
         for id in stream_ids {
             assert!(!event.to_string().contains(id), "{event}");
         }
-    }
-}
-
-/// Waits up to ten seconds for `done`, checking every 20 ms; panics with `what` if it never is.
-async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !done() {
-        assert!(Instant::now() < deadline, "{what}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -795,7 +787,7 @@ async fn a_start_on_a_hanging_group_doesnt_hold_up_another_group() {
     };
     let other = async {
         // Once Kitchen has been told its URL and hangs on it, Office starts.
-        wait_until("Kitchen was never given a URL", || {
+        eventually("Kitchen was never given a URL", WITHIN, async || {
             called(&setup.household, &setup.kitchen, SET_URI)
         })
         .await;
@@ -834,7 +826,7 @@ async fn a_start_whose_client_hangs_up_still_finishes() {
     );
     let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
     client.write_all(request.as_bytes()).await.unwrap();
-    wait_until("Office was never given a URL", || {
+    eventually("Office was never given a URL", WITHIN, async || {
         called(&setup.household, &setup.office, SET_URI)
     })
     .await;
@@ -842,7 +834,7 @@ async fn a_start_whose_client_hangs_up_still_finishes() {
     // The client hangs up before the answer.
     drop(client);
 
-    wait_until("Office never played", || {
+    eventually("Office never played", WITHIN, async || {
         setup.household.transport_state(&setup.office) == "PLAYING"
     })
     .await;

@@ -16,6 +16,7 @@ use test_support::bridge::{
     LIBRARY_SERVER_UNREACHABLE, NO_HANDOFF, SESSION_INVALID, TestBridge, home_with_sonos_toml,
     output_contains,
 };
+use test_support::eventually;
 
 use crate::forwarder::Forwarder;
 use crate::library_proxy::LibraryProxy;
@@ -132,11 +133,8 @@ impl Setup {
         before: usize,
         within: Duration,
     ) {
-        let deadline = Instant::now() + within;
-        while self.asked(player, action) == before {
-            assert!(Instant::now() < deadline, "{action} never came");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let what = format!("{action} never came");
+        eventually(&what, within, async || self.asked(player, action) > before).await;
     }
 
     fn position(&self, group: &PlayerId) -> Duration {

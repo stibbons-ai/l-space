@@ -1000,8 +1000,10 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         .trim_matches('"');
     let (urn, action) = soap_action.split_once('#').unwrap_or(("", soap_action));
     let service = urn.rsplit(':').nth(1).unwrap_or_default();
-    let fault = {
+    // When the call came: what it answers and does then, unless a fault delays it.
+    let (fault, received) = {
         let mut state = served.shared.lock();
+        let received = served.shared.clock.now();
         state
             .actions
             .push((served.uuid.clone(), format!("{service}#{action}")));
@@ -1010,13 +1012,18 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         {
             state.offered.push((served.uuid.clone(), uri));
         }
-        state.find(&served.uuid).map(|player| player.fault)
+        (
+            state.find(&served.uuid).map(|player| player.fault),
+            received,
+        )
     };
-    match fault {
+    // Whether a fault held the call up: it then answers and acts as of when it is let go.
+    let delayed = match fault {
         Some(Fault::Hang) => std::future::pending().await,
         Some(Fault::Garbage) => return xml(StatusCode::OK, "<s:Envelope><unclosed".to_owned()),
         Some(Fault::SlowPosition(delay)) if action == "GetPositionInfo" => {
             tokio::time::sleep(delay).await;
+            true
         }
         Some(Fault::FailTransportInfo) if action == "GetTransportInfo" => return invalid_action(),
         Some(Fault::RefusePlayback) if matches!(action, "SetAVTransportURI" | "Play") => {
@@ -1024,6 +1031,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         }
         Some(Fault::SlowPlayback(delay)) if action == "SetAVTransportURI" => {
             tokio::time::sleep(delay).await;
+            true
         }
         Some(Fault::RefuseControl)
             if matches!(
@@ -1046,11 +1054,13 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         }
         Some(Fault::RefuseSeekSlowPause(delay)) if action == "Pause" => {
             tokio::time::sleep(delay).await;
+            true
         }
         Some(Fault::HangSeek) if action == "Seek" => std::future::pending().await,
         Some(Fault::FailGroupVolume) if action == "GetGroupVolume" => return invalid_action(),
         Some(Fault::SlowTransport(delay)) if urn == AV_TRANSPORT => {
             tokio::time::sleep(delay).await;
+            true
         }
         Some(
             Fault::None
@@ -1068,11 +1078,15 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             | Fault::RefuseSeekSlowPause(_)
             | Fault::FailGroupVolume
             | Fault::SlowTransport(_),
-        ) => {}
+        ) => false,
         // Removed from the household: as good as unplugged.
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
-    let now = served.shared.clock.now();
+    };
+    let now = if delayed {
+        served.shared.clock.now()
+    } else {
+        received
+    };
     let mut state = served.shared.lock();
     for player in &mut state.players {
         player.transport.settle(now);
