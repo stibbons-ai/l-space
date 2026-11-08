@@ -1541,14 +1541,14 @@ impl<S: Store> Controls<S> {
     /// stopped on that stream after playing to the end of the Item gets Progress at the end
     /// written Finished: the supervisor's pending Finished write, or, when it hadn't found the
     /// Group stopped yet, one by the supervisor's rule on what it last saw of the Group
-    /// ([`supervise::Replaced::played_to_end`], timed on `clock`). A Group stopped there short
-    /// of the end gets nothing written. With no `time` at all, nothing is tried. Anything else,
-    /// a failure or running out of time is logged and otherwise left alone. A Finished write
-    /// left unmade is logged as an error when the write doesn't land; a pending one
-    /// (`known.finished`) also when there is no `time`, the Group doesn't tell what it plays,
-    /// or it tells no position playing or paused on that stream; a Group playing or paused on
-    /// that stream, telling a position, gets that position written instead, with no such
-    /// error.
+    /// ([`supervise::Replaced::finished_at_stop`], timed on `clock`). A Group stopped there
+    /// short of the end, or not read often enough near it to tell, gets nothing written. With
+    /// no `time` at all, nothing is tried. Anything else, a failure or running out of time is
+    /// logged and otherwise left alone. A Finished write left unmade is logged as an error when
+    /// the write doesn't land or the key is revoked instead; a pending one (`known.finished`)
+    /// also when there is no `time`, the Group doesn't tell what it plays, or it tells no
+    /// position playing or paused on that stream; a Group playing or paused on that stream,
+    /// telling a position, gets that position written instead, with no such error.
     async fn write_replaced(
         &self,
         group: &str,
@@ -1587,20 +1587,26 @@ impl<S: Store> Controls<S> {
             return;
         };
         let on_stream = plays_stream(&playback, &replaced.stream);
-        let duration = told_length(&playback).or(known.length);
         if on_stream && playback.state == sonos::TransportState::Stopped {
-            let finished = known.finished.or_else(|| known.played_to_end(at, duration));
-            if let Some(update) = finished {
-                let checked = self.check(&replaced.active, Wanted::No, &mut time).await;
-                let cause = "replaced, end of Item";
-                let wrote = self
-                    .write_progress(&replaced.active, checked.acting, update, cause, &mut time)
-                    .await;
-                if !matches!(wrote, Wrote::Written) {
-                    lost(Some(update), "the write did not land");
-                }
+            let Some(update) = known.finished_at_stop(at, told_length(&playback)) else {
+                tracing::info!(
+                    group,
+                    "a Group stopped on the Handoff a start replaces, short of the end of its \
+                     Item or not read often enough near it to tell; {not_written}"
+                );
                 return;
+            };
+            let checked = self.check(&replaced.active, Wanted::No, &mut time).await;
+            let cause = "replaced, end of Item";
+            let wrote = self
+                .write_progress(&replaced.active, checked.acting, update, cause, &mut time)
+                .await;
+            match wrote {
+                Wrote::Written => {}
+                Wrote::Revoked => lost(Some(update), "the Handoff's API key was revoked"),
+                Wrote::Not => lost(Some(update), "the write did not land"),
             }
+            return;
         }
         let position = playback.position.filter(|_| {
             on_stream
@@ -1622,6 +1628,7 @@ impl<S: Store> Controls<S> {
             return;
         };
         let position = position.as_secs_f64();
+        let duration = told_length(&playback).or(known.length);
         self.check_and_write(&replaced.active, position, duration, "replaced", &mut time)
             .await;
     }
@@ -1782,10 +1789,13 @@ impl<S: Store> Controls<S> {
     /// (Audiobookshelf doesn't check on a Progress write): the Handoff relies on the check made
     /// at its start. Over Progress the check found Finished, an unfinished write clears
     /// Finished first ([`abs::ProgressUpdate::over_finished`]), so it leaves the Item
-    /// unfinished also at the position it was Finished at. A failure is logged and otherwise
-    /// left alone; a key the Library Server rejects is revoked, which ends the Handoff. `cause`
-    /// (what wrote it: a pause, the cadence, ...) is logged with the write, and with a write
-    /// not made. Returns whether it was written.
+    /// unfinished also at the position it was Finished at; it then needs twice the
+    /// [`MIN_WRITE_TIME`], and if only the clearing lands, the Item is left unfinished at 0,
+    /// logged as an error with the position lost (a timeout can't tell, logged as not
+    /// confirmed). A failure is logged and otherwise left alone; a key the Library Server
+    /// rejects is revoked, which ends the Handoff. `cause` (what wrote it: a pause, the
+    /// cadence, ...) is logged with the write, and with a write not made. Returns whether it
+    /// was written.
     async fn write_progress(
         &self,
         active: &ActiveHandoff,
@@ -1835,7 +1845,9 @@ impl<S: Store> Controls<S> {
                 return Wrote::Not;
             }
         };
-        if time.0 < MIN_WRITE_TIME {
+        // At least MIN_WRITE_TIME per request: two when Finished is cleared first.
+        let requests = if update.clears_finished() { 2 } else { 1 };
+        if time.0 < MIN_WRITE_TIME * requests {
             not_written("no time left");
             return Wrote::Not;
         }
@@ -1863,19 +1875,45 @@ impl<S: Store> Controls<S> {
                 );
                 Wrote::Written
             }
-            Some(Err(abs::Error::Rejected)) => {
-                not_written("the Library Server rejected the Handoff's API key");
+            Some(Err(abs::ProgressError {
+                error,
+                finished_cleared,
+            })) => {
+                let rejected = matches!(error, abs::Error::Rejected);
+                let message;
+                let reason = if rejected {
+                    "the Library Server rejected the Handoff's API key"
+                } else {
+                    message = error.to_string();
+                    &message
+                };
+                if finished_cleared {
+                    tracing::error!(
+                        group,
+                        library_server,
+                        user_id = starter.user_id,
+                        library_item = handoff.library_item,
+                        episode = handoff.episode,
+                        position,
+                        finished,
+                        cause,
+                        reason,
+                        "Progress not written after Finished was cleared: the Item is left \
+                         unfinished at 0, the position lost"
+                    );
+                } else {
+                    not_written(reason);
+                }
+                if !rejected {
+                    return Wrote::Not;
+                }
                 let reason = "the Library Server rejected the API key";
                 match self.revoke(starter, &active.api_key, reason).await {
                     Acting::Revoked => Wrote::Revoked,
                     _ => Wrote::Not,
                 }
             }
-            Some(Err(error)) => {
-                not_written(&error.to_string());
-                Wrote::Not
-            }
-            // The request may have landed all the same.
+            // The request may have landed all the same: also clearing Finished alone.
             None => {
                 tracing::warn!(
                     group,
@@ -1885,6 +1923,7 @@ impl<S: Store> Controls<S> {
                     episode = handoff.episode,
                     position,
                     finished,
+                    clearing_finished = update.clears_finished(),
                     cause,
                     reason = "the Library Server did not answer in time",
                     "Progress write not confirmed"
@@ -1998,8 +2037,8 @@ impl Budget {
     }
 }
 
-/// The least time left for a Progress write to be sent at all: with less, it couldn't be
-/// confirmed, so it isn't sent.
+/// The least time left for each request of a Progress write to be sent at all: with less, it
+/// couldn't be confirmed, so it isn't sent.
 const MIN_WRITE_TIME: Duration = Duration::from_millis(250);
 
 /// Whether `playback`, Group `group`'s, plays `stream`, a Handoff's; [`ApiError::NoHandoff`]

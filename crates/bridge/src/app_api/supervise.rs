@@ -13,24 +13,29 @@
 //! End-of-Item detection assumes a Group stops (`STOPPED`) on the Handoff's stream at the end
 //! of a single URL, as `sonos-fake` models it. It never relies on the position a stopped Group
 //! tells (real hardware may tell 0 then; unverified): from about [`END_SLACK`] before the
-//! expected end the Group is read every [`END_RECHECK`], and a Group found stopped counts as
-//! played to its end only when the position it was last seen playing at, moved on by the time
-//! since (at most [`END_RECHECK`]) and by [`POSITION_GRANULARITY`], reaches the end
-//! ([`played_to_end`]). A Group stopped earlier gets nothing written and keeps its Handoff.
-//! The end is known only with the Item's length: as its Library Server told it at the start,
-//! else as the Group first tells it; without either, the Handoff never ends this way.
+//! expected end the Group is read every [`END_RECHECK`], without asking whom the key acts for
+//! first unless a write is due, and a Group found stopped counts as played to its end only
+//! when the position it was last seen playing at, moved on by the time since (at most
+//! [`PLAYED_SINCE_MAX`]) and by [`POSITION_GRANULARITY`], reaches the end ([`played_to_end`]).
+//! A Group stopped earlier gets nothing written and keeps its Handoff; so may one played to
+//! its end whose reads failed for more than about a second before it: the time since it was
+//! last seen playing then can't tell a natural end from a stop. The Finished write for a Group
+//! found at its end is made at once, by a visit right after the one that found it, which asks
+//! whom the key acts for first. The end is known only with the Item's length: as its Library
+//! Server told it at the start, else as the Group first tells it; without either, the Handoff
+//! never ends this way.
 //!
 //! The Finished write at the end is tried at most [`FINISH_TRIES`] times, again at the next
 //! cadence tick after one that didn't land (failed, unconfirmed, or the key's user not known),
-//! and each time only while the Group is still found stopped on the Handoff's stream: found
-//! playing or paused there again, the Handoff goes on as before, without it (and so on
-//! something else, logged). After the last failure the Handoff ends all the same (logged as an
-//! error, the Finished lost). A key revoked meanwhile ends it at once. A Handoff whose ending
-//! fails in storage is ended again at the next tick, under the same rule. A start replacing a
-//! Handoff whose Finished write is still pending makes that write itself; one replacing a
-//! Handoff whose Group stopped on its stream since the supervisor last read it judges by the
-//! same rule, on what the supervisor last saw, whether it was played to its end
-//! ([`Supervisors::replaced`]).
+//! and each time only while the Group is still found stopped on the Handoff's stream, not
+//! seen playing there since: found playing or paused there again, the Handoff goes on as
+//! before, without it (and so on something else, logged). After the last failure the Handoff
+//! ends all the same (logged as an error, the Finished lost). A key revoked meanwhile ends it
+//! at once. A Handoff whose ending fails in storage is ended again at the next tick, under the
+//! same rule. A start replacing a Handoff whose Finished write is still pending makes that
+//! write itself; one replacing a Handoff whose Group stopped on its stream since the
+//! supervisor last read it judges by the same rule, on what the supervisor last saw, whether
+//! it was played to its end ([`Supervisors::replaced`]).
 
 use std::collections::HashMap;
 use std::ops::ControlFlow::{self, Break, Continue};
@@ -73,6 +78,13 @@ const END_SLACK: Duration = Duration::from_secs(5);
 /// The least time between two visits to a Group: how often it is read near the end of the
 /// Item, and how soon a visit that learned nothing is made again.
 const END_RECHECK: Duration = Duration::from_secs(1);
+
+/// The most time [`played_to_end`] counts as played between the last sighting of a Group
+/// playing and finding it stopped. Near the end, a visit with no write due reads the Group
+/// without asking the Library Server first, so two reads are about [`END_RECHECK`] plus one
+/// Group read (at most [`GROUP_TIME`]) apart. A longer gap, as after a failed or skipped read
+/// near the end, counts only this much: the Group may as well have been stopped early in it.
+const PLAYED_SINCE_MAX: Duration = END_RECHECK.saturating_add(GROUP_TIME);
 
 /// How far a Group may have played beyond the position it tells: Sonos tells positions in
 /// whole seconds (`H:MM:SS`), so one telling 599 may be at 599.9.
@@ -117,23 +129,31 @@ pub(super) struct Replaced {
 
 impl Replaced {
     /// Progress at the end of the Item, Finished, if the Group, found stopped on the Handoff's
-    /// stream at `at` on the Bridge's clock, played to the end of the Item, `length` seconds
-    /// long, by what the supervisor last saw of it ([`played_to_end`]).
-    pub(super) fn played_to_end(&self, at: Instant, length: Option<f64>) -> Option<ProgressUpdate> {
-        played_to_end(self.last?, at, length)
+    /// stream at `at` on the Bridge's clock, played to the end of the Item: the pending
+    /// Finished write, else one by what the supervisor last saw of it ([`played_to_end`]),
+    /// judged with the Item's length as the supervisor knows it, else as the Group tells it
+    /// (`told`), as a visit does.
+    pub(super) fn finished_at_stop(
+        &self,
+        at: Instant,
+        told: Option<f64>,
+    ) -> Option<ProgressUpdate> {
+        self.finished
+            .or_else(|| played_to_end(self.last?, at, self.length.or(told)))
     }
 }
 
 /// Whether a Group `last` seen playing the Handoff's stream, and found stopped there at `at`,
 /// played to the end of the Item, `length` seconds long: Progress at the end, Finished, if so.
 /// It counts as played to the end when the position it was last seen playing at, moved on by
-/// the time since (at most [`END_RECHECK`], how often it is read near the end: stopped later
-/// than that, it would have been seen stopped already) and by [`POSITION_GRANULARITY`],
-/// reaches the end. The position the stopped Group tells is not used: real hardware may tell
-/// 0 then.
+/// the time since (at most [`PLAYED_SINCE_MAX`], about how far apart two reads near the end
+/// are) and by [`POSITION_GRANULARITY`], reaches the end. So a Group stopped by hand within a
+/// read or two of the end may count as played to it, and one that played to its end after its
+/// reads failed for longer than [`PLAYED_SINCE_MAX`] may not. The position the stopped Group
+/// tells is not used: real hardware may tell 0 then.
 fn played_to_end(last: Seen, at: Instant, length: Option<f64>) -> Option<ProgressUpdate> {
     let (position, length) = (last.playing?, length?);
-    let played = at.saturating_duration_since(last.at).min(END_RECHECK);
+    let played = at.saturating_duration_since(last.at).min(PLAYED_SINCE_MAX);
     let reached = (position + played + POSITION_GRANULARITY).as_secs_f64();
     ProgressUpdate::finished(length).filter(|_| reached >= length)
 }
@@ -368,9 +388,13 @@ impl<S: Store> Supervisor<S> {
         let started = seen.borrow_and_update().at;
         let mut tick = started + CADENCE;
         let mut not_before = started;
+        // The next visit comes at once: the last found a Finished write due without asking
+        // whom the key acts for first.
+        let mut at_once = false;
         loop {
             let Known { ending, last, .. } = *self.known();
             let wake = match ending {
+                _ if at_once => not_before,
                 Some(_) => tick,
                 None => self
                     .end_due(&last, not_before)
@@ -401,6 +425,13 @@ impl<S: Store> Supervisor<S> {
             if self.visit(cadence).await.is_break() {
                 return;
             }
+            // Only after the visit that left a first Finished write pending (a failed checked
+            // one leaves the second); one that then learns nothing leaves it so, never spinning.
+            at_once = ending.is_none()
+                && matches!(self.known().ending, Some(Ending::Finish { attempt: 1, .. }));
+            if at_once {
+                not_before = now;
+            }
         }
     }
 
@@ -424,19 +455,23 @@ impl<S: Store> Supervisor<S> {
     /// Reads what the Group plays, holding its turn, and acts on it. On a `cadence` visit, a
     /// Group playing the Handoff's stream gets its position written as Progress. A Group that
     /// stopped there, having played to the end of the Item ([`played_to_end`]), gets Progress
-    /// at the end written Finished, and the Handoff ends; one still stopped there gets what is
-    /// left of that done. A Group paused, stopped elsewhere, or playing something else gets
-    /// nothing written, and what was left of the end is dropped once it plays or pauses.
-    /// Updates what was last seen of the Group, unless the visit learned nothing; breaks once
-    /// the Handoff ended.
+    /// at the end written Finished, and the Handoff ends; on a visit that didn't check the key
+    /// first, that write is left pending for the next visit, which comes at once. One still
+    /// stopped there, not seen playing since, gets what is left of that done. A Group paused,
+    /// stopped elsewhere, or playing something else gets nothing written; what was left of the
+    /// end is dropped once it is seen playing or paused on the Handoff's stream, or on
+    /// something else, and kept while it is between states. Updates what was last seen of the
+    /// Group, unless the visit learned nothing; breaks once the Handoff ended.
     async fn visit(&self, cadence: bool) -> ControlFlow<()> {
         let group = self.handoff.group.as_str();
         let Known { ending, last, .. } = *self.known();
         // A cadence write is due: logged when it is skipped.
         let due = cadence && last.playing.is_some();
         // Checked before taking the turn, as the Library Server may be slow; only when a write
-        // may follow: a Group seen playing, or a Finished write pending.
-        let checked = if last.playing.is_some() || matches!(ending, Some(Ending::Finish { .. })) {
+        // is due: a cadence write, or a Finished write pending. Other visits, every second
+        // near the end, read the Group without, so their reads stay about a second apart
+        // ([`PLAYED_SINCE_MAX`]).
+        let checked = if due || matches!(ending, Some(Ending::Finish { .. })) {
             let Some(found) = self.active().await? else {
                 self.skipped(due, "storage failed");
                 return Continue(());
@@ -492,7 +527,7 @@ impl<S: Store> Supervisor<S> {
                     return Continue(());
                 };
                 self.saw(at, Some(position));
-                // Without a check, seen not playing before: the key is checked before the next.
+                // Not checked, not due: seen playing before only by a control, or not at all.
                 if let (true, Some(acting)) = (cadence, checked) {
                     let update = ProgressUpdate::at(position.as_secs_f64(), length);
                     if let Wrote::Revoked = self.write(&found, acting, update, "cadence").await {
@@ -506,26 +541,32 @@ impl<S: Store> Supervisor<S> {
             }
             sonos::TransportState::Stopped => {
                 let previous = self.saw(at, None);
-                match (ending, checked) {
-                    (Some(Ending::Store), _) => return self.end(&found).await,
-                    (Some(Ending::Finish { update, attempt }), Some(acting)) => {
-                        return self.finish(&found, acting, update, attempt).await;
-                    }
-                    _ => {}
-                }
                 let Some(position) = previous.playing else {
-                    return Continue(());
+                    // Only this visit changes what is left of the end: still `ending`.
+                    return match (ending, checked) {
+                        (Some(Ending::Store), _) => self.end(&found).await,
+                        (Some(Ending::Finish { update, attempt }), Some(acting)) => {
+                            self.finish(&found, acting, update, attempt).await
+                        }
+                        _ => Continue(()),
+                    };
                 };
+                // Seen playing since what is left of the end was found, if anything: by a
+                // control, while this visit waited for the turn.
+                self.drop_ending("the Group played the Handoff again");
                 match (played_to_end(previous, at, length), checked) {
                     (Some(update), Some(acting)) => {
                         return self.finish(&found, acting, update, 1).await;
                     }
-                    // Seen playing by a control only after the key was checked: the next tick
-                    // checks it and writes Finished, the Group still found stopped there.
+                    // The key not checked first: the next visit, at once, checks it and
+                    // writes Finished, the Group still found stopped there.
                     (Some(update), None) => {
                         self.known().ending = Some(Ending::Finish { update, attempt: 1 });
                     }
-                    (None, _) => self.stopped_short(position, length),
+                    (None, _) => {
+                        let gap = at.saturating_duration_since(previous.at);
+                        self.stopped_short(position, gap, length);
+                    }
                 }
             }
             sonos::TransportState::Transitioning | sonos::TransportState::Unknown => {
@@ -550,26 +591,29 @@ impl<S: Store> Supervisor<S> {
         std::mem::replace(&mut self.known().last, Seen { at, playing })
     }
 
-    /// Logs that the Group, last seen playing at `position`, stopped on the Handoff's stream
-    /// without having played to the end of the Item, `length` seconds long if known.
-    fn stopped_short(&self, position: Duration, length: Option<f64>) {
+    /// Logs that the Group, last seen playing at `position` `gap` before it was found stopped
+    /// on the Handoff's stream, did so without having played to the end of the Item, `length`
+    /// seconds long if known.
+    fn stopped_short(&self, position: Duration, gap: Duration, length: Option<f64>) {
         let handoff = &self.handoff;
-        let position = position.as_secs();
+        let (position, gap) = (position.as_secs(), gap.as_secs_f64());
         match length {
             Some(length) => tracing::info!(
                 group = handoff.group,
                 library_item = handoff.library_item,
                 episode = handoff.episode,
                 position,
+                gap,
                 length,
-                "a Group stopped short of the end of its Handoff's Item: nothing written, the \
-                 Handoff stays"
+                "a Group stopped short of the end of its Handoff's Item, or was not read often \
+                 enough near it to tell: nothing written, the Handoff stays"
             ),
             None => tracing::info!(
                 group = handoff.group,
                 library_item = handoff.library_item,
                 episode = handoff.episode,
                 position,
+                gap,
                 "a Group stopped before the end of its Handoff's Item was known to be reached: \
                  nothing written, the Handoff stays"
             ),

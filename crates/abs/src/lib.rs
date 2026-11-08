@@ -350,6 +350,24 @@ impl ProgressUpdate {
     pub fn is_finished(&self) -> bool {
         self.finished
     }
+
+    /// Whether the write clears Finished first, in a request of its own
+    /// ([`Client::set_progress`]).
+    pub fn clears_finished(&self) -> bool {
+        self.over_finished
+    }
+}
+
+/// Why a Progress write ([`Client::set_progress`]) failed, and whether it changed Progress all
+/// the same.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct ProgressError {
+    /// Why the request that failed did.
+    pub error: Error,
+    /// Whether Finished was cleared before the position write failed: Audiobookshelf then
+    /// holds the Progress unfinished at 0, the position not written.
+    pub finished_cleared: bool,
 }
 
 /// A duration in seconds, unless Audiobookshelf doesn't know it: it then sends 0 (or null).
@@ -608,7 +626,8 @@ impl Client {
     /// short of the end. Not Finished over Progress held Finished
     /// ([`ProgressUpdate::over_finished`]), that write comes after a first PATCH with
     /// `{"isFinished": false, "markAsFinishedTimeRemaining": 0}`, which clears Finished; a
-    /// failed first PATCH fails the whole, without the second.
+    /// failed first PATCH fails the whole, without the second, and a failed second one fails
+    /// with [`ProgressError::finished_cleared`] set, as the first already changed Progress.
     ///
     /// As Audiobookshelf 2.37.2 does it (`User.createUpdateMediaProgressFromPayload`,
     /// `MediaProgress.applyProgressUpdate`): the user gets Progress if they had none, and that
@@ -620,7 +639,7 @@ impl Client {
     /// `currentTime` as it was leaves Finished as it was: hence the first PATCH over Progress
     /// held Finished. `"isFinished": false` sets a Finished one back to 0 and drops a
     /// `currentTime` sent with it, so it goes in a PATCH of its own; over unfinished Progress
-    /// it changes nothing. Fails as [`Client::set_finished`] does.
+    /// it changes nothing. Fails as [`Client::set_finished`] does, in a [`ProgressError`].
     /// Audiobookshelf doesn't check that the user may see the Item: a caller that needs it
     /// checks that itself.
     pub async fn set_progress(
@@ -630,7 +649,7 @@ impl Client {
         library_item_id: &str,
         episode_id: Option<&str>,
         update: ProgressUpdate,
-    ) -> Result<(), Error> {
+    ) -> Result<(), ProgressError> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct ClearFinished {
@@ -650,7 +669,11 @@ impl Client {
             #[serde(skip_serializing_if = "Option::is_none")]
             mark_as_finished_time_remaining: Option<u8>,
         }
-        let url = progress_url(base_url, library_item_id, episode_id)?;
+        let not_written = |error| ProgressError {
+            error,
+            finished_cleared: false,
+        };
+        let url = progress_url(base_url, library_item_id, episode_id).map_err(not_written)?;
         let ProgressUpdate {
             current_time,
             duration,
@@ -662,7 +685,9 @@ impl Client {
                 is_finished: false,
                 mark_as_finished_time_remaining: 0,
             });
-            self.send(request, api_key, Names::One).await?;
+            self.send(request, api_key, Names::One)
+                .await
+                .map_err(not_written)?;
         }
         let duration = duration.filter(|duration| duration.is_finite() && *duration > 0.0);
         let request = self.http.patch(url).json(&Update {
@@ -672,7 +697,12 @@ impl Client {
             is_finished: finished.then_some(true),
             mark_as_finished_time_remaining: (!finished).then_some(0),
         });
-        self.send(request, api_key, Names::One).await?;
+        self.send(request, api_key, Names::One)
+            .await
+            .map_err(|error| ProgressError {
+                error,
+                finished_cleared: over_finished,
+            })?;
         Ok(())
     }
 
@@ -1517,8 +1547,32 @@ mod tests {
             .set_progress(&base_url, &ApiKey::new("key"), "li-1", None, update)
             .await
             .unwrap_err();
-        assert!(matches!(error, Error::Unavailable(_)), "{error:?}");
+        assert!(matches!(error.error, Error::Unavailable(_)), "{error:?}");
+        assert!(!error.finished_cleared);
         assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn setting_progress_over_finished_progress_tells_when_only_the_clearing_landed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Clearing Finished lands; the position write that follows fails.
+        let answered = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = answered.clone();
+        let base_url = serve(Router::new().fallback(move || async move {
+            match counted.fetch_add(1, Ordering::SeqCst) {
+                0 => StatusCode::OK,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        }))
+        .await;
+        let update = ProgressUpdate::at(30.0, None).over_finished();
+        let error = Client::new()
+            .set_progress(&base_url, &ApiKey::new("key"), "li-1", None, update)
+            .await
+            .unwrap_err();
+        assert!(matches!(error.error, Error::Unavailable(_)), "{error:?}");
+        assert!(error.finished_cleared);
+        assert_eq!(answered.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1556,7 +1610,8 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-            assert_eq!(format!("{error:?}"), expected, "{status}");
+            assert_eq!(format!("{:?}", error.error), expected, "{status}");
+            assert!(!error.finished_cleared);
         }
 
         let (base_url, requests) = recording(StatusCode::OK).await;
@@ -1572,7 +1627,10 @@ mod tests {
                             ProgressUpdate::at(1.0, None)
                         )
                         .await,
-                    Err(Error::NotFound(NotFound::InvalidId))
+                    Err(super::ProgressError {
+                        error: Error::NotFound(NotFound::InvalidId),
+                        finished_cleared: false
+                    })
                 ),
                 "{item:?} {episode:?}"
             );
