@@ -157,12 +157,16 @@ pub enum Fault {
     /// It answers each `SetAVTransportURI` correctly, but only after this long (in real time),
     /// and takes the URL only then.
     SlowPlayback(Duration),
-    /// It answers `Pause`, `Play`, `Seek` and `SetGroupVolume` with a SOAP fault (UPnP error
-    /// 701, transition not available), changing nothing, and everything else correctly.
+    /// It answers `Pause`, `Play`, `Seek`, `SnapshotGroupVolume` and `SetGroupVolume` with a
+    /// SOAP fault (UPnP error 701, transition not available), changing nothing, and everything
+    /// else correctly.
     RefuseControl,
     /// It accepts `Pause`, `Play`, `Seek`, `SnapshotGroupVolume` and `SetGroupVolume` and
     /// never answers them, changing nothing, and answers everything else correctly.
     HangControl,
+    /// It answers every AVTransport call correctly, but only after this long (in real time),
+    /// and acts only then.
+    SlowTransport(Duration),
     /// It answers `GetGroupVolume` with a SOAP fault, and everything else correctly.
     FailGroupVolume,
 }
@@ -860,7 +864,10 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             tokio::time::sleep(delay).await;
         }
         Some(Fault::RefuseControl)
-            if matches!(action, "Pause" | "Play" | "Seek" | "SetGroupVolume") =>
+            if matches!(
+                action,
+                "Pause" | "Play" | "Seek" | "SnapshotGroupVolume" | "SetGroupVolume"
+            ) =>
         {
             return upnp_fault(701);
         }
@@ -873,6 +880,9 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             std::future::pending().await
         }
         Some(Fault::FailGroupVolume) if action == "GetGroupVolume" => return invalid_action(),
+        Some(Fault::SlowTransport(delay)) if urn == AV_TRANSPORT => {
+            tokio::time::sleep(delay).await;
+        }
         Some(
             Fault::None
             | Fault::Padded(_)
@@ -884,7 +894,8 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             | Fault::SlowPlayback(_)
             | Fault::RefuseControl
             | Fault::HangControl
-            | Fault::FailGroupVolume,
+            | Fault::FailGroupVolume
+            | Fault::SlowTransport(_),
         ) => {}
         // Removed from the household: as good as unplugged.
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),

@@ -140,6 +140,38 @@ impl SqliteStore {
         .await
         .map_err(Error::new)?
     }
+
+    /// The active Handoff that `query` (a [`select_handoffs`] taking `param` as `?1`) finds,
+    /// with its stream; none if its key no longer opens (logged).
+    async fn find_handoff(
+        &self,
+        query: &'static str,
+        param: impl rusqlite::ToSql + Send + 'static,
+    ) -> Result<Option<GroupHandoff>, Error> {
+        let sealing = Arc::clone(&self.sealing);
+        let lookup = self
+            .transaction(move |tx| {
+                let Some((stream, (handoff, key))) = tx
+                    .prepare_cached(query)?
+                    .query_row(params![param], |row| {
+                        let stream: [u8; 32] = row.get(12)?;
+                        Ok((StreamId::from_bytes(stream), handoff_row(row)?))
+                    })
+                    .optional()?
+                else {
+                    return Ok(Lookup::Unknown);
+                };
+                Ok(match key.open(tx, &sealing)? {
+                    Some(api_key) => Lookup::Open(GroupHandoff {
+                        stream,
+                        active: ActiveHandoff { handoff, api_key },
+                    }),
+                    None => Lookup::Unreadable(key.user),
+                })
+            })
+            .await?;
+        Ok(lookup.found())
+    }
 }
 
 /// Closes a [`SqliteStore`] from outside it, e.g. once the server holding it has stopped.
@@ -561,49 +593,14 @@ impl Store for SqliteStore {
     }
 
     async fn handoff(&self, stream: &StreamId) -> Result<Option<ActiveHandoff>, Error> {
-        let (stream, sealing) = (*stream, Arc::clone(&self.sealing));
-        let lookup = self
-            .transaction(move |tx| {
-                let Some((handoff, key)) = tx
-                    .prepare_cached(select_handoffs!("WHERE h.stream_id = ?1"))?
-                    .query_row(params![stream.as_bytes()], handoff_row)
-                    .optional()?
-                else {
-                    return Ok(Lookup::Unknown);
-                };
-                Ok(match key.open(tx, &sealing)? {
-                    Some(api_key) => Lookup::Open(ActiveHandoff { handoff, api_key }),
-                    None => Lookup::Unreadable(key.user),
-                })
-            })
-            .await?;
-        Ok(lookup.found())
+        let query = select_handoffs!("WHERE h.stream_id = ?1");
+        let found = self.find_handoff(query, *stream.as_bytes()).await?;
+        Ok(found.map(|found| found.active))
     }
 
     async fn group_handoff(&self, group: &str) -> Result<Option<GroupHandoff>, Error> {
-        let (group, sealing) = (group.to_owned(), Arc::clone(&self.sealing));
-        let lookup = self
-            .transaction(move |tx| {
-                let Some((stream, (handoff, key))) = tx
-                    .prepare_cached(select_handoffs!("WHERE h.group_id = ?1"))?
-                    .query_row(params![group], |row| {
-                        let stream: [u8; 32] = row.get(12)?;
-                        Ok((StreamId::from_bytes(stream), handoff_row(row)?))
-                    })
-                    .optional()?
-                else {
-                    return Ok(Lookup::Unknown);
-                };
-                Ok(match key.open(tx, &sealing)? {
-                    Some(api_key) => Lookup::Open(GroupHandoff {
-                        stream,
-                        active: ActiveHandoff { handoff, api_key },
-                    }),
-                    None => Lookup::Unreadable(key.user),
-                })
-            })
-            .await?;
-        Ok(lookup.found())
+        let query = select_handoffs!("WHERE h.group_id = ?1");
+        self.find_handoff(query, group.to_owned()).await
     }
 
     async fn handoffs(&self) -> Result<Vec<Handoff>, Error> {

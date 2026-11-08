@@ -282,8 +282,11 @@ async fn skips_move_15_seconds_back_and_30_forward_within_the_item() {
 
 #[tokio::test]
 async fn a_groups_own_length_bounds_a_skip() {
-    let setup = setup().await;
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
     let api = setup.bridge.api();
+    let office = setup.office.uuid();
     let episode = setup.episode(2);
     setup.start(&episode, &setup.office).await;
     let stream = setup.household.uri(&setup.office).unwrap();
@@ -295,11 +298,22 @@ async fn a_groups_own_length_bounds_a_skip() {
             ..FakeTrack::new("Episode 3", seconds(700))
         },
     );
-    setup.clock.advance(seconds(690));
+    setup.clock.advance(seconds(100));
 
+    // With the Library Server down, "30 s forward" needs nothing from it: the Group skips,
+    // and nothing is written.
+    forwarder.stop().await;
     assert_eq!(
-        api.skip_group(&setup.bobs, setup.office.uuid(), Skip::Forward30)
-            .await,
+        api.skip_group(&setup.bobs, office, Skip::Forward30).await,
+        playback(TransportState::Playing, 130.0, 700.0)
+    );
+    assert_eq!(setup.position(&setup.office), seconds(130));
+    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
+    forwarder.resume();
+
+    setup.clock.advance(seconds(690 - 130));
+    assert_eq!(
+        api.skip_group(&setup.bobs, office, Skip::Forward30).await,
         playback(TransportState::Playing, 700.0, 700.0)
     );
     assert_eq!(setup.progress(&setup.alice, &episode).await, Some(700.0));
@@ -487,6 +501,11 @@ async fn an_unknown_refusing_or_silent_group_fails_and_nothing_is_written() {
             "{control:?}"
         );
     }
+    // The volume's snapshot was refused, so the volume itself was never sent.
+    let actions = setup.household.actions_of(&setup.kitchen);
+    let sent = |action: &str| actions.iter().any(|sent| sent == action);
+    assert!(sent("GroupRenderingControl#SnapshotGroupVolume"));
+    assert!(!sent("GroupRenderingControl#SetGroupVolume"));
     assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
     assert_eq!(
         setup.household.volume(&setup.kitchen),
@@ -620,8 +639,10 @@ async fn a_library_server_down_at_write_time_doesnt_undo_the_control() {
 }
 
 /// How long a control may take at most with a Library Server that doesn't answer: the
-/// Group's 4 seconds and the Library Server's 7, with a margin, well within the App's 15.
-const CONTROL_BOUND: Duration = Duration::from_secs(12);
+/// Bridge's 7 seconds for it, and a margin for the Group's quick answers. Below the 10 seconds
+/// Audiobookshelf's client gives each request, so only the Bridge's limit keeps a control
+/// within it.
+const LIBRARY_SERVER_BOUND: Duration = Duration::from_millis(8500);
 
 #[tokio::test]
 async fn a_library_server_that_hangs_doesnt_hold_a_control_up() {
@@ -645,7 +666,11 @@ async fn a_library_server_that_hangs_doesnt_hold_a_control_up() {
             duration: None,
         }
     );
-    assert!(start.elapsed() < CONTROL_BOUND, "{:?}", start.elapsed());
+    assert!(
+        start.elapsed() < LIBRARY_SERVER_BOUND,
+        "{:?}",
+        start.elapsed()
+    );
     assert_eq!(
         setup.household.transport_state(&setup.kitchen),
         "PAUSED_PLAYBACK"
@@ -659,11 +684,102 @@ async fn a_library_server_that_hangs_doesnt_hold_a_control_up() {
             duration: None,
         }
     );
-    assert!(start.elapsed() < CONTROL_BOUND, "{:?}", start.elapsed());
+    assert!(
+        start.elapsed() < LIBRARY_SERVER_BOUND,
+        "{:?}",
+        start.elapsed()
+    );
     assert_eq!(setup.position(&setup.kitchen), seconds(185));
     // Nothing written (read past the forwarder), and the Handoff goes on.
     assert_eq!(setup.progress(&setup.alice, &episode).await, None);
     assert_eq!(api.handoffs(&setup.bobs).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_progress_write_that_hangs_doesnt_hold_a_pause_up() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let api = setup.bridge.api();
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.clock.advance(seconds(200));
+
+    // It tells whom the key acts for and the Item's length, but never answers a write.
+    forwarder.stall_requests("PATCH /api/me/progress").await;
+    let start = Instant::now();
+    assert_eq!(
+        api.pause_group(&setup.bobs, setup.kitchen.uuid()).await,
+        playback(TransportState::Paused, 200.0, 600.0)
+    );
+    assert!(
+        start.elapsed() < LIBRARY_SERVER_BOUND,
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(
+        setup.household.transport_state(&setup.kitchen),
+        "PAUSED_PLAYBACK"
+    );
+    // The write never reached Audiobookshelf; the Handoff goes on.
+    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
+    assert_eq!(api.handoffs(&setup.bobs).await.len(), 1);
+
+    let output = setup.bridge.stop();
+    let unconfirmed = output
+        .iter()
+        .filter(|event| {
+            event["level"] == "WARN" && event["message"] == "Progress write not confirmed"
+        })
+        .count();
+    assert_eq!(unconfirmed, 1);
+}
+
+#[tokio::test]
+async fn a_slow_item_length_doesnt_keep_a_pause_from_writing_progress() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let api = setup.bridge.api();
+    let kitchen = setup.kitchen.uuid();
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.clock.advance(seconds(200));
+
+    // It tells whom the key acts for, but never the Item (and so its length).
+    forwarder.stall_requests("GET /api/items/").await;
+    let start = Instant::now();
+    assert_eq!(
+        api.pause_group(&setup.bobs, kitchen).await,
+        Playback {
+            state: TransportState::Paused,
+            position: Some(200.0),
+            duration: None,
+        }
+    );
+    assert!(
+        start.elapsed() < LIBRARY_SERVER_BOUND,
+        "{:?}",
+        start.elapsed()
+    );
+    // Written without the length.
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(200.0));
+
+    // "30 s forward" can't do without the length: refused in time, nothing sent.
+    let before = setup.playback_controls(&setup.kitchen);
+    let start = Instant::now();
+    assert_eq!(
+        api.control_error(&setup.bobs, kitchen, GroupControl::Skip(Skip::Forward30))
+            .await,
+        LIBRARY_SERVER_UNREACHABLE
+    );
+    assert!(
+        start.elapsed() < LIBRARY_SERVER_BOUND,
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(setup.playback_controls(&setup.kitchen), before);
+    assert_eq!(setup.position(&setup.kitchen), seconds(200));
 }
 
 #[tokio::test]
@@ -838,13 +954,16 @@ async fn a_group_already_as_asked_is_sent_nothing() {
 
 #[tokio::test]
 async fn a_group_that_tells_no_position_is_not_skipped_and_its_pause_writes_nothing() {
-    let setup = setup().await;
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
     let api = setup.bridge.api();
     let kitchen = setup.kitchen.uuid();
     let episode = setup.episode(0);
     setup.start(&episode, &setup.kitchen).await;
     setup.clock.advance(seconds(60));
     setup.household.set_fault(&setup.kitchen, Fault::NoPosition);
+    forwarder.record_requests().await;
 
     let before = setup.playback_controls(&setup.kitchen);
     for skip in [Skip::Back15, Skip::Forward30] {
@@ -870,6 +989,13 @@ async fn a_group_that_tells_no_position_is_not_skipped_and_its_pause_writes_noth
         "PAUSED_PLAYBACK"
     );
     assert_eq!(setup.progress(&setup.alice, &episode).await, None);
+    // Without a position there is nothing to ask the Library Server: neither whom the key acts
+    // for, nor the Item's length, nor a write (only the stream's audio passes, as the Group
+    // plays it).
+    let requests = forwarder.requests();
+    assert!(!requests.contains("/api/me"), "{requests}");
+    let item = format!("GET /api/items/{}?", episode.library_item);
+    assert!(!requests.contains(&item), "{requests}");
 }
 
 #[tokio::test]
@@ -908,6 +1034,125 @@ async fn a_group_that_hangs_on_a_control_after_telling_its_playback_fails_in_tim
         sonos_fake::DEFAULT_VOLUME
     );
     assert_eq!(setup.progress(&setup.alice, &episode).await, None);
+}
+
+#[tokio::test]
+async fn a_control_waits_for_its_turn_on_the_group_only_so_long() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    let kitchen = setup.kitchen.uuid();
+    setup.start(&setup.episode(0), &setup.kitchen).await;
+    setup.clock.advance(seconds(60));
+    // A pause that hangs holds the Group's turn for the Group's whole 4 seconds.
+    setup
+        .household
+        .set_fault(&setup.kitchen, Fault::HangControl);
+
+    let (first, (queued, waited)) = tokio::join!(
+        api.control_error(&setup.bobs, kitchen, GroupControl::Pause),
+        async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let start = Instant::now();
+            let queued = tokio::join!(
+                api.control_error(&setup.bobs, kitchen, GroupControl::Skip(Skip::Back15)),
+                api.control_error(&setup.bobs, kitchen, GroupControl::Volume(50)),
+            );
+            (queued, start.elapsed())
+        },
+    );
+    assert_eq!(first, GROUP_FAILED);
+    // The others gave up after 3 seconds of waiting, before the pause let go of the turn.
+    assert_eq!(queued, (GROUP_FAILED, GROUP_FAILED));
+    assert!(
+        seconds(3) <= waited && waited < Duration::from_millis(3700),
+        "{waited:?}"
+    );
+    // And sent nothing.
+    let actions = setup.household.actions_of(&setup.kitchen);
+    let count = |action: &str| actions.iter().filter(|sent| *sent == action).count();
+    assert_eq!(count("AVTransport#Pause"), 1);
+    assert_eq!(count("AVTransport#Seek"), 0);
+    assert_eq!(count("GroupRenderingControl#SnapshotGroupVolume"), 0);
+    assert_eq!(count("GroupRenderingControl#SetGroupVolume"), 0);
+}
+
+#[tokio::test]
+async fn a_controls_calls_to_the_group_share_one_time_limit() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.clock.advance(seconds(60));
+    // Each call answers within the 2 seconds Upnp gives one, but a forward skip's three (read,
+    // read again after the length, seek) take 4.5 seconds together.
+    setup.household.set_fault(
+        &setup.kitchen,
+        Fault::SlowTransport(Duration::from_millis(1500)),
+    );
+
+    let start = Instant::now();
+    assert_eq!(
+        api.control_error(
+            &setup.bobs,
+            setup.kitchen.uuid(),
+            GroupControl::Skip(Skip::Forward30)
+        )
+        .await,
+        GROUP_FAILED
+    );
+    let elapsed = start.elapsed();
+    assert!(elapsed < sonos::CONTROL_TIMEOUT + seconds(1), "{elapsed:?}");
+    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
+}
+
+#[tokio::test]
+async fn a_forward_skip_acts_only_if_the_group_still_plays_the_handoff_after_the_length() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let api = setup.bridge.api();
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.clock.advance(seconds(60));
+    // A slow Library Server: the Group changes while the Bridge waits for the Item's length.
+    // Each skip on fresh connections, so none reuses one already through the delay.
+    let skip_while = async |change: &dyn Fn()| {
+        forwarder.delay_by(seconds(2)).await;
+        let (skipped, ()) = tokio::join!(
+            api.control_error(
+                &setup.bobs,
+                setup.kitchen.uuid(),
+                GroupControl::Skip(Skip::Forward30)
+            ),
+            async {
+                tokio::time::sleep(seconds(1)).await;
+                change();
+            },
+        );
+        skipped
+    };
+    let before = setup.playback_controls(&setup.kitchen);
+
+    // It stops telling its playback.
+    let failing = || {
+        setup
+            .household
+            .set_fault(&setup.kitchen, Fault::FailTransportInfo);
+    };
+    assert_eq!(skip_while(&failing).await, GROUP_FAILED);
+    setup.household.set_fault(&setup.kitchen, Fault::None);
+
+    // It is made to play something else.
+    let radio = || {
+        let track = FakeTrack::new("Radio", seconds(3600));
+        setup.household.play(&setup.kitchen, track);
+    };
+    assert_eq!(skip_while(&radio).await, NO_HANDOFF);
+
+    // Neither was skipped or written; the Handoff isn't ended.
+    assert_eq!(setup.playback_controls(&setup.kitchen), before);
+    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
+    assert_eq!(api.handoffs(&setup.bobs).await.len(), 1);
 }
 
 #[tokio::test]

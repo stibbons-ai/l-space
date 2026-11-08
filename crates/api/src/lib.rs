@@ -493,8 +493,9 @@ pub enum ApiError {
     #[error("item_not_playable")]
     ItemNotPlayable,
     /// The Group has no active Handoff to control, or plays something other than its
-    /// Handoff's stream (switched in the Sonos app, for example: a Takeover). No control was
-    /// sent to the Group and no Progress written; a Handoff it still has goes on.
+    /// Handoff's stream (switched in the Sonos app, for example: what is a Takeover once
+    /// detected, #20, so the Handoff isn't ended yet). No control was sent to the Group and no
+    /// Progress written; a Handoff it still has goes on.
     #[error("no_handoff")]
     NoHandoff,
     /// A code this build of the App does not know yet, from a newer Bridge. Produced only on
@@ -736,9 +737,10 @@ pub async fn resume_group(group: String) -> Result<Playback, ApiError> {
 /// Moves Group `group`'s Handoff, whoever started it, 15 seconds back or 30 forward from
 /// where it is now, kept between the Item's start and its end (as the Group tells its length,
 /// else the Library Server); playing or paused as it was. Writes the new position as Progress
-/// as [`pause_group`] does, and answers likewise. A forward skip whose end neither the Group
-/// nor the Library Server tells is refused with [`ApiError::LibraryServerUnreachable`] if the
-/// Library Server didn't answer, and goes on without an end if it knows no length either.
+/// as [`pause_group`] does, and answers likewise. A forward skip on a Group that tells no
+/// length is refused with [`ApiError::LibraryServerUnreachable`] when the Library Server
+/// doesn't tell the length either (unreachable, too slow, or the Item is gone there), and goes
+/// on without an end if it knows the Item has none.
 #[post(
     "/api/groups/skip",
     headers: dioxus_fullstack::HeaderMap,

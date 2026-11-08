@@ -142,7 +142,7 @@ pub struct Group {
     /// is none.
     pub track: Option<Track>,
     /// The Group's volume, 0 to [`MAX_VOLUME`]; none if its coordinator didn't tell it in
-    /// time, or told one out of range.
+    /// time, refused to, or told something that isn't such a number.
     pub volume: Option<u8>,
 }
 

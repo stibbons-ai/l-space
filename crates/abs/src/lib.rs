@@ -550,8 +550,8 @@ impl Client {
     /// `MediaProgress.applyProgressUpdate`): the user gets Progress if they had none; with a
     /// length, Audiobookshelf itself marks the Progress Finished when under 10 seconds remain,
     /// and unfinished when an earlier Finished one moves away from there. Fails as
-    /// [`Client::set_finished`] does; as there, the caller first checks the user may see the
-    /// Item.
+    /// [`Client::set_finished`] does. Audiobookshelf doesn't check that the user may see the
+    /// Item: a caller that needs it checks that itself.
     pub async fn set_progress(
         &self,
         base_url: &str,

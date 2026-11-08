@@ -525,14 +525,15 @@ impl<S: Store> AppApi<S> {
     async fn groups(&self, token: SessionToken) -> Result<Vec<Group>, ApiError> {
         self.session(&token).await?;
         let (groups, handoffs) = tokio::join!(self.sonos.groups(), self.store.handoffs());
-        let groups = groups.map_err(|error| {
-            tracing::warn!(%error, "cannot list the Sonos Groups");
-            sonos_error(error)
-        })?;
+        // Logged first, so a store failure is logged when Sonos failed too.
         let handoffs = handoffs.unwrap_or_else(|error| {
             log_storage_error("list the Handoffs", &error);
             Vec::new()
         });
+        let groups = groups.map_err(|error| {
+            tracing::warn!(%error, "cannot list the Sonos Groups");
+            sonos_error(error)
+        })?;
         let mut handoffs: HashMap<String, store::Handoff> = handoffs
             .into_iter()
             .map(|handoff| (handoff.group.clone(), handoff))
@@ -696,7 +697,7 @@ impl<S: Store> AppApi<S> {
 
     /// Has Group `group` do `control` on its Handoff, for any valid session, whoever started
     /// the Handoff ([`Controls::control`]). Takes turns with starts and other controls on the
-    /// Group.
+    /// Group, waiting at most [`CONTROL_TURN_TIME`] for its turn.
     async fn control(
         &self,
         token: SessionToken,
@@ -718,7 +719,7 @@ impl<S: Store> AppApi<S> {
         // On its own task, as a start is, so no client hanging up can cut it off between the
         // Group's action and the Progress write; a panic in it is handled below.
         let controlled = tokio::spawn(async move {
-            let _turn = turn.lock().await;
+            let _turn = take_turn(&turn, &task_group).await?;
             controls.control(&task_group, control).await
         })
         .await;
@@ -730,7 +731,7 @@ impl<S: Store> AppApi<S> {
 
     /// Sets Group `group`'s volume to `volume` (above [`api::MAX_VOLUME`]: that), for any
     /// valid session, with or without a Handoff; takes turns with starts and controls on the
-    /// Group. Returns the volume set.
+    /// Group, waiting at most [`CONTROL_TURN_TIME`] for its turn. Returns the volume set.
     async fn set_group_volume(
         &self,
         token: SessionToken,
@@ -743,7 +744,7 @@ impl<S: Store> AppApi<S> {
         }
         let volume = volume.min(api::MAX_VOLUME);
         let turn = self.group_lock(&group);
-        let _turn = turn.lock().await;
+        let _turn = take_turn(&turn, &group).await?;
         self.sonos
             .set_volume(&group, volume)
             .await
@@ -872,11 +873,32 @@ impl<S: Store> AppApi<S> {
     }
 }
 
+/// How long a control (or a volume change) waits at most for its turn on the Group, behind a
+/// start or another control on it; past that it answers [`ApiError::GroupFailed`] without
+/// acting.
+const CONTROL_TURN_TIME: Duration = Duration::from_secs(3);
+
 /// How long a control's requests to the starter's Library Server may take in all: checking
-/// whom the Handoff's key acts for, looking up the Item's length, writing Progress. With the
-/// Group's [`sonos::CONTROL_TIMEOUT`] for the control's calls to the Group, a control answers
-/// in at most 11 seconds, within the App's 15.
+/// whom the Handoff's key acts for, looking up the Item's length, writing Progress. With
+/// [`CONTROL_TURN_TIME`] for its turn and the Group's [`sonos::CONTROL_TIMEOUT`] for the
+/// control's calls to the Group, a control answers in at most 14 seconds, within the App's 15.
 const CONTROL_LIBRARY_SERVER_TIME: Duration = Duration::from_secs(7);
+
+/// Waits for `turn`, Group `group`'s, at most [`CONTROL_TURN_TIME`].
+async fn take_turn<'a>(
+    turn: &'a tokio::sync::Mutex<()>,
+    group: &str,
+) -> Result<tokio::sync::MutexGuard<'a, ()>, ApiError> {
+    tokio::time::timeout(CONTROL_TURN_TIME, turn.lock())
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                group,
+                "a control not sent: the Group is busy with another start or control"
+            );
+            ApiError::GroupFailed
+        })
+}
 
 /// What a control on a Group's Handoff acts with, owned, so the control runs on its own task.
 struct Controls<S> {
@@ -895,7 +917,8 @@ impl<S: Store> Controls<S> {
     /// confirmed that key still acts for the starter. The control's calls to the Group take
     /// [`sonos::CONTROL_TIMEOUT`] in all, its requests to the Library Server
     /// [`CONTROL_LIBRARY_SERVER_TIME`]; a write that fails or runs out of time is logged and
-    /// otherwise left alone, as the Group already did what was asked.
+    /// otherwise left alone, as the Group already did what was asked, except that a key the
+    /// Library Server rejects is revoked, which ends the Handoff.
     async fn control(&self, group: &str, control: Control) -> Result<Playback, ApiError> {
         let mut group_time = Budget(sonos::CONTROL_TIMEOUT);
         let mut library_time = Budget(CONTROL_LIBRARY_SERVER_TIME);
@@ -943,7 +966,7 @@ impl<S: Store> Controls<S> {
                 };
                 let active = &found.active;
                 let checked = self
-                    .check(active, duration.is_none(), &mut library_time)
+                    .check(active, Wanted::optional(duration), &mut library_time)
                     .await;
                 let duration = duration.or(checked.length.told());
                 self.write_progress(
@@ -970,8 +993,9 @@ impl<S: Store> Controls<S> {
     /// Has Group `group`, which plays `found`'s stream as `playback` (read just before) tells,
     /// skip as `skip` says, within the Item; see [`Controls::control`]. A forward skip on a
     /// Group that tells no length first looks the Item's length up: if the Library Server
-    /// doesn't answer, the skip is refused ([`ApiError::LibraryServerUnreachable`]); if it
-    /// knows no length either, the skip has no end to stop at.
+    /// doesn't tell it (unreachable, too slow, or the Item is gone there), the skip is refused
+    /// ([`ApiError::LibraryServerUnreachable`]); if it knows no length either, the skip has no
+    /// end to stop at.
     async fn skip(
         &self,
         group: &str,
@@ -992,9 +1016,11 @@ impl<S: Store> Controls<S> {
         let mut duration = playback.duration.map(|duration| duration.as_secs_f64());
         let mut acting = None;
         if duration.is_none() && skip.seconds() > 0 {
-            let checked = self.check(active, true, &mut library_time).await;
-            if matches!(checked.acting, Acting::Revoked) {
-                return Err(ApiError::NoHandoff);
+            let checked = self.check(active, Wanted::Needed, &mut library_time).await;
+            match checked.acting {
+                Acting::Revoked => return Err(ApiError::NoHandoff),
+                Acting::RevokeFailed => return Err(ApiError::Internal),
+                Acting::Starter(_) | Acting::Unknown => {}
             }
             duration = match checked.length {
                 Length::Told(duration) => duration,
@@ -1010,13 +1036,7 @@ impl<S: Store> Controls<S> {
             acting = Some(checked.acting);
             // The Group moved on while the Library Server answered: skip from where it is now.
             playback = self.playback(group, &mut group_time).await?;
-            if !plays(&playback, &found.stream) {
-                tracing::info!(
-                    group,
-                    "a control for a Group that plays something other than its Handoff"
-                );
-                return Err(ApiError::NoHandoff);
-            }
+            ensure_plays(group, &playback, &found.stream)?;
         }
         let position = playback.position.ok_or_else(no_position)?;
         let target = skipped(position, skip, duration);
@@ -1032,7 +1052,7 @@ impl<S: Store> Controls<S> {
             Some(acting) => acting,
             None => {
                 let checked = self
-                    .check(active, duration.is_none(), &mut library_time)
+                    .check(active, Wanted::optional(duration), &mut library_time)
                     .await;
                 duration = duration.or(checked.length.told());
                 checked.acting
@@ -1050,12 +1070,17 @@ impl<S: Store> Controls<S> {
 
     /// What Group `group` plays, as its coordinator tells it within `time`.
     async fn playback(&self, group: &str, time: &mut Budget) -> Result<sonos::Playback, ApiError> {
-        let read = time.spend(self.sonos.playback(group)).await;
-        read.unwrap_or(Err(sonos::Error::GroupFailed))
-            .map_err(|error| {
-                tracing::warn!(group, %error, "cannot read what a Group plays");
-                sonos_error(error)
-            })
+        let Some(read) = time.spend(self.sonos.playback(group)).await else {
+            tracing::warn!(
+                group,
+                "a Group did not tell its playback within the control's time"
+            );
+            return Err(ApiError::GroupFailed);
+        };
+        read.map_err(|error| {
+            tracing::warn!(group, %error, "cannot read what a Group plays");
+            sonos_error(error)
+        })
     }
 
     /// Has Group `group` do `control` by `sent`, within `time`.
@@ -1066,12 +1091,19 @@ impl<S: Store> Controls<S> {
         time: &mut Budget,
         sent: impl Future<Output = Result<(), sonos::Error>>,
     ) -> Result<(), ApiError> {
-        let sent = time.spend(sent).await;
-        sent.unwrap_or(Err(sonos::Error::GroupFailed))
-            .map_err(|error| {
-                tracing::warn!(group, ?control, %error, "a Group did not take a control");
-                sonos_error(error)
-            })?;
+        let Some(sent) = time.spend(sent).await else {
+            tracing::warn!(
+                group,
+                ?control,
+                "a Group did not answer a control within the control's time; it may still have \
+                 acted"
+            );
+            return Err(ApiError::GroupFailed);
+        };
+        sent.map_err(|error| {
+            tracing::warn!(group, ?control, %error, "a Group did not take a control");
+            sonos_error(error)
+        })?;
         tracing::info!(group, ?control, "Group controlled");
         Ok(())
     }
@@ -1092,35 +1124,31 @@ impl<S: Store> Controls<S> {
             tracing::info!(group, "a control for a Group without a Handoff");
             return Err(ApiError::NoHandoff);
         };
-        if !plays(playback, &found.stream) {
-            tracing::info!(
-                group,
-                "a control for a Group that plays something other than its Handoff"
-            );
-            return Err(ApiError::NoHandoff);
-        }
+        ensure_plays(group, playback, &found.stream)?;
         Ok(found)
     }
 
     /// What the starter's Library Server tells about `active` with the Handoff's key, within
-    /// `time`: whom the key acts for, and the Item's length if `with_length`. A key the
-    /// Library Server rejects, or that now acts for another user, is revoked, which ends the
-    /// Handoff. Failures are logged.
+    /// `time`: whom the key acts for, and the Item's length as `wanted`. An optional length
+    /// gets at most half the time left, so that a slow one neither loses a timely answer on
+    /// the key nor leaves the Progress write no time. A key the Library Server rejects, or
+    /// that now acts for another user, is revoked, which ends the Handoff. Failures are
+    /// logged.
     async fn check(
         &self,
         active: &ActiveHandoff,
-        with_length: bool,
+        wanted: Wanted,
         time: &mut Budget,
     ) -> Checked<'_> {
         let handoff = &active.handoff;
         let (group, starter, key) = (&handoff.group, &handoff.started_by, &active.api_key);
+        let not_told = match wanted {
+            Wanted::No => Length::Unasked,
+            Wanted::Optional | Wanted::Needed => Length::Failed,
+        };
         let unknown = Checked {
             acting: Acting::Unknown,
-            length: if with_length {
-                Length::Failed
-            } else {
-                Length::Unasked
-            },
+            length: not_told,
         };
         // The operator may have removed the Library Server since the start.
         let Some(library_server) = configured_in(&self.library_servers, &starter.library_server)
@@ -1132,48 +1160,51 @@ impl<S: Store> Controls<S> {
             );
             return unknown;
         };
+        let late = |what: &'static str| {
+            tracing::warn!(
+                group,
+                library_server,
+                user_id = starter.user_id,
+                what,
+                "the Library Server of a Handoff did not answer a control in time"
+            );
+        };
         let id = ItemId {
             library_item: handoff.library_item.clone(),
             episode: handoff.episode.clone(),
         };
+        let length_time = match wanted {
+            Wanted::No => Duration::ZERO,
+            Wanted::Optional => time.0 / 2,
+            Wanted::Needed => time.0,
+        };
+        // None if not asked; Some(None) if not told in time.
         let length = async {
-            if with_length {
-                Some(
-                    self.abs
-                        .library_item(library_server, key, &id.library_item)
-                        .await,
-                )
-            } else {
-                None
+            if let Wanted::No = wanted {
+                return None;
             }
+            let lookup = self.abs.library_item(library_server, key, &id.library_item);
+            Some(tokio::time::timeout(length_time, lookup).await.ok())
         };
         let told = time
             .spend(async { tokio::join!(self.abs.me(library_server, key), length) })
             .await;
         let Some((me, item)) = told else {
-            tracing::warn!(
-                group,
-                library_server,
-                user_id = starter.user_id,
-                "the Library Server of a Handoff did not answer a control in time"
-            );
+            late("whom the Handoff's API key acts for");
             return unknown;
         };
         let rejected = matches!(me, Err(abs::Error::Rejected))
-            || matches!(item, Some(Err(abs::Error::Rejected)));
-        let ended = "this user's sessions and Handoffs using it ended";
+            || matches!(item, Some(Some(Err(abs::Error::Rejected))));
         let acting = match me {
             _ if rejected => {
                 let reason = "the Library Server rejected the API key";
-                revoke_key(self.store.as_ref(), starter, key, reason, ended).await;
-                Acting::Revoked
+                self.revoke(starter, key, reason).await
             }
             Ok(user) if user.id == starter.user_id => Acting::Starter(library_server),
             // An admin can move a key to another user; the starter's Progress must not follow.
             Ok(_) => {
                 let reason = "the API key now acts for another user";
-                revoke_key(self.store.as_ref(), starter, key, reason, ended).await;
-                Acting::Revoked
+                self.revoke(starter, key, reason).await
             }
             Err(error) => {
                 tracing::warn!(
@@ -1188,8 +1219,8 @@ impl<S: Store> Controls<S> {
         };
         let length = match item {
             None => Length::Unasked,
-            Some(Ok(item)) => Length::Told(browse::item_duration(item, &id)),
-            Some(Err(error)) => {
+            Some(Some(Ok(item))) => Length::Told(browse::item_duration(item, &id)),
+            Some(Some(Err(error))) => {
                 tracing::warn!(
                     group,
                     library_server,
@@ -1199,15 +1230,32 @@ impl<S: Store> Controls<S> {
                 );
                 Length::Failed
             }
+            Some(None) => {
+                late("the length of the Handoff's Item");
+                Length::Failed
+            }
         };
         Checked { acting, length }
     }
 
+    /// Revokes `key`, `starter`'s, because of `reason`, ending their Handoffs using it; whether
+    /// storage did.
+    async fn revoke(&self, starter: &LibraryUser, key: &abs::ApiKey, reason: &str) -> Acting<'_> {
+        let ended = "this user's sessions and Handoffs using it ended";
+        if revoke_key(self.store.as_ref(), starter, key, reason, ended).await {
+            Acting::Revoked
+        } else {
+            Acting::RevokeFailed
+        }
+    }
+
     /// Writes `position` (seconds, in an Item `duration` seconds long, if known) as Progress in
     /// `active`'s Item for the user who started it, with the Handoff's key, never with a
-    /// caller's, within `time`; only if the key still acts for the starter (`acting`). A
-    /// failure is logged and otherwise left alone; a key the Library Server rejects is
-    /// revoked, which ends the Handoff.
+    /// caller's, within `time`; only if the key still acts for the starter (`acting`). Whether
+    /// the starter may still see the Item is not checked again (Audiobookshelf doesn't check on
+    /// a Progress write): the Handoff relies on the check made at its start. A failure is
+    /// logged and otherwise left alone; a key the Library Server rejects is revoked, which ends
+    /// the Handoff.
     async fn write_progress(
         &self,
         active: &ActiveHandoff,
@@ -1222,6 +1270,16 @@ impl<S: Store> Controls<S> {
             Acting::Starter(library_server) => library_server,
             Acting::Revoked => {
                 let reason = "the Handoff's API key was revoked";
+                tracing::warn!(
+                    group,
+                    user_id = starter.user_id,
+                    reason,
+                    "Progress not written"
+                );
+                return;
+            }
+            Acting::RevokeFailed => {
+                let reason = "the Handoff's API key is to be revoked, but storage failed";
                 tracing::warn!(
                     group,
                     user_id = starter.user_id,
@@ -1270,9 +1328,8 @@ impl<S: Store> Controls<S> {
                     reason,
                     "Progress not written"
                 );
-                let ended = "this user's sessions and Handoffs using it ended";
                 let reason = "the Library Server rejected the API key";
-                revoke_key(self.store.as_ref(), starter, &active.api_key, reason, ended).await;
+                self.revoke(starter, &active.api_key, reason).await;
             }
             Some(Err(error)) => tracing::warn!(
                 group,
@@ -1283,6 +1340,7 @@ impl<S: Store> Controls<S> {
                 %error,
                 "Progress not written"
             ),
+            // The request may have landed all the same.
             None => {
                 let reason = "the Library Server did not answer in time";
                 tracing::warn!(
@@ -1290,7 +1348,7 @@ impl<S: Store> Controls<S> {
                     library_server,
                     user_id = starter.user_id,
                     reason,
-                    "Progress not written"
+                    "Progress write not confirmed"
                 );
             }
         }
@@ -1310,6 +1368,9 @@ enum Acting<'a> {
     Starter(&'a str),
     /// Not the starter any more, or no one: the key was revoked, ending the Handoff.
     Revoked,
+    /// Not the starter any more, or no one, but revoking the key failed: the Handoff and its
+    /// key are still stored.
+    RevokeFailed,
     /// Not known: the Library Server failed, or didn't answer in time.
     Unknown,
 }
@@ -1334,6 +1395,27 @@ impl Length {
     }
 }
 
+/// Whether a control asks the starter's Library Server for the Item's length.
+#[derive(Debug, Clone, Copy)]
+enum Wanted {
+    No,
+    /// For the Progress write: it is written without one if not told quickly.
+    Optional,
+    /// To act at all.
+    Needed,
+}
+
+impl Wanted {
+    /// Optional if the Group told no length (`told`), else not asked.
+    fn optional(told: Option<f64>) -> Self {
+        if told.is_some() {
+            Self::No
+        } else {
+            Self::Optional
+        }
+    }
+}
+
 /// Time that one party's answers to a call may take in all, spent only while it is waited on.
 #[derive(Debug)]
 struct Budget(Duration);
@@ -1348,13 +1430,22 @@ impl Budget {
     }
 }
 
-/// Whether `playback` plays `stream`, a Handoff's.
-fn plays(playback: &sonos::Playback, stream: &store::StreamId) -> bool {
-    playback
-        .uri
-        .as_deref()
-        .and_then(stream::stream_in_url)
-        .is_some_and(|played| played == *stream)
+/// Whether `playback`, Group `group`'s, plays `stream`, a Handoff's; [`ApiError::NoHandoff`]
+/// if not.
+fn ensure_plays(
+    group: &str,
+    playback: &sonos::Playback,
+    stream: &store::StreamId,
+) -> Result<(), ApiError> {
+    let played = playback.uri.as_deref().and_then(stream::stream_in_url);
+    if played.is_some_and(|played| played == *stream) {
+        return Ok(());
+    }
+    tracing::info!(
+        group,
+        "a control for a Group that plays something other than its Handoff"
+    );
+    Err(ApiError::NoHandoff)
 }
 
 /// `base_url` (already normalized), if it is one of `library_servers`'.

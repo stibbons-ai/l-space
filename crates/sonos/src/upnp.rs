@@ -3,7 +3,8 @@
 //! (AVTransport `GetTransportInfo` and `GetPositionInfo`) and its volume (GroupRenderingControl
 //! `GetGroupVolume`), a stream started on a Group by its coordinator (AVTransport
 //! `SetAVTransportURI`, then `Play`), and a Group controlled by its coordinator (AVTransport
-//! `Pause`, `Play` and `Seek`; GroupRenderingControl `SetGroupVolume`).
+//! `Pause`, `Play` and `Seek`; GroupRenderingControl `SnapshotGroupVolume`, then
+//! `SetGroupVolume`).
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
