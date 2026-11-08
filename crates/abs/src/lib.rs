@@ -347,8 +347,8 @@ impl Error {
     }
 }
 
-/// A client for any number of Library Servers.
-#[derive(Debug)]
+/// A client for any number of Library Servers. Cloning it is cheap: clones share connections.
+#[derive(Debug, Clone)]
 pub struct Client {
     http: reqwest::Client,
     /// For audio files, whose bodies have no time limit in all.
@@ -549,8 +549,9 @@ impl Client {
     /// As Audiobookshelf 2.37.2 does it (`User.createUpdateMediaProgressFromPayload`,
     /// `MediaProgress.applyProgressUpdate`): the user gets Progress if they had none; with a
     /// length, Audiobookshelf itself marks the Progress Finished when under 10 seconds remain,
-    /// and unfinished when an earlier Finished one moves away from there. It fails, and must be
-    /// checked first, as [`Client::set_finished`] does.
+    /// and unfinished when an earlier Finished one moves away from there. Fails as
+    /// [`Client::set_finished`] does; as there, the caller first checks the user may see the
+    /// Item.
     pub async fn set_progress(
         &self,
         base_url: &str,

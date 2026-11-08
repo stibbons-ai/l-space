@@ -12,8 +12,8 @@ use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
 use test_support::bridge::{
-    GROUP_FAILED, GROUP_NOT_FOUND, GroupControl, NO_HANDOFF, SESSION_INVALID, TestBridge,
-    home_with_sonos_toml, output_contains,
+    GROUP_FAILED, GROUP_NOT_FOUND, GroupControl, LIBRARY_SERVER_UNREACHABLE, NO_HANDOFF,
+    SESSION_INVALID, TestBridge, home_with_sonos_toml, output_contains,
 };
 
 use crate::forwarder::Forwarder;
@@ -162,8 +162,14 @@ async fn anyone_pauses_and_resumes_a_handoff_and_the_pause_is_the_starters_progr
     let office = groups.iter().find(|group| group.name == "Office").unwrap();
     assert_eq!(office.handoff, None);
 
-    // Bob resumes; it moves on from where it paused, and resuming writes nothing (nor asks
-    // the Library Server for the length the Group doesn't know).
+    // Alice's own player moves her Progress on meanwhile. Bob resumes; it moves on from where
+    // it paused, and resuming writes nothing: her Progress stays as her player left it.
+    let seeded = setup.abs.seeded();
+    let (podcast, first) = (&seeded.podcast, Some(seeded.episodes[0].as_str()));
+    setup
+        .abs
+        .set_progress(&setup.alice, podcast, first, 42.0, false)
+        .await;
     assert_eq!(
         api.resume_group(&setup.bobs, setup.kitchen.uuid()).await,
         Playback {
@@ -175,7 +181,7 @@ async fn anyone_pauses_and_resumes_a_handoff_and_the_pause_is_the_starters_progr
     assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
     setup.clock.advance(seconds(30));
     assert_eq!(setup.position(&setup.kitchen), seconds(150));
-    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(120.0));
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(42.0));
 
     // Alice logs out; the Handoff's key still writes her Progress when Bob pauses.
     api.logout(&setup.alices).await;
@@ -220,6 +226,15 @@ async fn skips_move_15_seconds_back_and_30_forward_within_the_item() {
     );
     assert_eq!(setup.position(&setup.kitchen), seconds(85));
     assert_eq!(setup.progress(&setup.alice, &episode).await, Some(85.0));
+    // With the Item's length, as Audiobookshelf stores it.
+    let seeded = setup.abs.seeded();
+    let record = setup
+        .abs
+        .progress_record(&setup.alice, &seeded.podcast, Some(&seeded.episodes[0]))
+        .await
+        .unwrap();
+    assert_eq!(record["duration"], 600.0);
+    assert_eq!(record["progress"].as_f64().unwrap(), 85.0 / 600.0);
     assert_eq!(
         api.skip_group(&setup.bobs, kitchen, Skip::Forward30).await,
         playback(TransportState::Playing, 115.0, 600.0)
@@ -460,11 +475,11 @@ async fn an_unknown_refusing_or_silent_group_fails_and_nothing_is_written() {
         }
     }
 
-    // Kitchen refuses every control.
+    // Kitchen refuses every control: those for a playing Group, then a resume once paused.
     setup
         .household
         .set_fault(&setup.kitchen, Fault::RefuseControl);
-    for control in every {
+    for control in every.into_iter().filter(|c| *c != GroupControl::Resume) {
         assert_eq!(
             api.control_error(&setup.bobs, setup.kitchen.uuid(), control)
                 .await,
@@ -478,6 +493,16 @@ async fn an_unknown_refusing_or_silent_group_fails_and_nothing_is_written() {
         sonos_fake::DEFAULT_VOLUME
     );
     assert_eq!(setup.progress(&setup.alice, &episode).await, None);
+    setup.household.pause(&setup.kitchen);
+    assert_eq!(
+        api.control_error(&setup.bobs, setup.kitchen.uuid(), GroupControl::Resume)
+            .await,
+        GROUP_FAILED
+    );
+    assert_eq!(
+        setup.household.transport_state(&setup.kitchen),
+        "PAUSED_PLAYBACK"
+    );
 
     // Office stops answering; Kitchen still tells the topology.
     setup.household.set_fault(&setup.office, Fault::Hang);
@@ -538,6 +563,7 @@ async fn a_library_server_down_at_write_time_doesnt_undo_the_control() {
     let forwarder = Forwarder::to(abs.address()).await;
     let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
     let api = setup.bridge.api();
+    let kitchen = setup.kitchen.uuid();
     let episode = setup.episode(0);
     setup.start(&episode, &setup.kitchen).await;
     setup.clock.advance(seconds(200));
@@ -546,7 +572,7 @@ async fn a_library_server_down_at_write_time_doesnt_undo_the_control() {
     let start = Instant::now();
     // Without the Library Server, the Item's length is unknown too.
     assert_eq!(
-        api.pause_group(&setup.bobs, setup.kitchen.uuid()).await,
+        api.pause_group(&setup.bobs, kitchen).await,
         Playback {
             state: TransportState::Paused,
             position: Some(200.0),
@@ -558,22 +584,31 @@ async fn a_library_server_down_at_write_time_doesnt_undo_the_control() {
         setup.household.transport_state(&setup.kitchen),
         "PAUSED_PLAYBACK"
     );
-    // A skip goes on without an end to stop at.
+    // "30 s forward" needs the Item's end, which only the Library Server tells for a stream:
+    // refused, and nothing sent to the Group.
+    let before = setup.playback_controls(&setup.kitchen);
     assert_eq!(
-        api.skip_group(&setup.bobs, setup.kitchen.uuid(), Skip::Forward30)
+        api.control_error(&setup.bobs, kitchen, GroupControl::Skip(Skip::Forward30))
+            .await,
+        LIBRARY_SERVER_UNREACHABLE
+    );
+    assert_eq!(setup.playback_controls(&setup.kitchen), before);
+    assert_eq!(setup.position(&setup.kitchen), seconds(200));
+    // "15 s back" needs no end.
+    assert_eq!(
+        api.skip_group(&setup.bobs, kitchen, Skip::Back15)
             .await
             .position,
-        Some(230.0)
+        Some(185.0)
     );
-    assert_eq!(setup.position(&setup.kitchen), seconds(230));
+    assert_eq!(setup.position(&setup.kitchen), seconds(185));
 
     forwarder.resume();
     assert_eq!(setup.progress(&setup.alice, &episode).await, None);
     // The Handoff goes on, and the next control writes again.
     assert_eq!(api.handoffs(&setup.bobs).await.len(), 1);
-    api.skip_group(&setup.bobs, setup.kitchen.uuid(), Skip::Back15)
-        .await;
-    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(215.0));
+    api.skip_group(&setup.bobs, kitchen, Skip::Back15).await;
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(170.0));
 
     let output = setup.bridge.stop();
     let unwritten = output
@@ -584,15 +619,159 @@ async fn a_library_server_down_at_write_time_doesnt_undo_the_control() {
     assert!(!output_contains(&output, &setup.alice.api_key.key));
 }
 
+/// How long a control may take at most with a Library Server that doesn't answer: the
+/// Group's 4 seconds and the Library Server's 7, with a margin, well within the App's 15.
+const CONTROL_BOUND: Duration = Duration::from_secs(12);
+
+#[tokio::test]
+async fn a_library_server_that_hangs_doesnt_hold_a_control_up() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let api = setup.bridge.api();
+    let kitchen = setup.kitchen.uuid();
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.clock.advance(seconds(200));
+
+    // It takes every request and never answers.
+    forwarder.stall_after(0).await;
+    let start = Instant::now();
+    assert_eq!(
+        api.pause_group(&setup.bobs, kitchen).await,
+        Playback {
+            state: TransportState::Paused,
+            position: Some(200.0),
+            duration: None,
+        }
+    );
+    assert!(start.elapsed() < CONTROL_BOUND, "{:?}", start.elapsed());
+    assert_eq!(
+        setup.household.transport_state(&setup.kitchen),
+        "PAUSED_PLAYBACK"
+    );
+    let start = Instant::now();
+    assert_eq!(
+        api.skip_group(&setup.bobs, kitchen, Skip::Back15).await,
+        Playback {
+            state: TransportState::Paused,
+            position: Some(185.0),
+            duration: None,
+        }
+    );
+    assert!(start.elapsed() < CONTROL_BOUND, "{:?}", start.elapsed());
+    assert_eq!(setup.position(&setup.kitchen), seconds(185));
+    // Nothing written (read past the forwarder), and the Handoff goes on.
+    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
+    assert_eq!(api.handoffs(&setup.bobs).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_forward_skip_waiting_for_the_length_skips_from_where_the_group_is_then() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let api = setup.bridge.api();
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.clock.advance(seconds(200));
+
+    // A slow Library Server: the Group plays on 20 seconds while the Bridge waits for the
+    // Item's length, which the Group doesn't tell for a stream.
+    forwarder.delay_by(seconds(2)).await;
+    forwarder.record_requests().await;
+    let (skipped, ()) = tokio::join!(
+        api.skip_group(&setup.bobs, setup.kitchen.uuid(), Skip::Forward30),
+        async {
+            tokio::time::sleep(seconds(1)).await;
+            setup.clock.advance(seconds(20));
+        },
+    );
+    assert_eq!(skipped, playback(TransportState::Playing, 250.0, 600.0));
+    assert_eq!(setup.position(&setup.kitchen), seconds(250));
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(250.0));
+
+    // The length was read, and everything asked, with the Handoff's key (Alice's), never
+    // with the key of Bob, who skipped.
+    let requests = forwarder.requests();
+    let item = format!("GET /api/items/{}?", episode.library_item);
+    assert!(requests.contains(&item), "{requests}");
+    assert!(requests.contains(&setup.alice.api_key.key));
+    assert!(!requests.contains(&setup.bob.api_key.key));
+}
+
 #[tokio::test]
 async fn a_starters_key_rejected_at_write_time_is_revoked_ending_the_handoff() {
+    for control in [GroupControl::Pause, GroupControl::Skip(Skip::Back15)] {
+        let setup = setup().await;
+        let api = setup.bridge.api();
+        let episode = setup.episode(0);
+        setup.start(&episode, &setup.kitchen).await;
+        setup.clock.advance(seconds(60));
+
+        setup.abs.delete_api_key(&setup.alice.api_key).await;
+
+        // The Group did as asked all the same.
+        let answered: Playback = api
+            .control(&setup.bobs, setup.kitchen.uuid(), control)
+            .await;
+        if control == GroupControl::Pause {
+            assert_eq!(answered.state, TransportState::Paused);
+            assert_eq!(
+                setup.household.transport_state(&setup.kitchen),
+                "PAUSED_PLAYBACK"
+            );
+        } else {
+            assert_eq!(answered.position, Some(45.0));
+            assert_eq!(setup.position(&setup.kitchen), seconds(45));
+        }
+        // Alice's key is revoked: her Handoff and her session ended; Bob's session goes on.
+        assert_eq!(api.handoffs(&setup.bobs).await, [], "{control:?}");
+        assert_eq!(api.current_user_error(&setup.alices).await, SESSION_INVALID);
+        assert_eq!(
+            api.control_error(&setup.bobs, setup.kitchen.uuid(), GroupControl::Resume)
+                .await,
+            NO_HANDOFF
+        );
+        assert_eq!(setup.progress(&setup.bob, &episode).await, None);
+        assert!(!output_contains(
+            &setup.bridge.stop(),
+            &setup.alice.api_key.key
+        ));
+    }
+
+    // "30 s forward" asks the Library Server for the length before it seeks: the rejected
+    // key is revoked then, and with the Handoff ended nothing is sent to the Group.
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    setup.start(&setup.episode(0), &setup.kitchen).await;
+    setup.clock.advance(seconds(60));
+    setup.abs.delete_api_key(&setup.alice.api_key).await;
+    let before = setup.playback_controls(&setup.kitchen);
+    assert_eq!(
+        api.control_error(
+            &setup.bobs,
+            setup.kitchen.uuid(),
+            GroupControl::Skip(Skip::Forward30)
+        )
+        .await,
+        NO_HANDOFF
+    );
+    assert_eq!(setup.playback_controls(&setup.kitchen), before);
+    assert_eq!(api.handoffs(&setup.bobs).await, []);
+}
+
+#[tokio::test]
+async fn a_starters_key_moved_to_another_user_is_revoked_and_writes_nothing() {
     let setup = setup().await;
     let api = setup.bridge.api();
     let episode = setup.episode(0);
     setup.start(&episode, &setup.kitchen).await;
     setup.clock.advance(seconds(60));
 
-    setup.abs.delete_api_key(&setup.alice.api_key).await;
+    // An admin makes Alice's key act for Bob.
+    let key = &setup.alice.api_key;
+    setup.abs.move_api_key(key, &setup.bob.id).await;
 
     // The Group paused all the same.
     assert_eq!(
@@ -601,23 +780,134 @@ async fn a_starters_key_rejected_at_write_time_is_revoked_ending_the_handoff() {
             .state,
         TransportState::Paused
     );
+    // The key is revoked: Alice's Handoff and session ended.
+    assert_eq!(api.handoffs(&setup.bobs).await, []);
+    assert_eq!(api.current_user_error(&setup.alices).await, SESSION_INVALID);
+    // Neither Bob, whom the key acts for now, nor Alice got Progress.
+    assert_eq!(setup.progress(&setup.bob, &episode).await, None);
+    setup.abs.move_api_key(key, &setup.alice.id).await;
+    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
+}
+
+#[tokio::test]
+async fn a_group_already_as_asked_is_sent_nothing() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    let kitchen = setup.kitchen.uuid();
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.clock.advance(seconds(60));
+    api.pause_group(&setup.bobs, kitchen).await;
+    // Alice's own player moves her Progress on.
+    let seeded = setup.abs.seeded();
+    let (podcast, first) = (&seeded.podcast, Some(seeded.episodes[0].as_str()));
+    setup
+        .abs
+        .set_progress(&setup.alice, podcast, first, 42.0, false)
+        .await;
+
+    // Paused already: a pause sends nothing and writes nothing.
+    let before = setup.playback_controls(&setup.kitchen);
+    assert_eq!(
+        api.pause_group(&setup.bobs, kitchen).await,
+        Playback {
+            state: TransportState::Paused,
+            position: Some(60.0),
+            duration: None,
+        }
+    );
+    assert_eq!(setup.playback_controls(&setup.kitchen), before);
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(42.0));
+
+    // Playing already: likewise for a resume.
+    api.resume_group(&setup.bobs, kitchen).await;
+    setup.clock.advance(seconds(5));
+    let before = setup.playback_controls(&setup.kitchen);
+    assert_eq!(
+        api.resume_group(&setup.bobs, kitchen).await,
+        Playback {
+            state: TransportState::Playing,
+            position: Some(65.0),
+            duration: None,
+        }
+    );
+    assert_eq!(setup.playback_controls(&setup.kitchen), before);
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(42.0));
+}
+
+#[tokio::test]
+async fn a_group_that_tells_no_position_is_not_skipped_and_its_pause_writes_nothing() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    let kitchen = setup.kitchen.uuid();
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.clock.advance(seconds(60));
+    setup.household.set_fault(&setup.kitchen, Fault::NoPosition);
+
+    let before = setup.playback_controls(&setup.kitchen);
+    for skip in [Skip::Back15, Skip::Forward30] {
+        assert_eq!(
+            api.control_error(&setup.bobs, kitchen, GroupControl::Skip(skip))
+                .await,
+            GROUP_FAILED,
+            "{skip:?}"
+        );
+    }
+    assert_eq!(setup.playback_controls(&setup.kitchen), before);
+
+    assert_eq!(
+        api.pause_group(&setup.bobs, kitchen).await,
+        Playback {
+            state: TransportState::Paused,
+            position: None,
+            duration: None,
+        }
+    );
     assert_eq!(
         setup.household.transport_state(&setup.kitchen),
         "PAUSED_PLAYBACK"
     );
-    // Alice's key is revoked: her Handoff and her session ended; Bob's session goes on.
-    assert_eq!(api.handoffs(&setup.bobs).await, []);
-    assert_eq!(api.current_user_error(&setup.alices).await, SESSION_INVALID);
+    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
+}
+
+#[tokio::test]
+async fn a_group_that_hangs_on_a_control_after_telling_its_playback_fails_in_time() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.clock.advance(seconds(60));
+    setup
+        .household
+        .set_fault(&setup.kitchen, Fault::HangControl);
+
+    for control in [
+        GroupControl::Pause,
+        GroupControl::Skip(Skip::Back15),
+        GroupControl::Volume(50),
+    ] {
+        let start = Instant::now();
+        assert_eq!(
+            api.control_error(&setup.bobs, setup.kitchen.uuid(), control)
+                .await,
+            GROUP_FAILED,
+            "{control:?}"
+        );
+        let elapsed = start.elapsed();
+        // One limit for all of a control's calls to the Group.
+        assert!(
+            elapsed < sonos::CONTROL_TIMEOUT + seconds(2),
+            "{control:?} {elapsed:?}"
+        );
+    }
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
     assert_eq!(
-        api.control_error(&setup.bobs, setup.kitchen.uuid(), GroupControl::Resume)
-            .await,
-        NO_HANDOFF
+        setup.household.volume(&setup.kitchen),
+        sonos_fake::DEFAULT_VOLUME
     );
-    assert_eq!(setup.progress(&setup.bob, &episode).await, None);
-    assert!(!output_contains(
-        &setup.bridge.stop(),
-        &setup.alice.api_key.key
-    ));
+    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
 }
 
 #[tokio::test]

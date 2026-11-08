@@ -22,7 +22,8 @@ use std::time::Duration;
 use abs::ApiKey;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use store::{
-    ActiveHandoff, Error, Handoff, HandoffFile, LibraryUser, Session, SessionId, Store, StreamId,
+    ActiveHandoff, Error, GroupHandoff, Handoff, HandoffFile, LibraryUser, Session, SessionId,
+    Store, StreamId,
 };
 
 pub use crate::sealing::EncryptionKey;
@@ -579,7 +580,7 @@ impl Store for SqliteStore {
         Ok(lookup.found())
     }
 
-    async fn group_handoff(&self, group: &str) -> Result<Option<(StreamId, ActiveHandoff)>, Error> {
+    async fn group_handoff(&self, group: &str) -> Result<Option<GroupHandoff>, Error> {
         let (group, sealing) = (group.to_owned(), Arc::clone(&self.sealing));
         let lookup = self
             .transaction(move |tx| {
@@ -594,7 +595,10 @@ impl Store for SqliteStore {
                     return Ok(Lookup::Unknown);
                 };
                 Ok(match key.open(tx, &sealing)? {
-                    Some(api_key) => Lookup::Open((stream, ActiveHandoff { handoff, api_key })),
+                    Some(api_key) => Lookup::Open(GroupHandoff {
+                        stream,
+                        active: ActiveHandoff { handoff, api_key },
+                    }),
                     None => Lookup::Unreadable(key.user),
                 })
             })

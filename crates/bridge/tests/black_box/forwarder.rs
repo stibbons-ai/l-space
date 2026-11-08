@@ -1,7 +1,7 @@
 //! A TCP forwarder on loopback in front of another server, that a test can take down and
 //! bring back: a Library Server outage, or a second Library Server URL for the same
 //! Audiobookshelf. It can also cut answers short (a Library Server failing mid-body), stall
-//! them (one hanging mid-body), and record what clients send.
+//! them (one hanging mid-body), delay them (a slow one), and record what clients send.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +33,8 @@ enum Answers {
     CutAfter(u64),
     /// This many bytes (none for 0), then nothing more; the connection stays open.
     StallAfter(u64),
+    /// Everything, but each connection only reaches `target` after this long.
+    Late(Duration),
 }
 
 #[derive(Debug)]
@@ -102,6 +104,12 @@ impl Forwarder {
         self.answer(Answers::StallAfter(bytes)).await;
     }
 
+    /// Closes every connection through the forwarder; from now on each new one reaches
+    /// `target` only after `delay`, then passes everything back.
+    pub async fn delay_by(&self, delay: Duration) {
+        self.answer(Answers::Late(delay)).await;
+    }
+
     async fn answer(&self, answers: Answers) {
         *self.state.answers.lock().unwrap() = answers;
         self.close_all().await;
@@ -159,6 +167,9 @@ async fn serve(listener: TcpListener, state: Arc<State>) {
         let recording = state.recording.load(Ordering::SeqCst);
         let requests = Arc::clone(&state.requests);
         connections.spawn(async move {
+            if let Answers::Late(delay) = answers {
+                tokio::time::sleep(delay).await;
+            }
             let mut outbound = match TcpStream::connect(&target).await {
                 Ok(outbound) => outbound,
                 Err(error) => {
@@ -166,14 +177,14 @@ async fn serve(listener: TcpListener, state: Arc<State>) {
                     return;
                 }
             };
-            if answers == Answers::Whole && !recording {
+            if matches!(answers, Answers::Whole | Answers::Late(_)) && !recording {
                 let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
                 return;
             }
             let (mut from_client, mut to_client) = inbound.split();
             let (from_server, mut to_server) = outbound.split();
             let (limit, stall) = match answers {
-                Answers::Whole => (u64::MAX, false),
+                Answers::Whole | Answers::Late(_) => (u64::MAX, false),
                 Answers::CutAfter(bytes) => (bytes, false),
                 Answers::StallAfter(bytes) => (bytes, true),
             };

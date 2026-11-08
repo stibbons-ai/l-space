@@ -482,7 +482,9 @@ impl Shared {
         })
     }
 
-    /// Has Group `group`'s coordinator do `control`, by `deadline`.
+    /// Has Group `group`'s coordinator do `control`, by `deadline`. A volume is set right
+    /// after a fresh `SnapshotGroupVolume`: `SetGroupVolume` changes the members' volumes in
+    /// proportion to the last snapshot, which may predate a member's volume changed on its own.
     async fn control(
         &self,
         group: &str,
@@ -490,21 +492,21 @@ impl Shared {
         deadline: tokio::time::Instant,
     ) -> Result<(), Error> {
         let coordinator = self.coordinator(group, deadline).await?;
+        let at = (group, coordinator);
+        let what = "control the Group";
+        if let Control::SetVolume(_) = control {
+            let snapshot = (Service::GroupRenderingControl, "SnapshotGroupVolume");
+            self.call_coordinator(at, snapshot, &[], deadline, what)
+                .await?;
+        }
         let (service, action, arguments) = control.call();
         let arguments: Vec<(&str, &str)> = arguments
             .iter()
             .map(|(name, value)| (*name, value.as_str()))
             .collect();
-        let at = (group, coordinator);
-        self.call_coordinator(
-            at,
-            (service, action),
-            &arguments,
-            deadline,
-            "control the Group",
-        )
-        .await
-        .map(drop)
+        self.call_coordinator(at, (service, action), &arguments, deadline, what)
+            .await
+            .map(drop)
     }
 
     /// The Group topology and the UUID of the player that told it, asking `candidates` (UUID,
@@ -1273,10 +1275,11 @@ mod tests {
     }
 
     /// The SOAP actions that control a Group, as `sonos-fake` records them.
-    const CONTROLS: [&str; 4] = [
+    const CONTROLS: [&str; 5] = [
         "AVTransport#Pause",
         "AVTransport#Play",
         "AVTransport#Seek",
+        "GroupRenderingControl#SnapshotGroupVolume",
         "GroupRenderingControl#SetGroupVolume",
     ];
 
@@ -1346,6 +1349,7 @@ mod tests {
                 "AVTransport#Pause",
                 "AVTransport#Seek",
                 "AVTransport#Play",
+                "GroupRenderingControl#SnapshotGroupVolume",
                 "GroupRenderingControl#SetGroupVolume",
             ]
         );

@@ -110,6 +110,14 @@ pub struct ActiveHandoff {
     pub api_key: ApiKey,
 }
 
+/// The active Handoff on a Group, as [`Store::group_handoff`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupHandoff {
+    /// Its stream.
+    pub stream: StreamId,
+    pub active: ActiveHandoff,
+}
+
 /// A storage failure. The store's state is unchanged by the failed operation.
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
@@ -183,7 +191,7 @@ pub trait Store: Send + Sync + 'static {
     fn group_handoff(
         &self,
         group: &str,
-    ) -> impl Future<Output = Result<Option<(StreamId, ActiveHandoff)>, Error>> + Send;
+    ) -> impl Future<Output = Result<Option<GroupHandoff>, Error>> + Send;
 
     /// Every active Handoff, the earliest started first (ties by Group id). As for
     /// [`Store::handoff`], a Handoff whose key can no longer be read is not listed, and the

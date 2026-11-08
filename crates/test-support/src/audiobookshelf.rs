@@ -217,21 +217,28 @@ impl Audiobookshelf {
         library_item: &str,
         episode: Option<&str>,
     ) -> Option<(f64, bool)> {
-        let me = self.whose_key(&user.api_key).await;
-        me["mediaProgress"]
-            .as_array()
-            .expect("mediaProgress")
-            .iter()
-            .find(|entry| match episode {
-                Some(episode) => entry["episodeId"] == episode,
-                None => entry["libraryItemId"] == library_item && entry["episodeId"].is_null(),
-            })
-            .map(|entry| {
-                (
-                    entry["currentTime"].as_f64().expect("currentTime"),
-                    entry["isFinished"].as_bool().expect("isFinished"),
-                )
-            })
+        let record = self.progress_record(user, library_item, episode).await?;
+        Some((
+            record["currentTime"].as_f64().expect("currentTime"),
+            record["isFinished"].as_bool().expect("isFinished"),
+        ))
+    }
+
+    /// `user`'s Progress record in audiobook `library_item`, or in its episode `episode`, as
+    /// Audiobookshelf lists it in `/api/me` for their key; none if they have none.
+    pub async fn progress_record(
+        &self,
+        user: &AbsUser,
+        library_item: &str,
+        episode: Option<&str>,
+    ) -> Option<Value> {
+        let mut me = self.whose_key(&user.api_key).await;
+        let records = me["mediaProgress"].as_array_mut().expect("mediaProgress");
+        let found = records.iter().position(|entry| match episode {
+            Some(episode) => entry["episodeId"] == episode,
+            None => entry["libraryItemId"] == library_item && entry["episodeId"].is_null(),
+        })?;
+        Some(records.swap_remove(found))
     }
 
     /// Its `host:port`, for a forwarder in front of it.

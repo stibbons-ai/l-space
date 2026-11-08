@@ -1,15 +1,17 @@
 //! A fake Sonos household for tests (PRD "Testing Decisions"): players on loopback that answer
 //! SSDP M-SEARCH and serve their device description and the UPnP subset the Bridge uses
 //! (ZoneGroupTopology `GetZoneGroupState`; AVTransport `GetTransportInfo`, `GetPositionInfo`,
-//! `SetAVTransportURI`, `Play`, `Pause` and `Seek`; GroupRenderingControl `GetGroupVolume` and
-//! `SetGroupVolume`), with Groups, playback, volume and faults the test controls.
+//! `SetAVTransportURI`, `Play`, `Pause` and `Seek`; GroupRenderingControl `GetGroupVolume`,
+//! `SnapshotGroupVolume` and `SetGroupVolume`), with Groups, playback, volume and faults the
+//! test controls.
 //!
 //! A Group told to play a URL (`SetAVTransportURI`, then `Play`) plays it like a speaker: its
 //! transport is Playing, its position moves on the clock, `GetPositionInfo` reports the URL,
 //! and it fetches the URL over HTTP with a `Range` request, recording what it got
 //! ([`Household::fetched`]). Paused (`Pause`), its position stops on the clock; `Play` moves it
 //! on from there; `Seek` (`REL_TIME`) sets it, playing or paused as it was. Each Group has a
-//! volume, [`DEFAULT_VOLUME`] until set (`SetGroupVolume`, or [`Household::set_volume`]).
+//! volume, [`DEFAULT_VOLUME`] until set (`SetGroupVolume`, or [`Household::set_volume`]);
+//! `SnapshotGroupVolume` is accepted and only recorded, as the fake has no member volumes.
 //!
 //! The household runs on its own Tokio runtime, so it answers whatever the test's runtime is
 //! doing (also while a test blocks on starting a Bridge). Each player listens on its own
@@ -59,6 +61,9 @@ const GROUP_RENDERING: &str = "urn:schemas-upnp-org:service:GroupRenderingContro
 
 /// A Group's volume until it is set.
 pub const DEFAULT_VOLUME: u8 = 20;
+
+/// The highest volume `SetGroupVolume` takes; the lowest is 0.
+pub const MAX_VOLUME: u8 = 100;
 
 /// A player in the household, by its UUID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -141,6 +146,9 @@ pub enum Fault {
     SlowPosition(Duration),
     /// It answers `GetTransportInfo` without a `CurrentTransportState`.
     NoTransportState,
+    /// It answers `GetPositionInfo` with `NOT_IMPLEMENTED` for the position (`RelTime`), and
+    /// everything else correctly.
+    NoPosition,
     /// It answers `GetTransportInfo` with a SOAP fault, and everything else correctly.
     FailTransportInfo,
     /// It answers `SetAVTransportURI` and `Play` with a SOAP fault (UPnP error 714, illegal
@@ -152,6 +160,9 @@ pub enum Fault {
     /// It answers `Pause`, `Play`, `Seek` and `SetGroupVolume` with a SOAP fault (UPnP error
     /// 701, transition not available), changing nothing, and everything else correctly.
     RefuseControl,
+    /// It accepts `Pause`, `Play`, `Seek`, `SnapshotGroupVolume` and `SetGroupVolume` and
+    /// never answers them, changing nothing, and answers everything else correctly.
+    HangControl,
     /// It answers `GetGroupVolume` with a SOAP fault, and everything else correctly.
     FailGroupVolume,
 }
@@ -583,11 +594,11 @@ impl HouseholdState {
 
     /// `SetAVTransportURI`, `Play`, `Pause` or `Seek` (with the SOAP `request`) on `served`'s
     /// player, which must coordinate its Group, at `now`. `Play` on a stopped Group starts
-    /// fetching the URL; on a paused one it moves on from where it is. The UPnP error code on
-    /// failure: 701 (transition not available) on a player that doesn't coordinate, with
-    /// nothing loaded, or pausing a Group that isn't playing; 402 (invalid arguments) without
-    /// a `CurrentURI`, or a seek that isn't `REL_TIME` to `H:MM:SS`; 711 (illegal seek target)
-    /// past the track's end.
+    /// fetching the URL; on a paused one it moves on from where it is. `Pause` on a paused
+    /// Group changes nothing. The UPnP error code on failure: 701 (transition not available)
+    /// on a player that doesn't coordinate, with nothing loaded, or pausing a stopped Group;
+    /// 402 (invalid arguments) without a `CurrentURI`, or a seek that isn't `REL_TIME` to
+    /// `H:MM:SS`; 711 (illegal seek target) past the track's end.
     fn transport(
         &mut self,
         served: &Served,
@@ -853,16 +864,26 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         {
             return upnp_fault(701);
         }
+        Some(Fault::HangControl)
+            if matches!(
+                action,
+                "Pause" | "Play" | "Seek" | "SnapshotGroupVolume" | "SetGroupVolume"
+            ) =>
+        {
+            std::future::pending().await
+        }
         Some(Fault::FailGroupVolume) if action == "GetGroupVolume" => return invalid_action(),
         Some(
             Fault::None
             | Fault::Padded(_)
             | Fault::SlowPosition(_)
             | Fault::NoTransportState
+            | Fault::NoPosition
             | Fault::FailTransportInfo
             | Fault::RefusePlayback
             | Fault::SlowPlayback(_)
             | Fault::RefuseControl
+            | Fault::HangControl
             | Fault::FailGroupVolume,
         ) => {}
         // Removed from the household: as good as unplugged.
@@ -892,7 +913,15 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
                 }
                 arguments
             } else {
-                position_info(transport, now)
+                let mut arguments = position_info(transport, now);
+                if fault == Some(Fault::NoPosition) {
+                    for (name, value) in &mut arguments {
+                        if *name == "RelTime" {
+                            "NOT_IMPLEMENTED".clone_into(value);
+                        }
+                    }
+                }
+                arguments
             }
         }
         (AV_TRANSPORT, "SetAVTransportURI" | "Play" | "Pause" | "Seek") => {
@@ -905,10 +934,14 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             Ok(coordinator) => vec![("CurrentVolume", coordinator.volume.to_string())],
             Err(code) => return upnp_fault(code),
         },
+        (GROUP_RENDERING, "SnapshotGroupVolume") => match state.coordinating_mut(&served) {
+            Ok(_) => Vec::new(),
+            Err(code) => return upnp_fault(code),
+        },
         (GROUP_RENDERING, "SetGroupVolume") => {
             let Some(volume) = input(&request, "DesiredVolume")
                 .and_then(|volume| volume.parse::<u8>().ok())
-                .filter(|volume| *volume <= 100)
+                .filter(|volume| *volume <= MAX_VOLUME)
             else {
                 return upnp_fault(402);
             };

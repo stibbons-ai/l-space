@@ -178,7 +178,8 @@ impl Notice {
 /// How long a call to the Bridge may take before the App treats the Bridge as unreachable.
 /// Longer than the Bridge's own 10-second limit for a Library Server request (`abs::TIMEOUT`),
 /// so a slow Library Server shows as `library_server_unreachable` rather than as the Bridge
-/// being unreachable, and a login answered late isn't dropped.
+/// being unreachable, and a login answered late isn't dropped; and than a Group control's own
+/// 11 seconds (4 for the Group, 7 for the Library Server).
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The App: what it remembers on the device and the screen it shows.
@@ -720,9 +721,9 @@ impl App {
     }
 
     /// On the Groups screen, pauses Group `group`'s Handoff (whoever started it) and shows the
-    /// Group paused where it stopped. On failure, as every Group control: a Group gone or
-    /// without a Handoff it plays has the Groups listed afresh with that notice; anything else
-    /// is said on the screen.
+    /// Group paused where it was just before pausing. On failure, as every Group control: a
+    /// Group gone or without a Handoff it plays has the Groups listed afresh with that notice;
+    /// anything else is said on the screen.
     pub async fn pause_group(&mut self, group: &str) {
         let call = api::pause_group(group.to_owned());
         self.control_group(group, call, show_playback).await;

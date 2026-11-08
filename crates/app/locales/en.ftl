@@ -118,5 +118,5 @@ error-sonos-search-failed = Clacks can't search your network for Sonos speakers 
 error-group-not-found = That Group is gone: it may have been regrouped in the Sonos app. Pick another one.
 error-group-failed = The Group didn't answer, or refused. Check that it is on and on your network, then try again.
 error-item-not-playable = Clacks can't play this on a Group yet: only episodes and audiobooks in a single file, in a format Sonos plays.
-error-no-handoff = Clacks no longer plays anything on that Group: it was stopped or replaced, maybe in the Sonos app. Start it again with “Play on…”.
+error-no-handoff = That Group isn't playing what Clacks started: it plays something else now (maybe from the Sonos app), or what Clacks played there ended. Start it again with “Play on…”.
 error-unknown = Something unexpected went wrong. Updating Ook may help.

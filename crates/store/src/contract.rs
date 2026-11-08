@@ -12,7 +12,8 @@
 use abs::ApiKey;
 
 use crate::{
-    ActiveHandoff, Handoff, HandoffFile, LibraryUser, Session, SessionId, Store, StreamId,
+    ActiveHandoff, GroupHandoff, Handoff, HandoffFile, LibraryUser, Session, SessionId, Store,
+    StreamId,
 };
 
 /// Empty storage that a store can be opened on, any number of times in turn: what one opened
@@ -561,19 +562,15 @@ pub async fn revoking_a_key_ends_the_handoffs_acting_with_it(backend: &impl Back
     assert_eq!(listed(&store).await, [office]);
 }
 
-async fn on_group(store: &impl Store, group: &str) -> Option<(StreamId, ActiveHandoff)> {
+async fn on_group(store: &impl Store, group: &str) -> Option<GroupHandoff> {
     store
         .group_handoff(group)
         .await
         .expect("look up a Group's handoff")
 }
 
-fn on_stream(
-    stream: StreamId,
-    handoff: &Handoff,
-    api_key: &str,
-) -> Option<(StreamId, ActiveHandoff)> {
-    acting_with(handoff, api_key).map(|active| (stream, active))
+fn on_stream(stream: StreamId, handoff: &Handoff, api_key: &str) -> Option<GroupHandoff> {
+    acting_with(handoff, api_key).map(|active| GroupHandoff { stream, active })
 }
 
 pub async fn a_groups_handoff_is_found_with_its_stream_and_starters_key(backend: &impl Backend) {
