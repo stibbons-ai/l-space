@@ -55,18 +55,31 @@ pub async fn clock(test_clock: Option<SocketAddr>) -> Result<Arc<dyn Clock>, Err
     Ok(Arc::new(clock))
 }
 
-/// Moves `clock` on with the household's, which stood at `seen` nanoseconds.
+/// Moves `clock` on with the household's, which stood at `seen` nanoseconds. Logs losing the
+/// household's clock once, and finding it again; and once that it went backwards, which the
+/// follower ignores.
 async fn follow(http: reqwest::Client, url: String, clock: ManualClock, mut seen: u64) {
+    let (mut lost, mut backwards) = (false, false);
     loop {
         match read(&http, &format!("{url}?after={seen}"), POLL_TIMEOUT).await {
             Ok(now) => {
+                if lost {
+                    tracing::info!("following the test clock again");
+                    lost = false;
+                }
                 if now > seen {
                     clock.advance(Duration::from_nanos(now - seen));
                     seen = now;
+                } else if now < seen && !backwards {
+                    tracing::warn!(now, seen, "the test clock went backwards; ignored");
+                    backwards = true;
                 }
             }
             Err(reason) => {
-                tracing::warn!(reason, "cannot follow the test clock");
+                if !lost {
+                    tracing::warn!(reason, "cannot follow the test clock; trying again");
+                    lost = true;
+                }
                 tokio::time::sleep(RETRY).await;
             }
         }

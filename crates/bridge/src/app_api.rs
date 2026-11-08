@@ -576,15 +576,18 @@ impl<S: Store> AppApi<S> {
     }
 
     /// Starts Item `id` on Group `group` for the session's user: resolves the Item's audio
-    /// file with the session's key, writes the Progress of the Handoff it replaces, if any
-    /// ([`Controls::write_replaced`]), stores the Handoff (replacing the Group's), then has the
-    /// Group play its stream and go to the start position ([`start_position`]: the user's
+    /// file with the session's key and the start position ([`start_position`]: the user's
     /// Progress, or 0 when `from_start`, Finished, without Progress, or when its whole seconds
-    /// lie at or past the Item's end), and supervises it (`supervise`) until it ends. If the
-    /// Group doesn't play or seek, the new Handoff ends again, and the one it replaced stays
-    /// ended: the Group is left with none. After a failed seek the Group, already playing, is
-    /// also paused, on a task of its own that keeps the Group's turn until the pause is done
-    /// (at most [`sonos::CONTROL_TIMEOUT`]) without holding up the answer.
+    /// lie at or past the Item's end), then writes the Progress of the Handoff it replaces, if
+    /// any ([`Controls::write_replaced`]), stores the Handoff (replacing the Group's), has the
+    /// Group play its stream and go to the start position, and supervises it (`supervise`)
+    /// until it ends. The start position is read before the replaced Handoff's write: a user
+    /// who starts the Item their own Handoff on the Group plays starts it from their Progress
+    /// as it was before that write. If the Group doesn't play or seek, the new Handoff ends
+    /// again, and the one it replaced stays ended: the Group is left with none. After a failed
+    /// seek the Group, already playing, is also paused, on a task of its own that keeps the
+    /// Group's turn until the pause is done (at most [`sonos::CONTROL_TIMEOUT`]) without
+    /// holding up the answer.
     ///
     /// Starts take turns with starts, controls and supervisors on the Group. A start that had
     /// to wait for its turn, or whose Group had a turn end while it resolved (a start, control
@@ -1096,14 +1099,15 @@ const CONTROL_LIBRARY_SERVER_TIME: Duration = Duration::from_secs(7);
 /// Group to play and, starting past 0, [`sonos::CONTROL_TIMEOUT`] for it to seek. Its turn
 /// waits only for what the others leave: at most 14 − 4 = 10 seconds less resolving for a
 /// start `from_start`, 14 − 2 − 4 − 4 = 4 for any other (which keeps the seek's time even
-/// without Progress, as the read may find some); a start left with less than it needs for the
-/// Group's calls after its turn sends nothing. One second under the App's 15.
+/// without Progress, as the read may find some); a start left after its turn with less than
+/// it needs for that read (when it reads again) and the Group's calls sends nothing. One
+/// second under the App's 15.
 const START_TIME: Duration = Duration::from_secs(14);
 
 /// The most a start gives the Progress write of the Handoff it replaces: reading where the
 /// Group is, checking whom the replaced Handoff's key acts for (and the Item's length, if the
 /// Group doesn't tell it), writing. It gets less when [`START_TIME`] leaves less beyond the
-/// Group's calls, and none when nothing is left.
+/// Group's calls; with nothing left, the write isn't tried (logged).
 const REPLACED_PROGRESS_TIME: Duration = Duration::from_secs(4);
 
 /// How long a start may take to read the user's Progress again after its turn: one `/api/me`
@@ -1544,8 +1548,8 @@ impl<S: Store> Controls<S> {
     /// reading the Group, checking the key (and the Item's length, if neither the Group nor
     /// `length`, as the replaced Handoff's supervisor knew it, tells it), writing. Only a Group
     /// playing or paused on that stream, telling a position, gets it written; a stopped one
-    /// may tell 0 there. Anything else, a failure or running out of time is logged and
-    /// otherwise left alone.
+    /// may tell 0 there. With no `time` at all, nothing is tried. Anything else, a failure or
+    /// running out of time is logged and otherwise left alone.
     async fn write_replaced(
         &self,
         group: &str,
@@ -1553,8 +1557,12 @@ impl<S: Store> Controls<S> {
         length: Option<f64>,
         time: Duration,
     ) {
-        let mut time = Budget(time);
         let not_written = "the replaced Handoff's Progress not written";
+        if time.is_zero() {
+            tracing::info!(group, reason = "no time left", "{not_written}");
+            return;
+        }
+        let mut time = Budget(time);
         let Ok(playback) = self.playback(group, &mut time).await else {
             tracing::info!(group, "{not_written}");
             return;
@@ -1727,13 +1735,14 @@ impl<S: Store> Controls<S> {
         }
     }
 
-    /// Writes `update` (unfinished unless it says Finished) as Progress in `active`'s Item for
-    /// the user who started it, with the Handoff's key, never with a caller's, within `time`;
-    /// only if the key still acts for the starter (`acting`). Whether the starter may still see
-    /// the Item is not checked again (Audiobookshelf doesn't check on a Progress write): the
-    /// Handoff relies on the check made at its start. A failure is logged and otherwise left
-    /// alone; a key the Library Server rejects is revoked, which ends the Handoff. `cause`
-    /// (what wrote it: a pause, the cadence, ...) is logged with the write.
+    /// Writes `update` as Progress in `active`'s Item for the user who started it, with the
+    /// Handoff's key, never with a caller's, within `time`; only if the key still acts for the
+    /// starter (`acting`). Whether the starter may still see the Item is not checked again
+    /// (Audiobookshelf doesn't check on a Progress write): the Handoff relies on the check made
+    /// at its start. A failure is logged and otherwise left alone; a key the Library Server
+    /// rejects is revoked, which ends the Handoff. `cause` (what wrote it: a pause, the
+    /// cadence, ...) is logged with the write, and with a write not made. Returns whether it
+    /// was written.
     async fn write_progress(
         &self,
         active: &ActiveHandoff,
@@ -1741,52 +1750,41 @@ impl<S: Store> Controls<S> {
         update: abs::ProgressUpdate,
         cause: &'static str,
         time: &mut Budget,
-    ) {
+    ) -> Wrote {
         let handoff = &active.handoff;
         let (group, starter) = (&handoff.group, &handoff.started_by);
-        let library_server = match acting {
-            Acting::Starter(library_server) => library_server,
-            Acting::Revoked => {
-                let reason = "the Handoff's API key was revoked";
-                tracing::warn!(
-                    group,
-                    user_id = starter.user_id,
-                    reason,
-                    "Progress not written"
-                );
-                return;
-            }
-            Acting::RevokeFailed => {
-                let reason = "the Handoff's API key is to be revoked, but storage failed";
-                tracing::warn!(
-                    group,
-                    user_id = starter.user_id,
-                    reason,
-                    "Progress not written"
-                );
-                return;
-            }
-            Acting::Unknown => {
-                let reason = "whom the Handoff's API key acts for is not known";
-                tracing::warn!(
-                    group,
-                    user_id = starter.user_id,
-                    reason,
-                    "Progress not written"
-                );
-                return;
-            }
-        };
-        if time.0 < MIN_WRITE_TIME {
-            let reason = "no time left";
+        let (position, finished) = (update.current_time(), update.is_finished());
+        let not_written = |reason: &str| {
             tracing::warn!(
                 group,
-                library_server,
                 user_id = starter.user_id,
+                library_item = handoff.library_item,
+                episode = handoff.episode,
+                position,
+                finished,
+                cause,
                 reason,
                 "Progress not written"
             );
-            return;
+        };
+        let library_server = match acting {
+            Acting::Starter(library_server) => library_server,
+            Acting::Revoked => {
+                not_written("the Handoff's API key was revoked");
+                return Wrote::Revoked;
+            }
+            Acting::RevokeFailed => {
+                not_written("the Handoff's API key is to be revoked, but storage failed");
+                return Wrote::Not;
+            }
+            Acting::Unknown => {
+                not_written("whom the Handoff's API key acts for is not known");
+                return Wrote::Not;
+            }
+        };
+        if time.0 < MIN_WRITE_TIME {
+            not_written("no time left");
+            return Wrote::Not;
         }
         let written = time
             .spend(self.abs.set_progress(
@@ -1798,48 +1796,47 @@ impl<S: Store> Controls<S> {
             ))
             .await;
         match written {
-            Some(Ok(())) => tracing::info!(
-                group,
-                library_server,
-                user_id = starter.user_id,
-                library_item = handoff.library_item,
-                episode = handoff.episode,
-                position = update.current_time,
-                finished = update.finished,
-                cause,
-                "Progress written"
-            ),
-            Some(Err(abs::Error::Rejected)) => {
-                let reason = "the Library Server rejected the Handoff's API key";
-                tracing::warn!(
+            Some(Ok(())) => {
+                tracing::info!(
                     group,
                     library_server,
                     user_id = starter.user_id,
-                    reason,
-                    "Progress not written"
+                    library_item = handoff.library_item,
+                    episode = handoff.episode,
+                    position,
+                    finished,
+                    cause,
+                    "Progress written"
                 );
-                let reason = "the Library Server rejected the API key";
-                self.revoke(starter, &active.api_key, reason).await;
+                Wrote::Written
             }
-            Some(Err(error)) => tracing::warn!(
-                group,
-                library_server,
-                user_id = starter.user_id,
-                library_item = handoff.library_item,
-                episode = handoff.episode,
-                %error,
-                "Progress not written"
-            ),
+            Some(Err(abs::Error::Rejected)) => {
+                not_written("the Library Server rejected the Handoff's API key");
+                let reason = "the Library Server rejected the API key";
+                match self.revoke(starter, &active.api_key, reason).await {
+                    Acting::Revoked => Wrote::Revoked,
+                    _ => Wrote::Not,
+                }
+            }
+            Some(Err(error)) => {
+                not_written(&error.to_string());
+                Wrote::Not
+            }
             // The request may have landed all the same.
             None => {
-                let reason = "the Library Server did not answer in time";
                 tracing::warn!(
                     group,
                     library_server,
                     user_id = starter.user_id,
-                    reason,
+                    library_item = handoff.library_item,
+                    episode = handoff.episode,
+                    position,
+                    finished,
+                    cause,
+                    reason = "the Library Server did not answer in time",
                     "Progress write not confirmed"
                 );
+                Wrote::Not
             }
         }
     }
@@ -1863,6 +1860,17 @@ enum Acting<'a> {
     RevokeFailed,
     /// Not known: the Library Server failed, or didn't answer in time.
     Unknown,
+}
+
+/// Whether a Progress write ([`Controls::write_progress`]) landed.
+#[derive(Debug, Clone, Copy)]
+enum Wrote {
+    Written,
+    /// Not written, as the Handoff's key was revoked, ending the Handoff.
+    Revoked,
+    /// Not written, or not confirmed: failed, refused for lack of time, or the key's user not
+    /// known.
+    Not,
 }
 
 /// An Item's length in seconds, as the starter's Library Server told a control.

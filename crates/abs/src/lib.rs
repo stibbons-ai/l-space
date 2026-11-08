@@ -293,19 +293,22 @@ pub struct EpisodePodcast {
     pub metadata: PodcastMetadata,
 }
 
-/// A Progress write ([`Client::set_progress`]).
+/// A Progress write ([`Client::set_progress`]): unfinished at a position ([`Self::at`]), or
+/// Finished at the end of an Item of known length ([`Self::finished`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ProgressUpdate {
     /// The position, in seconds.
-    pub current_time: f64,
+    current_time: f64,
     /// The Item's length in seconds, when known.
-    pub duration: Option<f64>,
-    /// Whether the write marks the Item Finished; otherwise it leaves it unfinished.
-    pub finished: bool,
+    duration: Option<f64>,
+    /// Whether the write marks the Item Finished; otherwise it doesn't (see
+    /// [`Client::set_progress`] for when Audiobookshelf leaves or marks it Finished then).
+    finished: bool,
 }
 
 impl ProgressUpdate {
-    /// Unfinished, `current_time` seconds into an Item `duration` seconds long, if known.
+    /// Not marked Finished, `current_time` seconds into an Item `duration` seconds long, if
+    /// known.
     pub fn at(current_time: f64, duration: Option<f64>) -> Self {
         Self {
             current_time,
@@ -321,6 +324,16 @@ impl ProgressUpdate {
             duration: Some(length),
             finished: true,
         }
+    }
+
+    /// The position written, in seconds.
+    pub fn current_time(&self) -> f64 {
+        self.current_time
+    }
+
+    /// Whether the write marks the Item Finished.
+    pub fn is_finished(&self) -> bool {
+        self.finished
     }
 }
 
@@ -575,17 +588,20 @@ impl Client {
     /// episode `episode_id` of the podcast `library_item_id`, as `update` says:
     /// `PATCH /api/me/progress/<library item>[/<episode>]` with `{"currentTime": …}`, plus
     /// `duration` (seconds) and the `progress` fraction it makes when the length is known, and
-    /// `"isFinished": true` when Finished. Unfinished, `isFinished` is not sent, and
-    /// `"markAsFinishedTimeRemaining": 0` keeps Audiobookshelf from marking it Finished itself.
+    /// `"isFinished": true` when Finished. Not Finished, `isFinished` is not sent, and
+    /// `"markAsFinishedTimeRemaining": 0` keeps Audiobookshelf from marking it Finished itself
+    /// short of the end.
     ///
     /// As Audiobookshelf 2.37.2 does it (`User.createUpdateMediaProgressFromPayload`,
     /// `MediaProgress.applyProgressUpdate`): the user gets Progress if they had none, and that
     /// first write leaves it unfinished unless Finished is sent. A write that moves Progress
-    /// they already have leaves it unfinished, also a Finished one, unless Finished is sent;
-    /// without the `markAsFinishedTimeRemaining` above it would mark it Finished when under 10
-    /// seconds of a known length remain. (Sending `"isFinished": false` instead would set a
-    /// Finished one back to 0 and drop the `currentTime`.) A write that leaves `currentTime` as
-    /// it was leaves Finished as it was. Fails as [`Client::set_finished`] does.
+    /// they already have leaves it unfinished, also a Finished one, unless Finished is sent or
+    /// `currentTime` lies past the Item's length as Audiobookshelf then holds it (it marks it
+    /// Finished itself then); without the `markAsFinishedTimeRemaining` above it would also
+    /// mark it Finished when under 10 seconds of a known length remain. (Sending
+    /// `"isFinished": false` instead would set a Finished one back to 0 and drop the
+    /// `currentTime`.) A write that leaves `currentTime` as it was leaves Finished as it was.
+    /// Fails as [`Client::set_finished`] does.
     /// Audiobookshelf doesn't check that the user may see the Item: a caller that needs it
     /// checks that itself.
     pub async fn set_progress(
