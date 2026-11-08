@@ -164,6 +164,12 @@ pub enum Fault {
     /// It accepts `Pause`, `Play`, `Seek`, `SnapshotGroupVolume` and `SetGroupVolume` and
     /// never answers them, changing nothing, and answers everything else correctly.
     HangControl,
+    /// It answers `Seek` with a SOAP fault (UPnP error 701, transition not available),
+    /// changing nothing, and everything else correctly.
+    RefuseSeek,
+    /// It accepts `Seek` and never answers it, changing nothing, and answers everything else
+    /// correctly.
+    HangSeek,
     /// It answers every AVTransport call correctly, but only after this long (in real time),
     /// and acts only then.
     SlowTransport(Duration),
@@ -879,6 +885,8 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         {
             std::future::pending().await
         }
+        Some(Fault::RefuseSeek) if action == "Seek" => return upnp_fault(701),
+        Some(Fault::HangSeek) if action == "Seek" => std::future::pending().await,
         Some(Fault::FailGroupVolume) if action == "GetGroupVolume" => return invalid_action(),
         Some(Fault::SlowTransport(delay)) if urn == AV_TRANSPORT => {
             tokio::time::sleep(delay).await;
@@ -894,6 +902,8 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             | Fault::SlowPlayback(_)
             | Fault::RefuseControl
             | Fault::HangControl
+            | Fault::RefuseSeek
+            | Fault::HangSeek
             | Fault::FailGroupVolume
             | Fault::SlowTransport(_),
         ) => {}

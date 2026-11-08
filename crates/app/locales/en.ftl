@@ -77,6 +77,7 @@ group-volume = Volume { $volume }
 group-volume-down = Quieter
 group-volume-up = Louder
 play-on = Play on…
+play-from-start = Play from start…
 playing-on = Playing on { $group }
 
 date = { $month ->

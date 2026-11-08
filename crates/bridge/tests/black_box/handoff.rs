@@ -24,6 +24,12 @@ const SET_URI: &str = "AVTransport#SetAVTransportURI";
 /// The SOAP action that has a Group play, as `sonos-fake` records it.
 const PLAY: &str = "AVTransport#Play";
 
+/// The SOAP action that moves a Group to a position, as `sonos-fake` records it.
+const SEEK: &str = "AVTransport#Seek";
+
+/// The WARN the Bridge logs when a Group doesn't go to a start's position.
+const NOT_SOUGHT: &str = "a Group did not go to a Handoff's start position";
+
 /// The WARN the Bridge logs when a Handoff's file breaks off from the Library Server.
 const BROKE_OFF: &str = "a Handoff's file broke off while streaming from its Library Server";
 
@@ -125,6 +131,34 @@ impl Setup {
 
     fn started_by(&self) -> CurrentUser {
         acting_as(&self.abs, &self.user)
+    }
+
+    /// Records `user`'s Progress in `item` in Audiobookshelf, as their own player would.
+    async fn set_progress(&self, user: &AbsUser, item: &ItemId, current_time: f64, finished: bool) {
+        self.abs
+            .set_progress(
+                user,
+                &item.library_item,
+                item.episode.as_deref(),
+                current_time,
+                finished,
+            )
+            .await;
+    }
+
+    /// `user`'s Progress in `item`, straight from Audiobookshelf: `(currentTime, isFinished)`.
+    async fn progress(&self, user: &AbsUser, item: &ItemId) -> Option<(f64, bool)> {
+        self.abs
+            .progress(user, &item.library_item, item.episode.as_deref())
+            .await
+    }
+
+    /// Where `group`'s Group is in its track, and whether it was sent a `Seek`.
+    fn position(&self, group: &PlayerId) -> (Duration, bool) {
+        (
+            self.household.position(group),
+            called(&self.household, group, SEEK),
+        )
     }
 }
 
@@ -1004,4 +1038,187 @@ async fn a_library_server_that_goes_down_while_streaming_is_a_bad_gateway() {
         &setup.user.api_key.key,
         &[stream_id(&url)],
     );
+}
+
+#[tokio::test]
+async fn a_start_begins_at_the_users_progress_in_whole_seconds() {
+    let setup = setup().await;
+    let episode = setup.episode(1);
+    let silence = ItemId {
+        library_item: setup.abs.seeded().silence.clone(),
+        episode: None,
+    };
+    setup
+        .set_progress(&setup.user, &episode, 754.6, false)
+        .await;
+    // An audiobook's Progress is keyed by the library item alone. The seeded one-file
+    // audiobook lasts a second, so its Progress here lies past its end, which the Bridge
+    // doesn't check and the fake Group, knowing no length for a stream, accepts.
+    setup.set_progress(&setup.user, &silence, 42.9, false).await;
+
+    setup.start(&episode, &setup.kitchen).await;
+    setup.start(&silence, &setup.office).await;
+
+    assert_eq!(
+        setup.position(&setup.kitchen),
+        (Duration::from_secs(754), true)
+    );
+    assert_eq!(
+        setup.position(&setup.office),
+        (Duration::from_secs(42), true)
+    );
+    // Told to play first, then to seek.
+    let started: Vec<String> = setup
+        .household
+        .actions_of(&setup.kitchen)
+        .into_iter()
+        .filter(|action| [SET_URI, PLAY, SEEK].contains(&action.as_str()))
+        .collect();
+    assert_eq!(started, [SET_URI, PLAY, SEEK]);
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+    // A start writes no Progress.
+    assert_eq!(
+        setup.progress(&setup.user, &episode).await,
+        Some((754.6, false))
+    );
+}
+
+#[tokio::test]
+async fn a_finished_item_or_one_without_progress_starts_at_0_without_a_seek() {
+    let setup = setup().await;
+    let (finished, untouched) = (setup.episode(1), setup.episode(0));
+    setup
+        .set_progress(&setup.user, &finished, 754.6, true)
+        .await;
+
+    setup.start(&finished, &setup.kitchen).await;
+    setup.start(&untouched, &setup.office).await;
+
+    assert_eq!(setup.position(&setup.kitchen), (Duration::ZERO, false));
+    assert_eq!(setup.position(&setup.office), (Duration::ZERO, false));
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+    assert_eq!(
+        setup.progress(&setup.user, &finished).await,
+        Some((754.6, true))
+    );
+}
+
+#[tokio::test]
+async fn play_from_start_starts_at_0_whatever_the_progress() {
+    let setup = setup().await;
+    let episode = setup.episode(1);
+    setup
+        .set_progress(&setup.user, &episode, 754.6, false)
+        .await;
+
+    let handoff = setup
+        .bridge
+        .api()
+        .start_handoff_from_start(&setup.session, &episode, setup.kitchen.uuid())
+        .await;
+
+    assert_eq!(handoff.item, episode);
+    assert_eq!(setup.position(&setup.kitchen), (Duration::ZERO, false));
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+}
+
+#[tokio::test]
+async fn an_app_that_sends_no_from_start_gets_the_progress() {
+    let setup = setup().await;
+    let episode = setup.episode(1);
+    setup
+        .set_progress(&setup.user, &episode, 754.6, false)
+        .await;
+
+    // The body an App sent before "Play from start" existed.
+    let body = serde_json::json!({"item": episode, "group": setup.kitchen.uuid()});
+    setup
+        .bridge
+        .api()
+        .start_handoff_with(&setup.session, body)
+        .await;
+
+    assert_eq!(
+        setup.position(&setup.kitchen),
+        (Duration::from_secs(754), true)
+    );
+}
+
+#[tokio::test]
+async fn another_users_progress_doesnt_move_a_start() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    let episode = setup.episode(1);
+    let other = setup.abs.new_user().await;
+    let others = api.login(setup.abs.base_url(), &other.api_key.key).await;
+    setup.set_progress(&other, &episode, 754.6, false).await;
+
+    // The user has none: theirs starts at 0.
+    setup.start(&episode, &setup.kitchen).await;
+    assert_eq!(setup.position(&setup.kitchen), (Duration::ZERO, false));
+
+    // With Progress of their own, each starts at theirs.
+    setup
+        .set_progress(&setup.user, &episode, 300.4, false)
+        .await;
+    setup.start(&episode, &setup.kitchen).await;
+    api.start_handoff(&others, &episode, setup.office.uuid())
+        .await;
+    assert_eq!(
+        setup.household.position(&setup.kitchen),
+        Duration::from_secs(300)
+    );
+    assert_eq!(
+        setup.household.position(&setup.office),
+        Duration::from_secs(754)
+    );
+}
+
+#[tokio::test]
+async fn a_group_that_refuses_or_does_not_answer_the_seek_keeps_no_handoff() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    let episode = setup.episode(1);
+    setup
+        .set_progress(&setup.user, &episode, 754.6, false)
+        .await;
+    let failed = (StatusCode::BAD_GATEWAY, ApiError::GroupFailed);
+    let (_, old) = setup.start(&setup.episode(0), &setup.kitchen).await;
+
+    setup.household.set_fault(&setup.kitchen, Fault::RefuseSeek);
+    assert_eq!(
+        api.start_handoff_error(&setup.session, &episode, setup.kitchen.uuid())
+            .await,
+        failed
+    );
+    // It played, then failed at the refused seek.
+    assert!(called(&setup.household, &setup.kitchen, PLAY));
+    assert!(called(&setup.household, &setup.kitchen, SEEK));
+    // Neither the replaced Handoff nor the new one is left.
+    let refused = setup.household.uri(&setup.kitchen).expect("a URL");
+    assert_ne!(stream_id(&refused), stream_id(&old));
+    for url in [&old, &refused] {
+        let response = api.fetch(Method::GET, path(url), Some("bytes=0-")).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    setup.household.set_fault(&setup.office, Fault::HangSeek);
+    let start = Instant::now();
+    assert_eq!(
+        api.start_handoff_error(&setup.session, &episode, setup.office.uuid())
+            .await,
+        failed
+    );
+    let elapsed = start.elapsed();
+    // It waited for Office's answer to the seek until the Bridge's limit, and not much longer.
+    let at_least = sonos::CONTROL_TIMEOUT - Duration::from_millis(500);
+    let bound = sonos::CONTROL_TIMEOUT + Duration::from_secs(3);
+    assert!(elapsed >= at_least && elapsed < bound, "{elapsed:?}");
+    assert!(called(&setup.household, &setup.office, SEEK));
+
+    assert_eq!(api.handoffs(&setup.session).await, []);
+    let output = setup.bridge.stop();
+    let not_sought = warns(&output, NOT_SOUGHT);
+    let groups: Vec<_> = not_sought.iter().map(|event| &event["group"]).collect();
+    assert_eq!(groups, [setup.kitchen.uuid(), setup.office.uuid()]);
 }

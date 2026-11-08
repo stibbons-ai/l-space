@@ -12,7 +12,7 @@ use api::server::{BoxFuture, Bridge};
 use api::{
     ApiError, CurrentUser, EpisodeFilter, Group, GroupMember, HOME_ENTRIES, Handoff, Home,
     HomeEntry, Item, ItemId, Library, LibraryEntry, LibraryServer, NowPlaying, Playback, Podcast,
-    Session, SessionToken, Skip, TransportState,
+    Progress, Session, SessionToken, Skip, TransportState,
 };
 use sonos::Sonos;
 use store::{ActiveHandoff, GroupHandoff, HandoffFile, LibraryUser, SessionId, Store};
@@ -549,16 +549,19 @@ impl<S: Store> AppApi<S> {
 
     /// Starts Item `id` on Group `group` for the session's user: resolves the Item's audio
     /// file with the session's key, stores the Handoff (replacing the Group's), then has the
-    /// Group play its stream. If the Group doesn't, the new Handoff ends again, and the one it
-    /// replaced stays ended: the Group is left with none. Starts take turns with starts and
-    /// controls on the Group, waiting for their turn only as long as [`START_TIME`] leaves
-    /// after resolving and before [`sonos::PLAY_TIMEOUT`]; past that, nothing is stored or
-    /// played ([`ApiError::GroupFailed`]).
+    /// Group play its stream and go to the start position ([`start_position`]: the user's
+    /// Progress, or 0 when `from_start`, Finished or without Progress). If the Group doesn't
+    /// play or seek, the new Handoff ends again, and the one it replaced stays ended: the
+    /// Group is left with none. Starts take turns with starts and controls on the Group,
+    /// waiting for their turn only as long as [`START_TIME`] leaves after resolving and before
+    /// [`sonos::PLAY_TIMEOUT`] (and [`sonos::CONTROL_TIMEOUT`] for a seek); past that, nothing
+    /// is stored or played ([`ApiError::GroupFailed`]).
     async fn start_handoff(
         &self,
         token: SessionToken,
         id: ItemId,
         group: String,
+        from_start: bool,
     ) -> Result<Handoff, ApiError> {
         let called = tokio::time::Instant::now();
         let library_item_id = id.library_item.clone();
@@ -614,6 +617,7 @@ impl<S: Store> AppApi<S> {
             return Err(ApiError::GroupNotFound);
         }
 
+        let position = start_position(browse::item_progress(&user, &id).as_ref(), from_start);
         let stream_token = StreamToken::new(random_hex("a stream id")?);
         let stream = stream_token.hash();
         let target = sonos::Stream {
@@ -633,9 +637,15 @@ impl<S: Store> AppApi<S> {
         let task_group = group.clone();
         let (logged_item, logged_episode) = (library_item_id.clone(), id.episode.clone());
         let started = tokio::spawn(async move {
+            let seek_time = if position.is_zero() {
+                Duration::ZERO
+            } else {
+                sonos::CONTROL_TIMEOUT
+            };
             let turn_time = START_TIME
                 .saturating_sub(called.elapsed())
-                .saturating_sub(sonos::PLAY_TIMEOUT);
+                .saturating_sub(sonos::PLAY_TIMEOUT)
+                .saturating_sub(seek_time);
             let not_done = "a Handoff not started";
             let _turn = take_turn(&turn, &task_group, turn_time, not_done).await?;
             let handoff = store::Handoff {
@@ -660,12 +670,26 @@ impl<S: Store> AppApi<S> {
                 end_unstarted(store.as_ref(), &stream, &handoff.group).await;
                 return Err(sonos_error(error));
             }
+            // Played first, then sought: the order Sonos is known to take
+            // (docs/research/sonos-smoke-2026-11-04.md).
+            if !position.is_zero()
+                && let Err(error) = sonos.seek(&handoff.group, position).await
+            {
+                tracing::warn!(
+                    group = handoff.group,
+                    %error,
+                    "a Group did not go to a Handoff's start position"
+                );
+                end_unstarted(store.as_ref(), &stream, &handoff.group).await;
+                return Err(sonos_error(error));
+            }
             tracing::info!(
                 group = handoff.group,
                 library_server,
                 user_id = handoff.started_by.user_id,
                 library_item = handoff.library_item,
                 episode = handoff.episode,
+                position = position.as_secs(),
                 "Handoff started"
             );
             Ok(handoff)
@@ -896,9 +920,25 @@ const CONTROL_TURN_TIME: Duration = Duration::from_secs(3);
 const CONTROL_LIBRARY_SERVER_TIME: Duration = Duration::from_secs(7);
 
 /// How long a start may take in all, about (plus local storage): resolving the Item, waiting
-/// for its turn on the Group, then [`sonos::PLAY_TIMEOUT`] for the Group; its turn waits only
-/// for what the other two leave. One second under the App's 15.
+/// for its turn on the Group, then [`sonos::PLAY_TIMEOUT`] for the Group to play and, starting
+/// past 0, [`sonos::CONTROL_TIMEOUT`] for it to seek; its turn waits only for what the others
+/// leave. One second under the App's 15.
 const START_TIME: Duration = Duration::from_secs(14);
+
+/// Where a start has the Group begin, in whole seconds: 0 when asked to play `from_start`, or
+/// when `progress` (the starting user's own) is absent, Finished, or less than a second in
+/// (or not a time at all); else its `current_time`, without the fraction.
+fn start_position(progress: Option<&Progress>, from_start: bool) -> Duration {
+    match progress {
+        Some(progress)
+            if !from_start && !progress.finished && progress.current_time.is_finite() =>
+        {
+            // Saturating: a negative time starts at 0.
+            Duration::from_secs(progress.current_time as u64)
+        }
+        _ => Duration::ZERO,
+    }
+}
 
 /// Waits for `turn`, Group `group`'s, at most `wait`; past it, logs that `not_done` (what
 /// the caller then doesn't do) and answers [`ApiError::GroupFailed`].
@@ -1668,8 +1708,9 @@ impl<S: Store> Bridge for AppApi<S> {
         token: SessionToken,
         item: ItemId,
         group: String,
+        from_start: bool,
     ) -> BoxFuture<'_, Result<Handoff, ApiError>> {
-        Box::pin(self.start_handoff(token, item, group))
+        Box::pin(self.start_handoff(token, item, group, from_start))
     }
 
     fn handoffs(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Handoff>, ApiError>> {
@@ -1950,4 +1991,38 @@ async fn end_unstarted<S: Store>(store: &S, stream: &store::StreamId, group: &st
             );
         })
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn progress(current_time: f64, finished: bool) -> Option<Progress> {
+        Some(Progress {
+            current_time,
+            finished,
+        })
+    }
+
+    #[test]
+    fn a_start_begins_at_the_whole_seconds_of_unfinished_progress_unless_from_start() {
+        let secs = Duration::from_secs;
+        let cases = [
+            (None, false, secs(0)),
+            (progress(754.6, false), false, secs(754)),
+            (progress(754.6, false), true, secs(0)),
+            (progress(754.6, true), false, secs(0)),
+            (progress(0.9, false), false, secs(0)),
+            (progress(-3.0, false), false, secs(0)),
+            (progress(f64::NAN, false), false, secs(0)),
+            (progress(f64::INFINITY, false), false, secs(0)),
+        ];
+        for (progress, from_start, expected) in cases {
+            assert_eq!(
+                start_position(progress.as_ref(), from_start),
+                expected,
+                "{progress:?} {from_start}"
+            );
+        }
+    }
 }

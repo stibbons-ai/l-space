@@ -65,10 +65,12 @@ pub enum Screen {
     /// One Item: its details, the person's Progress, and an audiobook's chapters.
     Item { item: Item, notice: Option<Notice> },
     /// Picks the Group to play an Item on: every Group; none when the Bridge found no Sonos
-    /// player.
+    /// player. The Item starts at the person's Progress, or from its beginning when
+    /// `from_start` ("Play from start").
     PlayOn {
         item: Item,
         groups: Vec<Group>,
+        from_start: bool,
         notice: Option<Notice>,
     },
     /// Logged in: every Sonos Group with its members, what it plays, its volume and its
@@ -647,8 +649,19 @@ impl App {
         }
     }
 
-    /// From the Item screen, lists every Group to play the Item on.
+    /// From the Item screen, lists every Group to play the Item on, at the person's Progress.
     pub async fn open_play_on(&mut self) {
+        self.open_picker(false).await;
+    }
+
+    /// From the Item screen, lists every Group to play the Item on from its beginning.
+    pub async fn open_play_from_start(&mut self) {
+        self.open_picker(true).await;
+    }
+
+    /// From the Item screen, lists every Group to play the Item on, from its beginning if
+    /// `from_start`.
+    async fn open_picker(&mut self, from_start: bool) {
         let Screen::Item { item, .. } = &self.screen else {
             return;
         };
@@ -656,26 +669,37 @@ impl App {
         self.go(api::groups(), |groups| Screen::PlayOn {
             item,
             groups,
+            from_start,
             notice: None,
         })
         .await;
     }
 
-    /// On the Group picker, starts the Item on Group `group` (its id), and goes back to the
+    /// On the Group picker, starts the Item on Group `group` (its id), at the person's
+    /// Progress or from its beginning, as the picker was opened for, and goes back to the
     /// Item, noting where it plays; or shows why it could not start. A Group that is gone
     /// (`group_not_found`) has the picker list the Groups afresh, with that notice; if they
     /// can't be listed, the picker keeps its list and shows why instead (an ended session
     /// leads to Login).
     pub async fn play_on(&mut self, group: &str) {
-        let Screen::PlayOn { item, groups, .. } = &self.screen else {
+        let Screen::PlayOn {
+            item,
+            groups,
+            from_start,
+            ..
+        } = &self.screen
+        else {
             return;
         };
-        let id = item.id.clone();
+        let (id, from_start) = (item.id.clone(), *from_start);
         let name = groups
             .iter()
             .find(|listed| listed.id == group)
             .map_or_else(|| group.to_owned(), |listed| listed.name.clone());
-        match self.call(api::start_handoff(id, group.to_owned())).await {
+        match self
+            .call(api::start_handoff(id, group.to_owned(), Some(from_start)))
+            .await
+        {
             Ok(_) => {
                 // Back to the Item screen the picker was opened from.
                 self.go_back();

@@ -178,6 +178,7 @@ texts! {
     GroupVolumeDown => "group-volume-down",
     GroupVolumeUp => "group-volume-up",
     PlayOn => "play-on",
+    PlayFromStart => "play-from-start",
     SettingsTitle => "settings-title",
     SettingsLibraryServer => "settings-library-server",
     SettingsAccount => "settings-account",
