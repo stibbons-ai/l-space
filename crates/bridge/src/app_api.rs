@@ -1377,7 +1377,7 @@ impl<S: Store> Controls<S> {
             match checked.acting {
                 Acting::Revoked => return Err(ApiError::NoHandoff),
                 Acting::RevokeFailed => return Err(ApiError::Internal),
-                Acting::Starter(_) | Acting::Unknown => {}
+                Acting::Starter { .. } | Acting::Unknown => {}
             }
             duration = match checked.length {
                 Length::Told(told) => {
@@ -1714,7 +1714,10 @@ impl<S: Store> Controls<S> {
                 late("whom the Handoff's API key acts for");
                 return unknown;
             }
-            Some(Ok(user)) if user.id == starter.user_id => Acting::Starter(library_server),
+            Some(Ok(user)) if user.id == starter.user_id => Acting::Starter {
+                library_server,
+                finished: browse::item_progress(&user, &id).is_some_and(|held| held.finished),
+            },
             // An admin can move a key to another user; the starter's Progress must not follow.
             Some(Ok(_)) => {
                 let reason = "the API key now acts for another user";
@@ -1767,10 +1770,12 @@ impl<S: Store> Controls<S> {
     /// Handoff's key, never with a caller's, within `time`; only if the key still acts for the
     /// starter (`acting`). Whether the starter may still see the Item is not checked again
     /// (Audiobookshelf doesn't check on a Progress write): the Handoff relies on the check made
-    /// at its start. A failure is logged and otherwise left alone; a key the Library Server
-    /// rejects is revoked, which ends the Handoff. `cause` (what wrote it: a pause, the
-    /// cadence, ...) is logged with the write, and with a write not made. Returns whether it
-    /// was written.
+    /// at its start. Over Progress the check found Finished, an unfinished write clears
+    /// Finished first ([`abs::ProgressUpdate::over_finished`]), so it leaves the Item
+    /// unfinished also at the position it was Finished at. A failure is logged and otherwise
+    /// left alone; a key the Library Server rejects is revoked, which ends the Handoff. `cause`
+    /// (what wrote it: a pause, the cadence, ...) is logged with the write, and with a write
+    /// not made. Returns whether it was written.
     async fn write_progress(
         &self,
         active: &ActiveHandoff,
@@ -1795,8 +1800,18 @@ impl<S: Store> Controls<S> {
                 "Progress not written"
             );
         };
-        let library_server = match acting {
-            Acting::Starter(library_server) => library_server,
+        let (library_server, update) = match acting {
+            Acting::Starter {
+                library_server,
+                finished,
+            } => (
+                library_server,
+                if finished {
+                    update.over_finished()
+                } else {
+                    update
+                },
+            ),
             Acting::Revoked => {
                 not_written("the Handoff's API key was revoked");
                 return Wrote::Revoked;
@@ -1879,8 +1894,12 @@ struct Checked<'a> {
 /// Whom a Handoff's key acts for, as the starter's Library Server told a control.
 #[derive(Debug, Clone, Copy)]
 enum Acting<'a> {
-    /// The starter, on this configured Library Server: Progress may be written with it.
-    Starter(&'a str),
+    /// The starter, on this configured Library Server: Progress may be written with it. Their
+    /// Progress in the Item was `finished` then.
+    Starter {
+        library_server: &'a str,
+        finished: bool,
+    },
     /// Not the starter any more, or no one: the key was revoked, ending the Handoff.
     Revoked,
     /// Not the starter any more, or no one, but revoking the key failed: the Handoff and its
