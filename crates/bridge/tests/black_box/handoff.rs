@@ -1084,6 +1084,36 @@ async fn a_start_begins_at_the_users_progress_in_whole_seconds() {
 }
 
 #[tokio::test]
+async fn an_audiobook_starts_at_the_users_progress() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    let resumable = setup.abs.resumable_book().await;
+    let reader = setup.abs.new_user_seeing(&[&resumable.library]).await;
+    let session = api.login(setup.abs.base_url(), &reader.api_key.key).await;
+    // An audiobook's Progress is keyed by the library item alone.
+    let book = ItemId {
+        library_item: resumable.book,
+        episode: None,
+    };
+    setup.set_progress(&reader, &book, 754.6, false).await;
+
+    api.start_handoff(&session, &book, setup.kitchen.uuid())
+        .await;
+
+    assert_eq!(
+        setup.position(&setup.kitchen),
+        (Duration::from_secs(754), true)
+    );
+    let started: Vec<String> = setup
+        .household
+        .actions_of(&setup.kitchen)
+        .into_iter()
+        .filter(|action| [SET_URI, PLAY, SEEK].contains(&action.as_str()))
+        .collect();
+    assert_eq!(started, [SET_URI, PLAY, SEEK]);
+}
+
+#[tokio::test]
 async fn a_finished_item_or_one_without_progress_starts_at_0_without_a_seek() {
     let setup = setup().await;
     let (finished, untouched) = (setup.episode(1), setup.episode(0));

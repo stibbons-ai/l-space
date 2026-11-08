@@ -556,10 +556,17 @@ impl<S: Store> AppApi<S> {
     /// seek the Group, already playing, is also paused, on a task of its own that keeps the
     /// Group's turn until the pause is done (at most [`sonos::CONTROL_TIMEOUT`]) without
     /// holding up the answer.
-    /// Starts take turns with starts and controls on the Group, waiting for their turn only as
-    /// long as [`START_TIME`] leaves after resolving and before [`sonos::PLAY_TIMEOUT`] (and
-    /// [`sonos::CONTROL_TIMEOUT`] for a seek); past that, or when resolving left less than
-    /// those, nothing is stored or played ([`ApiError::GroupFailed`]).
+    /// Starts take turns with starts and controls on the Group. A start that had to wait for
+    /// its turn reads the user's Progress again once it has it (unless `from_start`), as the
+    /// starts and controls before it may have changed it (a pause writes it), within
+    /// [`START_PROGRESS_TIME`], checking again that the session's key acts for its user. It
+    /// waits for its turn only as long as [`START_TIME`] leaves after resolving and before
+    /// that read, [`sonos::PLAY_TIMEOUT`] and [`sonos::CONTROL_TIMEOUT`] for a seek (just
+    /// [`sonos::PLAY_TIMEOUT`] when `from_start`); past that, or when resolving left less than
+    /// those, or the read fails, nothing is stored or played ([`ApiError::GroupFailed`], or
+    /// the read's error).
+    /// A start that didn't wait uses the Progress read while resolving, and needs only
+    /// [`sonos::PLAY_TIMEOUT`] (and [`sonos::CONTROL_TIMEOUT`] when it seeks) left after it.
     async fn start_handoff(
         &self,
         token: SessionToken,
@@ -584,12 +591,12 @@ impl<S: Store> AppApi<S> {
             })
             .await?;
         let progress = browse::item_progress(&user, &id);
-        // Only a start that may seek needs the Item's length.
-        let duration = (!from_start
-            && progress.as_ref().is_some_and(|progress| !progress.finished))
-        .then(|| browse::item_duration(library_item.clone(), &id))
-        .flatten();
-        let position = start_position(progress.as_ref(), from_start, duration);
+        // Only a start that may seek needs the Item's length; one that waits for its turn
+        // may find Progress the first read didn't.
+        let duration = (!from_start)
+            .then(|| browse::item_duration(&library_item, &id))
+            .flatten();
+        let mut position = start_position(progress.as_ref(), from_start, duration);
         let file = match browse::single_audio_file(library_item, &id) {
             Ok(file) => file,
             Err(NoSingleFile::Missing(reason)) => {
@@ -634,45 +641,68 @@ impl<S: Store> AppApi<S> {
             listen: self.listen,
             path: stream_token.path(&name),
         };
-        let (turn, store, sonos) = (
-            self.group_lock(&group),
-            Arc::clone(&self.store),
-            Arc::clone(&self.sonos),
-        );
+        let lock = self.group_lock(&group);
+        let turn = match Arc::clone(&lock).try_lock_owned() {
+            Ok(turn) => turn,
+            Err(_) => {
+                // Whatever held the turn may have changed Progress (a pause writes it), so a
+                // start that may seek reads it again once its turn comes, and keeps time for
+                // that read and a seek even when Progress was none.
+                let after_turn = if from_start {
+                    sonos::PLAY_TIMEOUT
+                } else {
+                    START_PROGRESS_TIME + sonos::PLAY_TIMEOUT + sonos::CONTROL_TIMEOUT
+                };
+                let turn_time = START_TIME
+                    .saturating_sub(called.elapsed())
+                    .saturating_sub(after_turn);
+                let turn = take_turn(&lock, &group, turn_time, START_NOT_DONE).await?;
+                if !from_start {
+                    // A turn taken with (next to) no wait left, after a slow resolve, leaves
+                    // too little for the read and the Group's calls within the App's limit.
+                    if START_TIME.saturating_sub(called.elapsed()) < after_turn {
+                        return Err(too_little_time(
+                            called,
+                            &group,
+                            library_server,
+                            &id,
+                            position,
+                        ));
+                    }
+                    let user = self
+                        .user_now(library_server, &session, START_PROGRESS_TIME)
+                        .await?;
+                    let progress = browse::item_progress(&user, &id);
+                    position = start_position(progress.as_ref(), false, duration);
+                }
+                turn
+            }
+        };
+        let seek_time = if position.is_zero() {
+            Duration::ZERO
+        } else {
+            sonos::CONTROL_TIMEOUT
+        };
+        // A turn free at once after a slow resolve may leave too little for the Group's calls.
+        if START_TIME.saturating_sub(called.elapsed()) < sonos::PLAY_TIMEOUT + seek_time {
+            return Err(too_little_time(
+                called,
+                &group,
+                library_server,
+                &id,
+                position,
+            ));
+        }
+        let (store, sonos) = (Arc::clone(&self.store), Arc::clone(&self.sonos));
         let library_server = library_server.to_owned();
         // On its own task, so no client hanging up can cut it off between storing the Handoff
         // and the Group playing it (or it ending again); a panic in it is handled below.
         // Dioxus runs server functions detached today as well, so a client hanging up doesn't
-        // cancel them; this keeps the start whole should that change.
+        // cancel them; this keeps the start whole should that change. Up to here nothing was
+        // stored or sent, so a cancelled call left nothing behind.
         let task_group = group.clone();
         let (logged_item, logged_episode) = (library_item_id.clone(), id.episode.clone());
         let started = tokio::spawn(async move {
-            let seek_time = if position.is_zero() {
-                Duration::ZERO
-            } else {
-                sonos::CONTROL_TIMEOUT
-            };
-            let turn_time = START_TIME
-                .saturating_sub(called.elapsed())
-                .saturating_sub(sonos::PLAY_TIMEOUT)
-                .saturating_sub(seek_time);
-            let not_done = "a Handoff not started";
-            let turn = take_turn(&turn, &task_group, turn_time, not_done).await?;
-            // A turn taken with (next to) no wait left, after a slow resolve, still leaves
-            // too little for the Group's calls within the App's limit.
-            if START_TIME.saturating_sub(called.elapsed()) < sonos::PLAY_TIMEOUT + seek_time {
-                tracing::warn!(
-                    group = task_group,
-                    elapsed_ms = called.elapsed().as_millis(),
-                    library_server,
-                    library_item = library_item_id,
-                    episode = id.episode,
-                    position = position.as_secs(),
-                    not_done,
-                    "a start has too little time left for the Group"
-                );
-                return Err(ApiError::GroupFailed);
-            }
             let handoff = store::Handoff {
                 group: task_group,
                 library_item: library_item_id,
@@ -903,6 +933,23 @@ impl<S: Store> AppApi<S> {
         }
     }
 
+    /// The session's user as the Library Server describes them now, read within `within`
+    /// (no answer by then is [`ApiError::LibraryServerUnreachable`]), checked as [`verified`]
+    /// checks it.
+    ///
+    /// [`verified`]: Self::verified
+    async fn user_now(
+        &self,
+        library_server: &str,
+        session: &store::Session,
+        within: Duration,
+    ) -> Result<abs::User, ApiError> {
+        let me = tokio::time::timeout(within, self.abs.me(library_server, &session.api_key))
+            .await
+            .unwrap_or_else(|_| Err(abs::Error::Unavailable("no answer in time".to_owned())));
+        self.verified(library_server, session, me).await
+    }
+
     /// The session's user as the Library Server described them (`me`), if its key still acts
     /// for them. A key the Library Server rejects, or that now belongs to another user, is
     /// revoked, ending this user's sessions opened with it.
@@ -976,11 +1023,46 @@ const CONTROL_TURN_TIME: Duration = Duration::from_secs(3);
 const CONTROL_LIBRARY_SERVER_TIME: Duration = Duration::from_secs(7);
 
 /// How long a start may take in all, about (plus local storage): resolving the Item, waiting
-/// for its turn on the Group, then [`sonos::PLAY_TIMEOUT`] for the Group to play and, starting
-/// past 0, [`sonos::CONTROL_TIMEOUT`] for it to seek; its turn waits only for what the others
-/// leave, and a start left with less than the Group's calls need sends nothing. One second
-/// under the App's 15.
+/// for its turn on the Group, then, when it had to wait and may seek, [`START_PROGRESS_TIME`]
+/// to read the user's Progress again, then [`sonos::PLAY_TIMEOUT`] for the Group to play and,
+/// starting past 0, [`sonos::CONTROL_TIMEOUT`] for it to seek. Its turn waits only for what
+/// the others leave: at most 14 − 4 = 10 seconds less resolving for a start `from_start`,
+/// 14 − 2 − 4 − 4 = 4 for any other (which keeps the seek's time even without Progress, as the
+/// read may find some); a start left with less than what comes after its turn needs sends
+/// nothing. One second under the App's 15.
 const START_TIME: Duration = Duration::from_secs(14);
+
+/// How long a start that waited for its turn may take to read the user's Progress again: one
+/// `/api/me` the Library Server already answered while resolving, so 2 seconds are ample, and
+/// still leave such a start 4 seconds of [`START_TIME`] to wait for its turn, more than a
+/// control's [`CONTROL_TURN_TIME`].
+const START_PROGRESS_TIME: Duration = Duration::from_secs(2);
+
+/// What a start that fails before the Group is told anything leaves undone, as logged.
+const START_NOT_DONE: &str = "a Handoff not started";
+
+/// Logs that a start `called` then, of Item `id` from `library_server` on Group `group` at
+/// `position`, has too little of [`START_TIME`] left for what comes next, so sends nothing;
+/// the error it answers with.
+fn too_little_time(
+    called: tokio::time::Instant,
+    group: &str,
+    library_server: &str,
+    id: &ItemId,
+    position: Duration,
+) -> ApiError {
+    tracing::warn!(
+        group,
+        elapsed_ms = called.elapsed().as_millis(),
+        library_server,
+        library_item = id.library_item,
+        episode = id.episode,
+        position = position.as_secs(),
+        not_done = START_NOT_DONE,
+        "a start has too little time left for the Group"
+    );
+    ApiError::GroupFailed
+}
 
 /// Where a start has the Group begin, in whole seconds: 0 when asked to play `from_start`, or
 /// when `progress` (the starting user's own) is absent, Finished, less than a second in (or
@@ -1414,7 +1496,7 @@ impl<S: Store> Controls<S> {
         };
         let length = match item {
             None => Length::Unasked,
-            Some(Some(Ok(item))) => Length::Told(browse::item_duration(item, &id)),
+            Some(Some(Ok(item))) => Length::Told(browse::item_duration(&item, &id)),
             Some(Some(Err(error))) => {
                 tracing::warn!(
                     group,

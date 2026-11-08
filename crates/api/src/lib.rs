@@ -685,10 +685,11 @@ pub async fn groups() -> Result<Vec<Group>, ApiError> {
 }
 
 /// Starts the Item `item` on Group `group`, replacing what the Group played and the Handoff it
-/// had, if any. It starts at the session user's Progress in the Item, in whole seconds; from
-/// its beginning when that is Finished or absent, when its whole seconds lie at or past the
-/// Item's end, or when `from_start` ("Play from start"; an App that sends none gets the
-/// Progress). The Bridge streams the Item to the Group, which keeps playing without the App.
+/// had, if any. It starts at the session user's Progress in the Item, in whole seconds, as it
+/// is once the starts and controls before it on the Group are done; from its beginning when
+/// that is Finished or absent, when its whole seconds lie at or past the Item's end, or when
+/// `from_start` ("Play from start"; an App that sends none gets the Progress). The Bridge
+/// streams the Item to the Group, which keeps playing without the App.
 /// Only an Item with exactly one audio file plays so far. Once the Item is found playable, the
 /// Group's Handoff is replaced before the Group is told to play and then, only when it starts
 /// past the beginning, to go to the start position: if it doesn't do what it is told (a Sonos

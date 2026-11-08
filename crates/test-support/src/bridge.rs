@@ -651,6 +651,22 @@ impl AppApi {
         .await
     }
 
+    /// Starts Item `item` on Group `group` as `session` from its beginning ("Play from
+    /// start"), expecting a rejection.
+    pub async fn start_handoff_from_start_error(
+        &self,
+        session: &Session,
+        item: &ItemId,
+        group: &str,
+    ) -> (StatusCode, ApiError) {
+        self.post_error(
+            "/api/handoffs/start",
+            Some(&bearer(session)),
+            handoff_body(item, group, true),
+        )
+        .await
+    }
+
     /// The active Handoffs `session` sees.
     pub async fn handoffs(&self, session: &Session) -> Vec<Handoff> {
         self.get_as(session, "/api/handoffs", &[]).await
