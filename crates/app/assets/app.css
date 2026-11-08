@@ -182,8 +182,20 @@ ol.chapters li {
   margin-top: 8px;
 }
 
-.actions button {
+.actions button,
+.volume button {
   margin: 0;
+}
+
+.volume {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.volume button {
+  min-width: 44px;
 }
 
 .filters {

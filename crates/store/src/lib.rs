@@ -64,6 +64,11 @@ impl StreamId {
         Self(Sha256::digest(id.as_bytes()).into())
     }
 
+    /// The stream whose id hashes to `hash`, as [`StreamId::as_bytes`] gave it.
+    pub fn from_bytes(hash: [u8; 32]) -> Self {
+        Self(hash)
+    }
+
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
@@ -103,6 +108,14 @@ pub struct HandoffFile {
 pub struct ActiveHandoff {
     pub handoff: Handoff,
     pub api_key: ApiKey,
+}
+
+/// The active Handoff on a Group, as [`Store::group_handoff`] finds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupHandoff {
+    /// Its stream.
+    pub stream: StreamId,
+    pub active: ActiveHandoff,
 }
 
 /// A storage failure. The store's state is unchanged by the failed operation.
@@ -171,6 +184,14 @@ pub trait Store: Send + Sync + 'static {
         &self,
         stream: &StreamId,
     ) -> impl Future<Output = Result<Option<ActiveHandoff>, Error>> + Send;
+
+    /// The active Handoff on Group `group` (its id), if any, with its stream and the key it
+    /// acts with. As for [`Store::handoff`], a Handoff whose key can no longer be read is not
+    /// active, and the implementation forgets that key, ending its sessions and Handoffs.
+    fn group_handoff(
+        &self,
+        group: &str,
+    ) -> impl Future<Output = Result<Option<GroupHandoff>, Error>> + Send;
 
     /// Every active Handoff, the earliest started first (ties by Group id). As for
     /// [`Store::handoff`], a Handoff whose key can no longer be read is not listed, and the

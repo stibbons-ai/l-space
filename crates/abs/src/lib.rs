@@ -347,8 +347,8 @@ impl Error {
     }
 }
 
-/// A client for any number of Library Servers.
-#[derive(Debug)]
+/// A client for any number of Library Servers. Cloning it is cheap: clones share connections.
+#[derive(Debug, Clone)]
 pub struct Client {
     http: reqwest::Client,
     /// For audio files, whose bodies have no time limit in all.
@@ -532,16 +532,51 @@ impl Client {
         struct Update {
             is_finished: bool,
         }
-        let library_item_id = id_segment(library_item_id)?;
-        let url = match episode_id {
-            Some(episode_id) => format!(
-                "{base_url}/api/me/progress/{library_item_id}/{}",
-                id_segment(episode_id)?
-            ),
-            None => format!("{base_url}/api/me/progress/{library_item_id}"),
-        };
+        let url = progress_url(base_url, library_item_id, episode_id)?;
         let request = self.http.patch(url).json(&Update {
             is_finished: finished,
+        });
+        self.send(request, api_key, Names::One).await?;
+        Ok(())
+    }
+
+    /// Sets the Progress of the user `api_key` acts for in the book `library_item_id`, or the
+    /// episode `episode_id` of the podcast `library_item_id`, to `current_time` seconds in:
+    /// `PATCH /api/me/progress/<library item>[/<episode>]` with `{"currentTime": …}`, plus
+    /// `duration` (seconds) and the `progress` fraction it makes when the length is known.
+    /// Finished is not sent.
+    ///
+    /// As Audiobookshelf 2.37.2 does it (`User.createUpdateMediaProgressFromPayload`,
+    /// `MediaProgress.applyProgressUpdate`): the user gets Progress if they had none, and that
+    /// first write leaves it unfinished. A write that updates Progress they already have, with
+    /// a length, has Audiobookshelf itself mark it Finished when under 10 seconds remain, and
+    /// unfinished when an earlier Finished one moves away from there. Fails as
+    /// [`Client::set_finished`] does. Audiobookshelf doesn't check that the user may see the
+    /// Item: a caller that needs it checks that itself.
+    pub async fn set_progress(
+        &self,
+        base_url: &str,
+        api_key: &ApiKey,
+        library_item_id: &str,
+        episode_id: Option<&str>,
+        current_time: f64,
+        duration: Option<f64>,
+    ) -> Result<(), Error> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Update {
+            current_time: f64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            duration: Option<f64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            progress: Option<f64>,
+        }
+        let url = progress_url(base_url, library_item_id, episode_id)?;
+        let duration = duration.filter(|duration| duration.is_finite() && *duration > 0.0);
+        let request = self.http.patch(url).json(&Update {
+            current_time,
+            duration,
+            progress: duration.map(|duration| (current_time / duration).clamp(0.0, 1.0)),
         });
         self.send(request, api_key, Names::One).await?;
         Ok(())
@@ -696,6 +731,23 @@ fn id_segment(id: &str) -> Result<&str, Error> {
     } else {
         Err(Error::NotFound(NotFound::InvalidId))
     }
+}
+
+/// The URL of the user's Progress in the book `library_item_id`, or in the episode
+/// `episode_id` of the podcast `library_item_id`: `/api/me/progress/<library item>[/<episode>]`.
+fn progress_url(
+    base_url: &str,
+    library_item_id: &str,
+    episode_id: Option<&str>,
+) -> Result<String, Error> {
+    let library_item_id = id_segment(library_item_id)?;
+    Ok(match episode_id {
+        Some(episode_id) => format!(
+            "{base_url}/api/me/progress/{library_item_id}/{}",
+            id_segment(episode_id)?
+        ),
+        None => format!("{base_url}/api/me/progress/{library_item_id}"),
+    })
 }
 
 #[cfg(test)]
@@ -1264,6 +1316,85 @@ mod tests {
                 matches!(
                     client
                         .set_finished(&base_url, &key, item, episode, true)
+                        .await,
+                    Err(Error::NotFound(NotFound::InvalidId))
+                ),
+                "{item:?} {episode:?}"
+            );
+        }
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn setting_progress_patches_the_current_time_with_the_length_when_known() {
+        let (base_url, requests) = recording(StatusCode::OK).await;
+        let client = Client::new();
+        let key = ApiKey::new("s3cret");
+        client
+            .set_progress(&base_url, &key, "li-1", None, 150.0, Some(600.0))
+            .await
+            .unwrap();
+        client
+            .set_progress(&base_url, &key, "li-2", Some("ep-1"), 42.0, None)
+            .await
+            .unwrap();
+        // A length Audiobookshelf would take as unknown is left out.
+        client
+            .set_progress(&base_url, &key, "li-2", Some("ep-1"), 0.0, Some(0.0))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *requests.lock().unwrap(),
+            [
+                (
+                    "PATCH".to_owned(),
+                    "/api/me/progress/li-1".to_owned(),
+                    "Bearer s3cret".to_owned(),
+                    json!({"currentTime": 150.0, "duration": 600.0, "progress": 0.25}),
+                ),
+                (
+                    "PATCH".to_owned(),
+                    "/api/me/progress/li-2/ep-1".to_owned(),
+                    "Bearer s3cret".to_owned(),
+                    json!({"currentTime": 42.0}),
+                ),
+                (
+                    "PATCH".to_owned(),
+                    "/api/me/progress/li-2/ep-1".to_owned(),
+                    "Bearer s3cret".to_owned(),
+                    json!({"currentTime": 0.0}),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_progress_fails_like_marking_finished() {
+        let cases = [
+            (StatusCode::UNAUTHORIZED, "Rejected"),
+            (StatusCode::FORBIDDEN, "NotFound(Forbidden)"),
+            (StatusCode::NOT_FOUND, "NotFound(Missing)"),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Unavailable(\"HTTP 500 Internal Server Error\")",
+            ),
+        ];
+        for (status, expected) in cases {
+            let (base_url, _) = recording(status).await;
+            let error = Client::new()
+                .set_progress(&base_url, &ApiKey::new("key"), "li-1", None, 1.0, None)
+                .await
+                .unwrap_err();
+            assert_eq!(format!("{error:?}"), expected, "{status}");
+        }
+
+        let (base_url, requests) = recording(StatusCode::OK).await;
+        for (item, episode) in [("../me", None), ("li-1", Some("../../li-2"))] {
+            assert!(
+                matches!(
+                    Client::new()
+                        .set_progress(&base_url, &ApiKey::new("key"), item, episode, 1.0, None)
                         .await,
                     Err(Error::NotFound(NotFound::InvalidId))
                 ),

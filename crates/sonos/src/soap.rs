@@ -1,7 +1,7 @@
 //! Calling a player's UPnP services: a SOAP request to a fixed control path, the answer read up
 //! to [`MAX_BODY`] bytes and parsed for the action's output arguments. Read actions send no
-//! arguments of their own (AVTransport's instance id aside); the actions that start playback
-//! send theirs XML-escaped.
+//! arguments of their own (the instance id of AVTransport and GroupRenderingControl aside);
+//! the actions that control playback or volume send theirs XML-escaped.
 
 use std::fmt::Write;
 use std::net::SocketAddr;
@@ -22,6 +22,7 @@ pub const MAX_BODY: usize = 1024 * 1024;
 pub(crate) enum Service {
     ZoneGroupTopology,
     AvTransport,
+    GroupRenderingControl,
 }
 
 impl Service {
@@ -29,6 +30,7 @@ impl Service {
         match self {
             Self::ZoneGroupTopology => "/ZoneGroupTopology/Control",
             Self::AvTransport => "/MediaRenderer/AVTransport/Control",
+            Self::GroupRenderingControl => "/MediaRenderer/GroupRenderingControl/Control",
         }
     }
 
@@ -36,6 +38,7 @@ impl Service {
         match self {
             Self::ZoneGroupTopology => "urn:schemas-upnp-org:service:ZoneGroupTopology:1",
             Self::AvTransport => "urn:schemas-upnp-org:service:AVTransport:1",
+            Self::GroupRenderingControl => "urn:schemas-upnp-org:service:GroupRenderingControl:1",
         }
     }
 
@@ -43,7 +46,7 @@ impl Service {
     fn arguments(self) -> &'static str {
         match self {
             Self::ZoneGroupTopology => "",
-            Self::AvTransport => "<InstanceID>0</InstanceID>",
+            Self::AvTransport | Self::GroupRenderingControl => "<InstanceID>0</InstanceID>",
         }
     }
 }

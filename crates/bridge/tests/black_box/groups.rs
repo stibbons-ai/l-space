@@ -92,6 +92,8 @@ async fn every_group_is_listed_as_grouped_in_sonos_with_what_it_plays() {
                 members: vec![member(&beam, "Daniels Zimmer")],
                 state: Some(TransportState::Stopped),
                 now_playing: None,
+                volume: Some(sonos_fake::DEFAULT_VOLUME),
+                handoff: None,
             },
             Group {
                 id: kitchen.uuid().to_owned(),
@@ -104,6 +106,8 @@ async fn every_group_is_listed_as_grouped_in_sonos_with_what_it_plays() {
                     position: Some(0.0),
                     duration: Some(600.0),
                 }),
+                volume: Some(sonos_fake::DEFAULT_VOLUME),
+                handoff: None,
             },
             Group {
                 id: office.uuid().to_owned(),
@@ -116,6 +120,8 @@ async fn every_group_is_listed_as_grouped_in_sonos_with_what_it_plays() {
                     position: Some(0.0),
                     duration: Some(600.0),
                 }),
+                volume: Some(sonos_fake::DEFAULT_VOLUME),
+                handoff: None,
             },
         ]
     );
@@ -126,6 +132,7 @@ async fn every_group_is_listed_as_grouped_in_sonos_with_what_it_plays() {
                 "ZoneGroupTopology#GetZoneGroupState",
                 "AVTransport#GetTransportInfo",
                 "AVTransport#GetPositionInfo",
+                "GroupRenderingControl#GetGroupVolume",
             ]
             .contains(&action.as_str()),
             "{action}"
@@ -160,6 +167,8 @@ async fn group_list_wire_shape() {
                     "position": 0.0,
                     "duration": 600.0,
                 },
+                "volume": 20,
+                "handoff": null,
             },
             {
                 "id": office.uuid(),
@@ -167,6 +176,8 @@ async fn group_list_wire_shape() {
                 "members": [{"id": office.uuid(), "name": "Office"}],
                 "state": "stopped",
                 "now_playing": null,
+                "volume": 20,
+                "handoff": null,
             },
         ])
     );

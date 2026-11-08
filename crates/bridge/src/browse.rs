@@ -259,6 +259,15 @@ pub fn single_audio_file(
     }
 }
 
+/// The length in seconds of Item `id` in `library_item`, as its screen shows it; none if
+/// unknown or `library_item` holds no such Item.
+pub fn item_duration(library_item: abs::LibraryItem, id: &ItemId) -> Option<f64> {
+    match select(library_item.media, id).ok()? {
+        Selected::Audiobook(book) => book_duration(&book.tracks, book.duration),
+        Selected::Episode { episode, .. } => episode_duration(&episode),
+    }
+}
+
 /// Why an Item has no single audio file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoSingleFile {

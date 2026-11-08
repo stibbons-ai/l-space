@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use api::{
     ApiError, CurrentUser, EpisodeFilter, Group, Handoff, Home, HomeEntry, Item, ItemId, Library,
-    LibraryEntry, Podcast, Progress, Session,
+    LibraryEntry, Playback, Podcast, Progress, Session, Skip,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -422,6 +422,24 @@ pub const KEY_REJECTED: (StatusCode, ApiError) =
 /// The rejection of an id that names nothing on the Library Server.
 pub const NOT_FOUND: (StatusCode, ApiError) = (StatusCode::NOT_FOUND, ApiError::NotFound);
 
+/// The rejection of a call naming a Group the household doesn't have.
+pub const GROUP_NOT_FOUND: (StatusCode, ApiError) =
+    (StatusCode::NOT_FOUND, ApiError::GroupNotFound);
+
+/// The rejection of a call whose Group didn't answer in time, or refused.
+pub const GROUP_FAILED: (StatusCode, ApiError) = (StatusCode::BAD_GATEWAY, ApiError::GroupFailed);
+
+/// The rejection of a control for a Group without a Handoff it plays.
+pub const NO_HANDOFF: (StatusCode, ApiError) = (StatusCode::CONFLICT, ApiError::NoHandoff);
+
+/// The rejection of a forward skip on an Item whose length neither the Group nor the Library
+/// Server knows.
+pub const LENGTH_UNKNOWN: (StatusCode, ApiError) = (StatusCode::CONFLICT, ApiError::LengthUnknown);
+
+/// The rejection of a call whose Library Server couldn't be reached, or didn't answer in time.
+pub const LIBRARY_SERVER_UNREACHABLE: (StatusCode, ApiError) =
+    (StatusCode::BAD_GATEWAY, ApiError::LibraryServerUnreachable);
+
 /// Who a session of `user` on `abs` acts as.
 pub fn acting_as(abs: &Audiobookshelf, user: &AbsUser) -> CurrentUser {
     acting_on(abs.base_url(), user)
@@ -622,6 +640,60 @@ impl AppApi {
         self.get_as(session, "/api/handoffs", &[]).await
     }
 
+    /// Pauses Group `group` as `session`, panicking unless that succeeds.
+    pub async fn pause_group(&self, session: &Session, group: &str) -> Playback {
+        self.control(session, group, GroupControl::Pause).await
+    }
+
+    /// Resumes Group `group` as `session`, panicking unless that succeeds.
+    pub async fn resume_group(&self, session: &Session, group: &str) -> Playback {
+        self.control(session, group, GroupControl::Resume).await
+    }
+
+    /// Skips Group `group` by `skip` as `session`, panicking unless that succeeds.
+    pub async fn skip_group(&self, session: &Session, group: &str, skip: Skip) -> Playback {
+        self.control(session, group, GroupControl::Skip(skip)).await
+    }
+
+    /// Sets Group `group`'s volume as `session`, panicking unless that succeeds; the volume
+    /// set.
+    pub async fn set_group_volume(&self, session: &Session, group: &str, volume: u8) -> u8 {
+        self.control(session, group, GroupControl::Volume(volume))
+            .await
+    }
+
+    /// Makes `control` on Group `group` as `session`, panicking unless that succeeds.
+    pub async fn control<T: serde::de::DeserializeOwned>(
+        &self,
+        session: &Session,
+        group: &str,
+        control: GroupControl,
+    ) -> T {
+        let (path, body) = control.request(group);
+        decode(self.post(path, Some(&bearer(session)), body).await).await
+    }
+
+    /// Makes `control` on Group `group` as `session`, expecting a rejection.
+    pub async fn control_error(
+        &self,
+        session: &Session,
+        group: &str,
+        control: GroupControl,
+    ) -> (StatusCode, ApiError) {
+        let (path, body) = control.request(group);
+        self.post_error(path, Some(&bearer(session)), body).await
+    }
+
+    /// Makes `control` on Group `group` without a session, expecting a rejection.
+    pub async fn control_error_unauthenticated(
+        &self,
+        group: &str,
+        control: GroupControl,
+    ) -> (StatusCode, ApiError) {
+        let (path, body) = control.request(group);
+        self.post_error(path, None, body).await
+    }
+
     /// `GET`s (or with `method`, `HEAD`s) `path` on the Bridge without authenticating, with
     /// the `Range` header `range`, if any, as a Group fetches a stream.
     pub async fn fetch(
@@ -750,6 +822,30 @@ pub fn filter_name(filter: EpisodeFilter) -> String {
 
 fn handoff_body(item: &ItemId, group: &str) -> Value {
     json!({"item": item, "group": group})
+}
+
+/// A call that controls a Group, as the App makes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupControl {
+    Pause,
+    Resume,
+    Skip(Skip),
+    Volume(u8),
+}
+
+impl GroupControl {
+    /// Its path and body for Group `group`.
+    fn request(self, group: &str) -> (&'static str, Value) {
+        match self {
+            Self::Pause => ("/api/groups/pause", json!({"group": group})),
+            Self::Resume => ("/api/groups/resume", json!({"group": group})),
+            Self::Skip(skip) => ("/api/groups/skip", json!({"group": group, "skip": skip})),
+            Self::Volume(volume) => (
+                "/api/groups/volume",
+                json!({"group": group, "volume": volume}),
+            ),
+        }
+    }
 }
 
 /// The body that marks Item `item` Finished (`finished`) or unfinished.

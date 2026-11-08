@@ -22,7 +22,10 @@
 //!
 //! A session also sees the household's Sonos Groups with what each plays, [`groups`], starts
 //! an Item on a Group, [`start_handoff`], and sees every active Handoff, [`handoffs`]. Any
-//! logged-in household member may start on any Group and sees every Handoff.
+//! logged-in household member may start on any Group and sees every Handoff. Any of them may
+//! also control any Group's Handoff, whoever started it: [`pause_group`], [`resume_group`],
+//! [`skip_group`]; and any Group's volume, [`set_group_volume`]. Pausing and skipping write
+//! the new position as Progress for the user who started the Handoff, with their key.
 
 use std::cmp::Reverse;
 use std::fmt;
@@ -330,7 +333,19 @@ pub struct Group {
     /// The track it has loaded, if any and if its coordinator said; none whenever `state` is
     /// none.
     pub now_playing: Option<NowPlaying>,
+    /// The Group's volume, 0 to [`MAX_VOLUME`]; none if its coordinator didn't tell it in
+    /// time, refused to, or told something that isn't such a number (and from a Bridge that
+    /// doesn't tell it).
+    #[serde(default)]
+    pub volume: Option<u8>,
+    /// The active Handoff on the Group, whoever started it; none without one (and from a
+    /// Bridge that doesn't tell). Its controls act only while the Group plays its stream.
+    #[serde(default)]
+    pub handoff: Option<Handoff>,
 }
+
+/// The highest volume a Group takes; [`set_group_volume`] sets this for anything louder.
+pub const MAX_VOLUME: u8 = 100;
 
 /// A Sonos player in a Group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -379,6 +394,38 @@ pub struct Handoff {
     pub started_by: CurrentUser,
     /// When it started, in milliseconds since the Unix epoch.
     pub started_at: i64,
+}
+
+/// What a Group plays after a control: what the App shows of it without listing the Groups
+/// again. Times are seconds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Playback {
+    pub state: TransportState,
+    /// How far into the Item the Group is; none if its coordinator didn't say.
+    pub position: Option<f64>,
+    /// The Item's length: as the Group tells it, else (pausing or skipping) as the Library
+    /// Server tells it; none if unknown.
+    pub duration: Option<f64>,
+}
+
+/// How far [`skip_group`] moves a Group's position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Skip {
+    /// 15 seconds back, but not before the start.
+    Back15,
+    /// 30 seconds forward, but not past the end.
+    Forward30,
+}
+
+impl Skip {
+    /// The seconds it moves by: negative back, positive forward.
+    pub fn seconds(self) -> i32 {
+        match self {
+            Self::Back15 => -15,
+            Self::Forward30 => 30,
+        }
+    }
 }
 
 /// An error code the App translates for the user.
@@ -438,13 +485,28 @@ pub enum ApiError {
     /// coordinator unplugged.
     #[error("group_not_found")]
     GroupNotFound,
-    /// The Group did not start playing: its coordinator didn't answer in time, or refused.
+    /// The Bridge could not complete or confirm what was asked of the Group: its coordinator
+    /// refused, or didn't answer in time (the Group may then have acted all the same), or it
+    /// was busy with another start or control on it, and nothing was sent.
     #[error("group_failed")]
     GroupFailed,
     /// The Item can't be played on a Group by this Bridge yet: it has more than one audio
     /// file, none, or one in a format Sonos doesn't play.
     #[error("item_not_playable")]
     ItemNotPlayable,
+    /// The Group has no active Handoff to control, or plays something other than its
+    /// Handoff's stream (switched in the Sonos app, for example: what is a Takeover once
+    /// detected, #20, so the Handoff isn't ended yet). No control was sent to the Group and no
+    /// Progress written; a Handoff it still has goes on, except after a forward skip that
+    /// needed the Item's length: if the Library Server rejected the starter's key there, or it
+    /// now acts for another user, the key was revoked, which ended the Handoff (see [`skip_group`]).
+    #[error("no_handoff")]
+    NoHandoff,
+    /// A forward skip was refused because neither the Group nor the Library Server knows the
+    /// Item's length, so it has no end to stop at. Nothing was sent to the Group and no
+    /// Progress written.
+    #[error("length_unknown")]
+    LengthUnknown,
     /// A code this build of the App does not know yet, from a newer Bridge. Produced only on
     /// the App's side, when decoding; the Bridge never sends it.
     #[serde(other)]
@@ -479,6 +541,7 @@ impl AsStatusCode for ApiError {
             Self::LibraryServerNotConfigured | Self::NotFound | Self::GroupNotFound => {
                 StatusCode::NOT_FOUND
             }
+            Self::NoHandoff | Self::LengthUnknown => StatusCode::CONFLICT,
             Self::ItemNotPlayable => StatusCode::UNPROCESSABLE_ENTITY,
             Self::BridgeUnreachable
             | Self::NotABridge
@@ -610,7 +673,8 @@ pub async fn home() -> Result<Home, ApiError> {
 }
 
 /// Every Sonos Group in the Bridge's household, exactly as grouped in the Sonos app, with
-/// what each plays; by name. None when the Bridge has found no Sonos player.
+/// what each plays, its volume and its active Handoff; by name. None when the Bridge has found
+/// no Sonos player.
 #[get(
     "/api/groups",
     headers: dioxus_fullstack::HeaderMap,
@@ -646,6 +710,77 @@ pub async fn handoffs() -> Result<Vec<Handoff>, ApiError> {
     bridge.handoffs(server::session_token(&headers)?).await
 }
 
+/// Pauses Group `group`'s Handoff, whoever started it, and writes where it paused as Progress
+/// for the user who started it, with their key (not the caller's), once their Library Server
+/// confirms the key still acts for them. Where it paused is read from the Group right after
+/// the pause; if that read fails, is late, or tells no position of the Handoff's stream,
+/// where it was just before pausing. Answers with the Group's playback then; a Group already paused is left as it is.
+/// Only while the Group plays its Handoff's stream: otherwise [`ApiError::NoHandoff`], and no
+/// control is sent to the Group. A Group that tells no position either time pauses, but no
+/// Progress is written. Writing the Progress may fail (the Library Server unreachable or too
+/// slow, say): the Group paused all the same, and the call succeeds; if the Library Server
+/// rejected the starter's key, or it now acts for another user, it is revoked, which ends the
+/// Handoff.
+#[post(
+    "/api/groups/pause",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn pause_group(group: String) -> Result<Playback, ApiError> {
+    bridge
+        .pause_group(server::session_token(&headers)?, group)
+        .await
+}
+
+/// Has Group `group` play its Handoff on from where it is, whoever started it; writes no
+/// Progress. Answers with the Group's playback then; a Group already playing is left as it
+/// is. Only while the Group plays its Handoff's stream, as for [`pause_group`].
+#[post(
+    "/api/groups/resume",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn resume_group(group: String) -> Result<Playback, ApiError> {
+    bridge
+        .resume_group(server::session_token(&headers)?, group)
+        .await
+}
+
+/// Moves Group `group`'s Handoff, whoever started it, 15 seconds back or 30 forward from
+/// where it is now, kept between the Item's start and its end (as the Group tells its length,
+/// else the Library Server); playing or paused as it was. Writes the new position as Progress
+/// as [`pause_group`] does, and answers likewise. A forward skip on a Group that tells no
+/// length first asks the Library Server for it: if the Library Server doesn't tell it
+/// (unreachable, too slow, or the Item is gone there), the skip is refused with
+/// [`ApiError::LibraryServerUnreachable`]; if it knows no length either, with
+/// [`ApiError::LengthUnknown`]. If the Library Server rejects the starter's key there, or it
+/// now acts for another user, the key is revoked and the skip answers
+/// [`ApiError::NoHandoff`], or [`ApiError::Internal`] if storing the revoke failed. In each
+/// of these cases nothing is sent to the Group and nothing written.
+#[post(
+    "/api/groups/skip",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn skip_group(group: String, skip: Skip) -> Result<Playback, ApiError> {
+    bridge
+        .skip_group(server::session_token(&headers)?, group, skip)
+        .await
+}
+
+/// Sets Group `group`'s volume, with or without a Handoff; a volume above 100 sets 100.
+/// Answers with the volume set.
+#[post(
+    "/api/groups/volume",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn set_group_volume(group: String, volume: u8) -> Result<u8, ApiError> {
+    bridge
+        .set_group_volume(server::session_token(&headers)?, group, volume)
+        .await
+}
+
 /// The Bridge's side of the App API.
 #[cfg(feature = "server")]
 pub mod server {
@@ -660,7 +795,7 @@ pub mod server {
 
     use crate::{
         ApiError, ApiKey, CurrentUser, EpisodeFilter, Group, Handoff, Home, Item, ItemId, Library,
-        LibraryEntry, LibraryServer, Podcast, Session, SessionToken,
+        LibraryEntry, LibraryServer, Playback, Podcast, Session, SessionToken, Skip,
     };
 
     /// A boxed future, so [`Bridge`] stays object-safe.
@@ -730,6 +865,36 @@ pub mod server {
 
         /// See [`crate::handoffs`].
         fn handoffs(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Handoff>, ApiError>>;
+
+        /// See [`crate::pause_group`].
+        fn pause_group(
+            &self,
+            token: SessionToken,
+            group: String,
+        ) -> BoxFuture<'_, Result<Playback, ApiError>>;
+
+        /// See [`crate::resume_group`].
+        fn resume_group(
+            &self,
+            token: SessionToken,
+            group: String,
+        ) -> BoxFuture<'_, Result<Playback, ApiError>>;
+
+        /// See [`crate::skip_group`].
+        fn skip_group(
+            &self,
+            token: SessionToken,
+            group: String,
+            skip: Skip,
+        ) -> BoxFuture<'_, Result<Playback, ApiError>>;
+
+        /// See [`crate::set_group_volume`].
+        fn set_group_volume(
+            &self,
+            token: SessionToken,
+            group: String,
+            volume: u8,
+        ) -> BoxFuture<'_, Result<u8, ApiError>>;
     }
 
     /// How server functions reach the [`Bridge`].

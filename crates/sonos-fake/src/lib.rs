@@ -1,12 +1,17 @@
 //! A fake Sonos household for tests (PRD "Testing Decisions"): players on loopback that answer
 //! SSDP M-SEARCH and serve their device description and the UPnP subset the Bridge uses
 //! (ZoneGroupTopology `GetZoneGroupState`; AVTransport `GetTransportInfo`, `GetPositionInfo`,
-//! `SetAVTransportURI` and `Play`), with Groups, playback and faults the test controls.
+//! `SetAVTransportURI`, `Play`, `Pause` and `Seek`; GroupRenderingControl `GetGroupVolume`,
+//! `SnapshotGroupVolume` and `SetGroupVolume`), with Groups, playback, volume and faults the
+//! test controls.
 //!
 //! A Group told to play a URL (`SetAVTransportURI`, then `Play`) plays it like a speaker: its
 //! transport is Playing, its position moves on the clock, `GetPositionInfo` reports the URL,
 //! and it fetches the URL over HTTP with a `Range` request, recording what it got
-//! ([`Household::fetched`]).
+//! ([`Household::fetched`]). Paused (`Pause`), its position stops on the clock; `Play` moves it
+//! on from there; `Seek` (`REL_TIME`) sets it, playing or paused as it was. Each Group has a
+//! volume, [`DEFAULT_VOLUME`] until set (`SetGroupVolume`, or [`Household::set_volume`]);
+//! `SnapshotGroupVolume` is accepted and only recorded, as the fake has no member volumes.
 //!
 //! The household runs on its own Tokio runtime, so it answers whatever the test's runtime is
 //! doing (also while a test blocks on starting a Bridge). Each player listens on its own
@@ -52,6 +57,13 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 const ZONE_PLAYER: &str = "urn:schemas-upnp-org:device:ZonePlayer:1";
 const TOPOLOGY: &str = "urn:schemas-upnp-org:service:ZoneGroupTopology:1";
 const AV_TRANSPORT: &str = "urn:schemas-upnp-org:service:AVTransport:1";
+const GROUP_RENDERING: &str = "urn:schemas-upnp-org:service:GroupRenderingControl:1";
+
+/// A Group's volume until it is set.
+pub const DEFAULT_VOLUME: u8 = 20;
+
+/// The highest volume `SetGroupVolume` takes; the lowest is 0.
+pub const MAX_VOLUME: u8 = 100;
 
 /// A player in the household, by its UUID.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -134,6 +146,9 @@ pub enum Fault {
     SlowPosition(Duration),
     /// It answers `GetTransportInfo` without a `CurrentTransportState`.
     NoTransportState,
+    /// It answers `GetPositionInfo` with `NOT_IMPLEMENTED` for the position (`RelTime`), and
+    /// everything else correctly.
+    NoPosition,
     /// It answers `GetTransportInfo` with a SOAP fault, and everything else correctly.
     FailTransportInfo,
     /// It answers `SetAVTransportURI` and `Play` with a SOAP fault (UPnP error 714, illegal
@@ -142,6 +157,18 @@ pub enum Fault {
     /// It answers each `SetAVTransportURI` correctly, but only after this long (in real time),
     /// and takes the URL only then.
     SlowPlayback(Duration),
+    /// It answers `Pause`, `Play`, `Seek`, `SnapshotGroupVolume` and `SetGroupVolume` with a
+    /// SOAP fault (UPnP error 701, transition not available), changing nothing, and everything
+    /// else correctly.
+    RefuseControl,
+    /// It accepts `Pause`, `Play`, `Seek`, `SnapshotGroupVolume` and `SetGroupVolume` and
+    /// never answers them, changing nothing, and answers everything else correctly.
+    HangControl,
+    /// It answers every AVTransport call correctly, but only after this long (in real time),
+    /// and acts only then.
+    SlowTransport(Duration),
+    /// It answers `GetGroupVolume` with a SOAP fault, and everything else correctly.
+    FailGroupVolume,
 }
 
 /// A fake Sonos household; dropping it stops every player.
@@ -188,6 +215,8 @@ struct Player {
     /// The UUID of its Group's coordinator.
     group: String,
     transport: Transport,
+    /// Its Group's volume, while it coordinates the Group.
+    volume: u8,
     fault: Fault,
 }
 
@@ -299,6 +328,7 @@ impl Household {
                     offset: Duration::ZERO,
                     since: None,
                 },
+                volume: DEFAULT_VOLUME,
                 fault: Fault::None,
             });
             uuid
@@ -308,6 +338,10 @@ impl Household {
             .route("/xml/device_description.xml", get(description))
             .route("/ZoneGroupTopology/Control", post(control))
             .route("/MediaRenderer/AVTransport/Control", post(control))
+            .route(
+                "/MediaRenderer/GroupRenderingControl/Control",
+                post(control),
+            )
             .with_state(Served {
                 shared: Arc::clone(&self.shared),
                 uuid: uuid.clone(),
@@ -457,6 +491,16 @@ impl Household {
         state.coordinator(coordinator).transport.position(now)
     }
 
+    /// `coordinator`'s Group's volume, as `GetGroupVolume` reports it.
+    pub fn volume(&self, coordinator: &PlayerId) -> u8 {
+        self.shared.lock().coordinator(coordinator).volume
+    }
+
+    /// `coordinator`'s Group's volume becomes `volume`, as if set in the Sonos app.
+    pub fn set_volume(&self, coordinator: &PlayerId, volume: u8) {
+        self.shared.lock().coordinator_mut(coordinator).volume = volume;
+    }
+
     /// The first fetch `coordinator` finished of a URL its Group was told to play (with
     /// `Range: bytes=0-`), waiting for it up to twice a fetch's own time limit. Panics if there
     /// is none by then.
@@ -542,43 +586,86 @@ impl HouseholdState {
         }
     }
 
-    /// `SetAVTransportURI` (with the SOAP `request`) or `Play` on `served`'s player, which must
-    /// coordinate its Group, at `now`. `Play` starts fetching the URL. The UPnP error code on
-    /// failure: 701 (transition not available) on a player that doesn't coordinate or with
-    /// nothing loaded, 402 (invalid arguments) without a `CurrentURI`.
-    fn start(
+    /// `served`'s player, if it coordinates its Group; UPnP error 701 (transition not
+    /// available) otherwise.
+    fn coordinating_mut(&mut self, served: &Served) -> Result<&mut Player, u16> {
+        let player = self.find_mut(&served.uuid).ok_or(701u16)?;
+        if player.group != served.uuid {
+            return Err(701);
+        }
+        Ok(player)
+    }
+
+    /// `SetAVTransportURI`, `Play`, `Pause` or `Seek` (with the SOAP `request`) on `served`'s
+    /// player, which must coordinate its Group, at `now`. `Play` on a stopped Group starts
+    /// fetching the URL; on a paused one it moves on from where it is. `Pause` on a paused
+    /// Group changes nothing. The UPnP error code on failure: 701 (transition not available)
+    /// on a player that doesn't coordinate, with nothing loaded, or pausing a stopped Group;
+    /// 402 (invalid arguments) without a `CurrentURI`, or a seek that isn't `REL_TIME` to
+    /// `H:MM:SS`; 711 (illegal seek target) past the track's end.
+    fn transport(
         &mut self,
         served: &Served,
         action: &str,
         request: &str,
         now: Instant,
     ) -> Result<(), u16> {
-        let player = self.find_mut(&served.uuid).ok_or(701u16)?;
-        if player.group != served.uuid {
-            return Err(701);
+        let transport = &mut self.coordinating_mut(served)?.transport;
+        match action {
+            "SetAVTransportURI" => {
+                let uri = input(request, "CurrentURI").ok_or(402u16)?;
+                *transport = Transport {
+                    state: "STOPPED",
+                    track: Some(FakeTrack {
+                        title: None,
+                        creator: None,
+                        uri,
+                        duration: None,
+                    }),
+                    offset: Duration::ZERO,
+                    since: None,
+                };
+            }
+            "Play" => {
+                let uri = transport.track.as_ref().ok_or(701u16)?.uri.clone();
+                let stopped = transport.state == "STOPPED";
+                if transport.since.is_none() {
+                    transport.since = Some(now);
+                }
+                transport.state = "PLAYING";
+                // A speaker fetches a URL it starts, not one it resumes.
+                if stopped {
+                    tokio::spawn(fetch(Arc::clone(&served.shared), served.uuid.clone(), uri));
+                }
+            }
+            "Pause" => match transport.state {
+                "PLAYING" => {
+                    transport.offset = transport.position(now);
+                    transport.since = None;
+                    transport.state = "PAUSED_PLAYBACK";
+                }
+                "PAUSED_PLAYBACK" => {}
+                _ => return Err(701),
+            },
+            "Seek" => {
+                let track = transport.track.as_ref().ok_or(701u16)?;
+                if input(request, "Unit").as_deref() != Some("REL_TIME") {
+                    return Err(402);
+                }
+                let target = input(request, "Target")
+                    .as_deref()
+                    .and_then(parse_upnp_time)
+                    .ok_or(402u16)?;
+                if track.duration.is_some_and(|end| target > end) {
+                    return Err(711);
+                }
+                transport.offset = target;
+                if transport.since.is_some() {
+                    transport.since = Some(now);
+                }
+            }
+            _ => return Err(401),
         }
-        let transport = &mut player.transport;
-        if action == "SetAVTransportURI" {
-            let uri = input(request, "CurrentURI").ok_or(402u16)?;
-            *transport = Transport {
-                state: "STOPPED",
-                track: Some(FakeTrack {
-                    title: None,
-                    creator: None,
-                    uri,
-                    duration: None,
-                }),
-                offset: Duration::ZERO,
-                since: None,
-            };
-            return Ok(());
-        }
-        let uri = transport.track.as_ref().ok_or(701u16)?.uri.clone();
-        if transport.since.is_none() {
-            transport.since = Some(now);
-        }
-        transport.state = "PLAYING";
-        tokio::spawn(fetch(Arc::clone(&served.shared), served.uuid.clone(), uri));
         Ok(())
     }
 
@@ -742,7 +829,7 @@ async fn description(State(served): State<Served>) -> Response {
     xml(StatusCode::OK, body)
 }
 
-/// Answers a SOAP call on either service by its `SOAPACTION` header.
+/// Answers a SOAP call on any service by its `SOAPACTION` header.
 async fn control(State(served): State<Served>, headers: HeaderMap, request: String) -> Response {
     let soap_action = headers
         .get("soapaction")
@@ -776,14 +863,39 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         Some(Fault::SlowPlayback(delay)) if action == "SetAVTransportURI" => {
             tokio::time::sleep(delay).await;
         }
+        Some(Fault::RefuseControl)
+            if matches!(
+                action,
+                "Pause" | "Play" | "Seek" | "SnapshotGroupVolume" | "SetGroupVolume"
+            ) =>
+        {
+            return upnp_fault(701);
+        }
+        Some(Fault::HangControl)
+            if matches!(
+                action,
+                "Pause" | "Play" | "Seek" | "SnapshotGroupVolume" | "SetGroupVolume"
+            ) =>
+        {
+            std::future::pending().await
+        }
+        Some(Fault::FailGroupVolume) if action == "GetGroupVolume" => return invalid_action(),
+        Some(Fault::SlowTransport(delay)) if urn == AV_TRANSPORT => {
+            tokio::time::sleep(delay).await;
+        }
         Some(
             Fault::None
             | Fault::Padded(_)
             | Fault::SlowPosition(_)
             | Fault::NoTransportState
+            | Fault::NoPosition
             | Fault::FailTransportInfo
             | Fault::RefusePlayback
-            | Fault::SlowPlayback(_),
+            | Fault::SlowPlayback(_)
+            | Fault::RefuseControl
+            | Fault::HangControl
+            | Fault::FailGroupVolume
+            | Fault::SlowTransport(_),
         ) => {}
         // Removed from the household: as good as unplugged.
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -812,14 +924,43 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
                 }
                 arguments
             } else {
-                position_info(transport, now)
+                let mut arguments = position_info(transport, now);
+                if fault == Some(Fault::NoPosition) {
+                    for (name, value) in &mut arguments {
+                        if *name == "RelTime" {
+                            "NOT_IMPLEMENTED".clone_into(value);
+                        }
+                    }
+                }
+                arguments
             }
         }
-        (AV_TRANSPORT, "SetAVTransportURI" | "Play") => {
-            match state.start(&served, action, &request, now) {
+        (AV_TRANSPORT, "SetAVTransportURI" | "Play" | "Pause" | "Seek") => {
+            match state.transport(&served, action, &request, now) {
                 Ok(()) => Vec::new(),
                 Err(code) => return upnp_fault(code),
             }
+        }
+        (GROUP_RENDERING, "GetGroupVolume") => match state.coordinating_mut(&served) {
+            Ok(coordinator) => vec![("CurrentVolume", coordinator.volume.to_string())],
+            Err(code) => return upnp_fault(code),
+        },
+        (GROUP_RENDERING, "SnapshotGroupVolume") => match state.coordinating_mut(&served) {
+            Ok(_) => Vec::new(),
+            Err(code) => return upnp_fault(code),
+        },
+        (GROUP_RENDERING, "SetGroupVolume") => {
+            let Some(volume) = input(&request, "DesiredVolume")
+                .and_then(|volume| volume.parse::<u8>().ok())
+                .filter(|volume| *volume <= MAX_VOLUME)
+            else {
+                return upnp_fault(402);
+            };
+            match state.coordinating_mut(&served) {
+                Ok(coordinator) => coordinator.volume = volume,
+                Err(code) => return upnp_fault(code),
+            }
+            Vec::new()
         }
         _ => return invalid_action(),
     };
@@ -869,6 +1010,25 @@ fn position_info(transport: &Transport, now: Instant) -> Vec<(&'static str, Stri
         ("RelCount", "2147483647".to_owned()),
         ("AbsCount", "2147483647".to_owned()),
     ]
+}
+
+/// `H:MM:SS` (any number of hours), as a Sonos player takes a `REL_TIME` seek target; none if
+/// it isn't one.
+fn parse_upnp_time(time: &str) -> Option<Duration> {
+    let mut parts = time.split(':');
+    let (hours, minutes, seconds) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || minutes.len() != 2 || seconds.len() != 2 {
+        return None;
+    }
+    let number = |part: &str| -> Option<u64> {
+        let digits = !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+        digits.then(|| part.parse().ok()).flatten()
+    };
+    let (hours, minutes, seconds) = (number(hours)?, number(minutes)?, number(seconds)?);
+    if minutes > 59 || seconds > 59 {
+        return None;
+    }
+    Some(Duration::from_secs(hours * 3600 + minutes * 60 + seconds))
 }
 
 /// `H:MM:SS`.

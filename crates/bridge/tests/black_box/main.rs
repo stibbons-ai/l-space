@@ -4,12 +4,14 @@
 //! modules here so they share one binary.
 
 mod browse;
+mod control;
 mod encryption;
 mod finished;
 mod forwarder;
 mod groups;
 mod handoff;
 mod home;
+mod library_proxy;
 mod library_servers;
 mod logging;
 mod login;

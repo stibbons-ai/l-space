@@ -1,7 +1,8 @@
 //! A TCP forwarder on loopback in front of another server, that a test can take down and
 //! bring back: a Library Server outage, or a second Library Server URL for the same
 //! Audiobookshelf. It can also cut answers short (a Library Server failing mid-body), stall
-//! them (one hanging mid-body), and record what clients send.
+//! them (one hanging mid-body), stall only some requests (one hanging on those), delay them
+//! (a slow one), and record what clients send.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +34,11 @@ enum Answers {
     CutAfter(u64),
     /// This many bytes (none for 0), then nothing more; the connection stays open.
     StallAfter(u64),
+    /// Everything, but each connection only reaches `target` after this long.
+    Late(Duration),
+    /// Everything, except that a request starting with this (method and path, e.g.
+    /// `"PATCH /api/me/progress"`) never reaches `target`, and its connection stays open.
+    StallRequests(&'static str),
 }
 
 #[derive(Debug)]
@@ -102,6 +108,21 @@ impl Forwarder {
         self.answer(Answers::StallAfter(bytes)).await;
     }
 
+    /// Closes every connection through the forwarder; from now on each new one reaches
+    /// `target` only after `delay`, then passes everything back.
+    pub async fn delay_by(&self, delay: Duration) {
+        self.answer(Answers::Late(delay)).await;
+    }
+
+    /// Closes every connection through the forwarder; from now on each new one passes
+    /// everything, except that a request starting with `start` (method and path, e.g.
+    /// `"PATCH /api/me/progress"`) never reaches `target` and is never answered. A request is
+    /// told by the first bytes of a read from the client, which holds for one request at a
+    /// time per connection, as HTTP/1.1 clients send them.
+    pub async fn stall_requests(&self, start: &'static str) {
+        self.answer(Answers::StallRequests(start)).await;
+    }
+
     async fn answer(&self, answers: Answers) {
         *self.state.answers.lock().unwrap() = answers;
         self.close_all().await;
@@ -159,6 +180,9 @@ async fn serve(listener: TcpListener, state: Arc<State>) {
         let recording = state.recording.load(Ordering::SeqCst);
         let requests = Arc::clone(&state.requests);
         connections.spawn(async move {
+            if let Answers::Late(delay) = answers {
+                tokio::time::sleep(delay).await;
+            }
             let mut outbound = match TcpStream::connect(&target).await {
                 Ok(outbound) => outbound,
                 Err(error) => {
@@ -166,38 +190,49 @@ async fn serve(listener: TcpListener, state: Arc<State>) {
                     return;
                 }
             };
-            if answers == Answers::Whole && !recording {
+            if matches!(answers, Answers::Whole | Answers::Late(_)) && !recording {
                 let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
                 return;
             }
             let (mut from_client, mut to_client) = inbound.split();
             let (from_server, mut to_server) = outbound.split();
             let (limit, stall) = match answers {
-                Answers::Whole => (u64::MAX, false),
+                Answers::Whole | Answers::Late(_) | Answers::StallRequests(_) => (u64::MAX, false),
                 Answers::CutAfter(bytes) => (bytes, false),
                 Answers::StallAfter(bytes) => (bytes, true),
             };
             let mut limited = from_server.take(limit);
+            // Whether a request was stalled.
             let sending = async {
                 let mut buffer = [0; 8192];
                 while let Ok(read @ 1..) = from_client.read(&mut buffer).await {
                     if recording {
                         requests.lock().unwrap().extend_from_slice(&buffer[..read]);
                     }
+                    if let Answers::StallRequests(start) = answers
+                        && buffer[..read].starts_with(start.as_bytes())
+                    {
+                        return true;
+                    }
                     if to_server.write_all(&buffer[..read]).await.is_err() {
                         break;
                     }
                 }
+                false
             };
-            // Whichever ends first ends the connection.
-            tokio::select! {
-                () = sending => {}
+            // Whichever ends first ends the connection, unless a request was stalled: then it
+            // stays open, whatever `target` does with its side.
+            let stalled = tokio::select! {
+                stalled = sending => stalled,
                 () = async {
                     let _ = copy(&mut limited, &mut to_client).await;
                     if stall {
                         std::future::pending::<()>().await;
                     }
-                } => {}
+                } => false,
+            };
+            if stalled {
+                std::future::pending::<()>().await;
             }
             let _ = to_client.shutdown().await;
         });

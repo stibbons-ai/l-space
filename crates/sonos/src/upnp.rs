@@ -1,7 +1,10 @@
 //! [`Sonos`] over local UPnP: players found with SSDP, the Group topology read from any of
 //! them (ZoneGroupTopology `GetZoneGroupState`), each Group's playback from its coordinator
-//! (AVTransport `GetTransportInfo` and `GetPositionInfo`), and a stream started on a Group by
-//! its coordinator (AVTransport `SetAVTransportURI`, then `Play`).
+//! (AVTransport `GetTransportInfo` and `GetPositionInfo`) and its volume (GroupRenderingControl
+//! `GetGroupVolume`), a stream started on a Group by its coordinator (AVTransport
+//! `SetAVTransportURI`, then `Play`), and a Group controlled by its coordinator (AVTransport
+//! `Pause`, `Play` and `Seek`; GroupRenderingControl `SnapshotGroupVolume`, then
+//! `SetGroupVolume`).
 
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
@@ -18,7 +21,9 @@ use tokio::task::AbortHandle;
 
 use crate::soap::{self, CallError, Service, argument};
 use crate::xml::{self, ZoneGroup};
-use crate::{Error, Group, Member, Sonos, Stream, Track, TransportState, ssdp};
+use crate::{
+    Error, Group, MAX_VOLUME, Member, Playback, Sonos, Stream, Track, TransportState, ssdp,
+};
 
 /// How long after one search the next one starts, on the [`Clock`].
 pub const REFRESH: Duration = Duration::from_secs(60);
@@ -31,10 +36,15 @@ pub const EXPIRY: Duration = Duration::from_secs(3 * 60);
 /// than the App's limit for a call to the Bridge.
 pub const LISTING_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// How long [`Upnp::play`] may take in all, waiting for the first search included. With the
-/// Library Server's 10 seconds for resolving an Item, a start stays within the App's limit for
-/// a call to the Bridge.
+/// How long [`Upnp::play`] may take in all, waiting for the first search included. A start
+/// in the Bridge resolves its Item and waits for its turn on the Group only as long as leaves
+/// this much within the App's limit for a call to the Bridge.
 pub const PLAY_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// How long each of [`Upnp`]'s calls controlling one Group may take in all (reading its
+/// playback, pausing, resuming, seeking, setting its volume), waiting for the first search
+/// included.
+pub const CONTROL_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// How long one SOAP call may take, connecting included.
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -132,6 +142,16 @@ impl Upnp {
         let deadline = tokio::time::Instant::now() + PLAY_TIMEOUT;
         self.shared.play(group, stream, deadline).await.map(drop)
     }
+
+    async fn playback(&self, group: &str) -> Result<Playback, Error> {
+        let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
+        self.shared.playback(group, deadline).await
+    }
+
+    async fn control(&self, group: &str, control: Control) -> Result<(), Error> {
+        let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
+        self.shared.control(group, control, deadline).await
+    }
 }
 
 impl Drop for Upnp {
@@ -147,6 +167,64 @@ impl Sonos for Upnp {
 
     fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>> {
         Box::pin(self.play(group, stream))
+    }
+
+    fn playback<'a>(&'a self, group: &'a str) -> BoxFuture<'a, Result<Playback, Error>> {
+        Box::pin(self.playback(group))
+    }
+
+    fn pause<'a>(&'a self, group: &'a str) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(self.control(group, Control::Pause))
+    }
+
+    fn resume<'a>(&'a self, group: &'a str) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(self.control(group, Control::Resume))
+    }
+
+    fn seek<'a>(&'a self, group: &'a str, position: Duration) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(self.control(group, Control::Seek(position)))
+    }
+
+    fn set_volume<'a>(&'a self, group: &'a str, volume: u8) -> BoxFuture<'a, Result<(), Error>> {
+        Box::pin(self.control(group, Control::SetVolume(volume.min(MAX_VOLUME))))
+    }
+}
+
+/// An action that controls a Group, on its coordinator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Control {
+    Pause,
+    Resume,
+    /// To this far into the current track.
+    Seek(Duration),
+    /// To this volume, at most [`MAX_VOLUME`].
+    SetVolume(u8),
+}
+
+impl Control {
+    /// The service, action and input arguments (name, unescaped value) that do it.
+    fn call(self) -> (Service, &'static str, Vec<(&'static str, String)>) {
+        match self {
+            Self::Pause => (Service::AvTransport, "Pause", Vec::new()),
+            Self::Resume => (
+                Service::AvTransport,
+                "Play",
+                vec![("Speed", "1".to_owned())],
+            ),
+            Self::Seek(position) => (
+                Service::AvTransport,
+                "Seek",
+                vec![
+                    ("Unit", "REL_TIME".to_owned()),
+                    ("Target", rel_time(position)),
+                ],
+            ),
+            Self::SetVolume(volume) => (
+                Service::GroupRenderingControl,
+                "SetGroupVolume",
+                vec![("DesiredVolume", volume.to_string())],
+            ),
+        }
     }
 }
 
@@ -288,6 +366,50 @@ impl Shared {
         Ok((players, topology))
     }
 
+    /// The address of Group `group`'s coordinator, as the topology read by `deadline` names it
+    /// and as the coordinator announced itself to the searches.
+    async fn coordinator(
+        &self,
+        group: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<SocketAddr, Error> {
+        let (players, topology) = self.topology_by(deadline).await?;
+        let known = topology
+            .iter()
+            .any(|zone| zone.coordinator == group && visible(zone).is_some());
+        if !known {
+            return Err(Error::UnknownGroup);
+        }
+        // Only an address a player announced for itself: the topology's could point anywhere.
+        players.get(group).copied().ok_or_else(|| {
+            tracing::warn!(
+                group,
+                "a Group's coordinator did not answer the last searches"
+            );
+            Error::GroupFailed
+        })
+    }
+
+    /// Calls `action` on `service` of Group `group`'s coordinator at `coordinator` with the
+    /// input `arguments`, by `deadline`. A failure is logged as the coordinator not doing
+    /// `what`.
+    async fn call_coordinator(
+        &self,
+        (group, coordinator): (&str, SocketAddr),
+        (service, action): (Service, &str),
+        arguments: &[(&str, &str)],
+        deadline: tokio::time::Instant,
+        what: &str,
+    ) -> Result<Vec<(String, String)>, Error> {
+        let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+        soap::call_with(&self.http, coordinator, service, action, arguments, timeout)
+            .await
+            .map_err(|error| {
+                tracing::warn!(group, action, %error, what, "a Group's coordinator failed");
+                Error::GroupFailed
+            })
+    }
+
     /// Has Group `group` play `stream` from its start, by `deadline`: its coordinator, as the
     /// topology read now names it, is given the stream's URL (`SetAVTransportURI`, without
     /// metadata) and told to play. Returns the URL.
@@ -297,21 +419,7 @@ impl Shared {
         stream: &Stream,
         deadline: tokio::time::Instant,
     ) -> Result<String, Error> {
-        let (players, topology) = self.topology_by(deadline).await?;
-        let known = topology
-            .iter()
-            .any(|zone| zone.coordinator == group && visible(zone).is_some());
-        if !known {
-            return Err(Error::UnknownGroup);
-        }
-        // Only an address a player announced for itself: the topology's could point anywhere.
-        let Some(&coordinator) = players.get(group) else {
-            tracing::warn!(
-                group,
-                "a Group's coordinator did not answer the last searches"
-            );
-            return Err(Error::GroupFailed);
-        };
+        let coordinator = self.coordinator(group, deadline).await?;
         let host = match route_to(coordinator.ip()) {
             Ok(host) => host,
             Err(error) => {
@@ -322,20 +430,16 @@ impl Shared {
         };
         let url = stream.url(host);
         let call = async |action, arguments: &[(&str, &str)]| {
-            let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
-            soap::call_with(
-                &self.http,
-                coordinator,
-                Service::AvTransport,
-                action,
+            let at = (group, coordinator);
+            let what = "start playing";
+            self.call_coordinator(
+                at,
+                (Service::AvTransport, action),
                 arguments,
-                timeout,
+                deadline,
+                what,
             )
             .await
-            .map_err(|error| {
-                tracing::warn!(group, action, %error, "a Group's coordinator did not start playing");
-                Error::GroupFailed
-            })
         };
         call(
             "SetAVTransportURI",
@@ -344,6 +448,66 @@ impl Shared {
         .await?;
         call("Play", &[("Speed", "1")]).await?;
         Ok(url)
+    }
+
+    /// What Group `group` plays, as its coordinator tells it by `deadline`: its transport
+    /// state, and its track's URL, position and length. A coordinator that doesn't tell
+    /// both, or tells no transport state at all, failed.
+    async fn playback(
+        &self,
+        group: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<Playback, Error> {
+        let coordinator = self.coordinator(group, deadline).await?;
+        let call = |action| {
+            let at = (group, coordinator);
+            let what = "tell its playback";
+            self.call_coordinator(at, (Service::AvTransport, action), &[], deadline, what)
+        };
+        let (transport, position) = tokio::join!(call("GetTransportInfo"), call("GetPositionInfo"));
+        let (transport, position) = (transport?, position?);
+        if argument(&transport, "CurrentTransportState").is_none() {
+            tracing::warn!(group, "a Group's coordinator told no transport state");
+            return Err(Error::GroupFailed);
+        }
+        let uri = argument(&position, "TrackURI")
+            .map(str::trim)
+            .filter(|uri| !uri.is_empty());
+        Ok(Playback {
+            state: state(group, &transport),
+            uri: uri.map(str::to_owned),
+            position: uri
+                .and(argument(&position, "RelTime"))
+                .and_then(xml::duration),
+            duration: track_duration(&position),
+        })
+    }
+
+    /// Has Group `group`'s coordinator do `control`, by `deadline`. A volume is set right
+    /// after a fresh `SnapshotGroupVolume`: `SetGroupVolume` changes the members' volumes in
+    /// proportion to the last snapshot, which may predate a member's volume changed on its own.
+    async fn control(
+        &self,
+        group: &str,
+        control: Control,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), Error> {
+        let coordinator = self.coordinator(group, deadline).await?;
+        let at = (group, coordinator);
+        let what = "control the Group";
+        if let Control::SetVolume(_) = control {
+            let snapshot = (Service::GroupRenderingControl, "SnapshotGroupVolume");
+            self.call_coordinator(at, snapshot, &[], deadline, what)
+                .await?;
+        }
+        let (service, action, arguments) = control.call();
+        let arguments: Vec<(&str, &str)> = arguments
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        self.call_coordinator(at, (service, action), &arguments, deadline, what)
+            .await
+            .map(drop)
     }
 
     /// The Group topology and the UUID of the player that told it, asking `candidates` (UUID,
@@ -386,9 +550,9 @@ impl Shared {
         Ok(xml::zone_groups(state)?)
     }
 
-    /// `group` with its transport state and track, as its coordinator (at `coordinator`, if
-    /// found by a search) tells them by `deadline`. Each is kept if it came in time; a track
-    /// without a state is not shown.
+    /// `group` with its transport state, track and volume, as its coordinator (at
+    /// `coordinator`, if found by a search) tells them by `deadline`. Each is kept if it came
+    /// in time; a track without a state is not shown.
     async fn with_playback(
         &self,
         mut group: Group,
@@ -402,14 +566,18 @@ impl Shared {
             );
             return group;
         };
-        let call = |action| async move {
+        let call = |service, action| async move {
             tokio::time::timeout_at(
                 deadline,
-                soap::call(&self.http, coordinator, Service::AvTransport, action),
+                soap::call(&self.http, coordinator, service, action),
             )
             .await
         };
-        let (transport, position) = tokio::join!(call("GetTransportInfo"), call("GetPositionInfo"));
+        let (transport, position, volume) = tokio::join!(
+            call(Service::AvTransport, "GetTransportInfo"),
+            call(Service::AvTransport, "GetPositionInfo"),
+            call(Service::GroupRenderingControl, "GetGroupVolume"),
+        );
         match transport {
             Ok(Ok(answer)) => group.state = Some(state(&group.id, &answer)),
             Ok(Err(error)) => {
@@ -429,6 +597,16 @@ impl Shared {
             Err(_) => tracing::warn!(
                 group = group.id,
                 "a Group's coordinator did not tell its track within the listing's time"
+            ),
+        }
+        match volume {
+            Ok(Ok(answer)) => group.volume = group_volume(&group.id, &answer),
+            Ok(Err(error)) => {
+                tracing::warn!(group = group.id, %error, "cannot read a Group's volume")
+            }
+            Err(_) => tracing::warn!(
+                group = group.id,
+                "a Group's coordinator did not tell its volume within the listing's time"
             ),
         }
         group
@@ -532,6 +710,7 @@ fn visible(zone: &ZoneGroup) -> Option<Group> {
         members,
         state: None,
         track: None,
+        volume: None,
     })
 }
 
@@ -544,16 +723,48 @@ fn track(answer: &[(String, String)]) -> Option<Track> {
         title,
         creator,
         position: argument(answer, "RelTime").and_then(xml::duration),
-        duration: argument(answer, "TrackDuration")
-            .and_then(xml::duration)
-            .filter(|duration| !duration.is_zero()),
+        duration: track_duration(answer),
     })
+}
+
+/// The track's length in a `GetPositionInfo` answer; none when unknown, which Sonos tells as
+/// `0:00:00` (as for a stream).
+fn track_duration(answer: &[(String, String)]) -> Option<Duration> {
+    argument(answer, "TrackDuration")
+        .and_then(xml::duration)
+        .filter(|duration| !duration.is_zero())
+}
+
+/// The volume in Group `group`'s `GetGroupVolume` answer: none, and logged, when it is
+/// missing, not a number, or above [`MAX_VOLUME`].
+fn group_volume(group: &str, answer: &[(String, String)]) -> Option<u8> {
+    let raw = argument(answer, "CurrentVolume");
+    let volume = raw
+        .and_then(|volume| volume.trim().parse::<u8>().ok())
+        .filter(|volume| *volume <= MAX_VOLUME);
+    if volume.is_none() {
+        let volume: String = raw.unwrap_or_default().chars().take(32).collect();
+        tracing::warn!(group, volume, "a Group's volume is not one Sonos uses");
+    }
+    volume
+}
+
+/// `position` as AVTransport's `REL_TIME` target: `H:MM:SS`, whole seconds, any fraction
+/// dropped.
+fn rel_time(position: Duration) -> String {
+    let seconds = position.as_secs();
+    format!(
+        "{}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use clock::ManualClock;
-    use sonos_fake::{FakeTrack, Fault, Household};
+    use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 
     use super::*;
     use crate::xml::ZoneMember;
@@ -1015,5 +1226,251 @@ mod tests {
             "{elapsed:?}"
         );
         assert!(household.actions_of(&office).contains(&set_uri));
+    }
+
+    #[test]
+    fn a_seek_target_is_hours_minutes_and_seconds_without_a_fraction() {
+        for (seconds, millis, expected) in [
+            (0, 0, "0:00:00"),
+            (59, 999, "0:00:59"),
+            (61, 0, "0:01:01"),
+            (3600, 0, "1:00:00"),
+            (3661, 500, "1:01:01"),
+            (36_000 + 59 * 60 + 59, 0, "10:59:59"),
+        ] {
+            let position = Duration::from_secs(seconds) + Duration::from_millis(millis);
+            assert_eq!(rel_time(position), expected, "{position:?}");
+        }
+    }
+
+    #[test]
+    fn a_group_volume_is_a_number_up_to_the_highest() {
+        let answer = |volume: &str| vec![("CurrentVolume".to_owned(), volume.to_owned())];
+        assert_eq!(group_volume("RINCON_K", &answer("0")), Some(0));
+        assert_eq!(group_volume("RINCON_K", &answer(" 35 ")), Some(35));
+        assert_eq!(group_volume("RINCON_K", &answer("100")), Some(MAX_VOLUME));
+        for unusable in ["101", "-1", "", "loud", "35.5"] {
+            assert_eq!(
+                group_volume("RINCON_K", &answer(unusable)),
+                None,
+                "{unusable:?}"
+            );
+        }
+        assert_eq!(group_volume("RINCON_K", &[]), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listing_reads_each_groups_volume_when_told() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        household.set_volume(&kitchen, 35);
+        let office = household.add_player("Office");
+        household.set_fault(&office, Fault::FailGroupVolume);
+        let shared = knowing(&household, &clock).await;
+
+        let groups = shared.groups(soon(LISTING_TIMEOUT)).await.unwrap();
+        let volumes: Vec<_> = groups.iter().map(|group| group.volume).collect();
+        assert_eq!(volumes, [Some(35), None]);
+        // Office's state still came, without its volume.
+        assert_eq!(groups[1].state, Some(TransportState::Stopped));
+    }
+
+    /// The SOAP actions that control a Group, as `sonos-fake` records them.
+    const CONTROLS: [&str; 5] = [
+        "AVTransport#Pause",
+        "AVTransport#Play",
+        "AVTransport#Seek",
+        "GroupRenderingControl#SnapshotGroupVolume",
+        "GroupRenderingControl#SetGroupVolume",
+    ];
+
+    fn controls(household: &Household, player: &PlayerId) -> Vec<String> {
+        let actions = household.actions_of(player);
+        let controls = actions
+            .into_iter()
+            .filter(|a| CONTROLS.contains(&a.as_str()));
+        controls.collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_group_is_paused_resumed_sought_and_its_volume_set_on_its_coordinator() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let bath = household.add_player("Bath");
+        household.join(&bath, &kitchen);
+        household.play(
+            &kitchen,
+            FakeTrack::new("Moby Dick", Duration::from_secs(600)),
+        );
+        clock.advance(Duration::from_secs(90));
+        let shared = knowing(&household, &clock).await;
+        let control = async |control| {
+            shared
+                .control(kitchen.uuid(), control, soon(CONTROL_TIMEOUT))
+                .await
+        };
+
+        let playback = shared
+            .playback(kitchen.uuid(), soon(CONTROL_TIMEOUT))
+            .await
+            .unwrap();
+        assert_eq!(
+            playback,
+            Playback {
+                state: TransportState::Playing,
+                uri: Some("http://127.0.0.1:1/track.mp3".into()),
+                position: Some(Duration::from_secs(90)),
+                duration: Some(Duration::from_secs(600)),
+            }
+        );
+
+        control(Control::Pause).await.unwrap();
+        assert_eq!(household.transport_state(&kitchen), "PAUSED_PLAYBACK");
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(household.position(&kitchen), Duration::from_secs(90));
+
+        // A fraction of a second is dropped.
+        control(Control::Seek(Duration::from_millis(125_900)))
+            .await
+            .unwrap();
+        assert_eq!(household.position(&kitchen), Duration::from_secs(125));
+        assert_eq!(household.transport_state(&kitchen), "PAUSED_PLAYBACK");
+
+        control(Control::Resume).await.unwrap();
+        assert_eq!(household.transport_state(&kitchen), "PLAYING");
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(household.position(&kitchen), Duration::from_secs(130));
+
+        control(Control::SetVolume(42)).await.unwrap();
+        assert_eq!(household.volume(&kitchen), 42);
+
+        assert_eq!(
+            controls(&household, &kitchen),
+            [
+                "AVTransport#Pause",
+                "AVTransport#Seek",
+                "AVTransport#Play",
+                "GroupRenderingControl#SnapshotGroupVolume",
+                "GroupRenderingControl#SetGroupVolume",
+            ]
+        );
+        // Nothing went to the member.
+        assert_eq!(controls(&household, &bath), Vec::<String>::new());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_highest_volume_is_sent_for_anything_louder() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let upnp = Upnp {
+            shared: Arc::new(knowing(&household, &clock).await),
+            discovery: tokio::spawn(async {}).abort_handle(),
+        };
+
+        Sonos::set_volume(&upnp, kitchen.uuid(), 255).await.unwrap();
+        assert_eq!(household.volume(&kitchen), MAX_VOLUME);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_group_in_the_topology_is_controlled() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let bath = household.add_player("Bath");
+        household.join(&bath, &kitchen);
+        let shared = knowing(&household, &clock).await;
+
+        for group in [bath.uuid(), "RINCON_NOSUCH01400"] {
+            assert_eq!(
+                shared.playback(group, soon(CONTROL_TIMEOUT)).await,
+                Err(Error::UnknownGroup),
+                "{group}"
+            );
+            for control in [
+                Control::Pause,
+                Control::Resume,
+                Control::Seek(Duration::ZERO),
+                Control::SetVolume(10),
+            ] {
+                assert_eq!(
+                    shared.control(group, control, soon(CONTROL_TIMEOUT)).await,
+                    Err(Error::UnknownGroup),
+                    "{group} {control:?}"
+                );
+            }
+        }
+        for player in [&kitchen, &bath] {
+            assert_eq!(controls(&household, player), Vec::<String>::new());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_coordinator_that_refuses_or_hangs_a_control_fails_in_time() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        household.play(
+            &kitchen,
+            FakeTrack::new("Moby Dick", Duration::from_secs(600)),
+        );
+        household.set_fault(&kitchen, Fault::RefuseControl);
+        let office = household.add_player("Office");
+        household.set_fault(&office, Fault::Hang);
+        let shared = knowing(&household, &clock).await;
+
+        for control in [
+            Control::Pause,
+            Control::Resume,
+            Control::Seek(Duration::from_secs(5)),
+            Control::SetVolume(10),
+        ] {
+            assert_eq!(
+                shared
+                    .control(kitchen.uuid(), control, soon(CONTROL_TIMEOUT))
+                    .await,
+                Err(Error::GroupFailed),
+                "{control:?}"
+            );
+        }
+        assert_eq!(household.transport_state(&kitchen), "PLAYING");
+        assert_eq!(household.volume(&kitchen), sonos_fake::DEFAULT_VOLUME);
+
+        // The topology comes from Kitchen; Office never answers its own calls.
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            shared
+                .control(office.uuid(), Control::Pause, soon(Duration::from_secs(1)))
+                .await,
+            Err(Error::GroupFailed)
+        );
+        assert_eq!(
+            shared
+                .playback(office.uuid(), soon(Duration::from_secs(1)))
+                .await,
+            Err(Error::GroupFailed)
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(1800) && elapsed < Duration::from_secs(3),
+            "{elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_group_with_nothing_loaded_tells_no_track() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let shared = knowing(&household, &clock).await;
+
+        assert_eq!(
+            shared
+                .playback(kitchen.uuid(), soon(CONTROL_TIMEOUT))
+                .await
+                .unwrap(),
+            Playback {
+                state: TransportState::Stopped,
+                uri: None,
+                position: None,
+                duration: None,
+            }
+        );
     }
 }

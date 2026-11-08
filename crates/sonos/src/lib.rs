@@ -1,10 +1,11 @@
 //! Sonos control behind one trait, [`Sonos`] (ADR 0002, ADR 0005), so the official cloud
 //! Control API can replace the local UPnP implementation, [`Upnp`], later.
 //!
-//! It reads every Group as set up in the Sonos app, with its members and what its coordinator
-//! plays, and starts a stream the Bridge serves on a Group ([`Sonos::play`]). [`media_type`]
-//! tells which audio formats a Group plays; `play` doesn't check, the caller does. It never
-//! changes volume or grouping.
+//! It reads every Group as set up in the Sonos app, with its members, what its coordinator
+//! plays and the Group's volume; starts a stream the Bridge serves on a Group
+//! ([`Sonos::play`]); and controls what a Group plays: pause, resume, seek, and the Group's
+//! volume. [`media_type`] tells which audio formats a Group plays; `play` doesn't check, the
+//! caller does. It never changes grouping.
 //!
 //! Every SSDP datagram and SOAP body sent or received is logged at DEBUG under the target
 //! [`RAW`], and only there; INFO and above summarise without raw bodies.
@@ -23,13 +24,20 @@ use futures::future::BoxFuture;
 pub use media::media_type;
 pub use soap::MAX_BODY;
 pub use ssdp::MULTICAST;
-pub use upnp::{EXPIRY, LISTING_TIMEOUT, PLAY_TIMEOUT, REFRESH, Upnp};
+pub use upnp::{CONTROL_TIMEOUT, EXPIRY, LISTING_TIMEOUT, PLAY_TIMEOUT, REFRESH, Upnp};
 
 /// The `tracing` target of the raw UPnP traffic: each SSDP datagram and SOAP request and
 /// response body, at DEBUG. Enable it with `RUST_LOG=sonos::raw=debug`.
 pub const RAW: &str = "sonos::raw";
 
+/// The highest volume a Group takes; the lowest is 0.
+pub const MAX_VOLUME: u8 = 100;
+
 /// Sonos, as the Bridge uses it.
+///
+/// Every call on one Group acts on its coordinator as the topology read for that call names
+/// it: a Group the topology doesn't have is [`Error::UnknownGroup`]; a coordinator the
+/// searches didn't find, or that doesn't answer in time or refuses, is [`Error::GroupFailed`].
 pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// Every Group as the Sonos app shows it, by name. A household where a working search found
     /// no player has none.
@@ -37,6 +45,23 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
 
     /// Group `group` (its id) plays `stream` from its start, replacing what it played.
     fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>>;
+
+    /// What Group `group` plays now, as its coordinator tells it.
+    fn playback<'a>(&'a self, group: &'a str) -> BoxFuture<'a, Result<Playback, Error>>;
+
+    /// Group `group` pauses where it is.
+    fn pause<'a>(&'a self, group: &'a str) -> BoxFuture<'a, Result<(), Error>>;
+
+    /// Group `group` plays on from where it is, at normal speed.
+    fn resume<'a>(&'a self, group: &'a str) -> BoxFuture<'a, Result<(), Error>>;
+
+    /// Group `group` goes to `position` into its current track, in whole seconds (any
+    /// fraction is dropped), playing or paused as it was.
+    fn seek<'a>(&'a self, group: &'a str, position: Duration) -> BoxFuture<'a, Result<(), Error>>;
+
+    /// Group `group`'s volume becomes `volume`, at most [`MAX_VOLUME`]: every member's
+    /// changes as the Sonos app's Group volume changes them.
+    fn set_volume<'a>(&'a self, group: &'a str, volume: u8) -> BoxFuture<'a, Result<(), Error>>;
 }
 
 /// A stream the Bridge serves over plain HTTP, for a Group to play. Its path is a capability,
@@ -92,8 +117,8 @@ pub enum Error {
     #[error("no such Sonos Group")]
     UnknownGroup,
     /// The Group's coordinator was not found by the last searches, didn't answer in time, or
-    /// refused (a SOAP fault).
-    #[error("the Group's coordinator did not start playing")]
+    /// refused (a SOAP fault), or answered without what was asked for.
+    #[error("the Group's coordinator did not do what was asked")]
     GroupFailed,
 }
 
@@ -116,6 +141,9 @@ pub struct Group {
     /// The current track, if one is loaded and the coordinator said so; none whenever `state`
     /// is none.
     pub track: Option<Track>,
+    /// The Group's volume, 0 to [`MAX_VOLUME`]; none if its coordinator didn't tell it in
+    /// time, refused to, or told something that isn't such a number.
+    pub volume: Option<u8>,
 }
 
 /// A player in a Group.
@@ -148,4 +176,29 @@ pub struct Track {
     pub position: Option<Duration>,
     /// The track's length; none when unknown, as for a stream.
     pub duration: Option<Duration>,
+}
+
+/// What a Group plays, as [`Sonos::playback`] reads it from its coordinator.
+#[derive(Clone, PartialEq)]
+pub struct Playback {
+    pub state: TransportState,
+    /// The URL of the track it has loaded; none if nothing is. For a stream the Bridge serves,
+    /// it carries the stream's capability, so `Debug` leaves it out.
+    pub uri: Option<String>,
+    /// How far into the track playback is; none if nothing is loaded or the coordinator didn't
+    /// say.
+    pub position: Option<Duration>,
+    /// The track's length; none when unknown, as for a stream.
+    pub duration: Option<Duration>,
+}
+
+impl std::fmt::Debug for Playback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Playback")
+            .field("state", &self.state)
+            .field("uri", &self.uri.as_ref().map(|_| "REDACTED"))
+            .field("position", &self.position)
+            .field("duration", &self.duration)
+            .finish()
+    }
 }
