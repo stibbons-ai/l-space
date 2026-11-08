@@ -17,7 +17,7 @@ use test_support::bridge::{
 };
 
 use crate::forwarder::Forwarder;
-use crate::length_hider::LengthHider;
+use crate::library_proxy::LibraryProxy;
 
 /// The SOAP actions that control a Group's playback, as `sonos-fake` records them.
 const PLAYBACK_CONTROLS: [&str; 3] = ["AVTransport#Pause", "AVTransport#Play", "AVTransport#Seek"];
@@ -920,8 +920,8 @@ async fn a_forward_skip_waiting_for_the_length_skips_from_where_the_group_is_the
 #[tokio::test]
 async fn a_forward_skip_on_an_item_of_unknown_length_is_refused() {
     let abs = Audiobookshelf::shared();
-    let hider = LengthHider::to(abs.base_url()).await;
-    let setup = setup_on(Arc::clone(&abs), &hider.url()).await;
+    let proxy = LibraryProxy::to(abs.base_url()).await;
+    let setup = setup_on(Arc::clone(&abs), &proxy.url()).await;
     let api = setup.bridge.api();
     let kitchen = setup.kitchen.uuid();
     let episode = setup.episode(0);
@@ -940,7 +940,7 @@ async fn a_forward_skip_on_an_item_of_unknown_length_is_refused() {
 
     // The Group tells no length for a stream, and the Library Server knows none either: there
     // is no end to stop at, so "30 s forward" is refused, nothing sent, nothing written.
-    hider.hide();
+    proxy.hide_lengths();
     let before = setup.playback_controls(&setup.kitchen);
     assert_eq!(
         api.control_error(&setup.bobs, kitchen, GroupControl::Skip(Skip::Forward30))
@@ -1027,6 +1027,72 @@ async fn a_starters_key_rejected_at_write_time_is_revoked_ending_the_handoff() {
     );
     assert_eq!(setup.playback_controls(&setup.kitchen), before);
     assert_eq!(api.handoffs(&setup.bobs).await, []);
+}
+
+/// After Bob paused Alice's Handoff (`answered`): the Group paused, Alice's key is
+/// revoked (her Handoff and session ended) and Bob's session goes on; nobody has Progress in
+/// `episode`. Read from the Bridge's own storage only, so that no later check of Alice's key
+/// with the Library Server can be what revoked it.
+async fn assert_revoked_by(setup: &Setup, episode: &ItemId, answered: &Playback) {
+    let api = setup.bridge.api();
+    assert_eq!(answered.state, TransportState::Paused);
+    assert_eq!(
+        setup.household.transport_state(&setup.kitchen),
+        "PAUSED_PLAYBACK"
+    );
+    assert_eq!(api.handoffs(&setup.bobs).await, []);
+    assert_eq!(
+        api.get_as_error(&setup.alices, "/api/handoffs", &[]).await,
+        SESSION_INVALID
+    );
+    assert_eq!(setup.progress(&setup.alice, episode).await, None);
+    assert_eq!(setup.progress(&setup.bob, episode).await, None);
+}
+
+#[tokio::test]
+async fn a_rejected_length_lookup_revokes_the_key_while_whom_it_acts_for_is_not_told() {
+    let abs = Audiobookshelf::shared();
+    let proxy = LibraryProxy::to(abs.base_url()).await;
+    let setup = setup_on(Arc::clone(&abs), &proxy.url()).await;
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.household.fetched(&setup.kitchen).await;
+    setup.clock.advance(seconds(100));
+
+    // The Group tells no length, so a pause asks the Library Server for the Item's: it rejects
+    // the key at once, but never says whom the key acts for.
+    proxy.reject_item_lookups();
+    proxy.hang_identity();
+    let answered = setup
+        .bridge
+        .api()
+        .pause_group(&setup.bobs, setup.kitchen.uuid())
+        .await;
+
+    assert_eq!(answered.position, Some(100.0));
+    assert_revoked_by(&setup, &episode, &answered).await;
+}
+
+#[tokio::test]
+async fn a_rejected_progress_write_revokes_the_key_ending_the_handoff() {
+    let abs = Audiobookshelf::shared();
+    let proxy = LibraryProxy::to(abs.base_url()).await;
+    let setup = setup_on(Arc::clone(&abs), &proxy.url()).await;
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.household.fetched(&setup.kitchen).await;
+    setup.clock.advance(seconds(110));
+
+    // Whom the key acts for and the Item's length are told; only the write is rejected.
+    proxy.reject_progress_writes();
+    let answered = setup
+        .bridge
+        .api()
+        .pause_group(&setup.bobs, setup.kitchen.uuid())
+        .await;
+
+    assert_eq!(answered, playback(TransportState::Paused, 110.0, 600.0));
+    assert_revoked_by(&setup, &episode, &answered).await;
 }
 
 #[tokio::test]

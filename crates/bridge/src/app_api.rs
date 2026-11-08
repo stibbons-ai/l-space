@@ -1209,11 +1209,11 @@ impl<S: Store> Controls<S> {
     /// What the starter's Library Server tells about `active` with the Handoff's key, within
     /// `time`: whom the key acts for, and the Item's length as `wanted`. An optional length
     /// gets at most half the time left, so that a slow one neither loses a timely answer on
-    /// the key nor leaves the Progress write less than half the time; a needed one gets all
-    /// but [`LENGTH_MARGIN`] of it, so its own timeout, not the budget's, ends a late lookup
-    /// and a timely answer on the key is kept. A slow answer on the key itself can still
-    /// leave the write too little time ([`MIN_WRITE_TIME`]). A key the Library Server
-    /// rejects, or that now acts for another user, is revoked, which ends the Handoff.
+    /// the key nor leaves the Progress write less than half the time; a needed one gets all of
+    /// it. Each answer is bounded on its own, so a timely one, a rejection above all, is kept
+    /// when the other is late. A slow answer on the key itself can still leave the write too
+    /// little time ([`MIN_WRITE_TIME`]). A key the Library Server rejects, or that now acts for
+    /// another user, is revoked, which ends the Handoff.
     /// Failures are logged.
     async fn check(
         &self,
@@ -1257,7 +1257,7 @@ impl<S: Store> Controls<S> {
         let length_time = match wanted {
             Wanted::No => Duration::ZERO,
             Wanted::Optional => time.0 / 2,
-            Wanted::Needed => time.0.saturating_sub(LENGTH_MARGIN),
+            Wanted::Needed => time.0,
         };
         // None if not asked; Some(None) if not told in time.
         let length = async {
@@ -1267,27 +1267,30 @@ impl<S: Store> Controls<S> {
             let lookup = self.abs.library_item(library_server, key, &id.library_item);
             Some(tokio::time::timeout(length_time, lookup).await.ok())
         };
-        let told = time
-            .spend(async { tokio::join!(self.abs.me(library_server, key), length) })
+        // Each bounded on its own, so a definitive answer survives its sibling being late.
+        let (me, item) = time
+            .spend_each(self.abs.me(library_server, key), length)
             .await;
-        let Some((me, item)) = told else {
-            late("whom the Handoff's API key acts for");
-            return unknown;
-        };
-        let rejected = matches!(me, Err(abs::Error::Rejected))
+        // A length lookup late on the budget rather than its own timeout is late all the same.
+        let item = item.unwrap_or(Some(None));
+        let rejected = matches!(me, Some(Err(abs::Error::Rejected)))
             || matches!(item, Some(Some(Err(abs::Error::Rejected))));
         let acting = match me {
             _ if rejected => {
                 let reason = "the Library Server rejected the API key";
                 self.revoke(starter, key, reason).await
             }
-            Ok(user) if user.id == starter.user_id => Acting::Starter(library_server),
+            None => {
+                late("whom the Handoff's API key acts for");
+                return unknown;
+            }
+            Some(Ok(user)) if user.id == starter.user_id => Acting::Starter(library_server),
             // An admin can move a key to another user; the starter's Progress must not follow.
-            Ok(_) => {
+            Some(Ok(_)) => {
                 let reason = "the API key now acts for another user";
                 self.revoke(starter, key, reason).await
             }
-            Err(error) => {
+            Some(Err(error)) => {
                 tracing::warn!(
                     group,
                     library_server,
@@ -1520,11 +1523,20 @@ impl Budget {
         self.0 = self.0.saturating_sub(started.elapsed());
         done
     }
-}
 
-/// How much sooner than a control's Library Server budget a needed length lookup times out, so
-/// that its own timeout, not the budget's, ends it and the answer on the key is kept.
-const LENGTH_MARGIN: Duration = Duration::from_millis(100);
+    /// What `a` and `b`, run together, each give in the time left; none for one that doesn't
+    /// (and it dropped), keeping the other's answer.
+    async fn spend_each<A, B>(
+        &mut self,
+        a: impl Future<Output = A>,
+        b: impl Future<Output = B>,
+    ) -> (Option<A>, Option<B>) {
+        let (left, started) = (self.0, tokio::time::Instant::now());
+        let (a, b) = tokio::join!(tokio::time::timeout(left, a), tokio::time::timeout(left, b));
+        self.0 = self.0.saturating_sub(started.elapsed());
+        (a.ok(), b.ok())
+    }
+}
 
 /// The least time left for a Progress write to be sent at all: with less, it couldn't be
 /// confirmed, so it isn't sent.

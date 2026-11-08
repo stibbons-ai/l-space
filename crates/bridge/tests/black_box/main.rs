@@ -11,7 +11,7 @@ mod forwarder;
 mod groups;
 mod handoff;
 mod home;
-mod length_hider;
+mod library_proxy;
 mod library_servers;
 mod logging;
 mod login;

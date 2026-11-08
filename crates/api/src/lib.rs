@@ -485,8 +485,9 @@ pub enum ApiError {
     /// coordinator unplugged.
     #[error("group_not_found")]
     GroupNotFound,
-    /// The Group did not do what was asked: its coordinator didn't answer in time, or
-    /// refused, or it was busy with another start or control on it and wasn't asked.
+    /// The Bridge could not complete or confirm what was asked of the Group: its coordinator
+    /// refused, or didn't answer in time (the Group may then have acted all the same), or it
+    /// was busy with another start or control on it, and nothing was sent.
     #[error("group_failed")]
     GroupFailed,
     /// The Item can't be played on a Group by this Bridge yet: it has more than one audio

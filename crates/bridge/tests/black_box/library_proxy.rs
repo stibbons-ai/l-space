@@ -1,8 +1,18 @@
-//! An HTTP proxy on loopback in front of a Library Server that, once told to, answers every
-//! Item lookup (`GET /api/items/<id>`, exactly one path segment after `/api/items/`, any query)
-//! with each `duration` in it set to `null`: an Item whose length Audiobookshelf doesn't know
-//! (as for an audio file it could not probe), without seeding one. Everything else, also every
-//! deeper path under an Item (its files, its cover), passes as it is.
+//! An HTTP proxy on loopback in front of a Library Server that, once told to, answers some
+//! requests itself instead of passing them on:
+//!
+//! - [`LibraryProxy::hide_lengths`]: every Item lookup (`GET /api/items/<id>`, exactly one path
+//!   segment after `/api/items/`, any query) with each `duration` in it set to `null`: an Item
+//!   whose length Audiobookshelf doesn't know (as for an audio file it could not probe),
+//!   without seeding one.
+//! - [`LibraryProxy::reject_item_lookups`]: every Item lookup at once with 401, as for a
+//!   rejected key.
+//! - [`LibraryProxy::hang_identity`]: every `GET /api/me` never.
+//! - [`LibraryProxy::reject_progress_writes`]: every `PATCH /api/me/progress/...` at once with
+//!   401, as for a rejected key, while the key stays valid.
+//!
+//! Everything else, also every deeper path under an Item (its files, its cover), passes as it
+//! is.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
-use axum::http::header;
+use axum::http::{Method, StatusCode, header};
 use axum::response::Response;
 use tokio::task::JoinHandle;
 
@@ -18,39 +28,50 @@ use tokio::task::JoinHandle;
 const MAX_BODY: usize = 64 << 20;
 
 /// Proxies requests on its own port to a Library Server; stops when dropped.
-pub struct LengthHider {
+pub struct LibraryProxy {
     port: u16,
-    hiding: Arc<AtomicBool>,
+    faults: Arc<Faults>,
     serving: JoinHandle<()>,
+}
+
+/// What the proxy answers itself; none at first.
+#[derive(Default)]
+struct Faults {
+    hide_lengths: AtomicBool,
+    reject_item_lookups: AtomicBool,
+    hang_identity: AtomicBool,
+    reject_progress_writes: AtomicBool,
 }
 
 #[derive(Clone)]
 struct Proxy {
     target: String,
-    hiding: Arc<AtomicBool>,
+    faults: Arc<Faults>,
     http: reqwest::Client,
 }
 
-impl LengthHider {
-    /// Starts proxying a free loopback port to `target`, a base URL; hides no length yet.
+impl LibraryProxy {
+    /// Starts proxying a free loopback port to `target`, a base URL; answers nothing itself yet.
     pub async fn to(target: &str) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind length hider");
-        let port = listener.local_addr().expect("length hider address").port();
-        let hiding = Arc::new(AtomicBool::new(false));
+            .expect("bind Library Server proxy");
+        let port = listener.local_addr().expect("proxy address").port();
+        let faults = Arc::new(Faults::default());
         let proxy = Proxy {
             target: target.trim_end_matches('/').to_owned(),
-            hiding: Arc::clone(&hiding),
+            faults: Arc::clone(&faults),
             http: reqwest::Client::new(),
         };
         let router = Router::new().fallback(forward).with_state(proxy);
         let serving = tokio::spawn(async move {
-            axum::serve(listener, router).await.expect("length hider");
+            axum::serve(listener, router)
+                .await
+                .expect("Library Server proxy");
         });
         Self {
             port,
-            hiding,
+            faults,
             serving,
         }
     }
@@ -61,12 +82,31 @@ impl LengthHider {
     }
 
     /// From now on, Item lookups tell no length.
-    pub fn hide(&self) {
-        self.hiding.store(true, Ordering::SeqCst);
+    pub fn hide_lengths(&self) {
+        self.faults.hide_lengths.store(true, Ordering::SeqCst);
+    }
+
+    /// From now on, Item lookups are rejected with 401 at once.
+    pub fn reject_item_lookups(&self) {
+        self.faults
+            .reject_item_lookups
+            .store(true, Ordering::SeqCst);
+    }
+
+    /// From now on, `GET /api/me` is never answered.
+    pub fn hang_identity(&self) {
+        self.faults.hang_identity.store(true, Ordering::SeqCst);
+    }
+
+    /// From now on, Progress writes are rejected with 401 at once.
+    pub fn reject_progress_writes(&self) {
+        self.faults
+            .reject_progress_writes
+            .store(true, Ordering::SeqCst);
     }
 }
 
-impl Drop for LengthHider {
+impl Drop for LibraryProxy {
     fn drop(&mut self) {
         self.serving.abort();
     }
@@ -74,18 +114,33 @@ impl Drop for LengthHider {
 
 async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
+    let faults = &proxy.faults;
     let path = parts
         .uri
         .path_and_query()
         .map_or("/", |path| path.as_str())
         .to_owned();
-    let hidden = proxy.hiding.load(Ordering::SeqCst)
-        && parts.method == axum::http::Method::GET
+    let item_lookup = parts.method == Method::GET
         && parts
             .uri
             .path()
             .strip_prefix("/api/items/")
             .is_some_and(|id| !id.is_empty() && !id.contains('/'));
+    let rejected = (item_lookup && faults.reject_item_lookups.load(Ordering::SeqCst))
+        || (parts.method == Method::PATCH
+            && parts.uri.path().starts_with("/api/me/progress/")
+            && faults.reject_progress_writes.load(Ordering::SeqCst));
+    if rejected {
+        let response = Response::builder().status(StatusCode::UNAUTHORIZED);
+        return response.body(Body::empty()).expect("response");
+    }
+    if parts.method == Method::GET
+        && parts.uri.path() == "/api/me"
+        && faults.hang_identity.load(Ordering::SeqCst)
+    {
+        std::future::pending::<()>().await;
+    }
+    let hidden = item_lookup && faults.hide_lengths.load(Ordering::SeqCst);
     let body = to_bytes(body, MAX_BODY).await.expect("request body");
     let mut sent = proxy
         .http
