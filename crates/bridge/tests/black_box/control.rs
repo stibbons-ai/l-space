@@ -123,6 +123,22 @@ impl Setup {
         actions.iter().filter(|sent| *sent == action).count()
     }
 
+    /// Waits until `player` was sent SOAP action `action` more than `before` times, at most
+    /// `within`.
+    async fn wait_until_asked(
+        &self,
+        player: &PlayerId,
+        action: &str,
+        before: usize,
+        within: Duration,
+    ) {
+        let deadline = Instant::now() + within;
+        while self.asked(player, action) == before {
+            assert!(Instant::now() < deadline, "{action} never came");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn position(&self, group: &PlayerId) -> Duration {
         self.household.position(group)
     }
@@ -1460,12 +1476,17 @@ async fn a_start_from_the_start_waits_for_its_turn_on_the_group_only_so_long() {
     start_behind_a_slow_pause(Some(754.6), true, seconds(9)..seconds(11)).await;
 }
 
+// At Alice's Progress, or without any (which the start reads again after its wait, and may
+// find), the start also leaves 2 seconds for that read and the Group's 4 to seek: it gives up
+// on its turn once 2 + 4 + 4 are left of its 14.
+
 #[tokio::test]
-async fn a_start_that_may_seek_waits_for_its_turn_less() {
-    // At Alice's Progress, or without any (which the start reads again after its wait, and may
-    // find), the start also leaves 2 seconds for that read and the Group's 4 to seek: it gives
-    // up on its turn once 2 + 4 + 4 are left of its 14.
+async fn a_start_at_progress_waits_for_its_turn_less() {
     start_behind_a_slow_pause(Some(754.6), false, seconds(3)..seconds(5)).await;
+}
+
+#[tokio::test]
+async fn a_start_without_progress_waits_for_its_turn_less() {
     start_behind_a_slow_pause(None, false, seconds(3)..seconds(5)).await;
 }
 
@@ -1499,18 +1520,14 @@ async fn start_behind_a_slow_pause(
     );
     forwarder.stall_requests("PATCH /api/me/progress").await;
     let asked = |action: &str| setup.asked(&setup.kitchen, action);
-    let (read_before, set_uri_before) = (
-        asked("AVTransport#GetTransportInfo"),
-        asked("AVTransport#SetAVTransportURI"),
-    );
+    let read = "AVTransport#GetTransportInfo";
+    let (read_before, set_uri_before) = (asked(read), asked("AVTransport#SetAVTransportURI"));
 
     let (paused, (started, elapsed)) = tokio::join!(api.pause_group(&setup.bobs, kitchen), async {
         // Once the Group is asked for its playback, the pause holds the turn.
-        let deadline = Instant::now() + seconds(3);
-        while asked("AVTransport#GetTransportInfo") == read_before {
-            assert!(Instant::now() < deadline, "the pause never came");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        setup
+            .wait_until_asked(&setup.kitchen, read, read_before, seconds(3))
+            .await;
         let start = Instant::now();
         let started = if from_start {
             api.start_handoff_from_start_error(&setup.alices, &second, kitchen)
@@ -1547,7 +1564,7 @@ async fn a_start_behind_a_pause_begins_at_the_progress_the_pause_wrote() {
 
     // Alice starts the Item again while Bob's pause, which writes 360 seconds, holds the
     // Group's turn: the start begins there, not at the 300 it read before its turn.
-    start_behind_a_pause(&setup, &episode).await;
+    start_behind_a_pause(&setup, &episode, Start::AtProgress).await;
 
     assert_eq!(setup.position(&setup.kitchen), seconds(360));
     assert_eq!(setup.progress(&setup.alice, &episode).await, Some(360.0));
@@ -1563,7 +1580,7 @@ async fn a_start_without_progress_behind_a_pause_that_writes_some_seeks_to_it() 
 
     // Alice has no Progress when she starts the Item again; Bob's pause, holding the turn,
     // writes her 60 seconds, and the start still has the time to seek there.
-    start_behind_a_pause(&setup, &episode).await;
+    start_behind_a_pause(&setup, &episode, Start::AtProgress).await;
 
     assert_eq!(setup.position(&setup.kitchen), seconds(60));
     assert_eq!(
@@ -1576,10 +1593,81 @@ async fn a_start_without_progress_behind_a_pause_that_writes_some_seeks_to_it() 
     assert_eq!(setup.progress(&setup.alice, &episode).await, Some(60.0));
 }
 
+#[tokio::test]
+async fn a_start_from_the_start_behind_a_pause_begins_at_0() {
+    let setup = setup().await;
+    let episode = setup.episode(1);
+    setup.set_progress(&setup.alice, &episode, 300.0).await;
+    setup.start(&episode, &setup.kitchen).await;
+    setup.household.fetched(&setup.kitchen).await;
+    setup.clock.advance(seconds(60));
+
+    // Bob's pause writes Alice 360 seconds while her "Play from start" waits for its turn: it
+    // still begins at 0, sending no Seek after its Play.
+    start_behind_a_pause(&setup, &episode, Start::FromStart).await;
+
+    assert_eq!(setup.position(&setup.kitchen), Duration::ZERO);
+    assert_eq!(
+        setup
+            .playback_controls(&setup.kitchen)
+            .last()
+            .map(String::as_str),
+        Some("AVTransport#Play")
+    );
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(360.0));
+}
+
+#[tokio::test]
+async fn a_start_resolving_while_a_pause_ends_begins_at_the_progress_the_pause_wrote() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let episode = setup.episode(1);
+    setup.set_progress(&setup.alice, &episode, 300.0).await;
+    setup.start(&episode, &setup.kitchen).await;
+    setup.household.fetched(&setup.kitchen).await;
+    setup.clock.advance(seconds(60));
+    forwarder.record_requests().await;
+    // Alice's start reads her Progress (300) at once, but gets the Item only 3 seconds later,
+    // after Bob's pause, which holds the turn about 2 seconds, wrote 360 and let go of it: it
+    // finds the turn free, and still begins at 360.
+    let item = format!("GET /api/items/{}?", episode.library_item);
+    forwarder.delay_next_request(item, seconds(3));
+
+    start_behind_a_pause(&setup, &episode, Start::AtProgress).await;
+
+    assert_eq!(setup.position(&setup.kitchen), seconds(360));
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(360.0));
+}
+
+#[tokio::test]
+async fn a_start_on_a_free_group_reads_the_users_progress_once() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let episode = setup.episode(1);
+    setup.set_progress(&setup.alice, &episode, 300.0).await;
+    forwarder.record_requests().await;
+
+    setup.start(&episode, &setup.kitchen).await;
+
+    assert_eq!(setup.position(&setup.kitchen), seconds(300));
+    assert_eq!(forwarder.requests().matches("GET /api/me ").count(), 1);
+}
+
+/// How Alice starts an Item in [`start_behind_a_pause`].
+#[derive(Debug, Clone, Copy)]
+enum Start {
+    /// "Play on…": at her Progress.
+    AtProgress,
+    /// "Play from start".
+    FromStart,
+}
+
 /// Has Bob pause Kitchen, which tells its position a second late, and Alice start `item` on
-/// it once the pause holds the Group's turn; checks that both succeeded, the start after the
-/// pause.
-async fn start_behind_a_pause(setup: &Setup, item: &ItemId) {
+/// it as `start` says once the pause holds the Group's turn; checks that both succeeded, the
+/// start after the pause.
+async fn start_behind_a_pause(setup: &Setup, item: &ItemId, start: Start) {
     let api = setup.bridge.api();
     let kitchen = setup.kitchen.uuid();
     setup
@@ -1590,24 +1678,27 @@ async fn start_behind_a_pause(setup: &Setup, item: &ItemId) {
 
     let (paused, started) = tokio::join!(api.pause_group(&setup.bobs, kitchen), async {
         // Once the Group is asked for its playback, the pause holds the turn.
-        let deadline = Instant::now() + seconds(3);
-        while setup.asked(&setup.kitchen, read) == read_before {
-            assert!(Instant::now() < deadline, "the pause never came");
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        setup
+            .wait_until_asked(&setup.kitchen, read, read_before, seconds(3))
+            .await;
+        match start {
+            Start::AtProgress => setup.start(item, &setup.kitchen).await,
+            Start::FromStart => {
+                api.start_handoff_from_start(&setup.alices, item, kitchen)
+                    .await
+            }
         }
-        setup.start(item, &setup.kitchen).await
     });
 
     assert_eq!(paused.state, TransportState::Paused);
     assert_eq!(started.item, *item);
     let order = setup.playback_controls(&setup.kitchen);
-    let paused_at = order
-        .iter()
-        .rposition(|action| action == "AVTransport#Pause");
-    let played_at = order
-        .iter()
-        .rposition(|action| action == "AVTransport#Play");
-    assert!(paused_at < played_at, "{order:?}");
+    let last = |sent: &str| order.iter().rposition(|action| action == sent);
+    let (paused_at, played_at) = (last("AVTransport#Pause"), last("AVTransport#Play"));
+    assert!(
+        paused_at.is_some_and(|paused_at| played_at.is_some_and(|played_at| paused_at < played_at)),
+        "{order:?}"
+    );
     setup.household.set_fault(&setup.kitchen, Fault::None);
 }
 
@@ -1631,9 +1722,10 @@ enum SecondRead {
 }
 
 /// Has Bob start an episode from the start on Kitchen, which takes the URL two seconds late,
-/// and Alice start another, with Progress, while Bob's holds the Group's turn; once she
-/// resolved it, her second read of her Progress fails as `read` says. Checks that her start
-/// answered accordingly and stored and sent nothing.
+/// and Alice start another, with Progress, while Bob's holds the Group's turn; once the Library
+/// Server answered her resolve, her second read of her Progress fails as `read` says. Checks
+/// that her start answered accordingly, a late read within its time once Bob's start let go of
+/// the turn, and stored and sent nothing.
 async fn start_failing_its_second_read(read: SecondRead) {
     let abs = Audiobookshelf::shared();
     let forwarder = Forwarder::to(abs.address()).await;
@@ -1645,46 +1737,56 @@ async fn start_failing_its_second_read(read: SecondRead) {
     setup
         .household
         .set_fault(&setup.kitchen, Fault::SlowPlayback(seconds(2)));
-    let offered = || setup.asked(&setup.kitchen, "AVTransport#SetAVTransportURI");
+    let set_uri = "AVTransport#SetAVTransportURI";
+    let played = "AVTransport#Play";
 
-    let (bobs, alices) = tokio::join!(
+    let (bobs, (alices, answered_at, turn_free_at)) = tokio::join!(
         api.start_handoff_from_start(&setup.bobs, &bobs_episode, kitchen),
         async {
-            let deadline = Instant::now() + seconds(5);
-            while offered() == 0 {
-                assert!(Instant::now() < deadline, "Bob's start never came");
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            setup
+                .wait_until_asked(&setup.kitchen, set_uri, 0, seconds(5))
+                .await;
             // Bob's start holds the turn; Alice's resolves, then waits for it.
             forwarder.record_requests().await;
-            let resolved = async {
-                let item = format!("GET /api/items/{}?", episode.library_item);
+            let failing = async {
+                // Both her resolve's answers began, so the Library Server handled both: what
+                // comes now meets only her second read.
                 let deadline = Instant::now() + seconds(1);
-                loop {
-                    let requests = forwarder.requests();
-                    if requests.contains("GET /api/me ") && requests.contains(&item) {
-                        break;
-                    }
+                while forwarder.answered() < 2 {
                     assert!(Instant::now() < deadline, "Alice's start never resolved");
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                // Their answers come in well within this.
-                tokio::time::sleep(Duration::from_millis(300)).await;
                 match read {
-                    SecondRead::Late => forwarder.stall_requests("GET /api/me ").await,
+                    SecondRead::Late => forwarder.stall_next_request("GET /api/me "),
                     SecondRead::Rejected => abs.delete_api_key(&setup.alice.api_key).await,
                 }
+                // Bob's start lets go of the turn once Kitchen was told to play.
+                setup
+                    .wait_until_asked(&setup.kitchen, played, 0, seconds(3))
+                    .await;
+                Instant::now()
             };
-            let (answered, ()) = tokio::join!(
-                api.start_handoff_error(&setup.alices, &episode, kitchen),
-                resolved,
-            );
-            answered
+            let starting = async {
+                let answered = api
+                    .start_handoff_error(&setup.alices, &episode, kitchen)
+                    .await;
+                (answered, Instant::now())
+            };
+            let ((answered, answered_at), turn_free_at) = tokio::join!(starting, failing);
+            (answered, answered_at, turn_free_at)
         },
     );
 
     match read {
-        SecondRead::Late => assert_eq!(alices, LIBRARY_SERVER_UNREACHABLE),
+        SecondRead::Late => {
+            assert_eq!(alices, LIBRARY_SERVER_UNREACHABLE);
+            // Within the read's 2 seconds, not the Library Server client's own 10.
+            let took = answered_at - turn_free_at;
+            assert!(
+                (Duration::from_millis(1500)..Duration::from_millis(2500)).contains(&took),
+                "{took:?}"
+            );
+        }
         SecondRead::Rejected => {
             assert_eq!(alices, KEY_REJECTED);
             // Her session went with the key.
@@ -1693,7 +1795,7 @@ async fn start_failing_its_second_read(read: SecondRead) {
     }
     // Bob's Handoff goes on; Kitchen was given no other URL.
     assert_eq!(api.handoffs(&setup.bobs).await, [bobs]);
-    assert_eq!(offered(), 1);
+    assert_eq!(setup.asked(&setup.kitchen, set_uri), 1);
 }
 
 /// Pins the wire shape the App decodes, independent of the shared Rust types.

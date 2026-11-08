@@ -163,6 +163,8 @@ pub struct Audiobookshelf {
     root_token: String,
     http: reqwest::Client,
     seeded: Seeded,
+    /// The folders a Library was created over: each takes one Library.
+    library_folders: Mutex<Vec<String>>,
 }
 
 impl std::fmt::Debug for Audiobookshelf {
@@ -328,7 +330,7 @@ impl Audiobookshelf {
     /// Creates the podcast Library "Crowded", holding one podcast of [`CROWDED_EPISODES`]
     /// episodes without publish dates, and waits until a scan has found them all. No test
     /// user sees it unless created to ([`Audiobookshelf::new_user_seeing`]). At most one test
-    /// per test run may call this: the folder takes one Library.
+    /// per test run may call this: the folder takes one Library, so a second call panics.
     pub async fn crowded_podcast(&self) -> Crowded {
         let library = self.new_library("Crowded", CROWDED_FOLDER, "podcast").await;
         let podcast = self
@@ -353,7 +355,7 @@ impl Audiobookshelf {
     /// of 20 minutes, and waits until a scan has found it: a single-file audiobook long enough
     /// to resume in. No test user sees it unless created to
     /// ([`Audiobookshelf::new_user_seeing`]). At most one test per test run may call this:
-    /// the folder takes one Library.
+    /// the folder takes one Library, so a second call panics.
     pub async fn resumable_book(&self) -> Resumable {
         let library = self
             .new_library("Resumable", RESUMABLE_FOLDER, "book")
@@ -634,6 +636,7 @@ impl Audiobookshelf {
             root_token,
             http,
             seeded: Seeded::default(),
+            library_folders: Mutex::default(),
         };
         abs.seeded = runtime.block_on(abs.seed());
         abs
@@ -731,7 +734,19 @@ impl Audiobookshelf {
     }
 
     /// Creates a Library of `media_type` over `folder`, starts a scan, and returns its id.
+    /// Panics if `folder` already has one.
     async fn new_library(&self, name: &str, folder: &str, media_type: &str) -> String {
+        {
+            let mut folders = self
+                .library_folders
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            assert!(
+                !folders.iter().any(|taken| taken == folder),
+                "{folder} already has a Library: only one test per run may create {name}"
+            );
+            folders.push(folder.to_owned());
+        }
         let library = self
             .admin(
                 reqwest::Method::POST,
