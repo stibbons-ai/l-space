@@ -6,9 +6,9 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use api::{ApiError, CurrentUser, Handoff, ItemId, Session};
+use api::{ApiError, CurrentUser, Handoff, ItemId, Session, TransportState};
 use reqwest::{Method, StatusCode};
-use sonos_fake::{Fault, Household, PlayerId};
+use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
 use test_support::bridge::{
@@ -229,6 +229,12 @@ async fn fetch_after_reconnect(
     bridge.api().fetch(Method::GET, path, range).await
 }
 
+/// `handoffs` in the order of their Groups' ids, which a listing doesn't promise.
+fn by_group(mut handoffs: Vec<Handoff>) -> Vec<Handoff> {
+    handoffs.sort_by(|a, b| a.group.cmp(&b.group));
+    handoffs
+}
+
 #[tokio::test]
 async fn choosing_a_group_plays_the_episode_there_from_the_bridges_stream() {
     let setup = setup().await;
@@ -395,19 +401,100 @@ async fn a_stream_serves_only_its_handoffs_file() {
             "{path}"
         );
     }
+}
 
-    // A new Handoff on Kitchen replaces its old one, whose URL is dead.
-    let (replacing, replaced_by) = setup.start(&second, &setup.kitchen).await;
-    assert_ne!(stream_id(&replaced_by), stream_id(&kitchen));
-    assert_eq!(get(path(&kitchen)).await.0, StatusCode::NOT_FOUND);
-    assert_eq!(get(path(&replaced_by)).await.0, StatusCode::PARTIAL_CONTENT);
-    let groups: Vec<String> = api
-        .handoffs(&setup.session)
-        .await
-        .into_iter()
-        .map(|handoff| handoff.group)
-        .collect();
-    assert_eq!(groups, [setup.office.uuid(), replacing.group.as_str()]);
+#[tokio::test]
+async fn a_handoff_replaces_another_source_without_asking() {
+    let setup = setup().await;
+    let (playing, paused) = (&setup.kitchen, &setup.office);
+    let radio = FakeTrack::new("Morning Radio", Duration::from_secs(3600)).by("Station");
+    setup.household.play(playing, radio.clone());
+    setup.household.play(paused, radio.clone());
+    setup.household.pause(paused);
+    let (episode, mut started) = (setup.episode(0), Vec::new());
+    let file = setup.file(&episode).await;
+
+    for group in [playing, paused] {
+        // One call, nothing to confirm.
+        let (handoff, url) = setup.start(&episode, group).await;
+
+        assert_eq!(handoff.group, group.uuid());
+        started.push(handoff);
+        assert!(
+            url.starts_with(&format!("{}/stream/", setup.bridge.url())),
+            "{url}"
+        );
+        assert_eq!(setup.household.transport_state(group), "PLAYING");
+        let fetch = setup.household.fetched(group).await;
+        assert_eq!(
+            (fetch.uri.as_str(), fetch.status),
+            (url.as_str(), Some(206))
+        );
+        assert_eq!(fetch.body, file);
+    }
+
+    // The Groups list shows the streams playing, not the other source.
+    let groups = setup.bridge.api().groups(&setup.session).await;
+    for group in [playing, paused] {
+        let shown = groups
+            .iter()
+            .find(|shown| shown.id == group.uuid())
+            .expect("the Group is listed");
+        assert_eq!(shown.state, Some(TransportState::Playing), "{shown:?}");
+        let now_playing = shown.now_playing.as_ref().expect("a track loaded");
+        assert_ne!(now_playing.title, radio.title, "{shown:?}");
+        assert_eq!(now_playing.duration, None, "{shown:?}");
+    }
+    let listed = setup.bridge.api().handoffs(&setup.session).await;
+    assert_eq!(by_group(listed), by_group(started));
+}
+
+#[tokio::test]
+async fn a_new_handoff_on_a_group_ends_its_old_one_whoever_starts_it() {
+    let setup = setup().await;
+    let (first, second) = (setup.episode(0), setup.episode(1));
+    let (_, old) = setup.start(&first, &setup.kitchen).await;
+    let (office, _) = setup.start(&second, &setup.office).await;
+    let other = setup.abs.new_user().await;
+    let api = setup.bridge.api();
+    let others = api.login(setup.abs.base_url(), &other.api_key.key).await;
+
+    // Another household member replaces the first user's Handoff on Kitchen.
+    let new = api
+        .start_handoff(&others, &second, setup.kitchen.uuid())
+        .await;
+    let url = setup.household.uri(&setup.kitchen).expect("a URL");
+    assert_ne!(stream_id(&url), stream_id(&old));
+    assert_eq!(
+        (&new.item, &new.started_by),
+        (&second, &acting_as(&setup.abs, &other))
+    );
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+
+    // The old stream URL is dead, however it is asked for; the new one serves.
+    for (method, range) in [
+        (Method::GET, None),
+        (Method::GET, Some("bytes=0-")),
+        (Method::HEAD, None),
+        (Method::HEAD, Some("bytes=0-99")),
+    ] {
+        let response = api.fetch(method.clone(), path(&old), range).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{method} {range:?}"
+        );
+        assert!(response.bytes().await.unwrap().is_empty());
+    }
+    let response = api.fetch(Method::GET, path(&url), Some("bytes=0-")).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert!(response.bytes().await.unwrap()[..] == setup.file(&second).await[..]);
+
+    // Only the new Handoff is listed for Kitchen, to everyone; Office's stays.
+    let expected = by_group(vec![office, new]);
+    for session in [&setup.session, &others] {
+        assert_eq!(by_group(api.handoffs(session).await), expected);
+    }
 }
 
 #[tokio::test]
