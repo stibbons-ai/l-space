@@ -119,4 +119,5 @@ error-group-not-found = Diese Gruppe gibt es nicht mehr: Vielleicht wurde sie in
 error-group-failed = Die Gruppe hat es nicht getan: Sie war beschäftigt, hat nicht geantwortet oder abgelehnt. Versuche es gleich noch einmal; klappt es weiterhin nicht, prüfe, ob sie eingeschaltet und in deinem Netzwerk ist.
 error-item-not-playable = Clacks kann das noch nicht auf einer Gruppe abspielen: nur Folgen und Hörbücher in einer einzigen Datei, in einem Format, das Sonos abspielt.
 error-no-handoff = Diese Gruppe spielt nicht ab, was Clacks gestartet hat: Sie spielt jetzt etwas anderes (vielleicht aus der Sonos-App), oder was Clacks dort abgespielt hat, ist beendet. Starte es erneut mit „Abspielen auf…“.
+error-length-unknown = Clacks weiß nicht, wie lang das ist, und kann deshalb nicht vorspulen. „15 s zurück“ geht weiterhin.
 error-unknown = Etwas Unerwartetes ist schiefgegangen. Ein Update von Ook kann helfen.

@@ -209,6 +209,7 @@ texts! {
     ErrorGroupFailed => "error-group-failed",
     ErrorItemNotPlayable => "error-item-not-playable",
     ErrorNoHandoff => "error-no-handoff",
+    ErrorLengthUnknown => "error-length-unknown",
     ErrorUnknown => "error-unknown",
 }
 
@@ -273,6 +274,7 @@ impl From<&api::ApiError> for Text {
             ApiError::GroupFailed => Self::ErrorGroupFailed,
             ApiError::ItemNotPlayable => Self::ErrorItemNotPlayable,
             ApiError::NoHandoff => Self::ErrorNoHandoff,
+            ApiError::LengthUnknown => Self::ErrorLengthUnknown,
             ApiError::Unknown => Self::ErrorUnknown,
         }
     }
@@ -825,8 +827,8 @@ mod tests {
         for (text, error) in &messages {
             assert_eq!(Text::from(error), *text, "{error:?}");
         }
-        // One message per code (ApiError has 15), each different in every language.
-        assert_eq!(messages.len(), 15, "{messages:?}");
+        // One message per code (ApiError has 16), each different in every language.
+        assert_eq!(messages.len(), 16, "{messages:?}");
         for language in Language::ALL {
             let distinct: BTreeSet<_> = messages
                 .iter()

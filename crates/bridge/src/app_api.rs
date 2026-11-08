@@ -930,19 +930,20 @@ impl<S: Store> Controls<S> {
     /// Has Group `group` do `control` on its Handoff; only while the Group plays the
     /// Handoff's stream, else no control is sent to it ([`ApiError::NoHandoff`]). A Group
     /// already paused (or playing) is sent nothing for a pause (or resume). After a pause or
-    /// a skip, the Group's position (read just before the pause; the seek's target) is
-    /// written as Progress for the starter, with the Handoff's key, once the Library Server
-    /// confirmed that key still acts for the starter. The control's calls to the Group take
-    /// [`sonos::CONTROL_TIMEOUT`] in all, its requests to the Library Server
-    /// [`CONTROL_LIBRARY_SERVER_TIME`]; a write that fails or runs out of time is logged and
-    /// otherwise left alone, as the Group already did what was asked, except that a key the
-    /// Library Server rejects is revoked, which ends the Handoff.
+    /// a skip, the Group's position is written as Progress for the starter, with the
+    /// Handoff's key, once the Library Server confirmed that key still acts for the starter:
+    /// for a pause, where the Group tells it paused (read right after the pause; if that read
+    /// fails or tells no position, where it was just before the pause), for a skip, the seek's
+    /// target. The control's calls to the Group take [`sonos::CONTROL_TIMEOUT`] in all, its
+    /// requests to the Library Server [`CONTROL_LIBRARY_SERVER_TIME`]; a write that fails or
+    /// runs out of time is logged and otherwise left alone, as the Group already did what was
+    /// asked, except that a key the Library Server rejects is revoked, which ends the Handoff.
     async fn control(&self, group: &str, control: Control) -> Result<Playback, ApiError> {
         let mut group_time = Budget(sonos::CONTROL_TIMEOUT);
         let mut library_time = Budget(CONTROL_LIBRARY_SERVER_TIME);
         let playback = self.playback(group, &mut group_time).await?;
         let found = self.playing_handoff(group, &playback).await?;
-        let duration = playback.duration.map(|duration| duration.as_secs_f64());
+        let duration = known_length(playback.duration.map(|duration| duration.as_secs_f64()));
         let position = playback.position.map(|position| position.as_secs_f64());
         let asked = match control {
             Control::Pause => Some(sonos::TransportState::Paused),
@@ -970,6 +971,10 @@ impl<S: Store> Controls<S> {
             Control::Pause => {
                 self.act(group, control, &mut group_time, self.sonos.pause(group))
                     .await?;
+                let position = self
+                    .paused_at(group, &found.stream, &mut group_time)
+                    .await
+                    .or(position);
                 let Some(position) = position else {
                     tracing::warn!(
                         group,
@@ -1008,12 +1013,13 @@ impl<S: Store> Controls<S> {
         }
     }
 
-    /// Has Group `group`, which plays `found`'s stream as `playback` (read just before) tells,
-    /// skip as `skip` says, within the Item; see [`Controls::control`]. A forward skip on a
-    /// Group that tells no length first looks the Item's length up: if the Library Server
-    /// doesn't tell it (unreachable, too slow, or the Item is gone there), the skip is refused
-    /// ([`ApiError::LibraryServerUnreachable`]); if it knows no length either, the skip has no
-    /// end to stop at.
+    /// Has Group `group` skip as `skip` says, kept within the Item; the Group plays `found`'s
+    /// stream, and `playback` is what it told just before. See [`Controls::control`]. If the
+    /// Group tells no length, a forward skip first looks the Item's length up on the Library
+    /// Server. When the Library Server doesn't answer with it (unreachable, too slow, or the
+    /// Item is gone there), the skip is refused with [`ApiError::LibraryServerUnreachable`].
+    /// When it answers but knows no length either, the skip is refused with
+    /// [`ApiError::LengthUnknown`]. Either way nothing is sent to the Group and nothing written.
     async fn skip(
         &self,
         group: &str,
@@ -1031,7 +1037,7 @@ impl<S: Store> Controls<S> {
         if playback.position.is_none() {
             return Err(no_position());
         }
-        let mut duration = playback.duration.map(|duration| duration.as_secs_f64());
+        let mut duration = known_length(playback.duration.map(|duration| duration.as_secs_f64()));
         let mut acting = None;
         if duration.is_none() && skip.seconds() > 0 {
             let checked = self.check(active, Wanted::Needed, &mut library_time).await;
@@ -1041,7 +1047,17 @@ impl<S: Store> Controls<S> {
                 Acting::Starter(_) | Acting::Unknown => {}
             }
             duration = match checked.length {
-                Length::Told(duration) => duration,
+                Length::Told(told) => {
+                    let Some(told) = known_length(told) else {
+                        tracing::info!(
+                            group,
+                            "a forward skip refused: neither the Group nor the Library Server \
+                             knows the Item's length"
+                        );
+                        return Err(ApiError::LengthUnknown);
+                    };
+                    Some(told)
+                }
                 Length::Unasked | Length::Failed => {
                     tracing::info!(
                         group,
@@ -1099,6 +1115,41 @@ impl<S: Store> Controls<S> {
             tracing::warn!(group, %error, "cannot read what a Group plays");
             sonos_error(error)
         })
+    }
+
+    /// Where Group `group` tells it is, read right after a pause within `time`, if it still
+    /// plays `stream` and tells a position; none otherwise.
+    async fn paused_at(
+        &self,
+        group: &str,
+        stream: &store::StreamId,
+        time: &mut Budget,
+    ) -> Option<f64> {
+        let read = match time.spend(self.sonos.playback(group)).await {
+            Some(Ok(read)) => read,
+            Some(Err(error)) => {
+                tracing::info!(group, %error, "cannot read where a Group paused; using where it was just before");
+                return None;
+            }
+            None => {
+                tracing::info!(
+                    group,
+                    "a Group did not tell where it paused in time; using where it was just before"
+                );
+                return None;
+            }
+        };
+        let plays = read.uri.as_deref().and_then(stream::stream_in_url);
+        let position = read
+            .position
+            .filter(|_| plays.is_some_and(|played| played == *stream));
+        if position.is_none() {
+            tracing::info!(
+                group,
+                "a Group told no position of its Handoff after pausing; using where it was just before"
+            );
+        }
+        position.map(|position| position.as_secs_f64())
     }
 
     /// Has Group `group` do `control` by `sent`, within `time`.
@@ -1421,7 +1472,7 @@ enum Length {
 impl Length {
     fn told(self) -> Option<f64> {
         match self {
-            Self::Told(length) => length,
+            Self::Told(length) => known_length(length),
             Self::Unasked | Self::Failed => None,
         }
     }
@@ -1737,6 +1788,11 @@ fn skipped(position: Duration, skip: Skip, duration: Option<f64>) -> Duration {
     }
     // `as` rounds down; the target is finite and not negative.
     Duration::from_secs(target as u64)
+}
+
+/// `length`, in seconds, if it is one an Item can have: finite and more than zero.
+fn known_length(length: Option<f64>) -> Option<f64> {
+    length.filter(|length| length.is_finite() && *length > 0.0)
 }
 
 /// 256 random bits from the operating system, hex-encoded, for `what` (a session token, a

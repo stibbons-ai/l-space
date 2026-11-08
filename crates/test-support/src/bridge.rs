@@ -432,6 +432,10 @@ pub const GROUP_FAILED: (StatusCode, ApiError) = (StatusCode::BAD_GATEWAY, ApiEr
 /// The rejection of a control for a Group without a Handoff it plays.
 pub const NO_HANDOFF: (StatusCode, ApiError) = (StatusCode::CONFLICT, ApiError::NoHandoff);
 
+/// The rejection of a forward skip on an Item whose length neither the Group nor the Library
+/// Server knows.
+pub const LENGTH_UNKNOWN: (StatusCode, ApiError) = (StatusCode::CONFLICT, ApiError::LengthUnknown);
+
 /// The rejection of a call whose Library Server couldn't be reached, or didn't answer in time.
 pub const LIBRARY_SERVER_UNREACHABLE: (StatusCode, ApiError) =
     (StatusCode::BAD_GATEWAY, ApiError::LibraryServerUnreachable);

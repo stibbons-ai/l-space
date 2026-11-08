@@ -496,9 +496,16 @@ pub enum ApiError {
     /// The Group has no active Handoff to control, or plays something other than its
     /// Handoff's stream (switched in the Sonos app, for example: what is a Takeover once
     /// detected, #20, so the Handoff isn't ended yet). No control was sent to the Group and no
-    /// Progress written; a Handoff it still has goes on.
+    /// Progress written; a Handoff it still has goes on, except after a forward skip that
+    /// needed the Item's length: if the Library Server rejected the starter's key there, the
+    /// key was revoked, which ended the Handoff (see [`skip_group`]).
     #[error("no_handoff")]
     NoHandoff,
+    /// A forward skip was refused because neither the Group nor the Library Server knows the
+    /// Item's length, so it has no end to stop at. Nothing was sent to the Group and no
+    /// Progress written.
+    #[error("length_unknown")]
+    LengthUnknown,
     /// A code this build of the App does not know yet, from a newer Bridge. Produced only on
     /// the App's side, when decoding; the Bridge never sends it.
     #[serde(other)]
@@ -533,7 +540,7 @@ impl AsStatusCode for ApiError {
             Self::LibraryServerNotConfigured | Self::NotFound | Self::GroupNotFound => {
                 StatusCode::NOT_FOUND
             }
-            Self::NoHandoff => StatusCode::CONFLICT,
+            Self::NoHandoff | Self::LengthUnknown => StatusCode::CONFLICT,
             Self::ItemNotPlayable => StatusCode::UNPROCESSABLE_ENTITY,
             Self::BridgeUnreachable
             | Self::NotABridge
@@ -702,14 +709,17 @@ pub async fn handoffs() -> Result<Vec<Handoff>, ApiError> {
     bridge.handoffs(server::session_token(&headers)?).await
 }
 
-/// Pauses Group `group`'s Handoff, whoever started it, and writes where it was just before
-/// pausing as Progress for the user who started it, with their key (not the caller's), once
-/// their Library Server confirms the key still acts for them. Answers with the Group's
-/// playback then; a Group already paused is left as it is. Only while the Group plays its
-/// Handoff's stream: otherwise [`ApiError::NoHandoff`], and no control is sent to the Group.
-/// Writing the Progress may fail (the Library Server unreachable or too slow, say): the Group
-/// paused all the same, and the call succeeds; if the Library Server rejected the starter's
-/// key, or it now acts for another user, it is revoked, which ends the Handoff.
+/// Pauses Group `group`'s Handoff, whoever started it, and writes where it paused as Progress
+/// for the user who started it, with their key (not the caller's), once their Library Server
+/// confirms the key still acts for them. Where it paused is read from the Group right after
+/// the pause; if that read fails, is late or tells no position, where it was just before
+/// pausing. Answers with the Group's playback then; a Group already paused is left as it is.
+/// Only while the Group plays its Handoff's stream: otherwise [`ApiError::NoHandoff`], and no
+/// control is sent to the Group. A Group that tells no position either time pauses, but no
+/// Progress is written. Writing the Progress may fail (the Library Server unreachable or too
+/// slow, say): the Group paused all the same, and the call succeeds; if the Library Server
+/// rejected the starter's key, or it now acts for another user, it is revoked, which ends the
+/// Handoff.
 #[post(
     "/api/groups/pause",
     headers: dioxus_fullstack::HeaderMap,
@@ -739,12 +749,13 @@ pub async fn resume_group(group: String) -> Result<Playback, ApiError> {
 /// where it is now, kept between the Item's start and its end (as the Group tells its length,
 /// else the Library Server); playing or paused as it was. Writes the new position as Progress
 /// as [`pause_group`] does, and answers likewise. A forward skip on a Group that tells no
-/// length is refused with [`ApiError::LibraryServerUnreachable`] when the Library Server
-/// doesn't tell the length either (unreachable, too slow, or the Item is gone there), and goes
-/// on without an end if it knows the Item has none. If the Library Server rejects the
-/// starter's key there, or it now acts for another user, the key is revoked and the skip
-/// answers [`ApiError::NoHandoff`], or [`ApiError::Internal`] if storing the revoke failed;
-/// nothing is sent to the Group then.
+/// length first asks the Library Server for it: if the Library Server doesn't tell it
+/// (unreachable, too slow, or the Item is gone there), the skip is refused with
+/// [`ApiError::LibraryServerUnreachable`]; if it knows no length either, with
+/// [`ApiError::LengthUnknown`]. If the Library Server rejects the starter's key there, or it
+/// now acts for another user, the key is revoked and the skip answers
+/// [`ApiError::NoHandoff`], or [`ApiError::Internal`] if storing the revoke failed. In each
+/// of these cases nothing is sent to the Group and nothing written.
 #[post(
     "/api/groups/skip",
     headers: dioxus_fullstack::HeaderMap,

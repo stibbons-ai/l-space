@@ -12,11 +12,12 @@ use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
 use test_support::bridge::{
-    GROUP_FAILED, GROUP_NOT_FOUND, GroupControl, LIBRARY_SERVER_UNREACHABLE, NO_HANDOFF,
-    SESSION_INVALID, TestBridge, home_with_sonos_toml, output_contains,
+    GROUP_FAILED, GROUP_NOT_FOUND, GroupControl, LENGTH_UNKNOWN, LIBRARY_SERVER_UNREACHABLE,
+    NO_HANDOFF, SESSION_INVALID, TestBridge, home_with_sonos_toml, output_contains,
 };
 
 use crate::forwarder::Forwarder;
+use crate::length_hider::LengthHider;
 
 /// The SOAP actions that control a Group's playback, as `sonos-fake` records them.
 const PLAYBACK_CONTROLS: [&str; 3] = ["AVTransport#Pause", "AVTransport#Play", "AVTransport#Seek"];
@@ -208,6 +209,45 @@ async fn anyone_pauses_and_resumes_a_handoff_and_the_pause_is_the_starters_progr
     assert!(!output_contains(&output, &setup.alice.api_key.key));
     assert!(!output_contains(&output, &setup.bob.api_key.key));
     assert!(!output_contains(&output, "/stream/"));
+}
+
+#[tokio::test]
+async fn a_pause_writes_where_the_group_paused() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    let kitchen = setup.kitchen.uuid();
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.clock.advance(seconds(130));
+
+    // A Group slow to act: it plays on one more second after the Bridge read where it was,
+    // before it pauses.
+    setup.household.set_fault(
+        &setup.kitchen,
+        Fault::SlowTransport(Duration::from_millis(300)),
+    );
+    let pauses = || {
+        let actions = setup.household.actions_of(&setup.kitchen).into_iter();
+        actions
+            .filter(|action| action == "AVTransport#Pause")
+            .count()
+    };
+    let before = pauses();
+    let (paused, ()) = tokio::join!(api.pause_group(&setup.bobs, kitchen), async {
+        let deadline = Instant::now() + seconds(4);
+        while pauses() == before {
+            assert!(
+                Instant::now() < deadline,
+                "the Pause never reached the Group"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        setup.clock.advance(seconds(1));
+    });
+
+    assert_eq!(setup.position(&setup.kitchen), seconds(131));
+    assert_eq!(paused, playback(TransportState::Paused, 131.0, 600.0));
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(131.0));
 }
 
 #[tokio::test]
@@ -814,6 +854,54 @@ async fn a_forward_skip_waiting_for_the_length_skips_from_where_the_group_is_the
     assert!(requests.contains(&item), "{requests}");
     assert!(requests.contains(&setup.alice.api_key.key));
     assert!(!requests.contains(&setup.bob.api_key.key));
+}
+
+#[tokio::test]
+async fn a_forward_skip_on_an_item_of_unknown_length_is_refused() {
+    let abs = Audiobookshelf::shared();
+    let hider = LengthHider::to(abs.base_url()).await;
+    let setup = setup_on(Arc::clone(&abs), &hider.url()).await;
+    let api = setup.bridge.api();
+    let kitchen = setup.kitchen.uuid();
+    let episode = setup.episode(0);
+    setup.start(&episode, &setup.kitchen).await;
+    setup.clock.advance(seconds(590));
+    setup
+        .abs
+        .set_progress(
+            &setup.alice,
+            &episode.library_item,
+            episode.episode.as_deref(),
+            42.0,
+            false,
+        )
+        .await;
+
+    // The Group tells no length for a stream, and the Library Server knows none either: there
+    // is no end to stop at, so "30 s forward" is refused, nothing sent, nothing written.
+    hider.hide();
+    let before = setup.playback_controls(&setup.kitchen);
+    assert_eq!(
+        api.control_error(&setup.bobs, kitchen, GroupControl::Skip(Skip::Forward30))
+            .await,
+        LENGTH_UNKNOWN
+    );
+    assert_eq!(setup.playback_controls(&setup.kitchen), before);
+    assert_eq!(setup.position(&setup.kitchen), seconds(590));
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(42.0));
+    assert_eq!(setup.progress(&setup.bob, &episode).await, None);
+
+    // "15 s back" needs no length.
+    assert_eq!(
+        api.skip_group(&setup.bobs, kitchen, Skip::Back15).await,
+        Playback {
+            state: TransportState::Playing,
+            position: Some(575.0),
+            duration: None,
+        }
+    );
+    assert_eq!(setup.position(&setup.kitchen), seconds(575));
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(575.0));
 }
 
 #[tokio::test]

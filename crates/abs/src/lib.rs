@@ -547,9 +547,10 @@ impl Client {
     /// Finished is not sent.
     ///
     /// As Audiobookshelf 2.37.2 does it (`User.createUpdateMediaProgressFromPayload`,
-    /// `MediaProgress.applyProgressUpdate`): the user gets Progress if they had none; with a
-    /// length, Audiobookshelf itself marks the Progress Finished when under 10 seconds remain,
-    /// and unfinished when an earlier Finished one moves away from there. Fails as
+    /// `MediaProgress.applyProgressUpdate`): the user gets Progress if they had none, and that
+    /// first write leaves it unfinished. A write that updates Progress they already have, with
+    /// a length, has Audiobookshelf itself mark it Finished when under 10 seconds remain, and
+    /// unfinished when an earlier Finished one moves away from there. Fails as
     /// [`Client::set_finished`] does. Audiobookshelf doesn't check that the user may see the
     /// Item: a caller that needs it checks that itself.
     pub async fn set_progress(
