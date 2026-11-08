@@ -443,7 +443,8 @@ async fn a_handoff_replaces_another_source_without_asking() {
         assert_eq!(shown.state, Some(TransportState::Playing), "{shown:?}");
         let now_playing = shown.now_playing.as_ref().expect("a track loaded");
         assert_ne!(now_playing.title, radio.title, "{shown:?}");
-        assert_eq!(now_playing.duration, None, "{shown:?}");
+        let radio_duration = radio.duration.map(|duration| duration.as_secs_f64());
+        assert_ne!(now_playing.duration, radio_duration, "{shown:?}");
     }
     let listed = setup.bridge.api().handoffs(&setup.session).await;
     assert_eq!(by_group(listed), by_group(started));
