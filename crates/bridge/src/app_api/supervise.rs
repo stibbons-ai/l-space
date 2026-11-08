@@ -45,8 +45,10 @@ use super::{
     Acting, Budget, CONTROL_TURN_TIME, Controls, Turns, Wanted, Wrote, plays_stream, told_length,
 };
 
-/// How often a playing Handoff's Progress is written, on the Bridge's clock; also how far
-/// apart the Finished write at the end is tried again.
+/// How often a playing Handoff's Progress is written, on the Bridge's clock. A failed
+/// Finished write at the end is tried again on these ticks too: the first retry at the next
+/// tick, anywhere from 1 second to a cadence after the try at the end, later ones a cadence
+/// apart.
 const CADENCE: Duration = Duration::from_secs(30);
 
 /// How long the starter's Library Server may take to tell whom the Handoff's key acts for,
@@ -210,7 +212,11 @@ impl<S: Store> Supervisors<S> {
     }
 
     /// What the supervisor of `stream`'s Handoff on Group `group` knows for a start replacing
-    /// it, holding the Group's turn: nothing without a supervisor.
+    /// it, holding the Group's turn: nothing without a supervisor. A pending ending is set only
+    /// under the turn, but a control's playing sighting clears it without the turn (in
+    /// `Supervisor::run`), so `finished` may still tell a Finished write the supervisor is
+    /// about to drop, on a sighting it hasn't handled yet; the start reads the Group itself
+    /// before writing it.
     pub(super) fn replaced(&self, group: &str, stream: &StreamId) -> Replaced {
         let running = self.lock();
         let Some(running) = running
@@ -572,7 +578,7 @@ impl<S: Store> Supervisor<S> {
         let handoff = &self.handoff;
         let pending = match ending {
             Ending::Finish { .. } => "the Finished write, not made",
-            Ending::Store => "ending the Handoff, after Finished was written",
+            Ending::Store => "ending the Handoff, after Finished was written or its tries ran out",
         };
         tracing::info!(
             group = handoff.group,

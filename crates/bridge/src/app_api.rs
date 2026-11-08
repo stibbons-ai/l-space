@@ -1540,8 +1540,11 @@ impl<S: Store> Controls<S> {
     /// stream, telling a position, gets it written; a stopped one may tell 0 there. A Group
     /// still stopped on that stream after playing to the end of the Item, whose Finished write
     /// the supervisor hadn't made yet, gets that one. With no `time` at all, nothing is tried.
-    /// Anything else, a failure or running out of time is logged and otherwise left alone; a
-    /// pending Finished write left unmade is logged as an error.
+    /// Anything else, a failure or running out of time is logged and otherwise left alone. A
+    /// pending Finished write (`known.finished`) left unmade is logged as an error when there
+    /// is no `time`, the Group doesn't tell what it plays, the write doesn't land, or the Group
+    /// tells no position playing or paused on that stream; a Group playing or paused on that
+    /// stream, telling a position, gets that position written instead, with no such error.
     async fn write_replaced(
         &self,
         group: &str,
