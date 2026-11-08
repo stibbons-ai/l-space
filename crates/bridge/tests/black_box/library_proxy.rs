@@ -35,6 +35,8 @@ use axum::response::Response;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use test_support::WITHIN;
+
 /// The most of a body the proxy passes on.
 const MAX_BODY: usize = 64 << 20;
 
@@ -192,12 +194,17 @@ pub struct HeldWrite {
 }
 
 impl HeldWrite {
-    /// Passes the held write on, and waits until the Library Server answered it.
+    /// Passes the held write on, and waits until the Library Server answered it. Panics if no
+    /// write was answered within [`WITHIN`]: none was held (none arrived, or one failed or
+    /// rejected by the proxy answered first).
     pub async fn release(self) {
         self.release
             .send(())
             .expect("the held write is still waiting");
-        self.answer.await.expect("the held write was answered");
+        tokio::time::timeout(WITHIN, self.answer)
+            .await
+            .expect("no held Progress write was answered: none arrived to be held")
+            .expect("the held write was answered");
     }
 }
 

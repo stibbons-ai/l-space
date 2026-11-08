@@ -681,12 +681,19 @@ async fn a_tick_among_the_reads_near_the_end_asks_nothing_so_a_slow_library_serv
     setup
         .wait_for_progress(&setup.alice, &episode, (595.0, false))
         .await;
-    setup.advance_and_settle(1).await;
+    // The read near the end comes at 569.5, so the next one comes at 570.5, after the tick
+    // at 570: reads and ticks off the same second, as on a real clock.
+    let before = (setup.asked(READ), setup.asked(READ_POSITION));
+    setup.clock.advance(Duration::from_millis(1500));
+    setup.household.clock_followed().await;
+    let read = async || setup.asked(READ) > before.0 && setup.asked(READ_POSITION) > before.1;
+    eventually("the Bridge never read Kitchen at 569.5", WITHIN, read).await;
+    setup.settle().await;
 
     // The Library Server takes 2.5 seconds to tell whom a key acts for. The tick at 570 is
-    // one of the reads near the end: the Bridge doesn't ask first, it reads Kitchen, so time
-    // moved on 3 seconds from there finds Kitchen stopped at its end, close enough to that
-    // read to count as played to it.
+    // one of the reads near the end: at 570.5 the Bridge doesn't ask first, it reads Kitchen,
+    // so time moved on 3 seconds from there finds Kitchen stopped at its end, close enough to
+    // that read to count as played to it.
     let before = (
         proxy.identity_requests(),
         setup.asked(READ),
@@ -699,12 +706,102 @@ async fn a_tick_among_the_reads_near_the_end_asks_nothing_so_a_slow_library_serv
             || (setup.asked(READ) > before.1 && setup.asked(READ_POSITION) > before.2)
     };
     eventually("the Bridge did nothing at the tick", WITHIN, acted).await;
+    assert_eq!(proxy.identity_requests(), before.0, "asked at the tick");
+    // The Finished write's own key check comes at full speed.
+    proxy.delay_next_identity(Duration::ZERO);
     setup.advance(3).await;
     setup
         .wait_for_progress(&setup.alice, &episode, (length, true))
         .await;
     setup.wait_until_no_handoff().await;
     assert_eq!(setup.household.transport_state(&setup.kitchen), "STOPPED");
+}
+
+#[tokio::test]
+async fn an_outside_resume_first_seen_at_a_tick_near_the_end_keeps_the_end() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    let length = EPISODE_DURATIONS[0];
+    // Started 536 seconds in: the tick at 30 writes 566, then Bob pauses and the Sonos app
+    // resumes Kitchen, which the Bridge doesn't see.
+    setup
+        .set_progress(&setup.alice, &episode, 536.0, false)
+        .await;
+    setup.start(&setup.alices, &episode, Some(length)).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (566.0, false))
+        .await;
+    setup.pause().await;
+    let sonos_app = sonos::Upnp::start(setup.household.ssdp(), Arc::new(clock::SystemClock));
+    sonos_app
+        .resume(setup.kitchen.uuid())
+        .await
+        .expect("resume");
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+
+    // The Library Server takes 2.5 seconds to tell whom a key acts for. The tick at 60 first
+    // sees Kitchen playing, at 596, 4 seconds from the end: the reads near the end have begun,
+    // so the visit right after it reads Kitchen without asking first, and writes nothing.
+    let asked = proxy.identity_requests();
+    let before = (setup.asked(READ), setup.asked(READ_POSITION));
+    proxy.delay_next_identity(Duration::from_millis(2500));
+    setup.advance(30).await;
+    let both =
+        async || setup.asked(READ) >= before.0 + 2 && setup.asked(READ_POSITION) >= before.1 + 2;
+    eventually(
+        "the tick and the visit after it never read Kitchen",
+        WITHIN,
+        both,
+    )
+    .await;
+    assert_eq!(proxy.identity_requests(), asked, "asked near the end");
+    // The Finished write's own key check comes at full speed.
+    proxy.delay_next_identity(Duration::ZERO);
+    setup.settle().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((566.0, false))
+    );
+
+    // Read every second up to 599, then found stopped at its end.
+    setup.read_every_second(3).await;
+    setup.advance(1).await;
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "STOPPED");
+    setup
+        .wait_for_progress(&setup.alice, &episode, (length, true))
+        .await;
+    setup.wait_until_no_handoff().await;
+}
+
+#[tokio::test]
+async fn the_ticks_write_again_once_the_group_plays_on_past_where_the_end_was_expected() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    // Audiobookshelf holds the episode as 600 seconds long; Kitchen plays it for 700.
+    setup
+        .set_progress(&setup.alice, &episode, 540.0, false)
+        .await;
+    setup.start(&setup.alices, &episode, Some(700.0)).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (570.0, false))
+        .await;
+    setup.settle().await;
+    let writes = proxy.progress_writes();
+
+    // Read every second from 595 to 606, the tick at 600 among them: nothing written.
+    setup.advance_and_read(25).await;
+    setup.read_every_second(11).await;
+    setup.settle().await;
+    assert_eq!(proxy.progress_writes(), writes);
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+
+    // Seen playing more than 5 seconds past where the end was expected, the reads near the
+    // end stop, and the tick at 90 writes again.
+    setup.advance(24).await;
+    let wrote = async || proxy.progress_writes() > writes;
+    eventually("the tick at 90 never wrote", WITHIN, wrote).await;
 }
 
 #[tokio::test]

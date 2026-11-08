@@ -57,13 +57,14 @@ use super::{
 
 /// How often a playing Handoff's Progress is written, on the Bridge's clock. A tick that finds
 /// the Group playing without having asked whom the key acts for first (it wasn't seen playing
-/// before: resumed outside the App, say) has a visit right after it ask and write. A tick
-/// falling among the reads near the end of the Item (from [`END_SLACK`] before it) neither
-/// asks nor writes, so those reads stay about [`END_RECHECK`] apart: Progress there comes
-/// from the Finished write at the end, a control, or the next tick once those reads stop (the
-/// Item's length was wrong). A failed Finished write at the end is tried again on these ticks
-/// too: the first retry at the next tick, anywhere from 1 second to a cadence after the try at
-/// the end, later ones a cadence apart.
+/// before: resumed outside the App, say) has a visit right after it ask and write, unless the
+/// reads near the end of the Item have begun by then. A tick falling among those reads (from
+/// [`END_SLACK`] before the end, judged at the tick) neither asks nor writes, so those reads
+/// stay about [`END_RECHECK`] apart: Progress there comes from the Finished write at the end, a
+/// control, or the next tick once those reads stop (the Item's length was wrong). A failed
+/// Finished write at the end is tried again on these ticks too: the first retry at the next
+/// tick, anywhere from 1 second to a cadence after the try at the end, later ones a cadence
+/// apart.
 const CADENCE: Duration = Duration::from_secs(30);
 
 /// How long the starter's Library Server may take to tell whom the Handoff's key acts for,
@@ -415,7 +416,11 @@ enum Then {
     /// visit asks, then writes it, the Group still found stopped there.
     Finish,
     /// The cadence write it found due without asking whom the key acts for first (the Group
-    /// not seen playing before it): the next visit asks, then writes it as the cadence's.
+    /// not seen playing before it): the next visit asks, then writes it as the cadence's, if
+    /// it still finds the Group playing there. Not once the reads near the end of the Item
+    /// have begun for the Group as last seen: the next visit is one of them then, neither
+    /// asking nor writing. Nor if a control paused the Group in between: that visit, not
+    /// seeing it playing when it began, neither asks nor writes.
     Write,
 }
 
@@ -471,9 +476,28 @@ impl<S: Store> Supervisor<S> {
                 }
             }
             let now = self.clock.now();
-            // A tick among the reads near the end is one of them: it neither asks whom the key
-            // acts for nor writes, so those reads stay about a second apart.
-            let cadence = then == Then::Write || (now >= tick && end.is_none_or(|end| end > tick));
+            // Whether the reads near the end began by `at`, for the Group as last seen.
+            let reading_end_by = |at: Instant| self.end_due(&last, at) == Some(at);
+            // A tick among the reads near the end is one of them, as is a revisit for a write
+            // once they began: it neither asks whom the key acts for nor writes, so those reads
+            // stay about a second apart. Judged at the tick, not at this visit's time, which
+            // falls after the tick unless the tick came on a read's time exactly.
+            let (wanted, cadence) = match then {
+                Then::Write => (true, !reading_end_by(now)),
+                Then::Wait | Then::Finish => {
+                    let ticked = now >= tick;
+                    (ticked, ticked && !end.is_some_and(|_| reading_end_by(tick)))
+                }
+            };
+            if wanted && !cadence {
+                tracing::debug!(
+                    group = self.handoff.group,
+                    user_id = self.handoff.started_by.user_id,
+                    library_item = self.handoff.library_item,
+                    episode = self.handoff.episode,
+                    "a cadence Progress write not made: among the reads near the end of the Item"
+                );
+            }
             while tick <= now {
                 tick += CADENCE;
             }
