@@ -187,11 +187,10 @@ fn listen_address_in_use() {
 
 #[test]
 fn unreachable_test_clock() {
-    // A loopback port nothing listens on any more.
-    let unused = TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .expect("find a free port");
-    let exited = run_with(&format!("{LISTEN}{DATABASE}{}", clock_toml(unused)));
+    let exited = run_with(&format!(
+        "{LISTEN}{DATABASE}{}",
+        clock_toml(test_support::closed_port())
+    ));
     refused(&exited, "cannot follow the test clock");
 }
 
