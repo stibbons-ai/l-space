@@ -8,6 +8,8 @@
 //! - [`LibraryProxy::reject_item_lookups`]: every Item lookup at once with 401, as for a
 //!   rejected key.
 //! - [`LibraryProxy::hang_identity`]: every `GET /api/me` never.
+//! - [`LibraryProxy::delay_next_identity`]: the next `GET /api/me` only after a while, as a
+//!   slow Library Server would.
 //! - [`LibraryProxy::reject_progress_writes`]: every `PATCH /api/me/progress/...` at once with
 //!   401, as for a rejected key, while the key stays valid, until
 //!   [`LibraryProxy::pass_progress_writes`].
@@ -15,13 +17,14 @@
 //!   Server failing for a moment would.
 //! - [`LibraryProxy::delay_progress_writes`]: every one of them only after a while, as a slow
 //!   Library Server would.
+//! - [`LibraryProxy::hold_next_progress_write`]: the next one until the test releases it.
 //!
 //! Everything else, also every deeper path under an Item (its files, its cover), passes as it
 //! is. [`LibraryProxy::progress_writes`] counts the Progress writes that arrived, whatever
 //! the proxy answered them, and [`LibraryProxy::identity_requests`] every `GET /api/me`.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Router;
@@ -29,6 +32,7 @@ use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::response::Response;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 /// The most of a body the proxy passes on.
@@ -58,6 +62,10 @@ struct Faults {
     progress_write_delay_ms: AtomicU64,
     /// How many `GET /api/me` arrived so far.
     identity_requests: AtomicUsize,
+    /// How long, in milliseconds, the next `GET /api/me` is held before it is passed on.
+    next_identity_delay_ms: AtomicU64,
+    /// What the next Progress write waits for before it is passed on, if anything.
+    next_write_held: Mutex<Option<Held>>,
 }
 
 #[derive(Clone)]
@@ -115,6 +123,14 @@ impl LibraryProxy {
         self.faults.hang_identity.store(true, Ordering::SeqCst);
     }
 
+    /// The next `GET /api/me` is passed on only after `delay`, in real time; later ones at once.
+    pub fn delay_next_identity(&self, delay: Duration) {
+        let millis = u64::try_from(delay.as_millis()).expect("a delay in milliseconds");
+        self.faults
+            .next_identity_delay_ms
+            .store(millis, Ordering::SeqCst);
+    }
+
     /// From now on, Progress writes are rejected with 401 at once.
     pub fn reject_progress_writes(&self) {
         self.faults
@@ -158,6 +174,37 @@ impl LibraryProxy {
             .progress_write_delay_ms
             .store(millis, Ordering::SeqCst);
     }
+
+    /// The next Progress write is held when it arrives, and passed on only once the returned
+    /// [`HeldWrite`] is released (or dropped).
+    pub fn hold_next_progress_write(&self) -> HeldWrite {
+        let (release, held) = oneshot::channel();
+        let (answered, answer) = oneshot::channel();
+        *self.faults.next_write_held.lock().expect("held write") = Some(Held { held, answered });
+        HeldWrite { release, answer }
+    }
+}
+
+/// Lets a held Progress write pass ([`LibraryProxy::hold_next_progress_write`]).
+pub struct HeldWrite {
+    release: oneshot::Sender<()>,
+    answer: oneshot::Receiver<()>,
+}
+
+impl HeldWrite {
+    /// Passes the held write on, and waits until the Library Server answered it.
+    pub async fn release(self) {
+        self.release
+            .send(())
+            .expect("the held write is still waiting");
+        self.answer.await.expect("the held write was answered");
+    }
+}
+
+/// A held Progress write's side of a [`HeldWrite`].
+struct Held {
+    held: oneshot::Receiver<()>,
+    answered: oneshot::Sender<()>,
 }
 
 impl Drop for LibraryProxy {
@@ -202,7 +249,18 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         let response = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR);
         return response.body(Body::empty()).expect("response");
     }
+    let mut answered = None;
     if progress_write {
+        let held = faults.next_write_held.lock().expect("held write").take();
+        if let Some(Held {
+            held,
+            answered: done,
+        }) = held
+        {
+            // Released or dropped, it passes on.
+            let _ = held.await;
+            answered = Some(done);
+        }
         let delay = faults.progress_write_delay_ms.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
@@ -211,6 +269,8 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         if faults.hang_identity.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
+        let delay = faults.next_identity_delay_ms.swap(0, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(delay)).await;
     }
     let hidden = item_lookup && faults.hide_lengths.load(Ordering::SeqCst);
     let body = to_bytes(body, MAX_BODY).await.expect("request body");
@@ -234,6 +294,10 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
     let status = answer.status();
     let headers = answer.headers().clone();
     let mut bytes = answer.bytes().await.expect("answer body").to_vec();
+    if let Some(answered) = answered {
+        // Dropped by now if the test no longer waits for it.
+        let _ = answered.send(());
+    }
     if hidden && status.is_success() {
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("Item JSON");
         hide_durations(&mut json);
