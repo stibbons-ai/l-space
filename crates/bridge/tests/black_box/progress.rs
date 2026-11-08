@@ -4,15 +4,21 @@
 //! replaced one's Progress first. Against the seeded Audiobookshelf (read back with each
 //! user's own key) and `sonos-fake` players, with the Bridge following the household's manual
 //! clock through its test-only clock hook, so time moves only when a test advances it.
+//!
+//! A supervisor visits its Group one visit after another, so a read a test waits for comes
+//! after any earlier one of the same supervisor: counting reads once an expected one arrived
+//! shows whether others came before it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use api::{ItemId, Session, TransportState};
+use api::{ItemId, Session, Skip, TransportState};
 use sonos_fake::{Fault, Household, PlayerId};
 
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_DURATIONS};
-use test_support::bridge::{GROUP_FAILED, TestBridge, clock_toml, home_with_sonos_toml};
+use test_support::bridge::{
+    GROUP_FAILED, SESSION_INVALID, TestBridge, clock_toml, home_with_sonos_toml,
+};
 use test_support::{WITHIN, eventually};
 
 use crate::library_proxy::LibraryProxy;
@@ -22,9 +28,6 @@ const READ: &str = "AVTransport#GetTransportInfo";
 
 /// The SOAP action a Bridge reads a Group's position with, alongside [`READ`].
 const READ_POSITION: &str = "AVTransport#GetPositionInfo";
-
-/// How long, in real time, a test watches for something that must not happen.
-const QUIET: Duration = Duration::from_millis(300);
 
 /// How long a start may take in all, in the Bridge (`START_TIME`).
 const START_TIME: Duration = Duration::from_secs(14);
@@ -37,6 +40,7 @@ struct Setup {
     household: Household,
     clock: clock::ManualClock,
     kitchen: PlayerId,
+    office: PlayerId,
     bridge: TestBridge,
     alice: AbsUser,
     alices: Session,
@@ -54,7 +58,7 @@ async fn setup() -> Setup {
 async fn setup_on(abs: Arc<Audiobookshelf>, url: &str) -> Setup {
     let (household, clock) = Household::with_manual_clock();
     let kitchen = household.add_player("Kitchen");
-    household.add_player("Office");
+    let office = household.add_player("Office");
     let config = format!(
         "{}{}",
         home_with_sonos_toml(url, household.ssdp()),
@@ -69,6 +73,7 @@ async fn setup_on(abs: Arc<Audiobookshelf>, url: &str) -> Setup {
         household,
         clock,
         kitchen,
+        office,
         bridge,
         alice,
         alices,
@@ -88,11 +93,7 @@ async fn setup_with_proxy() -> (LibraryProxy, Setup) {
 impl Setup {
     /// Episode `n` (0-based) of the seeded podcast: 600, 900 and 3960 seconds long.
     fn episode(&self, n: usize) -> ItemId {
-        let seeded = self.abs.seeded();
-        ItemId {
-            library_item: seeded.podcast.clone(),
-            episode: Some(seeded.episodes[n].clone()),
-        }
+        self.abs.seeded().episode(n)
     }
 
     /// `session`'s user starts `item` on Kitchen, which plays it to its end, `length` seconds
@@ -144,25 +145,34 @@ impl Setup {
         );
     }
 
-    /// Asserts the Bridge reads Kitchen no more than `reads` times in all, watching a while.
-    async fn assert_reads(&self, reads: usize) {
-        tokio::time::sleep(QUIET).await;
+    /// Asserts that nothing supervises Kitchen any more: Bob starts a witness Handoff on
+    /// Office, and time moves on to its first tick. Once the witness's Progress is written
+    /// there and Kitchen's turn is free, a supervisor of Kitchen woken by the same tick would
+    /// have read Kitchen.
+    async fn assert_kitchen_unsupervised(&self) {
+        let reads = self.asked(READ);
+        let witness = self.episode(2);
+        let office = self.office.uuid();
+        let api = self.bridge.api();
+        api.start_handoff(&self.bobs, &witness, office).await;
+        self.household.fetched(&self.office).await;
+        self.advance(30).await;
+        self.wait_for_progress(&self.bob, &witness, (30.0, false))
+            .await;
+        self.settle().await;
         assert_eq!(self.asked(READ), reads);
     }
 
     /// `user`'s Progress in `item`, read from Audiobookshelf with their own key:
     /// `(currentTime, isFinished)`, if any.
     async fn progress(&self, user: &AbsUser, item: &ItemId) -> Option<(f64, bool)> {
-        let episode = item.episode.as_deref();
-        self.abs.progress(user, &item.library_item, episode).await
+        self.abs.item_progress(user, item).await
     }
 
     /// Records `user`'s Progress in `item` in Audiobookshelf, as their own player would.
     async fn set_progress(&self, user: &AbsUser, item: &ItemId, current_time: f64, done: bool) {
-        let episode = item.episode.as_deref();
-        self.abs
-            .set_progress(user, &item.library_item, episode, current_time, done)
-            .await;
+        let abs = &self.abs;
+        abs.set_item_progress(user, item, current_time, done).await;
     }
 
     /// Waits until `user`'s Progress in `item` is `expected`.
@@ -174,17 +184,20 @@ impl Setup {
         .await;
     }
 
+    /// How many Handoffs are listed.
+    async fn handoffs(&self) -> usize {
+        self.bridge.api().handoffs(&self.bobs).await.len()
+    }
+
     /// Waits until no Handoff is listed.
     async fn wait_until_no_handoff(&self) {
-        let api = self.bridge.api();
-        let ended = async || api.handoffs(&self.bobs).await.is_empty();
+        let ended = async || self.handoffs().await == 0;
         eventually("the Handoff never ended", WITHIN, ended).await;
     }
 
     /// How often Kitchen was sent SOAP action `action`.
     fn asked(&self, action: &str) -> usize {
-        let actions = self.household.actions_of(&self.kitchen);
-        actions.iter().filter(|sent| *sent == action).count()
+        self.household.asked(&self.kitchen, action)
     }
 
     /// Bob pauses Kitchen.
@@ -193,6 +206,31 @@ impl Setup {
         let paused = self.bridge.api().pause_group(&self.bobs, kitchen).await;
         assert_eq!(paused.state, TransportState::Paused);
     }
+
+    /// Bob resumes Kitchen.
+    async fn resume(&self) {
+        let kitchen = self.kitchen.uuid();
+        let resumed = self.bridge.api().resume_group(&self.bobs, kitchen).await;
+        assert_eq!(resumed.state, TransportState::Playing);
+    }
+
+    /// Alice's Handoff of episode 0 (600 seconds) on Kitchen, played to its end, where Kitchen
+    /// stopped at 600 seconds, and its Finished write failed (as the next `failures` will);
+    /// 605 seconds in.
+    async fn ended_with_finished_failing(&self, proxy: &LibraryProxy, failures: usize) {
+        let episode = self.episode(0);
+        self.start(&self.alices, &episode, Some(EPISODE_DURATIONS[0]))
+            .await;
+        self.advance(590).await;
+        self.wait_for_progress(&self.alice, &episode, (590.0, false))
+            .await;
+        self.advance_and_read(5).await;
+        proxy.fail_progress_writes(failures);
+        self.advance(10).await;
+        let failed = async || proxy.progress_writes_failed() == 1;
+        eventually("the Finished write never came", WITHIN, failed).await;
+        self.settle().await;
+    }
 }
 
 #[tokio::test]
@@ -200,11 +238,18 @@ async fn a_playing_handoff_writes_the_starters_progress_every_30_seconds() {
     let setup = setup().await;
     let episode = setup.episode(0);
     setup.start(&setup.alices, &episode, None).await;
+    let reads = setup.asked(READ);
 
-    setup.advance(30).await;
+    // Not before 30 seconds: then once, with a single read of Kitchen.
+    setup.advance(29).await;
+    setup.settle().await;
+    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
+    setup.advance(1).await;
     setup
         .wait_for_progress(&setup.alice, &episode, (30.0, false))
         .await;
+    setup.settle().await;
+    assert_eq!(setup.asked(READ), reads + 1);
     setup.advance(30).await;
     setup
         .wait_for_progress(&setup.alice, &episode, (60.0, false))
@@ -221,6 +266,27 @@ async fn a_playing_handoff_writes_the_starters_progress_every_30_seconds() {
         setup.progress(&setup.alice, &episode).await,
         Some((42.0, false))
     );
+}
+
+#[tokio::test]
+async fn a_resume_from_the_app_has_the_next_tick_write() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    setup.advance(300).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (300.0, false))
+        .await;
+
+    // Paused, Kitchen is found so at the next tick; resumed from the App, it plays on from
+    // 300 seconds, and the tick after has its Progress written.
+    setup.pause().await;
+    setup.advance_and_settle(30).await;
+    setup.resume().await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (330.0, false))
+        .await;
 }
 
 #[tokio::test]
@@ -251,14 +317,61 @@ async fn reaching_the_end_of_the_item_sets_finished_and_the_group_stops() {
     // Nothing else was started on it, and nothing supervises it any more.
     assert_eq!(setup.asked("AVTransport#SetAVTransportURI"), 1);
     assert_eq!(setup.asked("AVTransport#Play"), 1);
-    let reads = setup.asked(READ);
-    setup.advance(60).await;
-    setup.assert_reads(reads).await;
+    setup.assert_kitchen_unsupervised().await;
     assert_eq!(setup.household.transport_state(&setup.kitchen), "STOPPED");
     assert_eq!(
         setup.progress(&setup.alice, &episode).await,
         Some((length, true))
     );
+}
+
+#[tokio::test]
+async fn a_skip_to_the_end_of_the_item_sets_finished_before_the_next_tick() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    let length = EPISODE_DURATIONS[0];
+    setup.start(&setup.alices, &episode, Some(length)).await;
+    setup.advance(570).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (570.0, false))
+        .await;
+
+    // Bob skips Kitchen to the end of the episode, where it stops; the Bridge, told so, finds
+    // it stopped there within seconds, well before the next tick at 600.
+    let kitchen = setup.kitchen.uuid();
+    let skipped = setup
+        .bridge
+        .api()
+        .skip_group(&setup.bobs, kitchen, Skip::Forward30)
+        .await;
+    assert_eq!(skipped.position, Some(length));
+    for _ in 0..5 {
+        setup.advance(1).await;
+    }
+    setup
+        .wait_for_progress(&setup.alice, &episode, (length, true))
+        .await;
+    setup.wait_until_no_handoff().await;
+}
+
+#[tokio::test]
+async fn an_item_whose_length_only_the_group_tells_ends_at_its_end() {
+    let (proxy, setup) = setup_with_proxy().await;
+    proxy.hide_lengths();
+    let episode = setup.episode(0);
+    let length = EPISODE_DURATIONS[0];
+    setup.start(&setup.alices, &episode, Some(length)).await;
+    setup.advance(590).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (590.0, false))
+        .await;
+
+    setup.advance_and_read(5).await;
+    setup.advance(10).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (length, true))
+        .await;
+    setup.wait_until_no_handoff().await;
 }
 
 #[tokio::test]
@@ -281,7 +394,7 @@ async fn a_group_stopped_short_of_the_end_is_not_finished() {
         setup.progress(&setup.alice, &episode).await,
         Some((575.0, false))
     );
-    assert_eq!(setup.bridge.api().handoffs(&setup.bobs).await.len(), 1);
+    assert_eq!(setup.handoffs().await, 1);
 }
 
 #[tokio::test]
@@ -311,7 +424,7 @@ async fn pausing_just_before_the_end_does_not_set_finished() {
         setup.household.transport_state(&setup.kitchen),
         "PAUSED_PLAYBACK"
     );
-    assert_eq!(setup.bridge.api().handoffs(&setup.bobs).await.len(), 1);
+    assert_eq!(setup.handoffs().await, 1);
 }
 
 #[tokio::test]
@@ -319,25 +432,14 @@ async fn a_finished_write_that_fails_is_tried_again() {
     let (proxy, setup) = setup_with_proxy().await;
     let episode = setup.episode(0);
     let length = EPISODE_DURATIONS[0];
-    setup.start(&setup.alices, &episode, Some(length)).await;
-    setup.advance(590).await;
-    setup
-        .wait_for_progress(&setup.alice, &episode, (590.0, false))
-        .await;
-    setup.advance_and_read(5).await;
 
-    // Kitchen stops at the end, and the Library Server fails the Finished write: the Handoff
-    // stays for another try.
-    proxy.fail_progress_writes(1);
-    setup.advance(10).await;
-    let failed = async || proxy.progress_writes_failed() == 1;
-    eventually("the Finished write never came", WITHIN, failed).await;
-    setup.settle().await;
+    // The Library Server fails the Finished write: the Handoff stays for another try.
+    setup.ended_with_finished_failing(&proxy, 1).await;
     assert_eq!(
         setup.progress(&setup.alice, &episode).await,
         Some((590.0, false))
     );
-    assert_eq!(setup.bridge.api().handoffs(&setup.bobs).await.len(), 1);
+    assert_eq!(setup.handoffs().await, 1);
 
     // The next try lands.
     setup.advance(30).await;
@@ -351,22 +453,13 @@ async fn a_finished_write_that_fails_is_tried_again() {
 async fn a_finished_write_that_keeps_failing_ends_the_handoff_after_three_tries() {
     let (proxy, setup) = setup_with_proxy().await;
     let episode = setup.episode(0);
-    setup
-        .start(&setup.alices, &episode, Some(EPISODE_DURATIONS[0]))
-        .await;
-    setup.advance(590).await;
-    setup
-        .wait_for_progress(&setup.alice, &episode, (590.0, false))
-        .await;
-    setup.advance_and_read(5).await;
 
-    proxy.fail_progress_writes(4);
-    setup.advance(10).await;
+    setup.ended_with_finished_failing(&proxy, 4).await;
     for tries in 1..=2 {
         let failed = async || proxy.progress_writes_failed() == tries;
         eventually("a Finished write never came", WITHIN, failed).await;
         setup.settle().await;
-        assert_eq!(setup.bridge.api().handoffs(&setup.bobs).await.len(), 1);
+        assert_eq!(setup.handoffs().await, 1);
         setup.advance(30).await;
     }
     setup.wait_until_no_handoff().await;
@@ -375,6 +468,56 @@ async fn a_finished_write_that_keeps_failing_ends_the_handoff_after_three_tries(
         setup.progress(&setup.alice, &episode).await,
         Some((590.0, false))
     );
+}
+
+#[tokio::test]
+async fn a_group_resumed_from_the_app_after_a_failed_finished_write_plays_on_unfinished() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    setup.ended_with_finished_failing(&proxy, 1).await;
+
+    // Bob resumes Kitchen, which plays the episode again from its start at 605 seconds: the
+    // next tick writes where it is, not Finished, and the Handoff goes on.
+    setup.resume().await;
+    setup.advance_and_settle(25).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((25.0, false))
+    );
+    assert_eq!(setup.handoffs().await, 1);
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+}
+
+#[tokio::test]
+async fn a_group_playing_again_after_a_failed_finished_write_is_not_finished() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    setup.ended_with_finished_failing(&proxy, 1).await;
+
+    // Played again from outside the App, at its start: the Bridge finds it so at the next
+    // tick, writes that, not Finished, and the Handoff goes on.
+    setup
+        .household
+        .set_transport_state(&setup.kitchen, "PLAYING");
+    setup.advance_and_settle(25).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((0.0, false))
+    );
+    assert_eq!(setup.handoffs().await, 1);
+}
+
+#[tokio::test]
+async fn a_start_replacing_a_handoff_whose_finished_write_failed_writes_it() {
+    let (proxy, setup) = setup_with_proxy().await;
+    setup.ended_with_finished_failing(&proxy, 1).await;
+
+    setup.start(&setup.bobs, &setup.episode(1), None).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &setup.episode(0)).await,
+        Some((EPISODE_DURATIONS[0], true))
+    );
+    assert_eq!(setup.progress(&setup.bob, &setup.episode(0)).await, None);
 }
 
 #[tokio::test]
@@ -387,15 +530,22 @@ async fn a_group_that_cant_be_read_past_its_end_is_read_at_a_bounded_rate() {
         .wait_for_progress(&setup.alice, &episode, (590.0, false))
         .await;
 
-    // Kitchen stops answering what it plays; the Bridge expected the end at 600 seconds.
+    // Kitchen stops answering what it plays; the Bridge expected the end at 600 seconds, so
+    // reads it every second from 595 until 630.
     setup
         .household
         .set_fault(&setup.kitchen, Fault::FailTransportInfo);
     let reads = setup.asked(READ);
-    setup.advance_and_settle(20).await;
-    setup.assert_reads(reads + 1).await;
-    setup.advance_and_settle(60).await;
-    setup.assert_reads(reads + 2).await;
+    setup.advance(4).await;
+    for _ in 595..=630 {
+        setup.advance_and_read(1).await;
+    }
+    // Then only at the ticks: the next at 660.
+    for _ in 631..660 {
+        setup.advance(1).await;
+    }
+    setup.advance_and_settle(1).await;
+    assert_eq!(setup.asked(READ), reads + 36 + 1);
 }
 
 #[tokio::test]
@@ -407,13 +557,15 @@ async fn a_key_rejected_on_a_cadence_write_is_revoked_ending_the_handoff() {
     proxy.reject_progress_writes();
     setup.advance(30).await;
     setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.bridge.api().current_user_error(&setup.alices).await,
+        SESSION_INVALID
+    );
     assert_eq!(setup.progress(&setup.alice, &episode).await, None);
 
-    // Nothing supervises Kitchen any more: no read, no write once writes pass again.
+    // Nothing supervises Kitchen any more: no read, and no write once writes pass again.
     proxy.pass_progress_writes();
-    let reads = setup.asked(READ);
-    setup.advance(30).await;
-    setup.assert_reads(reads).await;
+    setup.assert_kitchen_unsupervised().await;
     assert_eq!(setup.progress(&setup.alice, &episode).await, None);
 }
 
@@ -464,13 +616,12 @@ async fn replacing_a_handoff_writes_its_final_progress_before_the_new_one_starts
     );
     assert_eq!(setup.progress(&setup.bob, &first).await, None);
 
-    // Only Bob's Handoff is supervised from here on: Kitchen is read once at the next tick.
-    let reads = setup.asked(READ);
+    // From here on Bob's Handoff gets Progress at its ticks, Alice's none.
     setup.advance(30).await;
     setup
         .wait_for_progress(&setup.bob, &second, (30.0, false))
         .await;
-    setup.assert_reads(reads + 1).await;
+    setup.settle().await;
     assert_eq!(
         setup.progress(&setup.alice, &first).await,
         Some((110.0, false))
@@ -489,6 +640,14 @@ async fn replacing_a_handoff_writes_its_final_progress_before_the_new_one_starts
         .start_handoff_error(&setup.alices, &first, setup.kitchen.uuid())
         .await;
     assert_eq!(refused, GROUP_FAILED);
+    assert_eq!(
+        setup.progress(&setup.bob, &second).await,
+        Some((35.0, false))
+    );
+
+    // Neither Handoff is left, and nothing writes Bob's Progress any more.
+    assert_eq!(setup.handoffs().await, 0);
+    setup.assert_kitchen_unsupervised().await;
     assert_eq!(
         setup.progress(&setup.bob, &second).await,
         Some((35.0, false))
@@ -536,10 +695,27 @@ async fn a_rejected_replaced_progress_write_does_not_hold_up_the_new_start() {
     let started = Instant::now();
     setup.start(&setup.bobs, &setup.episode(1), None).await;
     assert_replaced_without_progress(&setup, started.elapsed()).await;
+    // Alice's key was revoked, and her session with it.
+    assert_eq!(
+        setup.bridge.api().current_user_error(&setup.alices).await,
+        SESSION_INVALID
+    );
 }
 
 #[tokio::test]
 async fn a_late_replaced_progress_write_does_not_hold_up_the_new_start() {
+    let (proxy, setup) = setup_with_proxy().await;
+    alice_at_110(&setup).await;
+
+    // The Library Server takes too long to write the replaced Handoff's Progress.
+    proxy.delay_progress_writes(Duration::from_secs(20));
+    let started = Instant::now();
+    setup.start(&setup.bobs, &setup.episode(1), None).await;
+    assert_replaced_without_progress(&setup, started.elapsed()).await;
+}
+
+#[tokio::test]
+async fn a_late_group_read_for_the_replaced_progress_does_not_hold_up_the_new_start() {
     let setup = setup().await;
     alice_at_110(&setup).await;
 

@@ -13,12 +13,15 @@
 //!   [`LibraryProxy::pass_progress_writes`].
 //! - [`LibraryProxy::fail_progress_writes`]: the next few of them with 500, as a Library
 //!   Server failing for a moment would.
+//! - [`LibraryProxy::delay_progress_writes`]: every one of them only after a while, as a slow
+//!   Library Server would.
 //!
 //! Everything else, also every deeper path under an Item (its files, its cover), passes as it
 //! is.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -48,6 +51,8 @@ struct Faults {
     fail_progress_writes: AtomicUsize,
     /// How many failed so far.
     progress_writes_failed: AtomicUsize,
+    /// How long, in milliseconds, each Progress write is held before it is passed on.
+    progress_write_delay_ms: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -130,6 +135,14 @@ impl LibraryProxy {
     pub fn progress_writes_failed(&self) -> usize {
         self.faults.progress_writes_failed.load(Ordering::SeqCst)
     }
+
+    /// From now on, each Progress write is passed on only after `delay`, in real time.
+    pub fn delay_progress_writes(&self, delay: Duration) {
+        let millis = u64::try_from(delay.as_millis()).expect("a delay in milliseconds");
+        self.faults
+            .progress_write_delay_ms
+            .store(millis, Ordering::SeqCst);
+    }
 }
 
 impl Drop for LibraryProxy {
@@ -170,6 +183,10 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         faults.progress_writes_failed.fetch_add(1, Ordering::SeqCst);
         let response = Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR);
         return response.body(Body::empty()).expect("response");
+    }
+    if progress_write {
+        let delay = faults.progress_write_delay_ms.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(delay)).await;
     }
     if parts.method == Method::GET
         && parts.uri.path() == "/api/me"

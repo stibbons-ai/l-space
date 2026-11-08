@@ -554,6 +554,16 @@ impl Household {
         actions.map(|(_, action)| action.clone()).collect()
     }
 
+    /// How often `player` was called with SOAP action `action`, as [`Household::actions`]
+    /// names it.
+    pub fn asked(&self, player: &PlayerId, action: &str) -> usize {
+        let state = self.shared.lock();
+        let actions = state.actions.iter();
+        actions
+            .filter(|(uuid, called)| *uuid == player.0 && called == action)
+            .count()
+    }
+
     /// Every URL `player` was given with `SetAVTransportURI`, in order, also those it then
     /// refused or never answered.
     pub fn offered(&self, player: &PlayerId) -> Vec<String> {

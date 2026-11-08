@@ -94,11 +94,7 @@ async fn setup_with(abs: Arc<Audiobookshelf>, url: &str, extra: &[&str]) -> Setu
 impl Setup {
     /// Episode `n` (0-based) of the seeded podcast.
     fn episode(&self, n: usize) -> ItemId {
-        let seeded = self.abs.seeded();
-        ItemId {
-            library_item: seeded.podcast.clone(),
-            episode: Some(seeded.episodes[n].clone()),
-        }
+        self.abs.seeded().episode(n)
     }
 
     /// The Audiobookshelf id of `item`'s one audio file.
@@ -139,22 +135,14 @@ impl Setup {
 
     /// Records `user`'s Progress in `item` in Audiobookshelf, as their own player would.
     async fn set_progress(&self, user: &AbsUser, item: &ItemId, current_time: f64, finished: bool) {
-        self.abs
-            .set_progress(
-                user,
-                &item.library_item,
-                item.episode.as_deref(),
-                current_time,
-                finished,
-            )
+        let abs = &self.abs;
+        abs.set_item_progress(user, item, current_time, finished)
             .await;
     }
 
     /// `user`'s Progress in `item`, straight from Audiobookshelf: `(currentTime, isFinished)`.
     async fn progress(&self, user: &AbsUser, item: &ItemId) -> Option<(f64, bool)> {
-        self.abs
-            .progress(user, &item.library_item, item.episode.as_deref())
-            .await
+        self.abs.item_progress(user, item).await
     }
 
     /// Where `group`'s Group is in its track, and whether it was sent a `Seek`.
@@ -230,10 +218,7 @@ fn assert_quiet(output: &[serde_json::Value], key: &str, stream_ids: &[&str]) {
 
 /// Whether `player` has been called with `action`.
 fn called(household: &Household, player: &PlayerId, action: &str) -> bool {
-    household
-        .actions_of(player)
-        .iter()
-        .any(|called| called == action)
+    household.asked(player, action) > 0
 }
 
 /// The WARN events with `message` in the Bridge's `output`.

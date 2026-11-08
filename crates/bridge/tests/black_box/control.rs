@@ -84,11 +84,7 @@ async fn setup_on(abs: Arc<Audiobookshelf>, url: &str) -> Setup {
 impl Setup {
     /// Episode `n` (0-based) of the seeded podcast: 600, 900 and 3960 seconds long.
     fn episode(&self, n: usize) -> ItemId {
-        let seeded = self.abs.seeded();
-        ItemId {
-            library_item: seeded.podcast.clone(),
-            episode: Some(seeded.episodes[n].clone()),
-        }
+        self.abs.seeded().episode(n)
     }
 
     /// Alice starts `item` on `group`'s Group.
@@ -102,26 +98,20 @@ impl Setup {
     /// `user`'s Progress in `item`, read from Audiobookshelf with their own key: its
     /// `currentTime`, if any.
     async fn progress(&self, user: &AbsUser, item: &ItemId) -> Option<f64> {
-        let progress = self
-            .abs
-            .progress(user, &item.library_item, item.episode.as_deref())
-            .await;
+        let progress = self.abs.item_progress(user, item).await;
         progress.map(|(current_time, _)| current_time)
     }
 
     /// Records `user`'s Progress in `item` in Audiobookshelf, `current_time` seconds in and not
     /// Finished, as their own player would.
     async fn set_progress(&self, user: &AbsUser, item: &ItemId, current_time: f64) {
-        let episode = item.episode.as_deref();
-        self.abs
-            .set_progress(user, &item.library_item, episode, current_time, false)
-            .await;
+        let abs = &self.abs;
+        abs.set_item_progress(user, item, current_time, false).await;
     }
 
     /// How often `player` was sent SOAP action `action`.
     fn asked(&self, player: &PlayerId, action: &str) -> usize {
-        let actions = self.household.actions_of(player);
-        actions.iter().filter(|sent| *sent == action).count()
+        self.household.asked(player, action)
     }
 
     /// Waits until `player` was sent SOAP action `action` more than `before` times, at most
