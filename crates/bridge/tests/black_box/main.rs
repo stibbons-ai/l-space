@@ -4,6 +4,7 @@
 //! modules here so they share one binary.
 
 mod browse;
+mod control;
 mod encryption;
 mod finished;
 mod forwarder;

@@ -10,8 +10,9 @@
 //! the same Fluent resources: [`duration`], [`progress`], [`date`], an episode's row
 //! ([`episode_summary`]), a row on Home ([`home_entry_summary`]), an Item's facts
 //! ([`item_facts`]) and its chapters with their start times ([`chapter_rows`], [`clock`]). So
-//! is what the Groups screen says about a Group's playback ([`group_playback`]), and the
-//! notice that an Item now plays on a Group ([`playing_on`]).
+//! is what the Groups screen says about a Group's playback ([`group_playback`]), where its
+//! track is ([`group_position`]) and its volume ([`group_volume`]), and the notice that an
+//! Item now plays on a Group ([`playing_on`]).
 
 use std::sync::LazyLock;
 
@@ -170,6 +171,12 @@ texts! {
     GroupTransitioning => "group-transitioning",
     GroupNotAnswering => "group-not-answering",
     GroupStateUnknown => "group-state-unknown",
+    GroupPause => "group-pause",
+    GroupResume => "group-resume",
+    GroupBack15 => "group-back-15",
+    GroupForward30 => "group-forward-30",
+    GroupVolumeDown => "group-volume-down",
+    GroupVolumeUp => "group-volume-up",
     PlayOn => "play-on",
     SettingsTitle => "settings-title",
     SettingsLibraryServer => "settings-library-server",
@@ -201,6 +208,7 @@ texts! {
     ErrorGroupNotFound => "error-group-not-found",
     ErrorGroupFailed => "error-group-failed",
     ErrorItemNotPlayable => "error-item-not-playable",
+    ErrorNoHandoff => "error-no-handoff",
     ErrorUnknown => "error-unknown",
 }
 
@@ -240,6 +248,7 @@ macro_rules! phrases {
 phrases! {
     ProgressLeft => "progress-left" ("duration"),
     PlayingOn => "playing-on" ("group"),
+    GroupVolume => "group-volume" ("volume"),
     DurationHoursMinutes => "duration-hours-minutes" ("hours", "minutes"),
     DurationHours => "duration-hours" ("hours"),
     DurationMinutes => "duration-minutes" ("minutes"),
@@ -263,6 +272,7 @@ impl From<&api::ApiError> for Text {
             ApiError::GroupNotFound => Self::ErrorGroupNotFound,
             ApiError::GroupFailed => Self::ErrorGroupFailed,
             ApiError::ItemNotPlayable => Self::ErrorItemNotPlayable,
+            ApiError::NoHandoff => Self::ErrorNoHandoff,
             ApiError::Unknown => Self::ErrorUnknown,
         }
     }
@@ -439,6 +449,24 @@ pub fn group_playback(language: Language, group: &Group) -> String {
         parts.extend(track.title.iter().chain(&track.creator).map(String::as_str));
     }
     parts.join(" · ")
+}
+
+/// Where a Group's track is, as a clock reading, with its length when known: "1:30 / 10:00";
+/// none without a track or a position.
+pub fn group_position(group: &Group) -> Option<String> {
+    let track = group.now_playing.as_ref()?;
+    let position = clock(track.position?);
+    Some(match track.duration {
+        Some(duration) => format!("{position} / {}", clock(duration)),
+        None => position,
+    })
+}
+
+/// A Group's volume as its row says it: "Volume 20".
+pub fn group_volume(language: Language, volume: u8) -> String {
+    let mut args = FluentArgs::new();
+    args.set("volume", volume);
+    phrase(language, Phrase::GroupVolume, &args)
 }
 
 /// An Item's chapters as the Item screen lists them: each title with its start time.
@@ -797,8 +825,8 @@ mod tests {
         for (text, error) in &messages {
             assert_eq!(Text::from(error), *text, "{error:?}");
         }
-        // One message per code (ApiError has 14), each different in every language.
-        assert_eq!(messages.len(), 14, "{messages:?}");
+        // One message per code (ApiError has 15), each different in every language.
+        assert_eq!(messages.len(), 15, "{messages:?}");
         for language in Language::ALL {
             let distinct: BTreeSet<_> = messages
                 .iter()

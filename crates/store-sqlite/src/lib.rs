@@ -394,13 +394,13 @@ fn warn_unreadable(user: &LibraryUser) {
 }
 
 /// A query of Handoffs with their keys, ending in `$rest`: from `handoffs h` joined with
-/// `api_keys k`, the columns [`handoff_row`] reads.
+/// `api_keys k`, the columns [`handoff_row`] reads, then the stream's id (column 12).
 macro_rules! select_handoffs {
     ($rest:literal) => {
         concat!(
             "SELECT h.group_id, h.library_item, h.episode, h.file_ino, h.file_name, h.username, \
-             h.started_at, k.id, k.library_server, k.user_id, k.key_fingerprint, k.sealed_key \
-             FROM handoffs h JOIN api_keys k ON k.id = h.api_key_id ",
+             h.started_at, k.id, k.library_server, k.user_id, k.key_fingerprint, k.sealed_key, \
+             h.stream_id FROM handoffs h JOIN api_keys k ON k.id = h.api_key_id ",
             $rest
         )
     };
@@ -572,6 +572,29 @@ impl Store for SqliteStore {
                 };
                 Ok(match key.open(tx, &sealing)? {
                     Some(api_key) => Lookup::Open(ActiveHandoff { handoff, api_key }),
+                    None => Lookup::Unreadable(key.user),
+                })
+            })
+            .await?;
+        Ok(lookup.found())
+    }
+
+    async fn group_handoff(&self, group: &str) -> Result<Option<(StreamId, ActiveHandoff)>, Error> {
+        let (group, sealing) = (group.to_owned(), Arc::clone(&self.sealing));
+        let lookup = self
+            .transaction(move |tx| {
+                let Some((stream, (handoff, key))) = tx
+                    .prepare_cached(select_handoffs!("WHERE h.group_id = ?1"))?
+                    .query_row(params![group], |row| {
+                        let stream: [u8; 32] = row.get(12)?;
+                        Ok((StreamId::from_bytes(stream), handoff_row(row)?))
+                    })
+                    .optional()?
+                else {
+                    return Ok(Lookup::Unknown);
+                };
+                Ok(match key.open(tx, &sealing)? {
+                    Some(api_key) => Lookup::Open((stream, ActiveHandoff { handoff, api_key })),
                     None => Lookup::Unreadable(key.user),
                 })
             })
@@ -925,6 +948,27 @@ mod tests {
             store.handoff(&StreamId::of("stream-1")).await.unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn a_groups_handoff_with_a_tampered_key_is_none_and_the_key_is_forgotten() {
+        let database = TempDatabase::new();
+        let store = database.open_with(1);
+        login(&store, 1, &alice(), "alice-key").await;
+        start_kitchen(&store, "stream-1", &alice(), "alice-key").await;
+        let mut sealed = database.sealed_key("alice-id");
+        sealed[30] ^= 1;
+        database.set_sealed_key("alice-id", &sealed);
+
+        assert_eq!(store.group_handoff("RINCON_K").await.unwrap(), None);
+        // Forgotten by that lookup, with the session and the Handoff using it.
+        let keys: i64 = database
+            .raw()
+            .query_row("SELECT count(*) FROM api_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(keys, 0);
+        assert_eq!(api_key(&store, 1).await, None);
+        assert_eq!(store.handoffs().await.unwrap(), []);
     }
 
     #[tokio::test]

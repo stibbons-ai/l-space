@@ -1,25 +1,25 @@
 //! The App API's view of this Bridge: configured Library Servers, logins and sessions,
-//! browsing a session's Library Server as its user, the household's Sonos Groups, and
-//! Handoffs.
+//! browsing a session's Library Server as its user, the household's Sonos Groups, Handoffs,
+//! and controlling a Group (its Handoff and its volume).
 
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use api::server::{BoxFuture, Bridge};
 use api::{
     ApiError, CurrentUser, EpisodeFilter, Group, GroupMember, HOME_ENTRIES, Handoff, Home,
-    HomeEntry, Item, ItemId, Library, LibraryEntry, LibraryServer, NowPlaying, Podcast, Session,
-    SessionToken, TransportState,
+    HomeEntry, Item, ItemId, Library, LibraryEntry, LibraryServer, NowPlaying, Playback, Podcast,
+    Session, SessionToken, Skip, TransportState,
 };
 use sonos::Sonos;
 use store::{ActiveHandoff, HandoffFile, LibraryUser, SessionId, Store};
 
 use crate::browse::{self, NoSingleFile};
 use crate::config::{LibraryServerConfig, LibraryServerUrl};
-use crate::stream::StreamToken;
+use crate::stream::{self, StreamToken};
 
 /// How many more Items in progress than the user has Progress records the Bridge asks the
 /// Library Server for, for Home. Audiobookshelf 2.37.2 lists one entry per Progress record
@@ -38,10 +38,11 @@ pub struct AppApi<S> {
     sonos: Arc<dyn Sonos>,
     /// Where the Bridge listens, port 0 resolved: where Groups fetch streams.
     listen: SocketAddr,
-    /// One lock per Group a start is under way on, so starts on one Group take turns from
-    /// storing the Handoff to the Group playing it (or it ending again). An entry whose lock
-    /// no start holds or waits for any more is dropped at the next start.
-    starting: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    /// One lock per Group a start or a control is under way on, so starts and controls on one
+    /// Group take turns: a start from storing the Handoff to the Group playing it (or it
+    /// ending again), a control from reading what the Group plays to writing Progress. An
+    /// entry whose lock no call holds or waits for any more is dropped at the next one.
+    turns: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl<S: Store> AppApi<S> {
@@ -64,7 +65,7 @@ impl<S: Store> AppApi<S> {
             store: Arc::new(store),
             sonos,
             listen,
-            starting: Mutex::default(),
+            turns: Mutex::default(),
         }
     }
 
@@ -522,16 +523,26 @@ impl<S: Store> AppApi<S> {
         Ok(item)
     }
 
-    /// Every Sonos Group, for any valid session.
+    /// Every Sonos Group, for any valid session, each with its active Handoff, if any.
     async fn groups(&self, token: SessionToken) -> Result<Vec<Group>, ApiError> {
         self.session(&token).await?;
-        match self.sonos.groups().await {
-            Ok(groups) => Ok(groups.into_iter().map(group).collect()),
-            Err(error) => {
-                tracing::warn!(%error, "cannot list the Sonos Groups");
-                Err(sonos_error(error))
-            }
-        }
+        let (groups, handoffs) = tokio::join!(self.sonos.groups(), self.store.handoffs());
+        let groups = groups.map_err(|error| {
+            tracing::warn!(%error, "cannot list the Sonos Groups");
+            sonos_error(error)
+        })?;
+        let mut handoffs: HashMap<String, store::Handoff> = handoffs
+            .map_err(storage_error("list the Handoffs"))?
+            .into_iter()
+            .map(|handoff| (handoff.group.clone(), handoff))
+            .collect();
+        Ok(groups
+            .into_iter()
+            .map(|listed| {
+                let handoff = handoffs.remove(&listed.id).map(api_handoff);
+                group(listed, handoff)
+            })
+            .collect())
     }
 
     /// Starts Item `id` on Group `group` for the session's user: resolves the Item's audio
@@ -669,16 +680,250 @@ impl<S: Store> AppApi<S> {
         Ok(api_handoff(handoff))
     }
 
-    /// The lock starts on Group `group` take turns with; forgets the locks no start holds.
+    /// The lock starts and controls on Group `group` take turns with; forgets the locks no
+    /// call holds.
     fn group_lock(&self, group: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut starting = self.starting.lock().unwrap_or_else(PoisonError::into_inner);
-        starting.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = starting.get(group).and_then(Weak::upgrade) {
+        let mut turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
+        turns.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = turns.get(group).and_then(Weak::upgrade) {
             return lock;
         }
         let lock = Arc::new(tokio::sync::Mutex::new(()));
-        starting.insert(group.to_owned(), Arc::downgrade(&lock));
+        turns.insert(group.to_owned(), Arc::downgrade(&lock));
         lock
+    }
+
+    /// Has Group `group` do `control` on its Handoff, for any valid session, whoever started
+    /// the Handoff; only while the Group plays the Handoff's stream, else nothing is sent to
+    /// it ([`ApiError::NoHandoff`]). After a pause or a skip, the Group's new position is
+    /// written as Progress for the starter, with the Handoff's key. Takes turns with starts
+    /// and other controls on the Group.
+    async fn control(
+        &self,
+        token: SessionToken,
+        group: String,
+        control: Control,
+    ) -> Result<Playback, ApiError> {
+        self.session(&token).await?;
+        if !is_group_id(&group) {
+            return Err(ApiError::GroupNotFound);
+        }
+        let turn = self.group_lock(&group);
+        let _turn = turn.lock().await;
+        let playback = self.sonos.playback(&group).await.map_err(|error| {
+            tracing::warn!(group, %error, "cannot read what a Group plays");
+            sonos_error(error)
+        })?;
+        let active = self.playing_handoff(&group, &playback).await?;
+        let mut duration = playback.duration.map(|duration| duration.as_secs_f64());
+        let (sent, state, position) = match control {
+            Control::Resume => (
+                self.sonos.resume(&group).await,
+                TransportState::Playing,
+                playback.position,
+            ),
+            Control::Pause => (
+                self.sonos.pause(&group).await,
+                TransportState::Paused,
+                playback.position,
+            ),
+            Control::Skip(skip) => {
+                let Some(position) = playback.position else {
+                    tracing::warn!(group, "a Group did not tell where it is, so it can't skip");
+                    return Err(ApiError::GroupFailed);
+                };
+                // Before the seek, to keep it within the Item.
+                if duration.is_none() {
+                    duration = self.item_duration(&active).await;
+                }
+                let target = skipped(position, skip, duration);
+                let sent = self.sonos.seek(&group, target).await;
+                (sent, api_state(playback.state), Some(target))
+            }
+        };
+        sent.map_err(|error| {
+            tracing::warn!(group, ?control, %error, "a Group did not take a control");
+            sonos_error(error)
+        })?;
+        tracing::info!(group, ?control, "Group controlled");
+        let position = position.map(|position| position.as_secs_f64());
+        if control != Control::Resume {
+            // After the pause, which mustn't wait for the Library Server; a skip asked before.
+            if control == Control::Pause && duration.is_none() {
+                duration = self.item_duration(&active).await;
+            }
+            match position {
+                Some(position) => self.write_progress(&active, position, duration).await,
+                None => tracing::warn!(
+                    group,
+                    "Progress not written: the Group did not tell where it paused"
+                ),
+            }
+        }
+        Ok(Playback {
+            state,
+            position,
+            duration,
+        })
+    }
+
+    /// The active Handoff on Group `group`, if the Group plays its stream (`playback`, as read
+    /// just before); [`ApiError::NoHandoff`] otherwise.
+    async fn playing_handoff(
+        &self,
+        group: &str,
+        playback: &sonos::Playback,
+    ) -> Result<ActiveHandoff, ApiError> {
+        let Some((stream, active)) = self
+            .store
+            .group_handoff(group)
+            .await
+            .map_err(storage_error("look up a Group's Handoff"))?
+        else {
+            tracing::info!(group, "a control for a Group without a Handoff");
+            return Err(ApiError::NoHandoff);
+        };
+        let playing = playback
+            .uri
+            .as_deref()
+            .and_then(stream::stream_in_url)
+            .is_some_and(|played| played == stream);
+        if !playing {
+            tracing::info!(
+                group,
+                "a control for a Group that plays something other than its Handoff"
+            );
+            return Err(ApiError::NoHandoff);
+        }
+        Ok(active)
+    }
+
+    /// The length in seconds of `active`'s Item, as its starter's Library Server tells it with
+    /// the Handoff's key; none if it doesn't (a failure is logged, and left to the Progress
+    /// write after it to act on).
+    async fn item_duration(&self, active: &ActiveHandoff) -> Option<f64> {
+        let handoff = &active.handoff;
+        let library_server = self.configured_base_url(&handoff.started_by.library_server)?;
+        let id = ItemId {
+            library_item: handoff.library_item.clone(),
+            episode: handoff.episode.clone(),
+        };
+        match self
+            .abs
+            .library_item(library_server, &active.api_key, &id.library_item)
+            .await
+        {
+            Ok(library_item) => browse::item_duration(library_item, &id),
+            Err(error) => {
+                tracing::warn!(
+                    group = handoff.group,
+                    library_server,
+                    library_item = id.library_item,
+                    %error,
+                    "cannot read the length of a Handoff's Item"
+                );
+                None
+            }
+        }
+    }
+
+    /// Writes `position` (seconds, in an Item `duration` seconds long, if known) as Progress in
+    /// `active`'s Item for the user who started it, with the Handoff's key; never with a
+    /// caller's. A failure is logged and otherwise left alone, as the Group already did what
+    /// was asked; a key the Library Server rejects is revoked, which ends the Handoff.
+    async fn write_progress(&self, active: &ActiveHandoff, position: f64, duration: Option<f64>) {
+        let handoff = &active.handoff;
+        let (group, starter) = (&handoff.group, &handoff.started_by);
+        // The operator may have removed the Library Server since the start.
+        let Some(library_server) = self.configured_base_url(&starter.library_server) else {
+            tracing::warn!(
+                group,
+                library_server = starter.library_server,
+                "Progress not written: the Handoff's Library Server is not configured"
+            );
+            return;
+        };
+        let written = self
+            .abs
+            .set_progress(
+                library_server,
+                &active.api_key,
+                &handoff.library_item,
+                handoff.episode.as_deref(),
+                position,
+                duration,
+            )
+            .await;
+        match written {
+            Ok(()) => tracing::info!(
+                group,
+                library_server,
+                user_id = starter.user_id,
+                library_item = handoff.library_item,
+                episode = handoff.episode,
+                position,
+                "Progress written"
+            ),
+            Err(abs::Error::Rejected) => {
+                tracing::warn!(
+                    group,
+                    library_server,
+                    user_id = starter.user_id,
+                    "Progress not written: the Library Server rejected the Handoff's API key"
+                );
+                match self.store.revoke_api_key(starter, &active.api_key).await {
+                    Ok(revoked) => {
+                        // A concurrent call may have revoked it first; that one logged it.
+                        if revoked {
+                            tracing::info!(
+                                library_server,
+                                user_id = starter.user_id,
+                                reason = "the Library Server rejected the API key",
+                                "API key revoked, this user's sessions and Handoffs using it \
+                                 ended"
+                            );
+                        }
+                    }
+                    Err(error) => log_storage_error("revoke an API key", &error),
+                }
+            }
+            Err(error) => tracing::warn!(
+                group,
+                library_server,
+                user_id = starter.user_id,
+                library_item = handoff.library_item,
+                episode = handoff.episode,
+                %error,
+                "Progress not written"
+            ),
+        }
+    }
+
+    /// Sets Group `group`'s volume to `volume` (above [`api::MAX_VOLUME`]: that), for any
+    /// valid session, with or without a Handoff; takes turns with starts and controls on the
+    /// Group. Returns the volume set.
+    async fn set_group_volume(
+        &self,
+        token: SessionToken,
+        group: String,
+        volume: u8,
+    ) -> Result<u8, ApiError> {
+        self.session(&token).await?;
+        if !is_group_id(&group) {
+            return Err(ApiError::GroupNotFound);
+        }
+        let volume = volume.min(api::MAX_VOLUME);
+        let turn = self.group_lock(&group);
+        let _turn = turn.lock().await;
+        self.sonos
+            .set_volume(&group, volume)
+            .await
+            .map_err(|error| {
+                tracing::warn!(group, volume, %error, "a Group's volume was not set");
+                sonos_error(error)
+            })?;
+        tracing::info!(group, volume, "Group volume set");
+        Ok(volume)
     }
 
     /// Every active Handoff, for any valid session.
@@ -896,6 +1141,40 @@ impl<S: Store> Bridge for AppApi<S> {
     fn handoffs(&self, token: SessionToken) -> BoxFuture<'_, Result<Vec<Handoff>, ApiError>> {
         Box::pin(self.handoffs(token))
     }
+
+    fn pause_group(
+        &self,
+        token: SessionToken,
+        group: String,
+    ) -> BoxFuture<'_, Result<Playback, ApiError>> {
+        Box::pin(self.control(token, group, Control::Pause))
+    }
+
+    fn resume_group(
+        &self,
+        token: SessionToken,
+        group: String,
+    ) -> BoxFuture<'_, Result<Playback, ApiError>> {
+        Box::pin(self.control(token, group, Control::Resume))
+    }
+
+    fn skip_group(
+        &self,
+        token: SessionToken,
+        group: String,
+        skip: Skip,
+    ) -> BoxFuture<'_, Result<Playback, ApiError>> {
+        Box::pin(self.control(token, group, Control::Skip(skip)))
+    }
+
+    fn set_group_volume(
+        &self,
+        token: SessionToken,
+        group: String,
+        volume: u8,
+    ) -> BoxFuture<'_, Result<u8, ApiError>> {
+        Box::pin(self.set_group_volume(token, group, volume))
+    }
 }
 
 /// The App API's answer to Sonos failing.
@@ -943,8 +1222,8 @@ fn now_millis() -> i64 {
     i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// A Group as the App API describes it.
-fn group(group: sonos::Group) -> Group {
+/// A Group as the App API describes it, with its active Handoff, if any.
+fn group(group: sonos::Group, handoff: Option<Handoff>) -> Group {
     Group {
         id: group.id,
         name: group.name,
@@ -956,20 +1235,46 @@ fn group(group: sonos::Group) -> Group {
                 name: member.name,
             })
             .collect(),
-        state: group.state.map(|state| match state {
-            sonos::TransportState::Playing => TransportState::Playing,
-            sonos::TransportState::Paused => TransportState::Paused,
-            sonos::TransportState::Stopped => TransportState::Stopped,
-            sonos::TransportState::Transitioning => TransportState::Transitioning,
-            sonos::TransportState::Unknown => TransportState::Unknown,
-        }),
+        state: group.state.map(api_state),
         now_playing: group.track.map(|track| NowPlaying {
             title: track.title,
             creator: track.creator,
             position: track.position.map(|position| position.as_secs_f64()),
             duration: track.duration.map(|duration| duration.as_secs_f64()),
         }),
+        volume: group.volume,
+        handoff,
     }
+}
+
+/// A transport state as the App API names it.
+fn api_state(state: sonos::TransportState) -> TransportState {
+    match state {
+        sonos::TransportState::Playing => TransportState::Playing,
+        sonos::TransportState::Paused => TransportState::Paused,
+        sonos::TransportState::Stopped => TransportState::Stopped,
+        sonos::TransportState::Transitioning => TransportState::Transitioning,
+        sonos::TransportState::Unknown => TransportState::Unknown,
+    }
+}
+
+/// A control of a Group's Handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Control {
+    Pause,
+    Resume,
+    Skip(Skip),
+}
+
+/// Where `skip` from `position` lands, in whole seconds: never before the start, nor past
+/// the end of an Item `duration` seconds long (if known).
+fn skipped(position: Duration, skip: Skip, duration: Option<f64>) -> Duration {
+    let mut target = (position.as_secs_f64() + f64::from(skip.seconds())).max(0.0);
+    if let Some(duration) = duration {
+        target = target.min(duration);
+    }
+    // `as` rounds down; the target is finite and not negative.
+    Duration::from_secs(target as u64)
 }
 
 /// 256 random bits from the operating system, hex-encoded, for `what` (a session token, a

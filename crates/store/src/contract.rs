@@ -53,6 +53,11 @@ macro_rules! store_contract_tests {
             ending_a_handoff_ends_only_it,
             revoking_a_key_ends_the_handoffs_acting_with_it,
             ending_a_replaced_stream_leaves_its_replacement,
+            a_groups_handoff_is_found_with_its_stream_and_starters_key,
+            a_group_without_a_handoff_has_none,
+            a_groups_handoff_is_the_one_that_replaced_its_old_one,
+            a_groups_handoff_ends_with_its_stream_or_its_key,
+            a_groups_handoff_outlives_the_session_that_started_it,
         );
     };
     (@tests $backend:expr; $($test:ident),* $(,)?) => {
@@ -554,4 +559,105 @@ pub async fn revoking_a_key_ends_the_handoffs_acting_with_it(backend: &impl Back
 
     assert_eq!(active(&store, stream(1)).await, None);
     assert_eq!(listed(&store).await, [office]);
+}
+
+async fn on_group(store: &impl Store, group: &str) -> Option<(StreamId, ActiveHandoff)> {
+    store
+        .group_handoff(group)
+        .await
+        .expect("look up a Group's handoff")
+}
+
+fn on_stream(
+    stream: StreamId,
+    handoff: &Handoff,
+    api_key: &str,
+) -> Option<(StreamId, ActiveHandoff)> {
+    acting_with(handoff, api_key).map(|active| (stream, active))
+}
+
+pub async fn a_groups_handoff_is_found_with_its_stream_and_starters_key(backend: &impl Backend) {
+    let store = backend.open().await;
+    let kitchen = handoff("RINCON_K", "ep-1", &alice(), 1_000);
+    let office = handoff("RINCON_O", "ep-2", &bob(), 2_000);
+    start(&store, stream(1), &kitchen, "alice-key").await;
+    start(&store, stream(2), &office, "bob-key").await;
+
+    assert_eq!(
+        on_group(&store, "RINCON_K").await,
+        on_stream(stream(1), &kitchen, "alice-key")
+    );
+    assert_eq!(
+        on_group(&store, "RINCON_O").await,
+        on_stream(stream(2), &office, "bob-key")
+    );
+}
+
+pub async fn a_group_without_a_handoff_has_none(backend: &impl Backend) {
+    let store = backend.open().await;
+    assert_eq!(on_group(&store, "RINCON_K").await, None);
+
+    start(
+        &store,
+        stream(1),
+        &handoff("RINCON_K", "ep-1", &alice(), 1_000),
+        "alice-key",
+    )
+    .await;
+    assert_eq!(on_group(&store, "RINCON_O").await, None);
+    // Group ids are exact.
+    assert_eq!(on_group(&store, "rincon_k").await, None);
+}
+
+pub async fn a_groups_handoff_is_the_one_that_replaced_its_old_one(backend: &impl Backend) {
+    let store = backend.open().await;
+    start(
+        &store,
+        stream(1),
+        &handoff("RINCON_K", "ep-1", &alice(), 1_000),
+        "alice-key",
+    )
+    .await;
+    let second = handoff("RINCON_K", "ep-2", &bob(), 2_000);
+    start(&store, stream(2), &second, "bob-key").await;
+
+    assert_eq!(
+        on_group(&store, "RINCON_K").await,
+        on_stream(stream(2), &second, "bob-key")
+    );
+}
+
+pub async fn a_groups_handoff_ends_with_its_stream_or_its_key(backend: &impl Backend) {
+    let store = backend.open().await;
+    let kitchen = handoff("RINCON_K", "ep-1", &alice(), 1_000);
+    let office = handoff("RINCON_O", "ep-2", &bob(), 2_000);
+    start(&store, stream(1), &kitchen, "alice-key").await;
+    start(&store, stream(2), &office, "bob-key").await;
+
+    assert!(store.end_handoff(&stream(1)).await.expect("end"));
+    assert_eq!(on_group(&store, "RINCON_K").await, None);
+
+    assert!(
+        store
+            .revoke_api_key(&bob(), &key("bob-key"))
+            .await
+            .expect("revoke")
+    );
+    assert_eq!(on_group(&store, "RINCON_O").await, None);
+}
+
+pub async fn a_groups_handoff_outlives_the_session_that_started_it(backend: &impl Backend) {
+    let kitchen = handoff("RINCON_K", "ep-1", &alice(), 1_000);
+    {
+        let store = backend.open().await;
+        open(&store, session_id(1), &alice(), "alice-key").await;
+        start(&store, stream(1), &kitchen, "alice-key").await;
+        assert!(store.close_session(&session_id(1)).await.expect("close"));
+    }
+
+    let store = backend.open().await;
+    assert_eq!(
+        on_group(&store, "RINCON_K").await,
+        on_stream(stream(1), &kitchen, "alice-key")
+    );
 }

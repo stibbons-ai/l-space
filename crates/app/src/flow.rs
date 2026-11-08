@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use api::{
     ApiError, ApiKey, Episode, EpisodeFilter, Group, Home, Item, ItemId, Library, LibraryEntry,
-    LibraryKind, LibraryServer, Podcast, Session, SessionToken,
+    LibraryKind, LibraryServer, Playback, Podcast, Session, SessionToken, Skip,
 };
 use dioxus::fullstack::http::header::{AUTHORIZATION, HeaderValue};
 use dioxus::fullstack::{HeaderMap, get_server_url, set_request_headers, set_server_url};
@@ -71,8 +71,8 @@ pub enum Screen {
         groups: Vec<Group>,
         notice: Option<Notice>,
     },
-    /// Logged in: every Sonos Group with its members and what it plays. Empty, with a notice,
-    /// when they could not be listed.
+    /// Logged in: every Sonos Group with its members, what it plays, its volume and its
+    /// Handoff, whose controls it offers. Empty, with a notice, when they could not be listed.
     Groups {
         groups: Vec<Group>,
         notice: Option<Notice>,
@@ -679,16 +679,7 @@ impl App {
                 self.go_back();
                 self.set_notice(Notice::PlayingOn(name));
             }
-            Err(ApiError::GroupNotFound) => match self.call(api::groups()).await {
-                Ok(listed) => {
-                    if let Screen::PlayOn { groups, .. } = &mut self.screen {
-                        *groups = listed;
-                    }
-                    self.set_notice(Notice::Api(ApiError::GroupNotFound));
-                }
-                // Why the Groups could not be listed afresh matters more now.
-                Err(error) => self.failed(error).await,
-            },
+            Err(error @ ApiError::GroupNotFound) => self.relist_groups(error).await,
             Err(error) => self.failed(error).await,
         }
     }
@@ -725,6 +716,85 @@ impl App {
                     };
                 }
             }
+        }
+    }
+
+    /// On the Groups screen, pauses Group `group`'s Handoff (whoever started it) and shows the
+    /// Group paused where it stopped. On failure, as every Group control: a Group gone or
+    /// without a Handoff it plays has the Groups listed afresh with that notice; anything else
+    /// is said on the screen.
+    pub async fn pause_group(&mut self, group: &str) {
+        let call = api::pause_group(group.to_owned());
+        self.control_group(group, call, show_playback).await;
+    }
+
+    /// On the Groups screen, has Group `group` play its Handoff on, and shows it playing.
+    pub async fn resume_group(&mut self, group: &str) {
+        let call = api::resume_group(group.to_owned());
+        self.control_group(group, call, show_playback).await;
+    }
+
+    /// On the Groups screen, moves Group `group`'s Handoff by `skip`, and shows where it is
+    /// then.
+    pub async fn skip_group(&mut self, group: &str, skip: Skip) {
+        let call = api::skip_group(group.to_owned(), skip);
+        self.control_group(group, call, show_playback).await;
+    }
+
+    /// On the Groups screen, sets Group `group`'s volume to `volume` (at most 100), and shows
+    /// the volume set.
+    pub async fn set_group_volume(&mut self, group: &str, volume: u8) {
+        let call = api::set_group_volume(group.to_owned(), volume);
+        self.control_group(group, call, |group, volume| group.volume = Some(volume))
+            .await;
+    }
+
+    /// On the Groups screen, makes `call` controlling Group `group`, and shows its answer on
+    /// the Group's row with `shown`, clearing any notice. A Group that is gone
+    /// (`group_not_found`) or no longer has a Handoff it plays (`no_handoff`) has the Groups
+    /// listed afresh, with that notice; if they can't be listed, the list stays and says why
+    /// instead (an ended session leads to Login). Any other failure is said on the screen as
+    /// it is.
+    async fn control_group<T>(
+        &mut self,
+        group: &str,
+        call: impl Future<Output = Result<T, ApiError>>,
+        shown: impl FnOnce(&mut Group, T),
+    ) {
+        if !matches!(self.screen, Screen::Groups { .. }) {
+            return;
+        }
+        match self.call(call).await {
+            Ok(answer) => {
+                if let Screen::Groups { groups, notice } = &mut self.screen {
+                    *notice = None;
+                    if let Some(listed) = groups.iter_mut().find(|listed| listed.id == group) {
+                        shown(listed, answer);
+                    }
+                }
+            }
+            Err(error @ (ApiError::GroupNotFound | ApiError::NoHandoff)) => {
+                self.relist_groups(error).await;
+            }
+            Err(error) => self.failed(error).await,
+        }
+    }
+
+    /// After `error` showed the Groups listed (on the picker or the Groups screen) are out of
+    /// date, lists them afresh and says `error`; if they can't be listed, the list stays and
+    /// says why instead (an ended session leads to Login).
+    async fn relist_groups(&mut self, error: ApiError) {
+        match self.call(api::groups()).await {
+            Ok(listed) => {
+                if let Screen::PlayOn { groups, .. } | Screen::Groups { groups, .. } =
+                    &mut self.screen
+                {
+                    *groups = listed;
+                }
+                self.set_notice(Notice::Api(error));
+            }
+            // Why the Groups could not be listed afresh matters more now.
+            Err(error) => self.failed(error).await,
         }
     }
 
@@ -998,6 +1068,29 @@ impl App {
         if let Some(notice) = self.screen.notice_mut() {
             *notice = Some(new);
         }
+    }
+}
+
+/// How much the Groups screen's volume buttons change a Group's volume.
+const VOLUME_STEP: u8 = 5;
+
+/// `volume` a [`VOLUME_STEP`] louder (`louder`) or quieter, within 0 to
+/// [`api::MAX_VOLUME`].
+pub fn volume_step(volume: u8, louder: bool) -> u8 {
+    if louder {
+        volume.saturating_add(VOLUME_STEP).min(api::MAX_VOLUME)
+    } else {
+        volume.saturating_sub(VOLUME_STEP)
+    }
+}
+
+/// Shows `playback`, a control's answer, on `group`'s row: its state and position, and the
+/// length if the answer tells one.
+fn show_playback(group: &mut Group, playback: Playback) {
+    group.state = Some(playback.state);
+    if let Some(now_playing) = &mut group.now_playing {
+        now_playing.position = playback.position;
+        now_playing.duration = playback.duration.or(now_playing.duration);
     }
 }
 

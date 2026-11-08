@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use api::{
     ApiError, ApiKey, EpisodeFilter, Group, GroupMember, Home, HomeEntry, Item, ItemId, Library,
-    LibraryEntry, LibraryKind, LibraryServer, NowPlaying, Podcast, Progress, Session,
+    LibraryEntry, LibraryKind, LibraryServer, NowPlaying, Podcast, Progress, Session, Skip,
     TransportState,
 };
 use app::flow::{App, Notice, Screen};
@@ -3293,6 +3293,8 @@ fn the_groups_screen_shows_each_group_and_what_it_plays() {
                     position: Some(90.0),
                     duration: Some(600.0),
                 }),
+                volume: Some(sonos_fake::DEFAULT_VOLUME),
+                handoff: None,
             },
             Group {
                 id: office.uuid().to_owned(),
@@ -3300,6 +3302,8 @@ fn the_groups_screen_shows_each_group_and_what_it_plays() {
                 members: vec![member(&office, "Office")],
                 state: Some(TransportState::Stopped),
                 now_playing: None,
+                volume: Some(sonos_fake::DEFAULT_VOLUME),
+                handoff: None,
             },
         ];
         assert_eq!(
@@ -3711,5 +3715,268 @@ fn a_group_gone_whose_groups_cant_be_listed_afresh_says_why() {
         );
         assert_eq!(picker_names(&app), ["Kitchen", "Office"]);
         assert!(app.session().is_some());
+    });
+}
+
+/// The Groups the Groups screen lists.
+fn shown_groups(app: &App) -> &[Group] {
+    let Screen::Groups { groups, .. } = app.screen() else {
+        panic!("{:?}", app.screen());
+    };
+    groups
+}
+
+/// The Group named `name` on the Groups screen.
+fn shown_group<'a>(app: &'a App, name: &str) -> &'a Group {
+    let groups = shown_groups(app);
+    let group = groups.iter().find(|group| group.name == name);
+    group.unwrap_or_else(|| panic!("no Group {name}: {groups:?}"))
+}
+
+/// Where the Group named `name` is on the Groups screen: its state and position.
+fn shown_playback(app: &App, name: &str) -> (Option<TransportState>, Option<f64>) {
+    let group = shown_group(app, name);
+    let position = group.now_playing.as_ref().and_then(|track| track.position);
+    (group.state, position)
+}
+
+/// Logs `other` in on `bridge` and starts episode `n` of the seeded podcast as them on
+/// `group`'s Group; returns the episode.
+async fn started_by(
+    bridge: &TestBridge,
+    abs: &Audiobookshelf,
+    other: &AbsUser,
+    n: usize,
+    group: &PlayerId,
+) -> ItemId {
+    let session = bridge.api().login(abs.base_url(), &other.api_key.key).await;
+    let seeded = abs.seeded();
+    let episode = ItemId {
+        library_item: seeded.podcast.clone(),
+        episode: Some(seeded.episodes[n].clone()),
+    };
+    bridge
+        .api()
+        .start_handoff(&session, &episode, group.uuid())
+        .await;
+    episode
+}
+
+#[test]
+fn the_groups_screen_controls_a_handoff_another_member_started() {
+    let (household, clock) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let office = household.add_player("Office");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let (alice, bob) = (abs.new_user().await, abs.new_user().await);
+        let episode = started_by(&bridge, &abs, &alice, 0, &kitchen).await;
+        clock.advance(Duration::from_secs(120));
+        let mut app = logged_in(&device, &bridge, &abs, &bob).await;
+        app.open_groups().await;
+        // Kitchen offers the controls of Alice's Handoff; Office has none.
+        let handoff = shown_group(&app, "Kitchen")
+            .handoff
+            .clone()
+            .expect("a Handoff");
+        assert_eq!(handoff.started_by.user_id, alice.id);
+        assert_eq!(shown_group(&app, "Office").handoff, None);
+
+        app.pause_group(kitchen.uuid()).await;
+        assert_eq!(
+            shown_playback(&app, "Kitchen"),
+            (Some(TransportState::Paused), Some(120.0))
+        );
+        assert_eq!(app.screen().notice(), None);
+        assert_eq!(household.transport_state(&kitchen), "PAUSED_PLAYBACK");
+        // The Library Server holds Alice's Progress, none of Bob's.
+        let progress = async |user: &AbsUser| {
+            let at = abs.progress(user, &episode.library_item, episode.episode.as_deref());
+            at.await.map(|(current_time, _)| current_time)
+        };
+        assert_eq!(progress(&alice).await, Some(120.0));
+        assert_eq!(progress(&bob).await, None);
+        // The row tells where it paused, in an Item the Library Server says is 10 min long.
+        assert_eq!(
+            i18n::group_position(shown_group(&app, "Kitchen")).as_deref(),
+            Some("2:00 / 10:00")
+        );
+
+        app.resume_group(kitchen.uuid()).await;
+        assert_eq!(
+            shown_playback(&app, "Kitchen"),
+            (Some(TransportState::Playing), Some(120.0))
+        );
+        app.skip_group(kitchen.uuid(), Skip::Forward30).await;
+        assert_eq!(
+            shown_playback(&app, "Kitchen"),
+            (Some(TransportState::Playing), Some(150.0))
+        );
+        app.skip_group(kitchen.uuid(), Skip::Back15).await;
+        assert_eq!(
+            shown_playback(&app, "Kitchen"),
+            (Some(TransportState::Playing), Some(135.0))
+        );
+        assert_eq!(household.position(&kitchen), Duration::from_secs(135));
+        assert_eq!(progress(&alice).await, Some(135.0));
+        assert_eq!(household.uri(&office), None);
+
+        // Refreshing shows the same.
+        app.open_groups().await;
+        assert_eq!(
+            shown_playback(&app, "Kitchen"),
+            (Some(TransportState::Playing), Some(135.0))
+        );
+    });
+}
+
+#[test]
+fn the_volume_steps_on_any_group_and_reads_in_english_and_german() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    household.set_volume(&kitchen, 98);
+    let office = household.add_player("Office");
+    household.set_volume(&office, 3);
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.open_groups().await;
+        let volume = |app: &App, name: &str| shown_group(app, name).volume;
+        assert_eq!(
+            (volume(&app, "Kitchen"), volume(&app, "Office")),
+            (Some(98), Some(3))
+        );
+
+        // Neither Group has a Handoff; steps stop at 100 and 0.
+        app.set_group_volume(kitchen.uuid(), app::flow::volume_step(98, true))
+            .await;
+        app.set_group_volume(office.uuid(), app::flow::volume_step(3, false))
+            .await;
+        assert_eq!(
+            (volume(&app, "Kitchen"), volume(&app, "Office")),
+            (Some(100), Some(0))
+        );
+        assert_eq!(
+            (household.volume(&kitchen), household.volume(&office)),
+            (100, 0)
+        );
+        assert_eq!(app.screen().notice(), None);
+        assert_eq!(
+            texts_of(&mut app, |app| i18n::group_volume(app.language(), 35)).await,
+            ("Volume 35".to_owned(), "Lautstärke 35".to_owned())
+        );
+    });
+}
+
+#[test]
+fn a_control_on_a_group_gone_or_without_its_handoff_lists_the_groups_afresh() {
+    let (household, clock) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let office = household.add_player("Office");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        started_by(&bridge, &abs, &user, 0, &kitchen).await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.open_groups().await;
+
+        // Something else plays on Kitchen since, from the Sonos app.
+        household.play(&kitchen, FakeTrack::new("Radio", Duration::from_secs(3600)));
+        clock.advance(Duration::from_secs(5));
+        app.pause_group(kitchen.uuid()).await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::NoHandoff))
+        );
+        assert_eq!(notice_texts(&mut app).await, both(Text::ErrorNoHandoff));
+        assert_eq!(household.transport_state(&kitchen), "PLAYING");
+        // Listed afresh: Kitchen plays the radio now.
+        let radio = shown_group(&app, "Kitchen").now_playing.clone();
+        assert_eq!(
+            radio.and_then(|track| track.title).as_deref(),
+            Some("Radio")
+        );
+
+        // Office is unplugged since.
+        household.remove(&office);
+        app.set_group_volume(office.uuid(), 50).await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::GroupNotFound))
+        );
+        let names: Vec<&str> = shown_groups(&app)
+            .iter()
+            .map(|group| group.name.as_str())
+            .collect();
+        assert_eq!(names, ["Kitchen"]);
+    });
+}
+
+#[test]
+fn a_group_that_refuses_a_control_says_so_and_keeps_its_row() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        started_by(&bridge, &abs, &user, 1, &kitchen).await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.open_groups().await;
+        let shown = shown_groups(&app).to_vec();
+        household.set_fault(&kitchen, Fault::RefuseControl);
+
+        app.skip_group(kitchen.uuid(), Skip::Forward30).await;
+        assert_eq!(
+            app.screen(),
+            &Screen::Groups {
+                groups: shown,
+                notice: Some(Notice::Api(ApiError::GroupFailed)),
+            }
+        );
+        assert_eq!(notice_texts(&mut app).await, both(Text::ErrorGroupFailed));
+
+        // The next control that works clears the notice.
+        household.set_fault(&kitchen, Fault::None);
+        app.pause_group(kitchen.uuid()).await;
+        assert_eq!(app.screen().notice(), None);
+        assert_eq!(
+            shown_playback(&app, "Kitchen").0,
+            Some(TransportState::Paused)
+        );
+    });
+}
+
+#[test]
+fn a_session_ended_elsewhere_leads_from_a_group_control_to_login() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        started_by(&bridge, &abs, &user, 0, &kitchen).await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.open_groups().await;
+        bridge.api().logout(&session(&app)).await;
+
+        app.pause_group(kitchen.uuid()).await;
+
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Login {
+                    notice: Some(Notice::Api(ApiError::SessionInvalid)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(household.transport_state(&kitchen), "PLAYING");
     });
 }

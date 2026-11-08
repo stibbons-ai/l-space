@@ -56,6 +56,17 @@ impl std::fmt::Debug for StreamToken {
     }
 }
 
+/// The stream named in `url`, if it is a stream's URL as a Group holds it:
+/// `http://<host>/stream/<id>/<file>`, on whatever address and port. Only the shape is
+/// checked; whether it names a Handoff is the store's to say.
+pub fn stream_in_url(url: &str) -> Option<store::StreamId> {
+    let (_, path) = url.strip_prefix("http://")?.split_once('/')?;
+    let mut segments = path.split('/');
+    let (stream, id, file) = (segments.next()?, segments.next()?, segments.next()?);
+    let shaped = stream == "stream" && !id.is_empty() && !file.is_empty();
+    (shaped && segments.next().is_none()).then(|| store::StreamId::of(id))
+}
+
 /// `text` as one URL path segment: ASCII letters, digits and `-._~` as they are, every other
 /// byte percent-encoded.
 fn path_segment(text: &str) -> String {
@@ -217,7 +228,31 @@ fn not_found() -> Response {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::{StreamToken, range};
+    use super::{StreamToken, range, stream_in_url};
+
+    #[test]
+    fn a_streams_id_is_read_back_from_its_url_on_any_address() {
+        let token = StreamToken::new("ab12".into());
+        let path = token.path("Episode 1.mp3");
+        for url in [
+            format!("http://127.0.0.1:9{path}"),
+            format!("http://[::1]:8080{path}"),
+        ] {
+            assert_eq!(stream_in_url(&url), Some(token.hash()), "{url}");
+        }
+        for other in [
+            "http://127.0.0.1:9/stream/ab12",
+            "http://127.0.0.1:9/stream//x.mp3",
+            "http://127.0.0.1:9/stream/ab12/x.mp3/more",
+            "http://127.0.0.1:9/track/ab12/x.mp3",
+            "https://127.0.0.1:9/stream/ab12/x.mp3",
+            "x-sonos-spotify:spotify%3atrack%3a1",
+            "http://127.0.0.1:9",
+            "",
+        ] {
+            assert_eq!(stream_in_url(other), None, "{other}");
+        }
+    }
 
     #[test]
     fn a_file_name_is_one_percent_encoded_segment() {

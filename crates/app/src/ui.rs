@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use api::{
     ApiKey, EpisodeFilter, Group, Home, HomeEntry, Item, Library, LibraryEntry, LibraryServer,
+    MAX_VOLUME, Skip, TransportState,
 };
 use dioxus::prelude::*;
 
-use crate::flow::{App, Notice, Screen};
+use crate::flow::{App, Notice, Screen, volume_step};
 use crate::i18n::{self, LanguageChoice, Text};
 use crate::storage::FileStore;
 
@@ -676,10 +677,101 @@ fn GroupsScreen(
                     span { class: "title", "{group.name}" }
                     span { class: "detail", {member_names(&group)} }
                     span { class: "detail", {i18n::group_playback(language, &group)} }
+                    if let Some(position) = i18n::group_position(&group) {
+                        span { class: "detail", "{position}" }
+                    }
+                    GroupControls { app, busy, group }
                 }
             }
         }
     }
+}
+
+/// A Group's controls: for its Handoff, Pause or Resume (by its state), 15 s back and 30 s
+/// forward; its volume with a step down and up, if it told one. All are off while any action
+/// runs, this Group's included.
+#[component]
+fn GroupControls(app: Signal<App>, busy: Signal<bool>, group: Group) -> Element {
+    let text = |text| app.read().text(text);
+    let language = app.read().language();
+    let playing = matches!(
+        group.state,
+        Some(TransportState::Playing | TransportState::Transitioning)
+    );
+    let (toggle, toggle_label) = if playing {
+        (Control::Pause, Text::GroupPause)
+    } else {
+        (Control::Resume, Text::GroupResume)
+    };
+    let id = group.id.clone();
+    let control = move |action: Control| {
+        let id = id.clone();
+        move |_: MouseEvent| {
+            let id = id.clone();
+            act(app, busy, async move |app: &mut App| match action {
+                Control::Pause => app.pause_group(&id).await,
+                Control::Resume => app.resume_group(&id).await,
+                Control::Skip(skip) => app.skip_group(&id, skip).await,
+                Control::Volume(volume) => app.set_group_volume(&id, volume).await,
+            });
+        }
+    };
+    rsx! {
+        if group.handoff.is_some() {
+            div { class: "actions", role: "group",
+                button {
+                    r#type: "button",
+                    disabled: busy(),
+                    onclick: control(toggle),
+                    {text(toggle_label)}
+                }
+                button {
+                    r#type: "button",
+                    class: "secondary",
+                    disabled: busy(),
+                    onclick: control(Control::Skip(Skip::Back15)),
+                    {text(Text::GroupBack15)}
+                }
+                button {
+                    r#type: "button",
+                    class: "secondary",
+                    disabled: busy(),
+                    onclick: control(Control::Skip(Skip::Forward30)),
+                    {text(Text::GroupForward30)}
+                }
+            }
+        }
+        if let Some(volume) = group.volume {
+            div { class: "volume", role: "group",
+                button {
+                    r#type: "button",
+                    class: "secondary",
+                    aria_label: text(Text::GroupVolumeDown),
+                    disabled: busy() || volume == 0,
+                    onclick: control(Control::Volume(volume_step(volume, false))),
+                    "−"
+                }
+                span { class: "detail", {i18n::group_volume(language, volume)} }
+                button {
+                    r#type: "button",
+                    class: "secondary",
+                    aria_label: text(Text::GroupVolumeUp),
+                    disabled: busy() || volume >= MAX_VOLUME,
+                    onclick: control(Control::Volume(volume_step(volume, true))),
+                    "+"
+                }
+            }
+        }
+    }
+}
+
+/// What a button on a Group's row does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Control {
+    Pause,
+    Resume,
+    Skip(Skip),
+    Volume(u8),
 }
 
 /// A Group's members as its row lists them: "Kitchen, Bath".
