@@ -17,7 +17,8 @@
 //!   Library Server would.
 //!
 //! Everything else, also every deeper path under an Item (its files, its cover), passes as it
-//! is.
+//! is. [`LibraryProxy::progress_writes`] counts the Progress writes that arrived, whatever
+//! the proxy answered them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -47,6 +48,8 @@ struct Faults {
     reject_item_lookups: AtomicBool,
     hang_identity: AtomicBool,
     reject_progress_writes: AtomicBool,
+    /// How many Progress writes arrived so far.
+    progress_writes: AtomicUsize,
     /// How many Progress writes are still to fail.
     fail_progress_writes: AtomicUsize,
     /// How many failed so far.
@@ -136,6 +139,11 @@ impl LibraryProxy {
         self.faults.progress_writes_failed.load(Ordering::SeqCst)
     }
 
+    /// How many Progress writes arrived so far, answered by the proxy or passed on.
+    pub fn progress_writes(&self) -> usize {
+        self.faults.progress_writes.load(Ordering::SeqCst)
+    }
+
     /// From now on, each Progress write is passed on only after `delay`, in real time.
     pub fn delay_progress_writes(&self, delay: Duration) {
         let millis = u64::try_from(delay.as_millis()).expect("a delay in milliseconds");
@@ -167,6 +175,9 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
             .is_some_and(|id| !id.is_empty() && !id.contains('/'));
     let progress_write =
         parts.method == Method::PATCH && parts.uri.path().starts_with("/api/me/progress/");
+    if progress_write {
+        faults.progress_writes.fetch_add(1, Ordering::SeqCst);
+    }
     let rejected = (item_lookup && faults.reject_item_lookups.load(Ordering::SeqCst))
         || (progress_write && faults.reject_progress_writes.load(Ordering::SeqCst));
     if rejected {

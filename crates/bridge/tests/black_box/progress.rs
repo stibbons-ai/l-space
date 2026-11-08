@@ -145,10 +145,13 @@ impl Setup {
         );
     }
 
-    /// Asserts that nothing supervises Kitchen any more: Bob starts a witness Handoff on
-    /// Office, and time moves on to its first tick. Once the witness's Progress is written
-    /// there and Kitchen's turn is free, a supervisor of Kitchen woken by the same tick would
-    /// have read Kitchen.
+    /// Defence in depth that nothing supervises Kitchen any more: Bob starts a witness Handoff
+    /// on Office, time moves on to its first tick, and once the witness's Progress is written
+    /// and Kitchen's turn is free, Kitchen must not have been read since. It catches a Kitchen
+    /// supervisor that reads Kitchen by that tick and before the witness's write lands; it
+    /// doesn't prove there is none: a supervisor is a task of its own, which the witness's
+    /// write and the turn don't order (one still checking a key before taking the turn could
+    /// read later), and a supervisor of a Handoff no longer stored stops before reading.
     async fn assert_kitchen_unsupervised(&self) {
         let reads = self.asked(READ);
         let witness = self.episode(2);
@@ -235,20 +238,21 @@ impl Setup {
 
 #[tokio::test]
 async fn a_playing_handoff_writes_the_starters_progress_every_30_seconds() {
-    let setup = setup().await;
+    let (proxy, setup) = setup_with_proxy().await;
     let episode = setup.episode(0);
     setup.start(&setup.alices, &episode, None).await;
     let reads = setup.asked(READ);
 
-    // Not before 30 seconds: then once, with a single read of Kitchen.
+    // Not before 30 seconds: then once, with a single read of Kitchen. The supervisor writes
+    // one write after another, so once the one at 30 arrived, any earlier one had too.
     setup.advance(29).await;
     setup.settle().await;
-    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
     setup.advance(1).await;
     setup
         .wait_for_progress(&setup.alice, &episode, (30.0, false))
         .await;
     setup.settle().await;
+    assert_eq!(proxy.progress_writes(), 1);
     assert_eq!(setup.asked(READ), reads + 1);
     setup.advance(30).await;
     setup
@@ -494,17 +498,56 @@ async fn a_group_playing_again_after_a_failed_finished_write_is_not_finished() {
     let episode = setup.episode(0);
     setup.ended_with_finished_failing(&proxy, 1).await;
 
-    // Played again from outside the App, at its start: the Bridge finds it so at the next
-    // tick, writes that, not Finished, and the Handoff goes on.
+    // Played again from outside the App: the Bridge finds it playing at the next tick, writes
+    // where it is, not Finished, and the Handoff goes on.
     setup
         .household
         .set_transport_state(&setup.kitchen, "PLAYING");
     setup.advance_and_settle(25).await;
-    assert_eq!(
-        setup.progress(&setup.alice, &episode).await,
-        Some((0.0, false))
+    let progress = setup.progress(&setup.alice, &episode).await;
+    assert!(
+        matches!(progress, Some((position, false)) if position < 590.0),
+        "{progress:?}"
     );
     assert_eq!(setup.handoffs().await, 1);
+}
+
+#[tokio::test]
+async fn a_group_resumed_from_the_app_then_stopped_after_a_failed_finished_write_is_not_finished() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    setup.ended_with_finished_failing(&proxy, 1).await;
+
+    // Bob resumes Kitchen, which plays the episode again from its start, and before the next
+    // tick it is stopped from the Sonos app: stopped short of the end, so nothing is written
+    // and the Handoff stays.
+    setup.resume().await;
+    setup.household.stop(&setup.kitchen);
+    setup.advance_and_settle(25).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((590.0, false))
+    );
+    assert_eq!(setup.handoffs().await, 1);
+}
+
+#[tokio::test]
+async fn a_key_rejected_on_a_finished_retry_is_revoked_ending_the_handoff() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    setup.ended_with_finished_failing(&proxy, 1).await;
+
+    proxy.reject_progress_writes();
+    setup.advance(30).await;
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.bridge.api().current_user_error(&setup.alices).await,
+        SESSION_INVALID
+    );
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((590.0, false))
+    );
 }
 
 #[tokio::test]
