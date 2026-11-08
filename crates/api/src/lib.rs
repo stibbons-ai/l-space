@@ -497,8 +497,8 @@ pub enum ApiError {
     /// Handoff's stream (switched in the Sonos app, for example: what is a Takeover once
     /// detected, #20, so the Handoff isn't ended yet). No control was sent to the Group and no
     /// Progress written; a Handoff it still has goes on, except after a forward skip that
-    /// needed the Item's length: if the Library Server rejected the starter's key there, the
-    /// key was revoked, which ended the Handoff (see [`skip_group`]).
+    /// needed the Item's length: if the Library Server rejected the starter's key there, or it
+    /// now acts for another user, the key was revoked, which ended the Handoff (see [`skip_group`]).
     #[error("no_handoff")]
     NoHandoff,
     /// A forward skip was refused because neither the Group nor the Library Server knows the
@@ -712,8 +712,8 @@ pub async fn handoffs() -> Result<Vec<Handoff>, ApiError> {
 /// Pauses Group `group`'s Handoff, whoever started it, and writes where it paused as Progress
 /// for the user who started it, with their key (not the caller's), once their Library Server
 /// confirms the key still acts for them. Where it paused is read from the Group right after
-/// the pause; if that read fails, is late or tells no position, where it was just before
-/// pausing. Answers with the Group's playback then; a Group already paused is left as it is.
+/// the pause; if that read fails, is late, or tells no position of the Handoff's stream,
+/// where it was just before pausing. Answers with the Group's playback then; a Group already paused is left as it is.
 /// Only while the Group plays its Handoff's stream: otherwise [`ApiError::NoHandoff`], and no
 /// control is sent to the Group. A Group that tells no position either time pauses, but no
 /// Progress is written. Writing the Progress may fail (the Library Server unreachable or too

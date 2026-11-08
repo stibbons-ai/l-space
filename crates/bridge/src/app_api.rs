@@ -933,8 +933,8 @@ impl<S: Store> Controls<S> {
     /// a skip, the Group's position is written as Progress for the starter, with the
     /// Handoff's key, once the Library Server confirmed that key still acts for the starter:
     /// for a pause, where the Group tells it paused (read right after the pause; if that read
-    /// fails or tells no position, where it was just before the pause), for a skip, the seek's
-    /// target. The control's calls to the Group take [`sonos::CONTROL_TIMEOUT`] in all, its
+    /// fails, is late, or tells no position of the Handoff's stream, where it was just before
+    /// the pause), for a skip, the seek's target. The control's calls to the Group take [`sonos::CONTROL_TIMEOUT`] in all, its
     /// requests to the Library Server [`CONTROL_LIBRARY_SERVER_TIME`]; a write that fails or
     /// runs out of time is logged and otherwise left alone, as the Group already did what was
     /// asked, except that a key the Library Server rejects is revoked, which ends the Handoff.
@@ -1139,15 +1139,24 @@ impl<S: Store> Controls<S> {
                 return None;
             }
         };
-        let plays = read.uri.as_deref().and_then(stream::stream_in_url);
-        let position = read
-            .position
-            .filter(|_| plays.is_some_and(|played| played == *stream));
+        let plays_handoff = read
+            .uri
+            .as_deref()
+            .and_then(stream::stream_in_url)
+            .is_some_and(|played| played == *stream);
+        let position = read.position.filter(|_| plays_handoff);
         if position.is_none() {
-            tracing::info!(
-                group,
-                "a Group told no position of its Handoff after pausing; using where it was just before"
-            );
+            if plays_handoff {
+                tracing::info!(
+                    group,
+                    "a Group told no position after pausing; using where it was just before"
+                );
+            } else {
+                tracing::info!(
+                    group,
+                    "a Group plays something other than its Handoff after pausing; using where it was just before"
+                );
+            }
         }
         position.map(|position| position.as_secs_f64())
     }

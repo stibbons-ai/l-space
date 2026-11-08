@@ -1,7 +1,8 @@
 //! An HTTP proxy on loopback in front of a Library Server that, once told to, answers every
-//! Item lookup (`GET /api/items/<id>`) with each `duration` in it set to `null`: an Item whose
-//! length Audiobookshelf doesn't know (as for an audio file it could not probe), without
-//! seeding one. Everything else passes as it is.
+//! Item lookup (`GET /api/items/<id>`, exactly one path segment after `/api/items/`, any query)
+//! with each `duration` in it set to `null`: an Item whose length Audiobookshelf doesn't know
+//! (as for an audio file it could not probe), without seeding one. Everything else, also every
+//! deeper path under an Item (its files, its cover), passes as it is.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,8 +81,11 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         .to_owned();
     let hidden = proxy.hiding.load(Ordering::SeqCst)
         && parts.method == axum::http::Method::GET
-        && parts.uri.path().starts_with("/api/items/")
-        && !parts.uri.path().contains("/file/");
+        && parts
+            .uri
+            .path()
+            .strip_prefix("/api/items/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'));
     let body = to_bytes(body, MAX_BODY).await.expect("request body");
     let mut sent = proxy
         .http

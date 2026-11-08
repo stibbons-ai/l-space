@@ -722,7 +722,7 @@ impl App {
     }
 
     /// On the Groups screen, pauses Group `group`'s Handoff (whoever started it) and shows the
-    /// Group paused where it was just before pausing. On failure, as every Group control: a
+    /// Group paused where the Bridge says it stopped. On failure, as every Group control: a
     /// Group gone or without a Handoff it plays has the Groups listed afresh with that notice;
     /// anything else is said on the screen.
     pub async fn pause_group(&mut self, group: &str) {

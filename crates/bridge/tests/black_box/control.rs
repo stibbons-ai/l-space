@@ -211,17 +211,12 @@ async fn anyone_pauses_and_resumes_a_handoff_and_the_pause_is_the_starters_progr
     assert!(!output_contains(&output, "/stream/"));
 }
 
-#[tokio::test]
-async fn a_pause_writes_where_the_group_paused() {
-    let setup = setup().await;
-    let api = setup.bridge.api();
-    let kitchen = setup.kitchen.uuid();
-    let episode = setup.episode(0);
-    setup.start(&episode, &setup.kitchen).await;
+/// Bob pauses the Handoff Alice started 130 seconds ago on Kitchen, a Group slow to act: once
+/// the Pause reached the Group, `change` runs and the Group plays on one more second before
+/// it pauses. Answers with what the pause answered.
+async fn pause_while(setup: &Setup, episode: &ItemId, change: impl FnOnce()) -> Playback {
+    setup.start(episode, &setup.kitchen).await;
     setup.clock.advance(seconds(130));
-
-    // A Group slow to act: it plays on one more second after the Bridge read where it was,
-    // before it pauses.
     setup.household.set_fault(
         &setup.kitchen,
         Fault::SlowTransport(Duration::from_millis(300)),
@@ -233,21 +228,87 @@ async fn a_pause_writes_where_the_group_paused() {
             .count()
     };
     let before = pauses();
-    let (paused, ()) = tokio::join!(api.pause_group(&setup.bobs, kitchen), async {
-        let deadline = Instant::now() + seconds(4);
-        while pauses() == before {
-            assert!(
-                Instant::now() < deadline,
-                "the Pause never reached the Group"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    let (paused, ()) = tokio::join!(
+        setup
+            .bridge
+            .api()
+            .pause_group(&setup.bobs, setup.kitchen.uuid()),
+        async {
+            let deadline = Instant::now() + seconds(4);
+            while pauses() == before {
+                assert!(
+                    Instant::now() < deadline,
+                    "the Pause never reached the Group"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            change();
+            setup.clock.advance(seconds(1));
         }
-        setup.clock.advance(seconds(1));
-    });
+    );
+    paused
+}
+
+#[tokio::test]
+async fn a_pause_writes_where_the_group_paused() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+
+    let paused = pause_while(&setup, &episode, || {}).await;
 
     assert_eq!(setup.position(&setup.kitchen), seconds(131));
     assert_eq!(paused, playback(TransportState::Paused, 131.0, 600.0));
     assert_eq!(setup.progress(&setup.alice, &episode).await, Some(131.0));
+}
+
+#[tokio::test]
+async fn a_pause_that_lands_on_something_else_writes_where_the_handoff_was() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+
+    // Made to play something else (in the Sonos app, say) while the Pause is on its way: the
+    // Pause pauses that, a second in.
+    let paused = pause_while(&setup, &episode, || {
+        let track = FakeTrack::new("Radio", seconds(3600));
+        setup.household.play(&setup.kitchen, track);
+    })
+    .await;
+
+    assert_eq!(setup.position(&setup.kitchen), seconds(1));
+    assert_eq!(paused.position, Some(130.0));
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(130.0));
+}
+
+#[tokio::test]
+async fn a_pause_whose_group_then_tells_no_position_writes_where_it_was_before() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+
+    let paused = pause_while(&setup, &episode, || {
+        setup.household.set_fault(&setup.kitchen, Fault::NoPosition);
+    })
+    .await;
+
+    assert_eq!(setup.position(&setup.kitchen), seconds(131));
+    assert_eq!(paused.position, Some(130.0));
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(130.0));
+}
+
+#[tokio::test]
+async fn a_pause_whose_group_then_fails_to_tell_its_playback_writes_where_it_was_before() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+
+    let paused = pause_while(&setup, &episode, || {
+        setup
+            .household
+            .set_fault(&setup.kitchen, Fault::FailTransportInfo);
+    })
+    .await;
+
+    assert_eq!(setup.position(&setup.kitchen), seconds(131));
+    assert_eq!(paused.position, Some(130.0));
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(130.0));
 }
 
 #[tokio::test]
