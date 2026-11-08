@@ -1,6 +1,9 @@
 //! The App API's view of this Bridge: configured Library Servers, logins and sessions,
-//! browsing a session's Library Server as its user, the household's Sonos Groups, Handoffs,
-//! and controlling a Group (its Handoff and its volume).
+//! browsing a session's Library Server as its user, the household's Sonos Groups, Handoffs
+//! (supervised while active: `supervise`), and controlling a Group (its Handoff and its
+//! volume).
+
+mod supervise;
 
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -15,12 +18,14 @@ use api::{
     HomeEntry, Item, ItemId, Library, LibraryEntry, LibraryServer, NowPlaying, Playback, Podcast,
     Progress, Session, SessionToken, Skip, TransportState,
 };
+use clock::Clock;
 use sonos::Sonos;
 use store::{ActiveHandoff, GroupHandoff, HandoffFile, LibraryUser, SessionId, Store};
 
 use crate::browse::{self, NoSingleFile};
 use crate::config::{LibraryServerConfig, LibraryServerUrl};
 use crate::stream::{self, StreamToken};
+use supervise::{Seen, Supervisor, Supervisors};
 
 /// How many more Items in progress than the user has Progress records the Bridge asks the
 /// Library Server for, for Home. Audiobookshelf 2.37.2 lists one entry per Progress record
@@ -39,11 +44,14 @@ pub struct AppApi<S> {
     sonos: Arc<dyn Sonos>,
     /// Where the Bridge listens, port 0 resolved: where Groups fetch streams.
     listen: SocketAddr,
-    /// One turn per Group a start or a control is under way on, so starts and controls on one
-    /// Group take turns: a start from after resolving its Item to the Group playing it (or it
-    /// ending again), a control from reading what the Group plays to writing Progress. An
-    /// entry no call holds or waits for any more is dropped at the next one.
-    turns: Mutex<HashMap<String, Weak<GroupTurn>>>,
+    /// One turn per Group a start, a control or a supervisor is under way on, so they take
+    /// turns on one Group: a start from after resolving its Item to the Group playing it (or
+    /// it ending again), a control from reading what the Group plays to writing Progress, a
+    /// supervisor from reading what the Group plays to writing Progress.
+    turns: Arc<Turns>,
+    /// What Handoff supervision is timed on: the system clock, or a test's (`test_clock`).
+    clock: Arc<dyn Clock>,
+    supervisors: Arc<Supervisors>,
 }
 
 impl<S: Store> AppApi<S> {
@@ -51,6 +59,7 @@ impl<S: Store> AppApi<S> {
         library_servers: Vec<LibraryServerConfig>,
         store: S,
         sonos: Arc<dyn Sonos>,
+        clock: Arc<dyn Clock>,
         listen: SocketAddr,
     ) -> Self {
         let library_servers = library_servers
@@ -66,7 +75,19 @@ impl<S: Store> AppApi<S> {
             store: Arc::new(store),
             sonos,
             listen,
-            turns: Mutex::default(),
+            turns: Arc::default(),
+            clock,
+            supervisors: Arc::default(),
+        }
+    }
+
+    /// What a control, a start's replacement write or a supervisor acts with.
+    fn controls(&self) -> Controls<S> {
+        Controls {
+            abs: self.abs.clone(),
+            store: Arc::clone(&self.store),
+            sonos: Arc::clone(&self.sonos),
+            library_servers: Arc::clone(&self.library_servers),
         }
     }
 
@@ -549,29 +570,34 @@ impl<S: Store> AppApi<S> {
     }
 
     /// Starts Item `id` on Group `group` for the session's user: resolves the Item's audio
-    /// file with the session's key, stores the Handoff (replacing the Group's), then has the
+    /// file with the session's key, writes the Progress of the Handoff it replaces, if any
+    /// ([`Controls::write_replaced`]), stores the Handoff (replacing the Group's), then has the
     /// Group play its stream and go to the start position ([`start_position`]: the user's
     /// Progress, or 0 when `from_start`, Finished, without Progress, or when its whole seconds
-    /// lie at or past the Item's end). If the Group doesn't play or seek, the new Handoff ends
-    /// again, and the one it replaced stays ended: the Group is left with none. After a failed
-    /// seek the Group, already playing, is also paused, on a task of its own that keeps the
-    /// Group's turn until the pause is done (at most [`sonos::CONTROL_TIMEOUT`]) without
-    /// holding up the answer.
+    /// lie at or past the Item's end), and supervises it (`supervise`) until it ends. If the
+    /// Group doesn't play or seek, the new Handoff ends again, and the one it replaced stays
+    /// ended: the Group is left with none. After a failed seek the Group, already playing, is
+    /// also paused, on a task of its own that keeps the Group's turn until the pause is done
+    /// (at most [`sonos::CONTROL_TIMEOUT`]) without holding up the answer.
     ///
-    /// Starts take turns with starts and controls on the Group. A start that had to wait for
-    /// its turn, or whose Group had a turn end while it resolved (a start or control that was
-    /// under way, or came and went), reads the user's Progress again once it has its turn
-    /// (unless `from_start`), as those starts and controls may have changed it (a pause writes
-    /// it), within [`START_PROGRESS_TIME`], checking again that the session's key acts for its
-    /// user. It waits for its turn only as long as [`START_TIME`] leaves after resolving, less
-    /// [`START_PROGRESS_TIME`] for that read, [`sonos::PLAY_TIMEOUT`] and
-    /// [`sonos::CONTROL_TIMEOUT`] for a seek (just [`sonos::PLAY_TIMEOUT`] when `from_start`);
-    /// past that, or when resolving left less than those, or the read fails, nothing is stored
-    /// or played ([`ApiError::GroupFailed`], or the read's error).
+    /// Starts take turns with starts, controls and supervisors on the Group. A start that had
+    /// to wait for its turn, or whose Group had a turn end while it resolved (a start, control
+    /// or supervisor visit that was under way, or came and went), reads the user's Progress
+    /// again once it has its turn (unless `from_start`), as those may have changed it (a pause
+    /// or the cadence writes it), within [`START_PROGRESS_TIME`], checking again that the
+    /// session's key acts for its user. It waits for its turn only as long as [`START_TIME`]
+    /// leaves after resolving, less [`START_PROGRESS_TIME`] for that read,
+    /// [`sonos::PLAY_TIMEOUT`] and [`sonos::CONTROL_TIMEOUT`] for a seek (just
+    /// [`sonos::PLAY_TIMEOUT`] when `from_start`); past that, or when resolving left less than
+    /// those, or the read fails, nothing is stored or played ([`ApiError::GroupFailed`], or the
+    /// read's error).
     ///
     /// A start that found its Group's turn free, with none ended since before resolving, uses
     /// the Progress read while resolving, and needs only [`sonos::PLAY_TIMEOUT`] (and
-    /// [`sonos::CONTROL_TIMEOUT`] when it seeks) left after it.
+    /// [`sonos::CONTROL_TIMEOUT`] when it seeks) left after it. The replaced Handoff's
+    /// Progress write gets what [`START_TIME`] leaves beyond those, at most
+    /// [`REPLACED_PROGRESS_TIME`]; one that fails or runs out of time is logged, and the start
+    /// goes on.
     async fn start_handoff(
         &self,
         token: SessionToken,
@@ -600,12 +626,8 @@ impl<S: Store> AppApi<S> {
             })
             .await?;
         let progress = browse::item_progress(&user, &id);
-        // Only a start that may seek needs the Item's length; one that waits for its turn
-        // may find Progress the first read didn't.
-        let duration = (!from_start)
-            .then(|| browse::item_duration(&library_item, &id))
-            .flatten();
-        let position = start_position(progress.as_ref(), from_start, duration);
+        let length = browse::item_duration(&library_item, &id);
+        let position = start_position(progress.as_ref(), from_start, length);
         let file = match browse::single_audio_file(library_item, &id) {
             Ok(file) => file,
             Err(NoSingleFile::Missing(reason)) => {
@@ -694,7 +716,7 @@ impl<S: Store> AppApi<S> {
                         .user_now(library_server, &session, reread, START_PROGRESS_TIME)
                         .await?;
                     let progress = browse::item_progress(&user, &id);
-                    (turn, start_position(progress.as_ref(), false, duration))
+                    (turn, start_position(progress.as_ref(), false, length))
                 }
             }
         };
@@ -715,6 +737,15 @@ impl<S: Store> AppApi<S> {
         }
         let (store, sonos) = (Arc::clone(&self.store), Arc::clone(&self.sonos));
         let library_server = library_server.to_owned();
+        let supervisor = Supervisor {
+            controls: self.controls(),
+            turns: Arc::clone(&self.turns),
+            clock: Arc::clone(&self.clock),
+            group: group.clone(),
+            stream,
+            length,
+        };
+        let supervisors = Arc::clone(&self.supervisors);
         // On its own task, so no client hanging up can cut it off between storing the Handoff
         // and the Group playing it (or it ending again); a panic in it is handled below.
         // Dioxus runs server functions detached today as well, so a client hanging up doesn't
@@ -723,6 +754,22 @@ impl<S: Store> AppApi<S> {
         let task_group = group.clone();
         let (logged_item, logged_episode) = (library_item_id.clone(), id.episode.clone());
         let started = tokio::spawn(async move {
+            // The Handoff this start replaces gets its Progress first, with what is left after
+            // keeping the time to play and seek.
+            match store.group_handoff(&task_group).await {
+                Ok(Some(replaced)) => {
+                    let time = START_TIME
+                        .saturating_sub(called.elapsed())
+                        .saturating_sub(sonos::PLAY_TIMEOUT + seek_time)
+                        .min(REPLACED_PROGRESS_TIME);
+                    supervisor
+                        .controls
+                        .write_replaced(&task_group, &replaced, time)
+                        .await;
+                }
+                Ok(None) => {}
+                Err(error) => log_storage_error("look up the Handoff a start replaces", &error),
+            }
             let handoff = store::Handoff {
                 group: task_group,
                 library_item: library_item_id,
@@ -739,6 +786,8 @@ impl<S: Store> AppApi<S> {
                 .start_handoff(&stream, &handoff, &session.api_key)
                 .await
                 .map_err(storage_error("start a Handoff"))?;
+            // The replaced Handoff, if any, is gone: so is its supervision.
+            supervisors.stop(&handoff.group);
             // The stream answers from here on: the Group may fetch it as soon as it is told.
             if let Err(error) = sonos.play(&handoff.group, &target).await {
                 tracing::warn!(group = handoff.group, %error, "a Group did not start a Handoff");
@@ -789,6 +838,12 @@ impl<S: Store> AppApi<S> {
                 });
                 return Err(sonos_error(error));
             }
+            let seen = Seen {
+                playing: true,
+                position,
+                at: supervisor.clock.now(),
+            };
+            supervisors.start(supervisor, seen);
             tracing::info!(
                 group = handoff.group,
                 library_server,
@@ -820,24 +875,15 @@ impl<S: Store> AppApi<S> {
         Ok(api_handoff(handoff))
     }
 
-    /// The turn starts and controls on Group `group` take; forgets the turns no call holds.
+    /// The turn starts, controls and supervisors on Group `group` take.
     fn group_turn(&self, group: &str) -> Arc<GroupTurn> {
-        let mut turns = self.turns.lock().unwrap_or_else(PoisonError::into_inner);
-        turns.retain(|_, turn| turn.strong_count() > 0);
-        if let Some(turn) = turns.get(group).and_then(Weak::upgrade) {
-            return turn;
-        }
-        let turn = Arc::new(GroupTurn {
-            lock: Arc::new(tokio::sync::Mutex::new(())),
-            ended: AtomicU64::new(0),
-        });
-        turns.insert(group.to_owned(), Arc::downgrade(&turn));
-        turn
+        self.turns.of(group)
     }
 
     /// Has Group `group` do `control` on its Handoff, for any valid session, whoever started
-    /// the Handoff ([`Controls::control`]). Takes turns with starts and other controls on the
-    /// Group, waiting at most [`CONTROL_TURN_TIME`] for its turn.
+    /// the Handoff ([`Controls::control`]), and tells the Handoff's supervisor where the Group
+    /// now is. Takes turns with starts, other controls and supervisors on the Group, waiting
+    /// at most [`CONTROL_TURN_TIME`] for its turn.
     async fn control(
         &self,
         token: SessionToken,
@@ -849,19 +895,29 @@ impl<S: Store> AppApi<S> {
             return Err(ApiError::GroupNotFound);
         }
         let turn = self.group_turn(&group);
-        let controls = Controls {
-            abs: self.abs.clone(),
-            store: Arc::clone(&self.store),
-            sonos: Arc::clone(&self.sonos),
-            library_servers: Arc::clone(&self.library_servers),
-        };
+        let controls = self.controls();
+        let (supervisors, clock) = (Arc::clone(&self.supervisors), Arc::clone(&self.clock));
         let task_group = group.clone();
         // On its own task, as a start is, so no client hanging up can cut it off between the
         // Group's action and the Progress write; a panic in it is handled below.
         let controlled = tokio::spawn(async move {
             let not_done = "a control not sent";
             let _turn = turn.take(&task_group, CONTROL_TURN_TIME, not_done).await?;
-            controls.control(&task_group, control).await
+            let controlled = controls.control(&task_group, control).await;
+            // Still holding the turn, so the supervisor told is this Handoff's.
+            if let Ok(playback) = &controlled
+                && let Some(position) = playback
+                    .position
+                    .and_then(|position| Duration::try_from_secs_f64(position).ok())
+            {
+                let seen = Seen {
+                    playing: playback.state == TransportState::Playing,
+                    position,
+                    at: clock.now(),
+                };
+                supervisors.seen(&task_group, seen);
+            }
+            controlled
         })
         .await;
         controlled.unwrap_or_else(|error| {
@@ -1037,8 +1093,8 @@ impl<S: Store> AppApi<S> {
 }
 
 /// How long a control (or a volume change) waits at most for its turn on the Group, behind a
-/// start or another control on it; past that it answers [`ApiError::GroupFailed`] without
-/// acting.
+/// start, another control or a supervisor's visit on it; past that it answers
+/// [`ApiError::GroupFailed`] without acting. A supervisor waits as long for its own turn.
 const CONTROL_TURN_TIME: Duration = Duration::from_secs(3);
 
 /// How long a control's requests to the starter's Library Server may take in all: checking
@@ -1050,14 +1106,21 @@ const CONTROL_LIBRARY_SERVER_TIME: Duration = Duration::from_secs(7);
 
 /// How long a start may take in all, about (plus local storage): resolving the Item, waiting
 /// for its turn on the Group, then, when it may seek and had to wait or saw a turn end while
-/// resolving, [`START_PROGRESS_TIME`] to read the user's Progress again, then
-/// [`sonos::PLAY_TIMEOUT`] for the Group to play and, starting past 0,
-/// [`sonos::CONTROL_TIMEOUT`] for it to seek. Its turn waits only for what the others leave:
-/// at most 14 − 4 = 10 seconds less resolving for a start `from_start`, 14 − 2 − 4 − 4 = 4
-/// for any other (which keeps the seek's time even without Progress, as the read may find
-/// some); a start left with less than it needs for what comes after its turn sends nothing.
-/// One second under the App's 15.
+/// resolving, [`START_PROGRESS_TIME`] to read the user's Progress again, then, when it
+/// replaces a Handoff, that Handoff's Progress write, with only what is left beyond the
+/// Group's calls (at most [`REPLACED_PROGRESS_TIME`]), then [`sonos::PLAY_TIMEOUT`] for the
+/// Group to play and, starting past 0, [`sonos::CONTROL_TIMEOUT`] for it to seek. Its turn
+/// waits only for what the others leave: at most 14 − 4 = 10 seconds less resolving for a
+/// start `from_start`, 14 − 2 − 4 − 4 = 4 for any other (which keeps the seek's time even
+/// without Progress, as the read may find some); a start left with less than it needs for the
+/// Group's calls after its turn sends nothing. One second under the App's 15.
 const START_TIME: Duration = Duration::from_secs(14);
+
+/// The most a start gives the Progress write of the Handoff it replaces: reading where the
+/// Group is, checking whom the replaced Handoff's key acts for (and the Item's length, if the
+/// Group doesn't tell it), writing. It gets less when [`START_TIME`] leaves less beyond the
+/// Group's calls, and none when nothing is left.
+const REPLACED_PROGRESS_TIME: Duration = Duration::from_secs(4);
 
 /// How long a start may take to read the user's Progress again after its turn: one `/api/me`
 /// the Library Server already answered while resolving, so 2 seconds are ample, and still
@@ -1117,8 +1180,30 @@ fn start_position(
     }
 }
 
-/// A Group's turn, which starts and controls on it take one at a time, and how many turns on
-/// it ended so far: a start can tell whether a start or control on its Group held the turn
+/// The turns on each Group a start, a control or a supervisor visit is under way on (or waits
+/// for). An entry nothing holds or waits for any more is dropped at the next lookup.
+#[derive(Debug, Default)]
+struct Turns(Mutex<HashMap<String, Weak<GroupTurn>>>);
+
+impl Turns {
+    /// Group `group`'s turn; forgets the turns nothing holds.
+    fn of(&self, group: &str) -> Arc<GroupTurn> {
+        let mut turns = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        turns.retain(|_, turn| turn.strong_count() > 0);
+        if let Some(turn) = turns.get(group).and_then(Weak::upgrade) {
+            return turn;
+        }
+        let turn = Arc::new(GroupTurn {
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            ended: AtomicU64::new(0),
+        });
+        turns.insert(group.to_owned(), Arc::downgrade(&turn));
+        turn
+    }
+}
+
+/// A Group's turn, which starts, controls and supervisor visits on it take one at a time,
+/// and how many turns on it ended so far: a start can tell whether one of them held the turn
 /// while it resolved its Item.
 struct GroupTurn {
     lock: Arc<tokio::sync::Mutex<()>>,
@@ -1255,14 +1340,9 @@ impl<S: Store> Controls<S> {
                     .check(active, Wanted::optional(duration), &mut library_time)
                     .await;
                 let duration = duration.or(checked.length.told());
-                self.write_progress(
-                    active,
-                    checked.acting,
-                    position,
-                    duration,
-                    &mut library_time,
-                )
-                .await;
+                let update = abs::ProgressUpdate::at(position, duration);
+                self.write_progress(active, checked.acting, update, "pause", &mut library_time)
+                    .await;
                 Ok(Playback {
                     state: TransportState::Paused,
                     position: Some(position),
@@ -1356,7 +1436,8 @@ impl<S: Store> Controls<S> {
             }
         };
         let target = target.as_secs_f64();
-        self.write_progress(active, acting, target, duration, &mut library_time)
+        let update = abs::ProgressUpdate::at(target, duration);
+        self.write_progress(active, acting, update, "skip", &mut library_time)
             .await;
         Ok(Playback {
             state: api_state(playback.state),
@@ -1467,6 +1548,56 @@ impl<S: Store> Controls<S> {
         };
         ensure_plays(group, playback, &found.stream)?;
         Ok(found)
+    }
+
+    /// Writes where Group `group` is on `replaced`'s stream as Progress for the replaced
+    /// Handoff's starter, with its key ([`Controls::write_progress`]), within `time` in all:
+    /// reading the Group, checking the key (and the Item's length, if the Group doesn't tell
+    /// it), writing. Only a Group playing or paused on that stream, telling a position, gets
+    /// it written; a stopped one may tell 0 there. Anything else, a failure or running out of
+    /// time is logged and otherwise left alone.
+    async fn write_replaced(&self, group: &str, replaced: &GroupHandoff, time: Duration) {
+        let mut time = Budget(time);
+        let not_written = "the replaced Handoff's Progress not written";
+        let playback = match time.spend(self.sonos.playback(group)).await {
+            Some(Ok(playback)) => playback,
+            Some(Err(error)) => {
+                tracing::warn!(group, %error, "cannot read what a Group plays; {not_written}");
+                return;
+            }
+            None => {
+                tracing::warn!(
+                    group,
+                    "a Group did not tell its playback in time; {not_written}"
+                );
+                return;
+            }
+        };
+        let played = playback.uri.as_deref().and_then(stream::stream_in_url);
+        let position = playback.position.filter(|_| {
+            played == Some(replaced.stream)
+                && matches!(
+                    playback.state,
+                    sonos::TransportState::Playing | sonos::TransportState::Paused
+                )
+        });
+        let Some(position) = position else {
+            tracing::info!(
+                group,
+                state = ?playback.state,
+                "a Group tells no position on the Handoff a start replaces; {not_written}"
+            );
+            return;
+        };
+        let duration = known_length(playback.duration.map(|duration| duration.as_secs_f64()));
+        let active = &replaced.active;
+        let checked = self
+            .check(active, Wanted::optional(duration), &mut time)
+            .await;
+        let duration = duration.or(checked.length.told());
+        let update = abs::ProgressUpdate::at(position.as_secs_f64(), duration);
+        self.write_progress(active, checked.acting, update, "replaced", &mut time)
+            .await;
     }
 
     /// What the starter's Library Server tells about `active` with the Handoff's key, within
@@ -1596,19 +1727,19 @@ impl<S: Store> Controls<S> {
         }
     }
 
-    /// Writes `position` (seconds, in an Item `duration` seconds long, if known) as Progress in
-    /// `active`'s Item for the user who started it, with the Handoff's key, never with a
-    /// caller's, within `time`; only if the key still acts for the starter (`acting`). Whether
-    /// the starter may still see the Item is not checked again (Audiobookshelf doesn't check on
-    /// a Progress write): the Handoff relies on the check made at its start. A failure is
-    /// logged and otherwise left alone; a key the Library Server rejects is revoked, which ends
-    /// the Handoff.
+    /// Writes `update` (unfinished unless it says Finished) as Progress in `active`'s Item for
+    /// the user who started it, with the Handoff's key, never with a caller's, within `time`;
+    /// only if the key still acts for the starter (`acting`). Whether the starter may still see
+    /// the Item is not checked again (Audiobookshelf doesn't check on a Progress write): the
+    /// Handoff relies on the check made at its start. A failure is logged and otherwise left
+    /// alone; a key the Library Server rejects is revoked, which ends the Handoff. `cause`
+    /// (what wrote it: a pause, the cadence, ...) is logged with the write.
     async fn write_progress(
         &self,
         active: &ActiveHandoff,
         acting: Acting<'_>,
-        position: f64,
-        duration: Option<f64>,
+        update: abs::ProgressUpdate,
+        cause: &'static str,
         time: &mut Budget,
     ) {
         let handoff = &active.handoff;
@@ -1663,8 +1794,7 @@ impl<S: Store> Controls<S> {
                 &active.api_key,
                 &handoff.library_item,
                 handoff.episode.as_deref(),
-                position,
-                duration,
+                update,
             ))
             .await;
         match written {
@@ -1674,7 +1804,9 @@ impl<S: Store> Controls<S> {
                 user_id = starter.user_id,
                 library_item = handoff.library_item,
                 episode = handoff.episode,
-                position,
+                position = update.current_time,
+                finished = update.finished,
+                cause,
                 "Progress written"
             ),
             Some(Err(abs::Error::Rejected)) => {

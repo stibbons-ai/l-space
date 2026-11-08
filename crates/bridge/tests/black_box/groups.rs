@@ -242,10 +242,14 @@ async fn a_playing_groups_position_moves_with_the_fakes_clock() {
     clock.advance(Duration::from_secs(60));
     assert_eq!(position().await, Some(90.0));
 
-    // Never past the end of the track.
+    // Never past the end of the track: played to its end, it stops, back at its start.
     household.play(&kitchen, FakeTrack::new("Short", Duration::from_secs(30)));
-    clock.advance(Duration::from_secs(45));
-    assert_eq!(position().await, Some(30.0));
+    clock.advance(Duration::from_secs(29));
+    assert_eq!(position().await, Some(29.0));
+    clock.advance(Duration::from_secs(16));
+    assert_eq!(position().await, Some(0.0));
+    let groups = bridge.api().groups(&session).await;
+    assert_eq!(groups[0].state, Some(TransportState::Stopped));
 }
 
 #[tokio::test]

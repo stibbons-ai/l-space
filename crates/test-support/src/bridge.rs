@@ -37,6 +37,12 @@
 //!   becomes a [`Value::String`]. [`run_until_exit_with_key`] passes other key variables.
 //! - A rejected call is checked with [`AppApi::get_error`] or [`AppApi::post_error`], which
 //!   return the status and the decoded [`ApiError`] code.
+//! - [`clock_toml`] turns on the Bridge's test-only clock hook: the Bridge then times Handoff
+//!   supervision (the Progress cadence, the end of an Item) on a `sonos_fake::Household`'s
+//!   clock instead of the system clock. After advancing that clock, a test waits with
+//!   `Household::clock_followed` until the Bridge has seen the new time, then waits on what
+//!   it observes (Progress, Handoffs) with a deadline. Without the hook the Bridge runs on the
+//!   system clock and a test's clock moves only the household.
 //!
 //! The Bridge's output is echoed to the test's output, so a failing test shows the Bridge's logs.
 
@@ -391,6 +397,12 @@ pub fn named_library_server_toml(url: &str, name: &str) -> String {
 /// `sonos_fake::Household`'s address.
 pub fn sonos_toml(ssdp: SocketAddr) -> String {
     format!("[sonos]\ndiscovery_address = \"{ssdp}\"\n")
+}
+
+/// The configuration section turning on the Bridge's test-only clock hook: it follows the
+/// clock a `sonos_fake::Household` serves at `clock` (`Household::clock_address`).
+pub fn clock_toml(clock: SocketAddr) -> String {
+    format!("[testing]\nclock_address = \"{clock}\"\n")
 }
 
 /// The configuration naming the Library Server at `url` "Home" and pointing Sonos discovery at

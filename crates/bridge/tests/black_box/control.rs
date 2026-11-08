@@ -1466,7 +1466,8 @@ async fn a_control_takes_turns_with_a_start_on_its_group() {
         ]
     );
     assert_eq!(setup.progress(&setup.alice, &second).await, Some(0.0));
-    assert_eq!(setup.progress(&setup.alice, &first).await, None);
+    // The replaced Handoff's Progress was written where Office was on it: still at 0.
+    assert_eq!(setup.progress(&setup.alice, &first).await, Some(0.0));
 }
 
 #[tokio::test]

@@ -8,6 +8,7 @@ mod encryption_key;
 mod shutdown;
 mod stream;
 mod telemetry;
+mod test_clock;
 
 use std::io;
 use std::net::SocketAddr;
@@ -128,10 +129,28 @@ async fn run(args: Args) -> Result<Closer, ExitCode> {
     let discovery_address = config.sonos.discovery_address;
     tracing::info!(%discovery_address, "searching for Sonos players");
     let sonos = sonos::Upnp::start(discovery_address, Arc::new(clock::SystemClock));
+    let clock: Arc<dyn clock::Clock> = match config.test_clock {
+        None => Arc::new(clock::SystemClock),
+        Some(address) => {
+            tracing::warn!(
+                %address,
+                "following a test clock for Handoff supervision: a test-only hook, never for \
+                 production"
+            );
+            match test_clock::follow(address).await {
+                Ok(clock) => Arc::new(clock),
+                Err(error) => {
+                    tracing::error!(%error, "cannot follow the test clock");
+                    return Err(ExitCode::FAILURE);
+                }
+            }
+        }
+    };
     let app_api = Arc::new(AppApi::new(
         config.library_servers,
         store,
         Arc::new(sonos),
+        clock,
         addr,
     ));
     let router = api::server::router(app_api.clone()).merge(stream::router(app_api));

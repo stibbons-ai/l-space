@@ -15,5 +15,6 @@ mod library_proxy;
 mod library_servers;
 mod logging;
 mod login;
+mod progress;
 mod shutdown;
 mod startup;
