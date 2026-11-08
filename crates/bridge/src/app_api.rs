@@ -608,7 +608,7 @@ impl<S: Store> AppApi<S> {
         let called = tokio::time::Instant::now();
         // Before resolving, so that a turn on the Group ending from here on, whose start or
         // control may change Progress, is seen.
-        let group_turn = self.group_turn(&group);
+        let group_turn = self.turns.of(&group);
         let ended = group_turn.ended();
         let library_item_id = id.library_item.clone();
         let request = Request {
@@ -737,15 +737,8 @@ impl<S: Store> AppApi<S> {
         }
         let (store, sonos) = (Arc::clone(&self.store), Arc::clone(&self.sonos));
         let library_server = library_server.to_owned();
-        let supervisor = Supervisor {
-            controls: self.controls(),
-            turns: Arc::clone(&self.turns),
-            clock: Arc::clone(&self.clock),
-            group: group.clone(),
-            stream,
-            length,
-        };
-        let supervisors = Arc::clone(&self.supervisors);
+        let (controls, turns) = (self.controls(), Arc::clone(&self.turns));
+        let (clock, supervisors) = (Arc::clone(&self.clock), Arc::clone(&self.supervisors));
         // On its own task, so no client hanging up can cut it off between storing the Handoff
         // and the Group playing it (or it ending again); a panic in it is handled below.
         // Dioxus runs server functions detached today as well, so a client hanging up doesn't
@@ -762,9 +755,9 @@ impl<S: Store> AppApi<S> {
                         .saturating_sub(called.elapsed())
                         .saturating_sub(sonos::PLAY_TIMEOUT + seek_time)
                         .min(REPLACED_PROGRESS_TIME);
-                    supervisor
-                        .controls
-                        .write_replaced(&task_group, &replaced, time)
+                    let length = supervisors.length(&task_group, &replaced.stream);
+                    controls
+                        .write_replaced(&task_group, &replaced, length, time)
                         .await;
                 }
                 Ok(None) => {}
@@ -841,7 +834,15 @@ impl<S: Store> AppApi<S> {
             let seen = Seen {
                 playing: true,
                 position,
-                at: supervisor.clock.now(),
+                at: clock.now(),
+            };
+            let supervisor = Supervisor {
+                controls,
+                turns,
+                clock,
+                group: handoff.group.clone(),
+                stream,
+                length: known_length(length),
             };
             supervisors.start(supervisor, seen);
             tracing::info!(
@@ -875,11 +876,6 @@ impl<S: Store> AppApi<S> {
         Ok(api_handoff(handoff))
     }
 
-    /// The turn starts, controls and supervisors on Group `group` take.
-    fn group_turn(&self, group: &str) -> Arc<GroupTurn> {
-        self.turns.of(group)
-    }
-
     /// Has Group `group` do `control` on its Handoff, for any valid session, whoever started
     /// the Handoff ([`Controls::control`]), and tells the Handoff's supervisor where the Group
     /// now is. Takes turns with starts, other controls and supervisors on the Group, waiting
@@ -894,7 +890,7 @@ impl<S: Store> AppApi<S> {
         if !is_group_id(&group) {
             return Err(ApiError::GroupNotFound);
         }
-        let turn = self.group_turn(&group);
+        let turn = self.turns.of(&group);
         let controls = self.controls();
         let (supervisors, clock) = (Arc::clone(&self.supervisors), Arc::clone(&self.clock));
         let task_group = group.clone();
@@ -905,17 +901,8 @@ impl<S: Store> AppApi<S> {
             let _turn = turn.take(&task_group, CONTROL_TURN_TIME, not_done).await?;
             let controlled = controls.control(&task_group, control).await;
             // Still holding the turn, so the supervisor told is this Handoff's.
-            if let Ok(playback) = &controlled
-                && let Some(position) = playback
-                    .position
-                    .and_then(|position| Duration::try_from_secs_f64(position).ok())
-            {
-                let seen = Seen {
-                    playing: playback.state == TransportState::Playing,
-                    position,
-                    at: clock.now(),
-                };
-                supervisors.seen(&task_group, seen);
+            if let Ok(playback) = &controlled {
+                supervisors.seen(&task_group, playback, clock.now());
             }
             controlled
         })
@@ -940,7 +927,7 @@ impl<S: Store> AppApi<S> {
             return Err(ApiError::GroupNotFound);
         }
         let volume = volume.min(api::MAX_VOLUME);
-        let turn = self.group_turn(&group);
+        let turn = self.turns.of(&group);
         let not_done = "a volume change not sent";
         let _turn = turn.take(&group, CONTROL_TURN_TIME, not_done).await?;
         self.sonos
@@ -1291,7 +1278,7 @@ impl<S: Store> Controls<S> {
         let mut library_time = Budget(CONTROL_LIBRARY_SERVER_TIME);
         let playback = self.playback(group, &mut group_time).await?;
         let found = self.playing_handoff(group, &playback).await?;
-        let duration = known_length(playback.duration.map(|duration| duration.as_secs_f64()));
+        let duration = told_length(&playback);
         let position = playback.position.map(|position| position.as_secs_f64());
         let asked = match control {
             Control::Pause => Some(sonos::TransportState::Paused),
@@ -1380,7 +1367,7 @@ impl<S: Store> Controls<S> {
         if playback.position.is_none() {
             return Err(no_position());
         }
-        let mut duration = known_length(playback.duration.map(|duration| duration.as_secs_f64()));
+        let mut duration = told_length(&playback);
         let mut acting = None;
         if duration.is_none() && skip.seconds() > 0 {
             let checked = self.check(active, Wanted::Needed, &mut library_time).await;
@@ -1449,10 +1436,7 @@ impl<S: Store> Controls<S> {
     /// What Group `group` plays, as its coordinator tells it within `time`.
     async fn playback(&self, group: &str, time: &mut Budget) -> Result<sonos::Playback, ApiError> {
         let Some(read) = time.spend(self.sonos.playback(group)).await else {
-            tracing::warn!(
-                group,
-                "a Group did not tell its playback within the control's time"
-            );
+            tracing::warn!(group, "a Group did not tell its playback in time");
             return Err(ApiError::GroupFailed);
         };
         read.map_err(|error| {
@@ -1483,11 +1467,7 @@ impl<S: Store> Controls<S> {
                 return None;
             }
         };
-        let plays_handoff = read
-            .uri
-            .as_deref()
-            .and_then(stream::stream_in_url)
-            .is_some_and(|played| played == *stream);
+        let plays_handoff = plays_stream(&read, stream);
         let position = read.position.filter(|_| plays_handoff);
         if position.is_none() {
             if plays_handoff {
@@ -1552,30 +1532,26 @@ impl<S: Store> Controls<S> {
 
     /// Writes where Group `group` is on `replaced`'s stream as Progress for the replaced
     /// Handoff's starter, with its key ([`Controls::write_progress`]), within `time` in all:
-    /// reading the Group, checking the key (and the Item's length, if the Group doesn't tell
-    /// it), writing. Only a Group playing or paused on that stream, telling a position, gets
-    /// it written; a stopped one may tell 0 there. Anything else, a failure or running out of
-    /// time is logged and otherwise left alone.
-    async fn write_replaced(&self, group: &str, replaced: &GroupHandoff, time: Duration) {
+    /// reading the Group, checking the key (and the Item's length, if neither the Group nor
+    /// `length`, as the replaced Handoff's supervisor knew it, tells it), writing. Only a Group
+    /// playing or paused on that stream, telling a position, gets it written; a stopped one
+    /// may tell 0 there. Anything else, a failure or running out of time is logged and
+    /// otherwise left alone.
+    async fn write_replaced(
+        &self,
+        group: &str,
+        replaced: &GroupHandoff,
+        length: Option<f64>,
+        time: Duration,
+    ) {
         let mut time = Budget(time);
         let not_written = "the replaced Handoff's Progress not written";
-        let playback = match time.spend(self.sonos.playback(group)).await {
-            Some(Ok(playback)) => playback,
-            Some(Err(error)) => {
-                tracing::warn!(group, %error, "cannot read what a Group plays; {not_written}");
-                return;
-            }
-            None => {
-                tracing::warn!(
-                    group,
-                    "a Group did not tell its playback in time; {not_written}"
-                );
-                return;
-            }
+        let Ok(playback) = self.playback(group, &mut time).await else {
+            tracing::info!(group, "{not_written}");
+            return;
         };
-        let played = playback.uri.as_deref().and_then(stream::stream_in_url);
         let position = playback.position.filter(|_| {
-            played == Some(replaced.stream)
+            plays_stream(&playback, &replaced.stream)
                 && matches!(
                     playback.state,
                     sonos::TransportState::Playing | sonos::TransportState::Paused
@@ -1589,7 +1565,7 @@ impl<S: Store> Controls<S> {
             );
             return;
         };
-        let duration = known_length(playback.duration.map(|duration| duration.as_secs_f64()));
+        let duration = told_length(&playback).or(length);
         let active = &replaced.active;
         let checked = self
             .check(active, Wanted::optional(duration), &mut time)
@@ -1944,8 +1920,7 @@ fn ensure_plays(
     playback: &sonos::Playback,
     stream: &store::StreamId,
 ) -> Result<(), ApiError> {
-    let played = playback.uri.as_deref().and_then(stream::stream_in_url);
-    if played.is_some_and(|played| played == *stream) {
+    if plays_stream(playback, stream) {
         return Ok(());
     }
     tracing::info!(
@@ -1953,6 +1928,12 @@ fn ensure_plays(
         "a control for a Group that plays something other than its Handoff"
     );
     Err(ApiError::NoHandoff)
+}
+
+/// Whether `playback` plays `stream`, a Handoff's.
+fn plays_stream(playback: &sonos::Playback, stream: &store::StreamId) -> bool {
+    let played = playback.uri.as_deref().and_then(stream::stream_in_url);
+    played.is_some_and(|played| played == *stream)
 }
 
 /// `base_url` (already normalized), if it is one of `library_servers`'.
@@ -2210,6 +2191,11 @@ fn skipped(position: Duration, skip: Skip, duration: Option<f64>) -> Duration {
 /// `length`, in seconds, if it is one an Item can have: finite and more than zero.
 fn known_length(length: Option<f64>) -> Option<f64> {
     length.filter(|length| length.is_finite() && *length > 0.0)
+}
+
+/// The length `playback` tells, in seconds, if it is one an Item can have.
+fn told_length(playback: &sonos::Playback) -> Option<f64> {
+    known_length(playback.duration.map(|duration| duration.as_secs_f64()))
 }
 
 /// 256 random bits from the operating system, hex-encoded, for `what` (a session token, a

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use api::{ItemId, Session, TransportState};
+use api::{ItemId, Playback, Session, TransportState};
 use sonos_fake::{Fault, Household, PlayerId};
 
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_DURATIONS};
@@ -134,12 +134,13 @@ impl Setup {
             assert!(Instant::now() < deadline, "the Bridge never read Kitchen");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let paused = self
-            .bridge
-            .api()
-            .pause_group(&self.bobs, self.kitchen.uuid())
-            .await;
-        assert_eq!(paused.state, TransportState::Paused);
+        assert_eq!(self.pause().await.state, TransportState::Paused);
+    }
+
+    /// Bob pauses Kitchen.
+    async fn pause(&self) -> Playback {
+        let kitchen = self.kitchen.uuid();
+        self.bridge.api().pause_group(&self.bobs, kitchen).await
     }
 }
 
@@ -162,11 +163,7 @@ async fn a_playing_handoff_writes_the_starters_progress_every_30_seconds() {
 
     // Paused, nothing is written: Alice's own player moves her Progress meanwhile, and it
     // stays as that left it.
-    setup
-        .bridge
-        .api()
-        .pause_group(&setup.bobs, setup.kitchen.uuid())
-        .await;
+    setup.pause().await;
     let (podcast, first) = (&episode.library_item, episode.episode.as_deref());
     setup
         .abs
@@ -231,11 +228,7 @@ async fn pausing_just_before_the_end_does_not_set_finished() {
         .await;
 
     // Five seconds before the end.
-    setup
-        .bridge
-        .api()
-        .pause_group(&setup.bobs, setup.kitchen.uuid())
-        .await;
+    setup.pause().await;
     assert_eq!(
         setup.progress(&setup.alice, &episode).await,
         Some((595.0, false))
@@ -275,11 +268,7 @@ async fn replaying_a_finished_item_clears_finished_once_progress_is_written() {
         .set_progress(&setup.alice, podcast, first, 600.0, true)
         .await;
     setup.advance(10).await;
-    setup
-        .bridge
-        .api()
-        .pause_group(&setup.bobs, setup.kitchen.uuid())
-        .await;
+    setup.pause().await;
     assert_eq!(
         setup.progress(&setup.alice, &episode).await,
         Some((40.0, false))

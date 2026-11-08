@@ -15,19 +15,21 @@
 //! may tell 0 then; unverified).
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use abs::ProgressUpdate;
+use api::{Playback, TransportState};
 use clock::Clock;
 use store::{GroupHandoff, Store, StreamId};
 use tokio::sync::watch;
 
-use super::{Acting, Budget, CONTROL_TURN_TIME, Controls, Turns, Wanted, known_length};
-use crate::stream;
+use super::{
+    Acting, Budget, CONTROL_TURN_TIME, Controls, Turns, Wanted, plays_stream, told_length,
+};
 
 /// How often a playing Handoff's Progress is written, on the Bridge's clock.
-pub(super) const CADENCE: Duration = Duration::from_secs(30);
+const CADENCE: Duration = Duration::from_secs(30);
 
 /// How long the starter's Library Server may take to tell whom the Handoff's key acts for,
 /// before a supervisor takes the Group's turn.
@@ -58,17 +60,6 @@ pub(super) struct Seen {
     pub(super) at: Instant,
 }
 
-impl Seen {
-    /// Where the Group is expected at `now`.
-    fn expected(&self, now: Instant) -> Duration {
-        if self.playing {
-            self.position + now.saturating_duration_since(self.at)
-        } else {
-            self.position
-        }
-    }
-}
-
 /// The supervisors running, one per Group with an active Handoff.
 #[derive(Debug, Default)]
 pub(super) struct Supervisors {
@@ -78,6 +69,8 @@ pub(super) struct Supervisors {
 #[derive(Debug)]
 struct Running {
     stream: StreamId,
+    /// The Item's length, as the supervisor knows it.
+    length: Option<f64>,
     /// Tells the supervisor what a control saw; dropping it stops the supervisor.
     seen: watch::Sender<Seen>,
     task: tokio::task::AbortHandle,
@@ -87,7 +80,12 @@ impl Supervisors {
     /// Starts `supervisor`, the Group last `seen` as given, stopping the Group's previous one.
     pub(super) fn start<S: Store>(self: &Arc<Self>, supervisor: Supervisor<S>, seen: Seen) {
         let (sender, receiver) = watch::channel(seen);
-        let (group, stream) = (supervisor.group.clone(), supervisor.stream);
+        let (group, stream, length) = (
+            supervisor.group.clone(),
+            supervisor.stream,
+            supervisor.length,
+        );
+        // Held until the entry is in, so a supervisor ending at once forgets it after.
         let mut running = self.lock();
         let supervisors = Arc::clone(self);
         let task = tokio::spawn(async move {
@@ -96,6 +94,7 @@ impl Supervisors {
         });
         let started = Running {
             stream,
+            length,
             seen: sender,
             task: task.abort_handle(),
         };
@@ -111,10 +110,31 @@ impl Supervisors {
         }
     }
 
-    /// Tells the supervisor of Group `group`'s Handoff, if any, where a control saw the Group.
-    pub(super) fn seen(&self, group: &str, seen: Seen) {
+    /// The length of the Item of `stream`'s Handoff on Group `group`, as its supervisor knows
+    /// it; none without a supervisor or a known length.
+    pub(super) fn length(&self, group: &str, stream: &StreamId) -> Option<f64> {
+        let running = self.lock();
+        let running = running
+            .get(group)
+            .filter(|running| running.stream == *stream)?;
+        running.length
+    }
+
+    /// Tells the supervisor of Group `group`'s Handoff, if any, how a control left the Group
+    /// (`playback`) at `now`; nothing if it told no position.
+    pub(super) fn seen(&self, group: &str, playback: &Playback, now: Instant) {
+        let Some(position) = playback
+            .position
+            .and_then(|position| Duration::try_from_secs_f64(position).ok())
+        else {
+            return;
+        };
         if let Some(running) = self.lock().get(group) {
-            running.seen.send_replace(seen);
+            running.seen.send_replace(Seen {
+                playing: playback.state == TransportState::Playing,
+                position,
+                at: now,
+            });
         }
     }
 
@@ -129,7 +149,7 @@ impl Supervisors {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Running>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Running>> {
         self.running.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -150,14 +170,6 @@ enum Next {
     Continue,
     /// The Handoff ended.
     Stop,
-}
-
-/// The supervised Handoff, as the store tells it.
-enum Found {
-    Active(GroupHandoff),
-    Ended,
-    /// Storage failed (logged).
-    Unknown,
 }
 
 impl<S: Store> Supervisor<S> {
@@ -191,10 +203,10 @@ impl<S: Store> Supervisor<S> {
     /// When the Group, `last` seen as given, is expected at the end of the Item; none unless
     /// it was playing and the length is known.
     fn end_due(&self, last: &Seen) -> Option<Instant> {
-        let length = Duration::try_from_secs_f64(known_length(self.length)?).ok()?;
         if !last.playing {
             return None;
         }
+        let length = Duration::try_from_secs_f64(self.length?).ok()?;
         Some(last.at + length.saturating_sub(last.position).max(END_RECHECK))
     }
 
@@ -204,14 +216,13 @@ impl<S: Store> Supervisor<S> {
     /// at the end written Finished, and the Handoff ends. A Group paused, stopped elsewhere,
     /// or playing something else gets nothing written. Updates `last`.
     async fn visit(&self, last: &mut Seen, cadence: bool) -> Next {
-        let found = match self.handoff().await {
-            Found::Active(found) => found,
-            Found::Ended => return Next::Stop,
-            Found::Unknown => return Next::Continue,
-        };
         // Checked before taking the turn, as the Library Server may be slow; only when a write
         // may follow, as only a Group seen playing gets one.
         let checked = if last.playing {
+            let found = match self.handoff().await {
+                Ok(found) => found,
+                Err(next) => return next,
+            };
             let mut time = Budget(CHECK_TIME);
             let checked = self
                 .controls
@@ -231,15 +242,17 @@ impl<S: Store> Supervisor<S> {
         };
         // A start or control may have come first.
         let found = match self.handoff().await {
-            Found::Active(found) => found,
-            Found::Ended => return Next::Stop,
-            Found::Unknown => return Next::Continue,
+            Ok(found) => found,
+            Err(next) => return next,
         };
-        let Some(playback) = self.playback().await else {
+        let Ok(playback) = self
+            .controls
+            .playback(&self.group, &mut Budget(GROUP_TIME))
+            .await
+        else {
             return Next::Continue;
         };
-        let played = playback.uri.as_deref().and_then(stream::stream_in_url);
-        if played != Some(self.stream) {
+        if !plays_stream(&playback, &self.stream) {
             tracing::debug!(
                 group = self.group,
                 "a supervised Group plays something other than its Handoff"
@@ -248,8 +261,7 @@ impl<S: Store> Supervisor<S> {
             return Next::Continue;
         }
         let now = self.clock.now();
-        let length = known_length(self.length)
-            .or_else(|| known_length(playback.duration.map(|length| length.as_secs_f64())));
+        let length = self.length.or_else(|| told_length(&playback));
         match playback.state {
             sonos::TransportState::Playing => {
                 let Some(position) = playback.position else {
@@ -260,15 +272,11 @@ impl<S: Store> Supervisor<S> {
                     position,
                     at: now,
                 };
-                if !cadence {
-                    return Next::Continue;
+                // Without a check, seen not playing before: the key is checked before the next.
+                if let (true, Some(acting)) = (cadence, checked) {
+                    let update = ProgressUpdate::at(position.as_secs_f64(), length);
+                    self.write(&found, acting, update, "cadence").await;
                 }
-                let Some(acting) = checked else {
-                    // Seen not playing before: the key is checked before the next write.
-                    return Next::Continue;
-                };
-                let update = ProgressUpdate::at(position.as_secs_f64(), length);
-                self.write(&found, acting, update, "cadence").await;
             }
             sonos::TransportState::Paused => {
                 last.playing = false;
@@ -277,17 +285,13 @@ impl<S: Store> Supervisor<S> {
                 }
             }
             sonos::TransportState::Stopped => {
-                let ended = length.zip(checked).filter(|(length, _)| {
-                    let expected = last.expected(now) + END_SLACK;
-                    last.playing && expected.as_secs_f64() >= *length
-                });
+                // Checked only when seen playing.
+                let expected = last.position + now.saturating_duration_since(last.at);
                 last.playing = false;
-                if let Some((length, acting)) = ended {
-                    let update = ProgressUpdate {
-                        current_time: length,
-                        duration: Some(length),
-                        finished: true,
-                    };
+                if let (Some(acting), Some(length)) = (checked, length)
+                    && (expected + END_SLACK).as_secs_f64() >= length
+                {
+                    let update = ProgressUpdate::finished(length);
                     self.write(&found, acting, update, "end of Item").await;
                     self.end(&found).await;
                     return Next::Stop;
@@ -298,36 +302,15 @@ impl<S: Store> Supervisor<S> {
         Next::Continue
     }
 
-    /// The Group's active Handoff, if it is still the supervised one.
-    async fn handoff(&self) -> Found {
+    /// The Group's active Handoff, if it is still the supervised one; else what the
+    /// supervisor does next: stop once it ended, go on after a storage failure (logged).
+    async fn handoff(&self) -> Result<GroupHandoff, Next> {
         match self.controls.store.group_handoff(&self.group).await {
-            Ok(Some(found)) if found.stream == self.stream => Found::Active(found),
-            Ok(_) => Found::Ended,
+            Ok(Some(found)) if found.stream == self.stream => Ok(found),
+            Ok(_) => Err(Next::Stop),
             Err(error) => {
                 super::log_storage_error("look up a supervised Group's Handoff", &error);
-                Found::Unknown
-            }
-        }
-    }
-
-    /// What the Group plays, within [`GROUP_TIME`]; none (logged) if it doesn't tell.
-    async fn playback(&self) -> Option<sonos::Playback> {
-        let group = &self.group;
-        match Budget(GROUP_TIME)
-            .spend(self.controls.sonos.playback(group))
-            .await
-        {
-            Some(Ok(playback)) => Some(playback),
-            Some(Err(error)) => {
-                tracing::warn!(group, %error, "cannot read what a supervised Group plays");
-                None
-            }
-            None => {
-                tracing::warn!(
-                    group,
-                    "a supervised Group did not tell its playback in time"
-                );
-                None
+                Err(Next::Continue)
             }
         }
     }

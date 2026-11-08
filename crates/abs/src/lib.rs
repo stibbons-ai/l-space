@@ -313,6 +313,15 @@ impl ProgressUpdate {
             finished: false,
         }
     }
+
+    /// Finished, at the end of an Item `length` seconds long.
+    pub fn finished(length: f64) -> Self {
+        Self {
+            current_time: length,
+            duration: Some(length),
+            finished: true,
+        }
+    }
 }
 
 /// A duration in seconds, unless Audiobookshelf doesn't know it: it then sends 0 (or null).
@@ -1381,11 +1390,7 @@ mod tests {
             .set_progress(&base_url, &key, "li-2", Some("ep-1"), at(0.0, Some(0.0)))
             .await
             .unwrap();
-        let finished = ProgressUpdate {
-            current_time: 600.0,
-            duration: Some(600.0),
-            finished: true,
-        };
+        let finished = ProgressUpdate::finished(600.0);
         client
             .set_progress(&base_url, &key, "li-1", None, finished)
             .await

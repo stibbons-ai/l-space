@@ -213,6 +213,8 @@ struct Shared {
     clock: Arc<dyn Clock>,
     /// When the household started, on `clock`: what `GET /clock` counts from.
     origin: Instant,
+    /// Woken each time a `GET /clock?after=…` starts waiting.
+    clock_waiting: tokio::sync::Notify,
     state: Mutex<HouseholdState>,
     /// How players fetch the URLs they play.
     http: reqwest::Client,
@@ -310,6 +312,7 @@ impl Household {
             .expect("an HTTP client without TLS builds");
         let shared = Arc::new(Shared {
             origin: clock.now(),
+            clock_waiting: tokio::sync::Notify::new(),
             clock,
             state: Mutex::default(),
             http,
@@ -362,17 +365,18 @@ impl Household {
     /// does by then. After advancing the clock, a test waits for this before it expects a
     /// Bridge following the clock to act on the new time.
     pub async fn clock_followed(&self) {
-        let deadline = Instant::now() + FOLLOW_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + FOLLOW_TIMEOUT;
         loop {
+            // Enabled before checking, so a follower arriving in between still wakes it.
+            let waiting = self.shared.clock_waiting.notified();
+            let mut waiting = std::pin::pin!(waiting);
+            waiting.as_mut().enable();
             let now = self.shared.elapsed();
             if self.shared.lock().clock_waits.contains(&now) {
                 return;
             }
-            assert!(
-                Instant::now() < deadline,
-                "nobody followed the clock to {now} ns"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            let woken = tokio::time::timeout_at(deadline, waiting).await;
+            assert!(woken.is_ok(), "nobody followed the clock to {now} ns");
         }
     }
 
@@ -679,6 +683,7 @@ struct ClockWait {
 impl ClockWait {
     fn new(shared: Arc<Shared>, after: u64) -> Self {
         shared.lock().clock_waits.push(after);
+        shared.clock_waiting.notify_waiters();
         Self { shared, after }
     }
 }

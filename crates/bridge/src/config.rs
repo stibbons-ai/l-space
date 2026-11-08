@@ -34,10 +34,7 @@ pub struct Config {
     /// In file order; no two share a [`LibraryServerUrl`].
     pub library_servers: Vec<LibraryServerConfig>,
     pub sonos: SonosConfig,
-    /// Where a `sonos-fake` household serves the test clock the Bridge times Handoff
-    /// supervision on instead of the system clock (`[testing] clock_address`); none unless set.
-    /// A test-only hook: see `crate::test_clock`.
-    pub test_clock: Option<SocketAddr>,
+    pub testing: TestingConfig,
 }
 
 /// One configured Library Server.
@@ -55,6 +52,15 @@ pub struct SonosConfig {
     pub discovery_address: SocketAddr,
 }
 
+/// Test-only hooks (`[testing]`); none set unless configured, never in production.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestingConfig {
+    /// Where a `sonos-fake` household serves the test clock the Bridge times Handoff
+    /// supervision on instead of the system clock (see `crate::test_clock`).
+    pub clock_address: Option<SocketAddr>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -65,7 +71,7 @@ struct RawConfig {
     #[serde(default)]
     sonos: RawSonos,
     #[serde(default)]
-    testing: RawTesting,
+    testing: TestingConfig,
 }
 
 #[derive(Deserialize)]
@@ -79,12 +85,6 @@ struct RawLibraryServer {
 #[serde(deny_unknown_fields)]
 struct RawSonos {
     discovery_address: Option<SocketAddr>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawTesting {
-    clock_address: Option<SocketAddr>,
 }
 
 /// Why the configuration was rejected. URL errors name the offending entry, and its value only
@@ -170,7 +170,7 @@ impl std::str::FromStr for Config {
             sonos: SonosConfig {
                 discovery_address: raw.sonos.discovery_address.unwrap_or(sonos::MULTICAST),
             },
-            test_clock: raw.testing.clock_address,
+            testing: raw.testing,
         })
     }
 }
@@ -506,12 +506,14 @@ mod tests {
     #[test]
     fn the_test_clock_hook_is_off_unless_set_and_takes_only_an_address() {
         let base = "listen = \"127.0.0.1:0\"\ndatabase = \"bridge.db\"\n";
-        assert_eq!(base.parse::<Config>().unwrap().test_clock, None);
+        let config = base.parse::<Config>().unwrap();
+        assert_eq!(config.testing.clock_address, None);
 
         let config = format!("{base}[testing]\nclock_address = \"127.0.0.1:41901\"\n")
             .parse::<Config>()
             .unwrap();
-        assert_eq!(config.test_clock, Some("127.0.0.1:41901".parse().unwrap()));
+        let expected = Some("127.0.0.1:41901".parse().unwrap());
+        assert_eq!(config.testing.clock_address, expected);
 
         for invalid in ["\"http://127.0.0.1:41901/clock\"", "\"127.0.0.1\"", "41901"] {
             let config = format!("{base}[testing]\nclock_address = {invalid}\n");
