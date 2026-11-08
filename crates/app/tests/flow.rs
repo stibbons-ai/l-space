@@ -3579,6 +3579,60 @@ fn play_on_lists_every_group_and_plays_the_episode_on_the_one_chosen() {
 }
 
 #[test]
+fn choosing_a_busy_group_plays_there_at_once() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let office = household.add_player("Office");
+    household.play(
+        &office,
+        FakeTrack::new("Morning Radio", Duration::from_secs(3600)),
+    );
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        open_episode(&mut app, &abs, 0).await;
+        app.open_play_on().await;
+        app.play_on(kitchen.uuid()).await;
+        let replaced = household.uri(&kitchen).expect("Kitchen was given a URL");
+        app.go_back();
+        open_episode(&mut app, &abs, 1).await;
+        let item = shown_item(&app).clone();
+
+        // Office plays another source, Kitchen a Handoff: one choice each starts the Item,
+        // with nothing to confirm.
+        for (group, name) in [(&office, "Office"), (&kitchen, "Kitchen")] {
+            app.open_play_on().await;
+            app.play_on(group.uuid()).await;
+            assert_eq!(
+                app.screen(),
+                &Screen::Item {
+                    item: item.clone(),
+                    notice: Some(Notice::PlayingOn(name.into())),
+                }
+            );
+            assert_eq!(household.transport_state(group), "PLAYING");
+            let url = household.uri(group).expect("a URL");
+            assert!(
+                url.starts_with(&format!("{}/stream/", bridge.url())),
+                "{url}"
+            );
+        }
+        assert_ne!(household.uri(&kitchen), Some(replaced));
+        let mut handoffs = bridge.api().handoffs(&session(&app)).await;
+        handoffs.sort_by(|a, b| a.group.cmp(&b.group));
+        let mut expected = [(kitchen.uuid(), &item.id), (office.uuid(), &item.id)];
+        expected.sort_unstable_by_key(|(group, _)| *group);
+        let listed: Vec<_> = handoffs
+            .iter()
+            .map(|h| (h.group.as_str(), &h.item))
+            .collect();
+        assert_eq!(listed, expected);
+    });
+}
+
+#[test]
 fn a_start_that_fails_is_explained_on_the_picker() {
     let (household, _) = Household::with_manual_clock();
     let kitchen = household.add_player("Kitchen");
