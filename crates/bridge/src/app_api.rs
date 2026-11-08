@@ -550,13 +550,17 @@ impl<S: Store> AppApi<S> {
     /// Starts Item `id` on Group `group` for the session's user: resolves the Item's audio
     /// file with the session's key, stores the Handoff (replacing the Group's), then has the
     /// Group play its stream. If the Group doesn't, the new Handoff ends again, and the one it
-    /// replaced stays ended: the Group is left with none. Starts on one Group take turns.
+    /// replaced stays ended: the Group is left with none. Starts take turns with starts and
+    /// controls on the Group, waiting for their turn only as long as [`START_TIME`] leaves
+    /// after resolving and before [`sonos::PLAY_TIMEOUT`]; past that, nothing is stored or
+    /// played ([`ApiError::GroupFailed`]).
     async fn start_handoff(
         &self,
         token: SessionToken,
         id: ItemId,
         group: String,
     ) -> Result<Handoff, ApiError> {
+        let called = tokio::time::Instant::now();
         let library_item_id = id.library_item.clone();
         let request = Request {
             operation: "start a Handoff",
@@ -629,7 +633,11 @@ impl<S: Store> AppApi<S> {
         let task_group = group.clone();
         let (logged_item, logged_episode) = (library_item_id.clone(), id.episode.clone());
         let started = tokio::spawn(async move {
-            let _turn = turn.lock().await;
+            let turn_time = START_TIME
+                .saturating_sub(called.elapsed())
+                .saturating_sub(sonos::PLAY_TIMEOUT);
+            let not_done = "a Handoff not started";
+            let _turn = take_turn(&turn, &task_group, turn_time, not_done).await?;
             let handoff = store::Handoff {
                 group: task_group,
                 library_item: library_item_id,
@@ -719,7 +727,8 @@ impl<S: Store> AppApi<S> {
         // On its own task, as a start is, so no client hanging up can cut it off between the
         // Group's action and the Progress write; a panic in it is handled below.
         let controlled = tokio::spawn(async move {
-            let _turn = take_turn(&turn, &task_group).await?;
+            let not_done = "a control not sent";
+            let _turn = take_turn(&turn, &task_group, CONTROL_TURN_TIME, not_done).await?;
             controls.control(&task_group, control).await
         })
         .await;
@@ -744,7 +753,8 @@ impl<S: Store> AppApi<S> {
         }
         let volume = volume.min(api::MAX_VOLUME);
         let turn = self.group_lock(&group);
-        let _turn = take_turn(&turn, &group).await?;
+        let not_done = "a volume change not sent";
+        let _turn = take_turn(&turn, &group, CONTROL_TURN_TIME, not_done).await?;
         self.sonos
             .set_volume(&group, volume)
             .await
@@ -881,23 +891,31 @@ const CONTROL_TURN_TIME: Duration = Duration::from_secs(3);
 /// How long a control's requests to the starter's Library Server may take in all: checking
 /// whom the Handoff's key acts for, looking up the Item's length, writing Progress. With
 /// [`CONTROL_TURN_TIME`] for its turn and the Group's [`sonos::CONTROL_TIMEOUT`] for the
-/// control's calls to the Group, a control answers in at most 14 seconds, within the App's 15.
+/// control's calls to the Group, a control answers in about 14 seconds at most (plus local
+/// storage), within the App's 15.
 const CONTROL_LIBRARY_SERVER_TIME: Duration = Duration::from_secs(7);
 
-/// Waits for `turn`, Group `group`'s, at most [`CONTROL_TURN_TIME`].
+/// How long a start may take in all, about (plus local storage): resolving the Item, waiting
+/// for its turn on the Group, then [`sonos::PLAY_TIMEOUT`] for the Group; its turn waits only
+/// for what the other two leave. One second under the App's 15.
+const START_TIME: Duration = Duration::from_secs(14);
+
+/// Waits for `turn`, Group `group`'s, at most `wait`; past it, logs that `not_done` (what
+/// the caller then doesn't do) and answers [`ApiError::GroupFailed`].
 async fn take_turn<'a>(
     turn: &'a tokio::sync::Mutex<()>,
     group: &str,
+    wait: Duration,
+    not_done: &'static str,
 ) -> Result<tokio::sync::MutexGuard<'a, ()>, ApiError> {
-    tokio::time::timeout(CONTROL_TURN_TIME, turn.lock())
-        .await
-        .map_err(|_| {
-            tracing::warn!(
-                group,
-                "a control not sent: the Group is busy with another start or control"
-            );
-            ApiError::GroupFailed
-        })
+    tokio::time::timeout(wait, turn.lock()).await.map_err(|_| {
+        tracing::warn!(
+            group,
+            not_done,
+            "the Group is busy with another start or control"
+        );
+        ApiError::GroupFailed
+    })
 }
 
 /// What a control on a Group's Handoff acts with, owned, so the control runs on its own task.
@@ -1131,9 +1149,12 @@ impl<S: Store> Controls<S> {
     /// What the starter's Library Server tells about `active` with the Handoff's key, within
     /// `time`: whom the key acts for, and the Item's length as `wanted`. An optional length
     /// gets at most half the time left, so that a slow one neither loses a timely answer on
-    /// the key nor leaves the Progress write no time. A key the Library Server rejects, or
-    /// that now acts for another user, is revoked, which ends the Handoff. Failures are
-    /// logged.
+    /// the key nor leaves the Progress write less than half the time; a needed one gets all
+    /// but [`LENGTH_MARGIN`] of it, so its own timeout, not the budget's, ends a late lookup
+    /// and a timely answer on the key is kept. A slow answer on the key itself can still
+    /// leave the write too little time ([`MIN_WRITE_TIME`]). A key the Library Server
+    /// rejects, or that now acts for another user, is revoked, which ends the Handoff.
+    /// Failures are logged.
     async fn check(
         &self,
         active: &ActiveHandoff,
@@ -1176,7 +1197,7 @@ impl<S: Store> Controls<S> {
         let length_time = match wanted {
             Wanted::No => Duration::ZERO,
             Wanted::Optional => time.0 / 2,
-            Wanted::Needed => time.0,
+            Wanted::Needed => time.0.saturating_sub(LENGTH_MARGIN),
         };
         // None if not asked; Some(None) if not told in time.
         let length = async {
@@ -1299,6 +1320,17 @@ impl<S: Store> Controls<S> {
                 return;
             }
         };
+        if time.0 < MIN_WRITE_TIME {
+            let reason = "no time left";
+            tracing::warn!(
+                group,
+                library_server,
+                user_id = starter.user_id,
+                reason,
+                "Progress not written"
+            );
+            return;
+        }
         let written = time
             .spend(self.abs.set_progress(
                 library_server,
@@ -1429,6 +1461,14 @@ impl Budget {
         done
     }
 }
+
+/// How much sooner than a control's Library Server budget a needed length lookup times out, so
+/// that its own timeout, not the budget's, ends it and the answer on the key is kept.
+const LENGTH_MARGIN: Duration = Duration::from_millis(100);
+
+/// The least time left for a Progress write to be sent at all: with less, it couldn't be
+/// confirmed, so it isn't sent.
+const MIN_WRITE_TIME: Duration = Duration::from_millis(250);
 
 /// Whether `playback`, Group `group`'s, plays `stream`, a Handoff's; [`ApiError::NoHandoff`]
 /// if not.

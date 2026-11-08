@@ -36,9 +36,9 @@ pub const EXPIRY: Duration = Duration::from_secs(3 * 60);
 /// than the App's limit for a call to the Bridge.
 pub const LISTING_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// How long [`Upnp::play`] may take in all, waiting for the first search included. With the
-/// Library Server's 10 seconds for resolving an Item, a start stays within the App's limit for
-/// a call to the Bridge.
+/// How long [`Upnp::play`] may take in all, waiting for the first search included. A start
+/// in the Bridge resolves its Item and waits for its turn on the Group only as long as leaves
+/// this much within the App's limit for a call to the Bridge.
 pub const PLAY_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// How long each of [`Upnp`]'s calls controlling one Group may take in all (reading its

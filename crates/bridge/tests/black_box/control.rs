@@ -823,6 +823,8 @@ async fn a_starters_key_rejected_at_write_time_is_revoked_ending_the_handoff() {
         let api = setup.bridge.api();
         let episode = setup.episode(0);
         setup.start(&episode, &setup.kitchen).await;
+        // No request with Alice's key in flight while it is deleted (see `delete_api_key`).
+        setup.household.fetched(&setup.kitchen).await;
         setup.clock.advance(seconds(60));
 
         setup.abs.delete_api_key(&setup.alice.api_key).await;
@@ -861,6 +863,7 @@ async fn a_starters_key_rejected_at_write_time_is_revoked_ending_the_handoff() {
     let setup = setup().await;
     let api = setup.bridge.api();
     setup.start(&setup.episode(0), &setup.kitchen).await;
+    setup.household.fetched(&setup.kitchen).await;
     setup.clock.advance(seconds(60));
     setup.abs.delete_api_key(&setup.alice.api_key).await;
     let before = setup.playback_controls(&setup.kitchen);
@@ -883,6 +886,8 @@ async fn a_starters_key_moved_to_another_user_is_revoked_and_writes_nothing() {
     let api = setup.bridge.api();
     let episode = setup.episode(0);
     setup.start(&episode, &setup.kitchen).await;
+    // No request with Alice's key in flight while it is moved (see `move_api_key`).
+    setup.household.fetched(&setup.kitchen).await;
     setup.clock.advance(seconds(60));
 
     // An admin makes Alice's key act for Bob.
@@ -1051,7 +1056,17 @@ async fn a_control_waits_for_its_turn_on_the_group_only_so_long() {
     let (first, (queued, waited)) = tokio::join!(
         api.control_error(&setup.bobs, kitchen, GroupControl::Pause),
         async {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // Once the Group got the Pause, the pause holds the turn.
+            let deadline = Instant::now() + seconds(3);
+            while !setup
+                .household
+                .actions_of(&setup.kitchen)
+                .iter()
+                .any(|action| action == "AVTransport#Pause")
+            {
+                assert!(Instant::now() < deadline, "the Group got no Pause");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             let start = Instant::now();
             let queued = tokio::join!(
                 api.control_error(&setup.bobs, kitchen, GroupControl::Skip(Skip::Back15)),
@@ -1064,7 +1079,7 @@ async fn a_control_waits_for_its_turn_on_the_group_only_so_long() {
     // The others gave up after 3 seconds of waiting, before the pause let go of the turn.
     assert_eq!(queued, (GROUP_FAILED, GROUP_FAILED));
     assert!(
-        seconds(3) <= waited && waited < Duration::from_millis(3700),
+        seconds(3) <= waited && waited < Duration::from_millis(3900),
         "{waited:?}"
     );
     // And sent nothing.
@@ -1083,8 +1098,9 @@ async fn a_controls_calls_to_the_group_share_one_time_limit() {
     let episode = setup.episode(0);
     setup.start(&episode, &setup.kitchen).await;
     setup.clock.advance(seconds(60));
-    // Each call answers within the 2 seconds Upnp gives one, but a forward skip's three (read,
-    // read again after the length, seek) take 4.5 seconds together.
+    // Each call alone answers well within the 4 seconds a control has for the Group (a fresh
+    // 4 seconds per call would pass each), but a forward skip's three (read, read again after
+    // the length, seek) take 4.5 seconds together, so only one limit shared by all fails it.
     setup.household.set_fault(
         &setup.kitchen,
         Fault::SlowTransport(Duration::from_millis(1500)),
@@ -1204,6 +1220,63 @@ async fn a_control_takes_turns_with_a_start_on_its_group() {
     );
     assert_eq!(setup.progress(&setup.alice, &second).await, Some(0.0));
     assert_eq!(setup.progress(&setup.alice, &first).await, None);
+}
+
+#[tokio::test]
+async fn a_start_waits_for_its_turn_on_the_group_only_so_long() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let api = setup.bridge.api();
+    let kitchen = setup.kitchen.uuid();
+    let (first, second) = (setup.episode(0), setup.episode(1));
+    let handoff = setup.start(&first, &setup.kitchen).await;
+    setup.household.fetched(&setup.kitchen).await;
+    setup.clock.advance(seconds(60));
+    // A pause holds the Group's turn about 10.4 seconds: 3.4 for the Group's slow answers
+    // (its playback, then the Pause), then the 7 the Library Server has for a write it never
+    // answers.
+    setup.household.set_fault(
+        &setup.kitchen,
+        Fault::SlowTransport(Duration::from_millis(1700)),
+    );
+    forwarder.stall_requests("PATCH /api/me/progress").await;
+    let asked = |action: &str| {
+        let actions = setup.household.actions_of(&setup.kitchen);
+        actions.iter().filter(|sent| *sent == action).count()
+    };
+    let (read_before, set_uri_before) = (
+        asked("AVTransport#GetTransportInfo"),
+        asked("AVTransport#SetAVTransportURI"),
+    );
+
+    let (paused, (started, waited)) = tokio::join!(api.pause_group(&setup.bobs, kitchen), async {
+        // Once the Group is asked for its playback, the pause holds the turn.
+        let deadline = Instant::now() + seconds(3);
+        while asked("AVTransport#GetTransportInfo") == read_before {
+            assert!(Instant::now() < deadline, "the pause never came");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let start = Instant::now();
+        let started = api
+            .start_handoff_error(&setup.alices, &second, kitchen)
+            .await;
+        (started, start.elapsed())
+    },);
+
+    // The start gave up on its turn once only the Group's 4 seconds were left of its 14,
+    // before the pause let go, and well within the App's 15.
+    assert_eq!(started, GROUP_FAILED);
+    assert!(seconds(9) <= waited && waited < seconds(11), "{waited:?}");
+    assert_eq!(paused.state, TransportState::Paused);
+    // It stored nothing and played nothing: the first Handoff goes on, and the Group was
+    // given no other URL.
+    assert_eq!(api.handoffs(&setup.bobs).await, [handoff]);
+    assert_eq!(asked("AVTransport#SetAVTransportURI"), set_uri_before);
+    assert!(output_contains(
+        &setup.bridge.stop(),
+        "a Handoff not started"
+    ));
 }
 
 /// Pins the wire shape the App decodes, independent of the shared Rust types.

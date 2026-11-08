@@ -430,7 +430,15 @@ impl Audiobookshelf {
         }
     }
 
-    /// Deletes `api_key`, as an admin revoking it would.
+    /// Deletes `api_key`, as an admin revoking it would, and waits until Audiobookshelf
+    /// rejects it.
+    ///
+    /// Audiobookshelf (2.37.2) drops a key from its key cache before deleting its row, so a
+    /// request with the key in flight meanwhile caches the old row again, and the deleted key
+    /// goes on being accepted; deployments see the same when an admin deletes a key while it
+    /// is used. Callers wait until no request with the key is in flight; should the key still
+    /// be accepted, this panics with "Audiobookshelf's API-key cache is stale", a harness
+    /// problem rather than a Bridge one.
     pub async fn delete_api_key(&self, api_key: &IssuedKey) {
         self.admin(
             reqwest::Method::DELETE,
@@ -438,6 +446,7 @@ impl Audiobookshelf {
             None,
         )
         .await;
+        self.confirm_key(api_key, None).await;
     }
 
     /// Renames user `user_id`, as an admin editing them would.
@@ -450,7 +459,9 @@ impl Audiobookshelf {
         .await;
     }
 
-    /// Makes `api_key` act for user `user_id` instead, as an admin editing it would.
+    /// Makes `api_key` act for user `user_id` instead, as an admin editing it would, and waits
+    /// until Audiobookshelf says so; as [`Self::delete_api_key`], panics if its key cache is
+    /// stale.
     pub async fn move_api_key(&self, api_key: &IssuedKey, user_id: &str) {
         self.admin(
             reqwest::Method::PATCH,
@@ -458,6 +469,44 @@ impl Audiobookshelf {
             Some(json!({"userId": user_id})),
         )
         .await;
+        self.confirm_key(api_key, Some(user_id)).await;
+    }
+
+    /// Waits briefly until `api_key` acts for `user_id` (none: is rejected), according to
+    /// Audiobookshelf; panics if it doesn't.
+    async fn confirm_key(&self, api_key: &IssuedKey, user_id: Option<&str>) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut acts_for;
+        loop {
+            let response = self
+                .http
+                .get(format!("{}/api/me", self.base_url))
+                .bearer_auth(&api_key.key)
+                .send()
+                .await
+                .expect("GET /api/me");
+            acts_for = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                None
+            } else {
+                let me: Value = response
+                    .error_for_status()
+                    .expect("GET /api/me")
+                    .json()
+                    .await
+                    .expect("GET /api/me body");
+                Some(me["id"].as_str().expect("user id").to_owned())
+            };
+            if acts_for.as_deref() == user_id || Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            acts_for.as_deref(),
+            user_id,
+            "Audiobookshelf's API-key cache is stale: key {} acts for {acts_for:?}, not {user_id:?}",
+            api_key.id
+        );
     }
 
     /// Who `api_key` acts for, according to Audiobookshelf itself.

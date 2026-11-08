@@ -485,7 +485,8 @@ pub enum ApiError {
     /// coordinator unplugged.
     #[error("group_not_found")]
     GroupNotFound,
-    /// The Group did not do what was asked: its coordinator didn't answer in time, or refused.
+    /// The Group did not do what was asked: its coordinator didn't answer in time, or
+    /// refused, or it was busy with another start or control on it and wasn't asked.
     #[error("group_failed")]
     GroupFailed,
     /// The Item can't be played on a Group by this Bridge yet: it has more than one audio
@@ -740,7 +741,10 @@ pub async fn resume_group(group: String) -> Result<Playback, ApiError> {
 /// as [`pause_group`] does, and answers likewise. A forward skip on a Group that tells no
 /// length is refused with [`ApiError::LibraryServerUnreachable`] when the Library Server
 /// doesn't tell the length either (unreachable, too slow, or the Item is gone there), and goes
-/// on without an end if it knows the Item has none.
+/// on without an end if it knows the Item has none. If the Library Server rejects the
+/// starter's key there, or it now acts for another user, the key is revoked and the skip
+/// answers [`ApiError::NoHandoff`], or [`ApiError::Internal`] if storing the revoke failed;
+/// nothing is sent to the Group then.
 #[post(
     "/api/groups/skip",
     headers: dioxus_fullstack::HeaderMap,
