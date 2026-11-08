@@ -1185,7 +1185,12 @@ async fn a_group_that_refuses_or_does_not_answer_the_seek_keeps_no_handoff() {
     let failed = (StatusCode::BAD_GATEWAY, ApiError::GroupFailed);
     let (_, old) = setup.start(&setup.episode(0), &setup.kitchen).await;
 
-    setup.household.set_fault(&setup.kitchen, Fault::RefuseSeek);
+    // Kitchen answers its Pause only after a while: the pause after the refused seek is still
+    // under way when the start answers.
+    let pause_time = Duration::from_millis(1500);
+    setup
+        .household
+        .set_fault(&setup.kitchen, Fault::RefuseSeekSlowPause(pause_time));
     assert_eq!(
         api.start_handoff_error(&setup.session, &episode, setup.kitchen.uuid())
             .await,
@@ -1202,9 +1207,15 @@ async fn a_group_that_refuses_or_does_not_answer_the_seek_keeps_no_handoff() {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
     // The Group, already playing from 0, is paused; the pause keeps the Group's turn, so a
-    // volume change, which waits for it, comes after.
+    // volume change, which waits for it (up to its 3 seconds), comes only after the pause.
+    let volume = Instant::now();
     api.set_group_volume(&setup.session, setup.kitchen.uuid(), 10)
         .await;
+    let waited = volume.elapsed();
+    assert!(
+        waited >= pause_time - Duration::from_millis(500),
+        "{waited:?}"
+    );
     assert_eq!(
         setup.household.transport_state(&setup.kitchen),
         "PAUSED_PLAYBACK"
@@ -1265,4 +1276,28 @@ async fn a_start_left_too_little_time_to_seek_sends_nothing() {
         &setup.bridge.stop(),
         "a start has too little time left for the Group"
     ));
+}
+
+#[tokio::test]
+async fn a_start_at_0_after_a_slow_resolve_still_has_time_to_play() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let api = setup.bridge.api();
+    let episode = setup.episode(0);
+    // Resolving takes about 7.5 of the start's 14 seconds: a start without Progress sends no
+    // seek, so the Group's 4 to play are still left.
+    forwarder.delay_by(Duration::from_millis(7500)).await;
+
+    let start = Instant::now();
+    let handoff = api
+        .start_handoff(&setup.session, &episode, setup.kitchen.uuid())
+        .await;
+    let elapsed = start.elapsed();
+    assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+
+    assert_eq!(handoff.item, episode);
+    assert!(called(&setup.household, &setup.kitchen, SET_URI));
+    assert!(!called(&setup.household, &setup.kitchen, SEEK));
+    assert_eq!(api.handoffs(&setup.session).await.len(), 1);
 }

@@ -686,12 +686,13 @@ pub async fn groups() -> Result<Vec<Group>, ApiError> {
 
 /// Starts the Item `item` on Group `group`, replacing what the Group played and the Handoff it
 /// had, if any. It starts at the session user's Progress in the Item, in whole seconds; from
-/// its beginning when that is Finished or absent, or when `from_start` ("Play from start"; an
-/// App that sends none gets the Progress). The Bridge streams the Item to the Group, which
-/// keeps playing without the App. Only an Item with exactly one audio file plays so far. Once
-/// the Item is found playable, the Group's Handoff is replaced before the Group is told to
-/// play and then to go to the start position: if it doesn't do both (a Sonos error), the
-/// Group is left with no Handoff.
+/// its beginning when that is Finished or absent, when its whole seconds lie at or past the
+/// Item's end, or when `from_start` ("Play from start"; an App that sends none gets the
+/// Progress). The Bridge streams the Item to the Group, which keeps playing without the App.
+/// Only an Item with exactly one audio file plays so far. Once the Item is found playable, the
+/// Group's Handoff is replaced before the Group is told to play and then, only when it starts
+/// past the beginning, to go to the start position: if it doesn't do what it is told (a Sonos
+/// error), the Group is left with no Handoff.
 #[post(
     "/api/handoffs/start",
     headers: dioxus_fullstack::HeaderMap,

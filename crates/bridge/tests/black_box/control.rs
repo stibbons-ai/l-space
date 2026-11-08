@@ -1439,12 +1439,38 @@ async fn a_control_takes_turns_with_a_start_on_its_group() {
 
 #[tokio::test]
 async fn a_start_waits_for_its_turn_on_the_group_only_so_long() {
+    // The start gave up on its turn once only the Group's 4 seconds were left of its 14,
+    // before the pause let go, and well within the App's 15.
+    start_behind_a_slow_pause(None, seconds(9)..seconds(11)).await;
+}
+
+#[tokio::test]
+async fn a_start_that_seeks_waits_for_its_turn_less() {
+    // Starting at Alice's Progress, the start also leaves the Group's 4 seconds to seek: it
+    // gives up on its turn once 4 + 4 are left of its 14.
+    start_behind_a_slow_pause(Some(754.6), seconds(5)..seconds(7)).await;
+}
+
+/// Has Alice start an episode, with `progress` in it (seconds) if any, on Kitchen while Bob's
+/// pause holds the Group's turn longer than the start can wait, and checks that it gave up on
+/// its turn after a wait within `waited`, storing and playing nothing.
+async fn start_behind_a_slow_pause(progress: Option<f64>, waited: std::ops::Range<Duration>) {
     let abs = Audiobookshelf::shared();
     let forwarder = Forwarder::to(abs.address()).await;
     let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
     let api = setup.bridge.api();
     let kitchen = setup.kitchen.uuid();
     let (first, second) = (setup.episode(0), setup.episode(1));
+    if let Some(progress) = progress {
+        abs.set_progress(
+            &setup.alice,
+            &second.library_item,
+            second.episode.as_deref(),
+            progress,
+            false,
+        )
+        .await;
+    }
     let handoff = setup.start(&first, &setup.kitchen).await;
     setup.household.fetched(&setup.kitchen).await;
     setup.clock.advance(seconds(60));
@@ -1465,7 +1491,7 @@ async fn a_start_waits_for_its_turn_on_the_group_only_so_long() {
         asked("AVTransport#SetAVTransportURI"),
     );
 
-    let (paused, (started, waited)) = tokio::join!(api.pause_group(&setup.bobs, kitchen), async {
+    let (paused, (started, elapsed)) = tokio::join!(api.pause_group(&setup.bobs, kitchen), async {
         // Once the Group is asked for its playback, the pause holds the turn.
         let deadline = Instant::now() + seconds(3);
         while asked("AVTransport#GetTransportInfo") == read_before {
@@ -1479,74 +1505,11 @@ async fn a_start_waits_for_its_turn_on_the_group_only_so_long() {
         (started, start.elapsed())
     },);
 
-    // The start gave up on its turn once only the Group's 4 seconds were left of its 14,
-    // before the pause let go, and well within the App's 15.
     assert_eq!(started, GROUP_FAILED);
-    assert!(seconds(9) <= waited && waited < seconds(11), "{waited:?}");
+    assert!(waited.contains(&elapsed), "{elapsed:?}");
     assert_eq!(paused.state, TransportState::Paused);
     // It stored nothing and played nothing: the first Handoff goes on, and the Group was
     // given no other URL.
-    assert_eq!(api.handoffs(&setup.bobs).await, [handoff]);
-    assert_eq!(asked("AVTransport#SetAVTransportURI"), set_uri_before);
-    assert!(output_contains(
-        &setup.bridge.stop(),
-        "a Handoff not started"
-    ));
-}
-
-#[tokio::test]
-async fn a_start_that_seeks_waits_for_its_turn_less() {
-    let abs = Audiobookshelf::shared();
-    let forwarder = Forwarder::to(abs.address()).await;
-    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
-    let api = setup.bridge.api();
-    let kitchen = setup.kitchen.uuid();
-    let (first, second) = (setup.episode(0), setup.episode(1));
-    abs.set_progress(
-        &setup.alice,
-        &second.library_item,
-        second.episode.as_deref(),
-        754.6,
-        false,
-    )
-    .await;
-    let handoff = setup.start(&first, &setup.kitchen).await;
-    setup.household.fetched(&setup.kitchen).await;
-    setup.clock.advance(seconds(60));
-    // A pause holds the Group's turn about 10.4 seconds, as in
-    // `a_start_waits_for_its_turn_on_the_group_only_so_long`.
-    setup.household.set_fault(
-        &setup.kitchen,
-        Fault::SlowTransport(Duration::from_millis(1700)),
-    );
-    forwarder.stall_requests("PATCH /api/me/progress").await;
-    let asked = |action: &str| {
-        let actions = setup.household.actions_of(&setup.kitchen);
-        actions.iter().filter(|sent| *sent == action).count()
-    };
-    let (read_before, set_uri_before) = (
-        asked("AVTransport#GetTransportInfo"),
-        asked("AVTransport#SetAVTransportURI"),
-    );
-
-    let (paused, (started, waited)) = tokio::join!(api.pause_group(&setup.bobs, kitchen), async {
-        let deadline = Instant::now() + seconds(3);
-        while asked("AVTransport#GetTransportInfo") == read_before {
-            assert!(Instant::now() < deadline, "the pause never came");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let start = Instant::now();
-        let started = api
-            .start_handoff_error(&setup.alices, &second, kitchen)
-            .await;
-        (started, start.elapsed())
-    },);
-
-    // Starting at Alice's Progress, the start also leaves the Group's 4 seconds to seek: it
-    // gave up on its turn once 4 + 4 were left of its 14.
-    assert_eq!(started, GROUP_FAILED);
-    assert!(seconds(5) <= waited && waited < seconds(7), "{waited:?}");
-    assert_eq!(paused.state, TransportState::Paused);
     assert_eq!(api.handoffs(&setup.bobs).await, [handoff]);
     assert_eq!(asked("AVTransport#SetAVTransportURI"), set_uri_before);
     assert!(output_contains(
