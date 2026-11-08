@@ -317,13 +317,14 @@ impl ProgressUpdate {
         }
     }
 
-    /// Finished, at the end of an Item `length` seconds long.
-    pub fn finished(length: f64) -> Self {
-        Self {
+    /// Finished, at the end of an Item `length` seconds long; none unless `length` is one an
+    /// Item can have (finite and more than zero).
+    pub fn finished(length: f64) -> Option<Self> {
+        (length.is_finite() && length > 0.0).then_some(Self {
             current_time: length,
             duration: Some(length),
             finished: true,
-        }
+        })
     }
 
     /// The position written, in seconds.
@@ -1406,7 +1407,7 @@ mod tests {
             .set_progress(&base_url, &key, "li-2", Some("ep-1"), at(0.0, Some(0.0)))
             .await
             .unwrap();
-        let finished = ProgressUpdate::finished(600.0);
+        let finished = ProgressUpdate::finished(600.0).unwrap();
         client
             .set_progress(&base_url, &key, "li-1", None, finished)
             .await
@@ -1440,6 +1441,18 @@ mod tests {
                     json!({"currentTime": 600.0, "duration": 600.0, "progress": 1.0, "isFinished": true}),
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn only_a_length_an_item_can_have_is_written_finished() {
+        for length in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(ProgressUpdate::finished(length), None, "{length}");
+        }
+        let finished = ProgressUpdate::finished(0.5).unwrap();
+        assert_eq!(
+            (finished.current_time(), finished.is_finished()),
+            (0.5, true)
         );
     }
 

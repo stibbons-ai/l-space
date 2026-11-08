@@ -89,12 +89,7 @@ impl<S: Store> AppApi<S> {
 
     /// What a control, a start's replacement write or a supervisor acts with.
     fn controls(&self) -> Controls<S> {
-        Controls {
-            abs: self.abs.clone(),
-            store: Arc::clone(&self.store),
-            sonos: Arc::clone(&self.sonos),
-            library_servers: Arc::clone(&self.library_servers),
-        }
+        self.supervisors.controls().clone()
     }
 
     /// The base URL of the configured Library Server that `url` (in any spelling) normalizes
@@ -763,9 +758,9 @@ impl<S: Store> AppApi<S> {
                         .saturating_sub(called.elapsed())
                         .saturating_sub(sonos::PLAY_TIMEOUT + seek_time)
                         .min(REPLACED_PROGRESS_TIME);
-                    let length = supervisors.length(&task_group, &replaced.stream);
+                    let known = supervisors.replaced(&task_group, &replaced.stream);
                     controls
-                        .write_replaced(&task_group, &replaced, length, time)
+                        .write_replaced(&task_group, &replaced, known, time)
                         .await;
                 }
                 Ok(None) => {}
@@ -839,12 +834,7 @@ impl<S: Store> AppApi<S> {
                 });
                 return Err(sonos_error(error));
             }
-            supervisors.start(
-                handoff.group.clone(),
-                stream,
-                known_length(length),
-                position,
-            );
+            supervisors.start(&handoff, stream, known_length(length), position);
             tracing::info!(
                 group = handoff.group,
                 library_server,
@@ -1546,29 +1536,63 @@ impl<S: Store> Controls<S> {
     /// Writes where Group `group` is on `replaced`'s stream as Progress for the replaced
     /// Handoff's starter, with its key ([`Controls::write_progress`]), within `time` in all:
     /// reading the Group, checking the key (and the Item's length, if neither the Group nor
-    /// `length`, as the replaced Handoff's supervisor knew it, tells it), writing. Only a Group
-    /// playing or paused on that stream, telling a position, gets it written; a stopped one
-    /// may tell 0 there. With no `time` at all, nothing is tried. Anything else, a failure or
-    /// running out of time is logged and otherwise left alone.
+    /// its supervisor (`known`) tells it), writing. Only a Group playing or paused on that
+    /// stream, telling a position, gets it written; a stopped one may tell 0 there. A Group
+    /// still stopped on that stream after playing to the end of the Item, whose Finished write
+    /// the supervisor hadn't made yet, gets that one. With no `time` at all, nothing is tried.
+    /// Anything else, a failure or running out of time is logged and otherwise left alone; a
+    /// pending Finished write left unmade is logged as an error.
     async fn write_replaced(
         &self,
         group: &str,
         replaced: &GroupHandoff,
-        length: Option<f64>,
+        known: supervise::Replaced,
         time: Duration,
     ) {
         let not_written = "the replaced Handoff's Progress not written";
+        let handoff = &replaced.active.handoff;
+        let lost = |reason: &str| {
+            if let Some(update) = known.finished {
+                tracing::error!(
+                    group,
+                    user_id = handoff.started_by.user_id,
+                    library_item = handoff.library_item,
+                    episode = handoff.episode,
+                    position = update.current_time(),
+                    finished = update.is_finished(),
+                    reason,
+                    "Finished at the end of a replaced Handoff's Item was never written: lost"
+                );
+            }
+        };
         if time.is_zero() {
             tracing::info!(group, reason = "no time left", "{not_written}");
+            lost("no time left");
             return;
         }
         let mut time = Budget(time);
         let Ok(playback) = self.playback(group, &mut time).await else {
             tracing::info!(group, "{not_written}");
+            lost("the Group did not tell what it plays");
             return;
         };
+        let on_stream = plays_stream(&playback, &replaced.stream);
+        if let Some(update) = known.finished
+            && on_stream
+            && playback.state == sonos::TransportState::Stopped
+        {
+            let checked = self.check(&replaced.active, Wanted::No, &mut time).await;
+            let cause = "replaced, end of Item";
+            let wrote = self
+                .write_progress(&replaced.active, checked.acting, update, cause, &mut time)
+                .await;
+            if !matches!(wrote, Wrote::Written) {
+                lost("the write did not land");
+            }
+            return;
+        }
         let position = playback.position.filter(|_| {
-            plays_stream(&playback, &replaced.stream)
+            on_stream
                 && matches!(
                     playback.state,
                     sonos::TransportState::Playing | sonos::TransportState::Paused
@@ -1580,9 +1604,10 @@ impl<S: Store> Controls<S> {
                 state = ?playback.state,
                 "a Group tells no position on the Handoff a start replaces; {not_written}"
             );
+            lost("the Group is no longer stopped on the Handoff");
             return;
         };
-        let duration = told_length(&playback).or(length);
+        let duration = told_length(&playback).or(known.length);
         let position = position.as_secs_f64();
         self.check_and_write(&replaced.active, position, duration, "replaced", &mut time)
             .await;
