@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use api::{ItemId, Session, Skip, TransportState};
-use sonos_fake::{Fault, Household, PlayerId};
+use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_DURATIONS};
 use test_support::bridge::{
@@ -133,6 +133,15 @@ impl Setup {
         self.settle().await;
     }
 
+    /// Moves time on by `seconds`, one second at a time, waiting each time until the Bridge
+    /// read Kitchen afterwards: as real time passes near the end of an Item, where the Bridge
+    /// reads the Group every second.
+    async fn read_every_second(&self, seconds: u64) {
+        for _ in 0..seconds {
+            self.advance_and_read(1).await;
+        }
+    }
+
     /// Waits until whatever the Bridge does holding Kitchen's turn is done: Bob sets Kitchen's
     /// volume to what it is, which changes nothing, once he has the turn.
     async fn settle(&self) {
@@ -229,9 +238,10 @@ impl Setup {
             .await;
         self.advance_and_read(5).await;
         proxy.fail_progress_writes(failures);
-        self.advance(10).await;
+        self.read_every_second(5).await;
         let failed = async || proxy.progress_writes_failed() == 1;
         eventually("the Finished write never came", WITHIN, failed).await;
+        self.advance(5).await;
         self.settle().await;
     }
 }
@@ -307,7 +317,7 @@ async fn reaching_the_end_of_the_item_sets_finished_and_the_group_stops() {
     // Near the end, the Bridge reads Kitchen every second; it plays on to the end of the
     // episode and stops there.
     setup.advance_and_read(5).await;
-    setup.advance(10).await;
+    setup.read_every_second(5).await;
     setup
         .wait_for_progress(&setup.alice, &episode, (length, true))
         .await;
@@ -371,11 +381,37 @@ async fn an_item_whose_length_only_the_group_tells_ends_at_its_end() {
         .await;
 
     setup.advance_and_read(5).await;
-    setup.advance(10).await;
+    setup.read_every_second(5).await;
     setup
         .wait_for_progress(&setup.alice, &episode, (length, true))
         .await;
     setup.wait_until_no_handoff().await;
+}
+
+#[tokio::test]
+async fn a_handoff_started_mid_item_writes_absolute_positions_and_finishes_at_the_end() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    let length = EPISODE_DURATIONS[0];
+    setup
+        .set_progress(&setup.alice, &episode, 300.0, false)
+        .await;
+
+    // It starts at her Progress, so its first tick writes 30 seconds further on.
+    setup.start(&setup.alices, &episode, Some(length)).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (330.0, false))
+        .await;
+
+    // 300 seconds after the start, Kitchen reaches the end of the episode.
+    setup.advance_and_settle(265).await;
+    setup.read_every_second(5).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (length, true))
+        .await;
+    setup.wait_until_no_handoff().await;
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "STOPPED");
 }
 
 #[tokio::test]
@@ -397,6 +433,29 @@ async fn a_group_stopped_short_of_the_end_is_not_finished() {
     assert_eq!(
         setup.progress(&setup.alice, &episode).await,
         Some((575.0, false))
+    );
+    assert_eq!(setup.handoffs().await, 1);
+}
+
+#[tokio::test]
+async fn a_group_stopped_five_seconds_before_the_end_is_not_finished() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup
+        .start(&setup.alices, &episode, Some(EPISODE_DURATIONS[0]))
+        .await;
+    setup.advance(595).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (595.0, false))
+        .await;
+
+    // Stopped from the Sonos app 5 seconds before the end, where the Bridge reads Kitchen
+    // every second: found stopped a second later, it was not played to the end.
+    setup.household.stop(&setup.kitchen);
+    setup.advance_and_settle(1).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((595.0, false))
     );
     assert_eq!(setup.handoffs().await, 1);
 }
@@ -429,6 +488,37 @@ async fn pausing_just_before_the_end_does_not_set_finished() {
         "PAUSED_PLAYBACK"
     );
     assert_eq!(setup.handoffs().await, 1);
+}
+
+#[tokio::test]
+async fn a_group_paused_near_the_end_then_resumed_finishes_at_the_end() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    let length = EPISODE_DURATIONS[0];
+    setup.start(&setup.alices, &episode, Some(length)).await;
+    setup.advance(595).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (595.0, false))
+        .await;
+
+    // Paused 5 seconds before the end for 30 seconds: nothing is written meanwhile.
+    setup.pause().await;
+    let writes = proxy.progress_writes();
+    setup.advance_and_settle(30).await;
+    assert_eq!(proxy.progress_writes(), writes);
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((595.0, false))
+    );
+
+    // Resumed from the App, it plays on to the end of the episode.
+    setup.resume().await;
+    setup.read_every_second(5).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (length, true))
+        .await;
+    setup.wait_until_no_handoff().await;
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "STOPPED");
 }
 
 #[tokio::test]
@@ -640,6 +730,36 @@ async fn replaying_a_finished_item_clears_finished_once_progress_is_written() {
 }
 
 #[tokio::test]
+async fn replaying_a_finished_item_clears_finished_also_at_the_position_it_was_finished_at() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    // Marked Finished 30 seconds in: the first tick writes that same position.
+    setup.set_progress(&setup.alice, &episode, 30.0, true).await;
+
+    setup.start(&setup.alices, &episode, None).await;
+    setup.advance_and_settle(30).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
+}
+
+#[tokio::test]
+async fn pausing_a_replayed_finished_item_at_its_start_clears_finished() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    // Marked Finished without ever being played.
+    setup.set_progress(&setup.alice, &episode, 0.0, true).await;
+
+    setup.start(&setup.alices, &episode, None).await;
+    setup.pause().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((0.0, false))
+    );
+}
+
+#[tokio::test]
 async fn replacing_a_handoff_writes_its_final_progress_before_the_new_one_starts() {
     let setup = setup().await;
     let (first, second) = (setup.episode(0), setup.episode(1));
@@ -697,6 +817,93 @@ async fn replacing_a_handoff_writes_its_final_progress_before_the_new_one_starts
     );
 }
 
+/// Alice's Handoff of episode 0 (600 seconds) on Kitchen, started at `from` seconds, and
+/// Kitchen read by the Bridge once time moved on by `played` seconds; time stands still from
+/// there, so Kitchen isn't read again.
+async fn alice_read_at(setup: &Setup, from: f64, played: u64) {
+    let first = setup.episode(0);
+    setup.set_progress(&setup.alice, &first, from, false).await;
+    let reads = setup.asked(READ);
+    setup
+        .start(&setup.alices, &first, Some(EPISODE_DURATIONS[0]))
+        .await;
+    if played == 0 {
+        let read = async || setup.asked(READ) > reads;
+        eventually("the Bridge never read Kitchen", WITHIN, read).await;
+    } else {
+        setup.advance_and_read(played).await;
+    }
+    setup.settle().await;
+}
+
+/// Asserts Bob's Handoff of episode 1 is the one listed.
+async fn assert_bobs_handoff_listed(setup: &Setup) {
+    let listed = setup.bridge.api().handoffs(&setup.bobs).await;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(
+        (&listed[0].item, &listed[0].started_by.user_id),
+        (&setup.episode(1), &setup.bob.id)
+    );
+}
+
+#[tokio::test]
+async fn a_start_replacing_a_handoff_played_to_its_end_before_the_next_read_writes_finished() {
+    let setup = setup().await;
+    let (first, length) = (setup.episode(0), EPISODE_DURATIONS[0]);
+    // A second before the end, the Bridge reads Kitchen at once.
+    alice_read_at(&setup, 599.0, 0).await;
+
+    // Kitchen reaches the end and stops there (telling 0, as at the end of a URL) before the
+    // Bridge reads it again, and Bob starts his episode on it.
+    setup.household.stop(&setup.kitchen);
+    setup.start(&setup.bobs, &setup.episode(1), None).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &first).await,
+        Some((length, true))
+    );
+    assert_bobs_handoff_listed(&setup).await;
+}
+
+#[tokio::test]
+async fn a_start_replacing_a_handoff_stopped_short_of_the_end_writes_no_finished() {
+    let setup = setup().await;
+    let first = setup.episode(0);
+    // Read 5 seconds before the end, then stopped from the Sonos app.
+    alice_read_at(&setup, 590.0, 5).await;
+
+    setup.household.stop(&setup.kitchen);
+    setup.start(&setup.bobs, &setup.episode(1), None).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &first).await,
+        Some((590.0, false))
+    );
+    assert_bobs_handoff_listed(&setup).await;
+}
+
+#[tokio::test]
+async fn a_group_playing_something_else_gets_no_progress_written() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup
+        .start(&setup.alices, &episode, Some(EPISODE_DURATIONS[0]))
+        .await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+
+    // Kitchen is made to play other audio from outside the App: neither the next tick nor
+    // the time the episode would have ended writes anything to Alice's Progress.
+    let other = FakeTrack::new("Another show", Duration::from_secs(3600));
+    setup.household.play(&setup.kitchen, other);
+    setup.advance_and_settle(30).await;
+    setup.advance_and_settle(600).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
+}
+
 /// Asserts that Bob's start, which replaced Alice's Handoff at 110 seconds after taking
 /// `took`, went on although her Progress write didn't land: within the start's time, his
 /// Handoff listed, her Progress as it was at 100 seconds, and nothing written with either
@@ -704,12 +911,7 @@ async fn replacing_a_handoff_writes_its_final_progress_before_the_new_one_starts
 async fn assert_replaced_without_progress(setup: &Setup, took: Duration) {
     let (first, second) = (setup.episode(0), setup.episode(1));
     assert!(took < START_TIME, "the start took {took:?}");
-    let listed = setup.bridge.api().handoffs(&setup.bobs).await;
-    assert_eq!(listed.len(), 1);
-    assert_eq!(
-        (&listed[0].item, &listed[0].started_by.user_id),
-        (&second, &setup.bob.id)
-    );
+    assert_bobs_handoff_listed(setup).await;
     assert_eq!(
         setup.progress(&setup.alice, &first).await,
         Some((100.0, false))
