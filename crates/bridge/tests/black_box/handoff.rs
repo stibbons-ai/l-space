@@ -27,6 +27,9 @@ const PLAY: &str = "AVTransport#Play";
 /// The SOAP action that moves a Group to a position, as `sonos-fake` records it.
 const SEEK: &str = "AVTransport#Seek";
 
+/// The SOAP action that pauses a Group, as `sonos-fake` records it.
+const PAUSE: &str = "AVTransport#Pause";
+
 /// The WARN the Bridge logs when a Group doesn't go to a start's position.
 const NOT_SOUGHT: &str = "a Group did not go to a Handoff's start position";
 
@@ -1052,8 +1055,8 @@ async fn a_start_begins_at_the_users_progress_in_whole_seconds() {
         .set_progress(&setup.user, &episode, 754.6, false)
         .await;
     // An audiobook's Progress is keyed by the library item alone. The seeded one-file
-    // audiobook lasts a second, so its Progress here lies past its end, which the Bridge
-    // doesn't check and the fake Group, knowing no length for a stream, accepts.
+    // audiobook lasts a second, so its Progress here lies past its end: a Group would
+    // refuse that seek, and the start begins at 0 instead.
     setup.set_progress(&setup.user, &silence, 42.9, false).await;
 
     setup.start(&episode, &setup.kitchen).await;
@@ -1063,10 +1066,7 @@ async fn a_start_begins_at_the_users_progress_in_whole_seconds() {
         setup.position(&setup.kitchen),
         (Duration::from_secs(754), true)
     );
-    assert_eq!(
-        setup.position(&setup.office),
-        (Duration::from_secs(42), true)
-    );
+    assert_eq!(setup.position(&setup.office), (Duration::ZERO, false));
     // Told to play first, then to seek.
     let started: Vec<String> = setup
         .household
@@ -1201,6 +1201,15 @@ async fn a_group_that_refuses_or_does_not_answer_the_seek_keeps_no_handoff() {
         let response = api.fetch(Method::GET, path(url), Some("bytes=0-")).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
+    // The Group, already playing from 0, is paused; the pause keeps the Group's turn, so a
+    // volume change, which waits for it, comes after.
+    api.set_group_volume(&setup.session, setup.kitchen.uuid(), 10)
+        .await;
+    assert_eq!(
+        setup.household.transport_state(&setup.kitchen),
+        "PAUSED_PLAYBACK"
+    );
+    assert!(called(&setup.household, &setup.kitchen, PAUSE));
 
     setup.household.set_fault(&setup.office, Fault::HangSeek);
     let start = Instant::now();
@@ -1221,4 +1230,39 @@ async fn a_group_that_refuses_or_does_not_answer_the_seek_keeps_no_handoff() {
     let not_sought = warns(&output, NOT_SOUGHT);
     let groups: Vec<_> = not_sought.iter().map(|event| &event["group"]).collect();
     assert_eq!(groups, [setup.kitchen.uuid(), setup.office.uuid()]);
+}
+
+#[tokio::test]
+async fn a_start_left_too_little_time_to_seek_sends_nothing() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let api = setup.bridge.api();
+    let episode = setup.episode(1);
+    setup
+        .set_progress(&setup.user, &episode, 754.6, false)
+        .await;
+    // Resolving takes about 7.5 of the start's 14 seconds: less than the Group's 4 to play
+    // and 4 to seek are left.
+    forwarder.delay_by(Duration::from_millis(7500)).await;
+
+    let start = Instant::now();
+    assert_eq!(
+        api.start_handoff_error(&setup.session, &episode, setup.kitchen.uuid())
+            .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed)
+    );
+    let elapsed = start.elapsed();
+    // It waited for the slow Library Server, then answered within the App's 15 seconds.
+    assert!(
+        Duration::from_millis(7500) <= elapsed && elapsed < Duration::from_secs(15),
+        "{elapsed:?}"
+    );
+
+    assert!(!called(&setup.household, &setup.kitchen, SET_URI));
+    assert_eq!(api.handoffs(&setup.session).await, []);
+    assert!(output_contains(
+        &setup.bridge.stop(),
+        "a start has too little time left for the Group"
+    ));
 }

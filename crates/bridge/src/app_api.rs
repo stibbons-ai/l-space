@@ -550,12 +550,15 @@ impl<S: Store> AppApi<S> {
     /// Starts Item `id` on Group `group` for the session's user: resolves the Item's audio
     /// file with the session's key, stores the Handoff (replacing the Group's), then has the
     /// Group play its stream and go to the start position ([`start_position`]: the user's
-    /// Progress, or 0 when `from_start`, Finished or without Progress). If the Group doesn't
-    /// play or seek, the new Handoff ends again, and the one it replaced stays ended: the
-    /// Group is left with none. Starts take turns with starts and controls on the Group,
-    /// waiting for their turn only as long as [`START_TIME`] leaves after resolving and before
-    /// [`sonos::PLAY_TIMEOUT`] (and [`sonos::CONTROL_TIMEOUT`] for a seek); past that, nothing
-    /// is stored or played ([`ApiError::GroupFailed`]).
+    /// Progress, or 0 when `from_start`, Finished, without Progress, or at or past the Item's
+    /// end). If the Group doesn't play or seek, the new Handoff ends again, and the one it
+    /// replaced stays ended: the Group is left with none. After a failed seek the Group,
+    /// already playing, is also paused, on a task of its own that keeps the Group's turn until
+    /// the pause is done (at most [`sonos::CONTROL_TIMEOUT`]) without holding up the answer.
+    /// Starts take turns with starts and controls on the Group, waiting for their turn only as
+    /// long as [`START_TIME`] leaves after resolving and before [`sonos::PLAY_TIMEOUT`] (and
+    /// [`sonos::CONTROL_TIMEOUT`] for a seek); past that, or when resolving left less than
+    /// those, nothing is stored or played ([`ApiError::GroupFailed`]).
     async fn start_handoff(
         &self,
         token: SessionToken,
@@ -579,6 +582,12 @@ impl<S: Store> AppApi<S> {
                 self.abs.library_item(server, key, &library_item_id).await
             })
             .await?;
+        let progress = browse::item_progress(&user, &id);
+        // Only a start that may seek needs the Item's length.
+        let duration = (!from_start && progress.is_some())
+            .then(|| browse::item_duration(library_item.clone(), &id))
+            .flatten();
+        let position = start_position(progress.as_ref(), from_start, duration);
         let file = match browse::single_audio_file(library_item, &id) {
             Ok(file) => file,
             Err(NoSingleFile::Missing(reason)) => {
@@ -617,7 +626,6 @@ impl<S: Store> AppApi<S> {
             return Err(ApiError::GroupNotFound);
         }
 
-        let position = start_position(browse::item_progress(&user, &id).as_ref(), from_start);
         let stream_token = StreamToken::new(random_hex("a stream id")?);
         let stream = stream_token.hash();
         let target = sonos::Stream {
@@ -647,7 +655,17 @@ impl<S: Store> AppApi<S> {
                 .saturating_sub(sonos::PLAY_TIMEOUT)
                 .saturating_sub(seek_time);
             let not_done = "a Handoff not started";
-            let _turn = take_turn(&turn, &task_group, turn_time, not_done).await?;
+            let turn = take_turn(&turn, &task_group, turn_time, not_done).await?;
+            // A turn taken with (next to) no wait left, after a slow resolve, still leaves
+            // too little for the Group's calls within the App's limit.
+            if START_TIME.saturating_sub(called.elapsed()) < sonos::PLAY_TIMEOUT + seek_time {
+                tracing::warn!(
+                    group = task_group,
+                    not_done,
+                    "a start has too little time left for the Group"
+                );
+                return Err(ApiError::GroupFailed);
+            }
             let handoff = store::Handoff {
                 group: task_group,
                 library_item: library_item_id,
@@ -670,17 +688,34 @@ impl<S: Store> AppApi<S> {
                 end_unstarted(store.as_ref(), &stream, &handoff.group).await;
                 return Err(sonos_error(error));
             }
-            // Played first, then sought: the order Sonos is known to take
-            // (docs/research/sonos-smoke-2026-11-04.md).
+            // Seek once told to play, as in docs/research/sonos-smoke-2026-11-04.md; a Seek
+            // right after Play is unverified on hardware.
             if !position.is_zero()
                 && let Err(error) = sonos.seek(&handoff.group, position).await
             {
                 tracing::warn!(
                     group = handoff.group,
+                    position = position.as_secs(),
+                    library_item = handoff.library_item,
+                    episode = handoff.episode,
                     %error,
                     "a Group did not go to a Handoff's start position"
                 );
                 end_unstarted(store.as_ref(), &stream, &handoff.group).await;
+                // The Group already plays, from 0: paused, so the listener doesn't hear the
+                // Item from its beginning without a Handoff. Its turn is kept until then, but
+                // the answer doesn't wait for it.
+                let group = handoff.group;
+                tokio::spawn(async move {
+                    if let Err(error) = sonos.pause(&group).await {
+                        tracing::warn!(
+                            group,
+                            %error,
+                            "a Group that did not go to a Handoff's start position was not paused"
+                        );
+                    }
+                    drop(turn);
+                });
                 return Err(sonos_error(error));
             }
             tracing::info!(
@@ -922,19 +957,30 @@ const CONTROL_LIBRARY_SERVER_TIME: Duration = Duration::from_secs(7);
 /// How long a start may take in all, about (plus local storage): resolving the Item, waiting
 /// for its turn on the Group, then [`sonos::PLAY_TIMEOUT`] for the Group to play and, starting
 /// past 0, [`sonos::CONTROL_TIMEOUT`] for it to seek; its turn waits only for what the others
-/// leave. One second under the App's 15.
+/// leave, and a start left with less than the Group's calls need sends nothing. One second
+/// under the App's 15.
 const START_TIME: Duration = Duration::from_secs(14);
 
 /// Where a start has the Group begin, in whole seconds: 0 when asked to play `from_start`, or
-/// when `progress` (the starting user's own) is absent, Finished, or less than a second in
-/// (or not a time at all); else its `current_time`, without the fraction.
-fn start_position(progress: Option<&Progress>, from_start: bool) -> Duration {
+/// when `progress` (the starting user's own) is absent, Finished, less than a second in (or
+/// not a time at all), or at or past the Item's end (`duration`, in seconds, when known);
+/// else its `current_time`, without the fraction.
+fn start_position(
+    progress: Option<&Progress>,
+    from_start: bool,
+    duration: Option<f64>,
+) -> Duration {
     match progress {
         Some(progress)
             if !from_start && !progress.finished && progress.current_time.is_finite() =>
         {
             // Saturating: a negative time starts at 0.
-            Duration::from_secs(progress.current_time as u64)
+            let position = Duration::from_secs(progress.current_time as u64);
+            match duration {
+                // A Group refuses a seek past its track.
+                Some(duration) if position.as_secs_f64() >= duration => Duration::ZERO,
+                _ => position,
+            }
         }
         _ => Duration::ZERO,
     }
@@ -942,20 +988,22 @@ fn start_position(progress: Option<&Progress>, from_start: bool) -> Duration {
 
 /// Waits for `turn`, Group `group`'s, at most `wait`; past it, logs that `not_done` (what
 /// the caller then doesn't do) and answers [`ApiError::GroupFailed`].
-async fn take_turn<'a>(
-    turn: &'a tokio::sync::Mutex<()>,
+async fn take_turn(
+    turn: &Arc<tokio::sync::Mutex<()>>,
     group: &str,
     wait: Duration,
     not_done: &'static str,
-) -> Result<tokio::sync::MutexGuard<'a, ()>, ApiError> {
-    tokio::time::timeout(wait, turn.lock()).await.map_err(|_| {
-        tracing::warn!(
-            group,
-            not_done,
-            "the Group is busy with another start or control"
-        );
-        ApiError::GroupFailed
-    })
+) -> Result<tokio::sync::OwnedMutexGuard<()>, ApiError> {
+    tokio::time::timeout(wait, Arc::clone(turn).lock_owned())
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                group,
+                not_done,
+                "the Group is busy with another start or control"
+            );
+            ApiError::GroupFailed
+        })
 }
 
 /// What a control on a Group's Handoff acts with, owned, so the control runs on its own task.
@@ -2008,20 +2056,25 @@ mod tests {
     fn a_start_begins_at_the_whole_seconds_of_unfinished_progress_unless_from_start() {
         let secs = Duration::from_secs;
         let cases = [
-            (None, false, secs(0)),
-            (progress(754.6, false), false, secs(754)),
-            (progress(754.6, false), true, secs(0)),
-            (progress(754.6, true), false, secs(0)),
-            (progress(0.9, false), false, secs(0)),
-            (progress(-3.0, false), false, secs(0)),
-            (progress(f64::NAN, false), false, secs(0)),
-            (progress(f64::INFINITY, false), false, secs(0)),
+            (None, false, None, secs(0)),
+            (progress(754.6, false), false, None, secs(754)),
+            (progress(754.6, false), true, None, secs(0)),
+            (progress(754.6, true), false, None, secs(0)),
+            (progress(0.9, false), false, None, secs(0)),
+            (progress(-3.0, false), false, None, secs(0)),
+            (progress(f64::NAN, false), false, None, secs(0)),
+            (progress(f64::INFINITY, false), false, None, secs(0)),
+            // Within the Item's length; at or past its end.
+            (progress(754.6, false), false, Some(754.3), secs(754)),
+            (progress(754.6, false), false, Some(754.0), secs(0)),
+            (progress(900.0, false), false, Some(754.3), secs(0)),
+            (progress(754.6, false), false, Some(f64::NAN), secs(754)),
         ];
-        for (progress, from_start, expected) in cases {
+        for (progress, from_start, duration, expected) in cases {
             assert_eq!(
-                start_position(progress.as_ref(), from_start),
+                start_position(progress.as_ref(), from_start, duration),
                 expected,
-                "{progress:?} {from_start}"
+                "{progress:?} {from_start} {duration:?}"
             );
         }
     }

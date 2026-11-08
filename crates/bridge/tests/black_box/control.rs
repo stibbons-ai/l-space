@@ -1494,6 +1494,67 @@ async fn a_start_waits_for_its_turn_on_the_group_only_so_long() {
     ));
 }
 
+#[tokio::test]
+async fn a_start_that_seeks_waits_for_its_turn_less() {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let api = setup.bridge.api();
+    let kitchen = setup.kitchen.uuid();
+    let (first, second) = (setup.episode(0), setup.episode(1));
+    abs.set_progress(
+        &setup.alice,
+        &second.library_item,
+        second.episode.as_deref(),
+        754.6,
+        false,
+    )
+    .await;
+    let handoff = setup.start(&first, &setup.kitchen).await;
+    setup.household.fetched(&setup.kitchen).await;
+    setup.clock.advance(seconds(60));
+    // A pause holds the Group's turn about 10.4 seconds, as in
+    // `a_start_waits_for_its_turn_on_the_group_only_so_long`.
+    setup.household.set_fault(
+        &setup.kitchen,
+        Fault::SlowTransport(Duration::from_millis(1700)),
+    );
+    forwarder.stall_requests("PATCH /api/me/progress").await;
+    let asked = |action: &str| {
+        let actions = setup.household.actions_of(&setup.kitchen);
+        actions.iter().filter(|sent| *sent == action).count()
+    };
+    let (read_before, set_uri_before) = (
+        asked("AVTransport#GetTransportInfo"),
+        asked("AVTransport#SetAVTransportURI"),
+    );
+
+    let (paused, (started, waited)) = tokio::join!(api.pause_group(&setup.bobs, kitchen), async {
+        let deadline = Instant::now() + seconds(3);
+        while asked("AVTransport#GetTransportInfo") == read_before {
+            assert!(Instant::now() < deadline, "the pause never came");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let start = Instant::now();
+        let started = api
+            .start_handoff_error(&setup.alices, &second, kitchen)
+            .await;
+        (started, start.elapsed())
+    },);
+
+    // Starting at Alice's Progress, the start also leaves the Group's 4 seconds to seek: it
+    // gave up on its turn once 4 + 4 were left of its 14.
+    assert_eq!(started, GROUP_FAILED);
+    assert!(seconds(5) <= waited && waited < seconds(7), "{waited:?}");
+    assert_eq!(paused.state, TransportState::Paused);
+    assert_eq!(api.handoffs(&setup.bobs).await, [handoff]);
+    assert_eq!(asked("AVTransport#SetAVTransportURI"), set_uri_before);
+    assert!(output_contains(
+        &setup.bridge.stop(),
+        "a Handoff not started"
+    ));
+}
+
 /// Pins the wire shape the App decodes, independent of the shared Rust types.
 #[tokio::test]
 async fn control_wire_shape() {
