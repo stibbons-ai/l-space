@@ -18,12 +18,12 @@
 //! when the position it was last seen playing at, moved on by the time since (at most
 //! [`PLAYED_SINCE_MAX`]) and by [`POSITION_GRANULARITY`], reaches the end ([`played_to_end`]).
 //! A Group stopped earlier gets nothing written and keeps its Handoff; so may one played to
-//! its end whose reads failed for more than about a second before it: the time since it was
-//! last seen playing then can't tell a natural end from a stop. The Finished write for a Group
-//! found at its end is made at once, by a visit right after the one that found it, which asks
-//! whom the key acts for first. The end is known only with the Item's length: as its Library
-//! Server told it at the start, else as the Group first tells it; without either, the Handoff
-//! never ends this way.
+//! its end whose reads failed for more than about two seconds before it: the time since it
+//! was last seen playing then can't tell a natural end from a stop. The Finished write for a
+//! Group found at its end is made at once: by the visit that found it when that one asked
+//! whom the key acts for first (a cadence visit), else by a visit right after it, which asks
+//! first. The end is known only with the Item's length: as its Library Server told it at the
+//! start, else as the Group first tells it; without either, the Handoff never ends this way.
 //!
 //! The Finished write at the end is tried at most [`FINISH_TRIES`] times, again at the next
 //! cadence tick after one that didn't land (failed, unconfirmed, or the key's user not known),
@@ -81,9 +81,12 @@ const END_RECHECK: Duration = Duration::from_secs(1);
 
 /// The most time [`played_to_end`] counts as played between the last sighting of a Group
 /// playing and finding it stopped. Near the end, a visit with no write due reads the Group
-/// without asking the Library Server first, so two reads are about [`END_RECHECK`] plus one
-/// Group read (at most [`GROUP_TIME`]) apart. A longer gap, as after a failed or skipped read
-/// near the end, counts only this much: the Group may as well have been stopped early in it.
+/// without asking the Library Server first, and the time of each sighting is taken just
+/// before its read; visits are spaced [`END_RECHECK`] from when each began, so the reads'
+/// own time falls within that spacing, and the rest (one more [`GROUP_TIME`]) is slack for
+/// the next visit's wait for the Group's turn and for storage. A longer gap, as after a
+/// failed or skipped read near the end, counts only this much: the Group may as well have
+/// been stopped early in it.
 const PLAYED_SINCE_MAX: Duration = END_RECHECK.saturating_add(GROUP_TIME);
 
 /// How far a Group may have played beyond the position it tells: Sonos tells positions in
@@ -527,7 +530,8 @@ impl<S: Store> Supervisor<S> {
                     return Continue(());
                 };
                 self.saw(at, Some(position));
-                // Not checked, not due: seen playing before only by a control, or not at all.
+                // Not checked, not due: not seen playing when the visit began (a control's
+                // sighting may have come while it waited for the turn), or not a cadence visit.
                 if let (true, Some(acting)) = (cadence, checked) {
                     let update = ProgressUpdate::at(position.as_secs_f64(), length);
                     if let Wrote::Revoked = self.write(&found, acting, update, "cadence").await {
@@ -552,7 +556,8 @@ impl<S: Store> Supervisor<S> {
                     };
                 };
                 // Seen playing since what is left of the end was found, if anything: by a
-                // control, while this visit waited for the turn.
+                // control, while this visit waited for the turn, or before the visit, when its
+                // wake was taken over the control's news.
                 self.drop_ending("the Group played the Handoff again");
                 match (played_to_end(previous, at, length), checked) {
                     (Some(update), Some(acting)) => {

@@ -1591,8 +1591,11 @@ impl<S: Store> Controls<S> {
             let Some(update) = known.finished_at_stop(at, told_length(&playback)) else {
                 tracing::info!(
                     group,
-                    "a Group stopped on the Handoff a start replaces, short of the end of its \
-                     Item or not read often enough near it to tell; {not_written}"
+                    user_id = handoff.started_by.user_id,
+                    library_item = handoff.library_item,
+                    episode = handoff.episode,
+                    "no Finished write due for the replaced Handoff's stopped Group; \
+                     {not_written}"
                 );
                 return;
             };
@@ -1604,7 +1607,7 @@ impl<S: Store> Controls<S> {
             match wrote {
                 Wrote::Written => {}
                 Wrote::Revoked => lost(Some(update), "the Handoff's API key was revoked"),
-                Wrote::Not => lost(Some(update), "the write did not land"),
+                Wrote::Not => lost(Some(update), "not written (see the warning before)"),
             }
             return;
         }
@@ -1845,7 +1848,8 @@ impl<S: Store> Controls<S> {
                 return Wrote::Not;
             }
         };
-        // At least MIN_WRITE_TIME per request: two when Finished is cleared first.
+        // At least MIN_WRITE_TIME for the whole write, twice that when Finished is cleared
+        // first: not a bound on each request.
         let requests = if update.clears_finished() { 2 } else { 1 };
         if time.0 < MIN_WRITE_TIME * requests {
             not_written("no time left");
@@ -1898,8 +1902,8 @@ impl<S: Store> Controls<S> {
                         finished,
                         cause,
                         reason,
-                        "Progress not written after Finished was cleared: the Item is left \
-                         unfinished at 0, the position lost"
+                        "Progress not written after Finished was cleared: the Item is \
+                         probably left unfinished at 0, the position lost"
                     );
                 } else {
                     not_written(reason);
@@ -2037,8 +2041,9 @@ impl Budget {
     }
 }
 
-/// The least time left for each request of a Progress write to be sent at all: with less, it
-/// couldn't be confirmed, so it isn't sent.
+/// The least time left for a whole Progress write to be sent at all, twice this when it
+/// clears Finished first (two requests); with less, it couldn't be confirmed, so it isn't
+/// sent. It bounds the whole write, not each of its requests.
 const MIN_WRITE_TIME: Duration = Duration::from_millis(250);
 
 /// Whether `playback`, Group `group`'s, plays `stream`, a Handoff's; [`ApiError::NoHandoff`]
