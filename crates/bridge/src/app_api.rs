@@ -760,7 +760,7 @@ impl<S: Store> AppApi<S> {
                         .min(REPLACED_PROGRESS_TIME);
                     let known = supervisors.replaced(&task_group, &replaced.stream);
                     controls
-                        .write_replaced(&task_group, &replaced, known, time)
+                        .write_replaced(&task_group, &replaced, known, supervisors.clock(), time)
                         .await;
                 }
                 Ok(None) => {}
@@ -1538,24 +1538,29 @@ impl<S: Store> Controls<S> {
     /// reading the Group, checking the key (and the Item's length, if neither the Group nor
     /// its supervisor (`known`) tells it), writing. Only a Group playing or paused on that
     /// stream, telling a position, gets it written; a stopped one may tell 0 there. A Group
-    /// still stopped on that stream after playing to the end of the Item, whose Finished write
-    /// the supervisor hadn't made yet, gets that one. With no `time` at all, nothing is tried.
-    /// Anything else, a failure or running out of time is logged and otherwise left alone. A
-    /// pending Finished write (`known.finished`) left unmade is logged as an error when there
-    /// is no `time`, the Group doesn't tell what it plays, the write doesn't land, or the Group
-    /// tells no position playing or paused on that stream; a Group playing or paused on that
-    /// stream, telling a position, gets that position written instead, with no such error.
+    /// stopped on that stream after playing to the end of the Item gets Progress at the end
+    /// written Finished: the supervisor's pending Finished write, or, when it hadn't found the
+    /// Group stopped yet, one by the supervisor's rule on what it last saw of the Group
+    /// ([`supervise::Replaced::played_to_end`], timed on `clock`). A Group stopped there short
+    /// of the end gets nothing written. With no `time` at all, nothing is tried. Anything else,
+    /// a failure or running out of time is logged and otherwise left alone. A Finished write
+    /// left unmade is logged as an error when the write doesn't land; a pending one
+    /// (`known.finished`) also when there is no `time`, the Group doesn't tell what it plays,
+    /// or it tells no position playing or paused on that stream; a Group playing or paused on
+    /// that stream, telling a position, gets that position written instead, with no such
+    /// error.
     async fn write_replaced(
         &self,
         group: &str,
         replaced: &GroupHandoff,
         known: supervise::Replaced,
+        clock: &dyn Clock,
         time: Duration,
     ) {
         let not_written = "the replaced Handoff's Progress not written";
         let handoff = &replaced.active.handoff;
-        let lost = |reason: &str| {
-            if let Some(update) = known.finished {
+        let lost = |finished: Option<abs::ProgressUpdate>, reason: &str| {
+            if let Some(update) = finished {
                 tracing::error!(
                     group,
                     user_id = handoff.started_by.user_id,
@@ -1570,29 +1575,32 @@ impl<S: Store> Controls<S> {
         };
         if time.is_zero() {
             tracing::info!(group, reason = "no time left", "{not_written}");
-            lost("no time left");
+            lost(known.finished, "no time left");
             return;
         }
         let mut time = Budget(time);
+        // Where the Group is when asked.
+        let at = clock.now();
         let Ok(playback) = self.playback(group, &mut time).await else {
             tracing::info!(group, "{not_written}");
-            lost("the Group did not tell what it plays");
+            lost(known.finished, "the Group did not tell what it plays");
             return;
         };
         let on_stream = plays_stream(&playback, &replaced.stream);
-        if let Some(update) = known.finished
-            && on_stream
-            && playback.state == sonos::TransportState::Stopped
-        {
-            let checked = self.check(&replaced.active, Wanted::No, &mut time).await;
-            let cause = "replaced, end of Item";
-            let wrote = self
-                .write_progress(&replaced.active, checked.acting, update, cause, &mut time)
-                .await;
-            if !matches!(wrote, Wrote::Written) {
-                lost("the write did not land");
+        let duration = told_length(&playback).or(known.length);
+        if on_stream && playback.state == sonos::TransportState::Stopped {
+            let finished = known.finished.or_else(|| known.played_to_end(at, duration));
+            if let Some(update) = finished {
+                let checked = self.check(&replaced.active, Wanted::No, &mut time).await;
+                let cause = "replaced, end of Item";
+                let wrote = self
+                    .write_progress(&replaced.active, checked.acting, update, cause, &mut time)
+                    .await;
+                if !matches!(wrote, Wrote::Written) {
+                    lost(Some(update), "the write did not land");
+                }
+                return;
             }
-            return;
         }
         let position = playback.position.filter(|_| {
             on_stream
@@ -1607,10 +1615,12 @@ impl<S: Store> Controls<S> {
                 state = ?playback.state,
                 "a Group tells no position on the Handoff a start replaces; {not_written}"
             );
-            lost("the Group is no longer stopped on the Handoff");
+            lost(
+                known.finished,
+                "the Group is no longer stopped on the Handoff",
+            );
             return;
         };
-        let duration = told_length(&playback).or(known.length);
         let position = position.as_secs_f64();
         self.check_and_write(&replaced.active, position, duration, "replaced", &mut time)
             .await;
