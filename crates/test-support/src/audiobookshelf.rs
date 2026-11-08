@@ -8,8 +8,9 @@
 //! ([`Audiobookshelf::set_progress`]). The seeded Libraries are shared by all tests, and users
 //! are never deleted while the container runs. A test user sees only the seeded Libraries,
 //! explicit content included, unless the test says otherwise; so a test may add a Library
-//! ([`Audiobookshelf::crowded_podcast`]) or mark a seeded Item explicit or tag it without
-//! hiding or showing anything to other tests' users, as long as it undoes the mark or tags.
+//! ([`Audiobookshelf::crowded_podcast`], [`Audiobookshelf::resumable_book`]) or mark a seeded
+//! Item explicit or tag it without hiding or showing anything to other tests' users, as long
+//! as it undoes the mark or tags.
 //!
 //! Setup goes through Audiobookshelf's REST API as its root user, the way an admin would,
 //! never through its database: users are created there, API keys created, moved and deleted,
@@ -77,6 +78,20 @@ pub struct Crowded {
     pub library: String,
     pub podcast: String,
     pub episodes: Vec<String>,
+}
+
+/// The folder of [`Audiobookshelf::resumable_book`], in no Library until a test asks for it.
+const RESUMABLE_FOLDER: &str = "/resumable";
+
+/// [`Audiobookshelf::resumable_book`]'s one audio file: path in the container, length in
+/// seconds (20 minutes).
+const RESUMABLE_FILE: (&str, u32) = ("/resumable/L-Space/Resumed/Resumed.wav", 1200);
+
+/// The Library [`Audiobookshelf::resumable_book`] created, and its audiobook.
+#[derive(Debug, Clone)]
+pub struct Resumable {
+    pub library: String,
+    pub book: String,
 }
 
 /// The seeded episodes' publish dates, oldest first: 2026-01-01, 2026-02-15 and 2026-03-31,
@@ -148,6 +163,8 @@ pub struct Audiobookshelf {
     root_token: String,
     http: reqwest::Client,
     seeded: Seeded,
+    /// The folders a Library was created over: each takes one Library.
+    library_folders: Mutex<Vec<String>>,
 }
 
 impl std::fmt::Debug for Audiobookshelf {
@@ -313,23 +330,14 @@ impl Audiobookshelf {
     /// Creates the podcast Library "Crowded", holding one podcast of [`CROWDED_EPISODES`]
     /// episodes without publish dates, and waits until a scan has found them all. No test
     /// user sees it unless created to ([`Audiobookshelf::new_user_seeing`]). At most one test
-    /// per test run may call this: the folder takes one Library.
+    /// per test run may call this: the folder takes one Library, so a second call panics.
     pub async fn crowded_podcast(&self) -> Crowded {
         let library = self.new_library("Crowded", CROWDED_FOLDER, "podcast").await;
-        let deadline = Instant::now() + SCAN_TIMEOUT;
-        let podcast = loop {
-            let podcasts = self.library_items(&library).await;
-            if let [podcast] = podcasts.as_slice()
-                && podcast["media"]["numEpisodes"] == CROWDED_EPISODES
-            {
-                break podcast["id"].as_str().expect("podcast id").to_owned();
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the crowded podcast did not appear within {SCAN_TIMEOUT:?}: {podcasts:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        };
+        let podcast = self
+            .scanned_alone(&library, "the crowded podcast", |podcast| {
+                podcast["media"]["numEpisodes"] == CROWDED_EPISODES
+            })
+            .await;
         let episodes = self
             .podcast_episodes(&podcast)
             .await
@@ -340,6 +348,47 @@ impl Audiobookshelf {
             library,
             podcast,
             episodes,
+        }
+    }
+
+    /// Creates the audiobook Library "Resumable", holding "Resumed" by L-Space, one audio file
+    /// of 20 minutes, and waits until a scan has found it: a single-file audiobook long enough
+    /// to resume in. No test user sees it unless created to
+    /// ([`Audiobookshelf::new_user_seeing`]). At most one test per test run may call this:
+    /// the folder takes one Library, so a second call panics.
+    pub async fn resumable_book(&self) -> Resumable {
+        let library = self
+            .new_library("Resumable", RESUMABLE_FOLDER, "book")
+            .await;
+        let book = self
+            .scanned_alone(&library, "the resumable book", |book| {
+                book["media"]["numAudioFiles"] == 1
+            })
+            .await;
+        Resumable { library, book }
+    }
+
+    /// The id of the one library item in Library `library` once a scan found it `ready`;
+    /// panics, naming it `what`, if that takes longer than [`SCAN_TIMEOUT`].
+    async fn scanned_alone(
+        &self,
+        library: &str,
+        what: &str,
+        ready: impl Fn(&Value) -> bool,
+    ) -> String {
+        let deadline = Instant::now() + SCAN_TIMEOUT;
+        loop {
+            let items = self.library_items(library).await;
+            if let [item] = items.as_slice()
+                && ready(item)
+            {
+                return item["id"].as_str().expect("library item id").to_owned();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what} did not appear within {SCAN_TIMEOUT:?}: {items:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -560,6 +609,8 @@ impl Audiobookshelf {
                 silence(1),
             );
         }
+        let (path, seconds) = RESUMABLE_FILE;
+        image = image.with_copy_to(path, silence(seconds));
         let container = image
             .with_startup_timeout(STARTUP_TIMEOUT)
             .start()
@@ -585,6 +636,7 @@ impl Audiobookshelf {
             root_token,
             http,
             seeded: Seeded::default(),
+            library_folders: Mutex::default(),
         };
         abs.seeded = runtime.block_on(abs.seed());
         abs
@@ -682,7 +734,19 @@ impl Audiobookshelf {
     }
 
     /// Creates a Library of `media_type` over `folder`, starts a scan, and returns its id.
+    /// Panics if `folder` already has one.
     async fn new_library(&self, name: &str, folder: &str, media_type: &str) -> String {
+        {
+            let mut folders = self
+                .library_folders
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            assert!(
+                !folders.iter().any(|taken| taken == folder),
+                "{folder} already has a Library: only one test per run may create {name}"
+            );
+            folders.push(folder.to_owned());
+        }
         let library = self
             .admin(
                 reqwest::Method::POST,

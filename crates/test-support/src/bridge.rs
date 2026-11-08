@@ -608,14 +608,30 @@ impl AppApi {
         self.get_as(session, "/api/groups", &[]).await
     }
 
-    /// Starts Item `item` on Group `group` as `session`, panicking unless that succeeds.
+    /// Starts Item `item` on Group `group` as `session`, at the session user's Progress,
+    /// panicking unless that succeeds.
     pub async fn start_handoff(&self, session: &Session, item: &ItemId, group: &str) -> Handoff {
+        self.start_handoff_with(session, handoff_body(item, group, false))
+            .await
+    }
+
+    /// Starts Item `item` on Group `group` as `session` from its beginning ("Play from
+    /// start"), panicking unless that succeeds.
+    pub async fn start_handoff_from_start(
+        &self,
+        session: &Session,
+        item: &ItemId,
+        group: &str,
+    ) -> Handoff {
+        self.start_handoff_with(session, handoff_body(item, group, true))
+            .await
+    }
+
+    /// Starts a Handoff as `session` with request body `body`, panicking unless that
+    /// succeeds.
+    pub async fn start_handoff_with(&self, session: &Session, body: Value) -> Handoff {
         let response = self
-            .post(
-                "/api/handoffs/start",
-                Some(&bearer(session)),
-                handoff_body(item, group),
-            )
+            .post("/api/handoffs/start", Some(&bearer(session)), body)
             .await;
         decode(response).await
     }
@@ -630,7 +646,23 @@ impl AppApi {
         self.post_error(
             "/api/handoffs/start",
             Some(&bearer(session)),
-            handoff_body(item, group),
+            handoff_body(item, group, false),
+        )
+        .await
+    }
+
+    /// Starts Item `item` on Group `group` as `session` from its beginning ("Play from
+    /// start"), expecting a rejection.
+    pub async fn start_handoff_from_start_error(
+        &self,
+        session: &Session,
+        item: &ItemId,
+        group: &str,
+    ) -> (StatusCode, ApiError) {
+        self.post_error(
+            "/api/handoffs/start",
+            Some(&bearer(session)),
+            handoff_body(item, group, true),
         )
         .await
     }
@@ -820,8 +852,8 @@ pub fn filter_name(filter: EpisodeFilter) -> String {
     }
 }
 
-fn handoff_body(item: &ItemId, group: &str) -> Value {
-    json!({"item": item, "group": group})
+fn handoff_body(item: &ItemId, group: &str, from_start: bool) -> Value {
+    json!({"item": item, "group": group, "from_start": from_start})
 }
 
 /// A call that controls a Group, as the App makes it.

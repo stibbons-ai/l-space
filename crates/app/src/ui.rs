@@ -54,8 +54,8 @@ pub fn root() -> Element {
                 Screen::Item { item, notice } => rsx! {
                     ItemScreen { app, busy, item, notice }
                 },
-                Screen::PlayOn { item, groups, notice } => rsx! {
-                    PlayOnScreen { app, busy, item, groups, notice }
+                Screen::PlayOn { item, groups, from_start, notice } => rsx! {
+                    PlayOnScreen { app, busy, item, groups, from_start, notice }
                 },
                 Screen::Groups { groups, notice } => rsx! {
                     GroupsScreen { app, busy, groups, notice }
@@ -573,6 +573,12 @@ fn ItemScreen(app: Signal<App>, busy: Signal<bool>, item: Item, notice: Option<N
                     onclick: move |_| act(app, busy, async |app: &mut App| app.open_play_on().await),
                     {text(Text::PlayOn)}
                 }
+                button {
+                    r#type: "button",
+                    disabled: busy(),
+                    onclick: move |_| act(app, busy, async |app: &mut App| app.open_play_from_start().await),
+                    {text(Text::PlayFromStart)}
+                }
             }
             button {
                 r#type: "button",
@@ -604,19 +610,20 @@ fn ItemScreen(app: Signal<App>, busy: Signal<bool>, item: Item, notice: Option<N
     }
 }
 
-/// Picks the Group to play an Item on.
+/// Picks the Group to play an Item on, at the person's Progress or `from_start`.
 #[component]
 fn PlayOnScreen(
     app: Signal<App>,
     busy: Signal<bool>,
     item: Item,
     groups: Vec<Group>,
+    from_start: bool,
     notice: Option<Notice>,
 ) -> Element {
     let text = |text| app.read().text(text);
     rsx! {
         BackButton { app, busy }
-        h1 { {text(Text::PlayOn)} }
+        h1 { {text(if from_start { Text::PlayFromStart } else { Text::PlayOn })} }
         p { class: "byline", "{item.title}" }
         NoticeView { app, notice }
         if groups.is_empty() {

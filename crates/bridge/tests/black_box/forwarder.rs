@@ -2,7 +2,8 @@
 //! bring back: a Library Server outage, or a second Library Server URL for the same
 //! Audiobookshelf. It can also cut answers short (a Library Server failing mid-body), stall
 //! them (one hanging mid-body), stall only some requests (one hanging on those), delay them
-//! (a slow one), and record what clients send.
+//! (a slow one), record what clients send and are answered, and, while recording, hold up the
+//! next request of a kind without touching the connections already open.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,6 +42,26 @@ enum Answers {
     StallRequests(&'static str),
 }
 
+/// What the next request of a kind meets, while recording.
+#[derive(Debug, Clone, Copy)]
+enum Hold {
+    /// It reaches `target` this much later.
+    Late(Duration),
+    /// It never reaches `target`, and its connection stays open.
+    Never,
+}
+
+/// What connections opened while recording share.
+#[derive(Debug, Default)]
+struct Recording {
+    /// What clients sent.
+    requests: Vec<u8>,
+    /// What `target` answered.
+    responses: Vec<u8>,
+    /// The next request starting with this (method and path) meets that, then nothing more.
+    hold: Option<(String, Hold)>,
+}
+
 #[derive(Debug)]
 struct State {
     target: String,
@@ -48,11 +69,12 @@ struct State {
     forwarding: AtomicBool,
     /// For connections opened since it was set.
     answers: std::sync::Mutex<Answers>,
-    /// While true, a connection opened since records what the client sends in `requests`.
+    /// While true, a connection opened since records what the client sends and is answered
+    /// in `recording`, and meets its hold.
     recording: AtomicBool,
     /// Shared with the connections, which hold nothing else of the state: dropping the
     /// forwarder drops `connections`, aborting them.
-    requests: Arc<std::sync::Mutex<Vec<u8>>>,
+    recorded: Arc<std::sync::Mutex<Recording>>,
     connections: Mutex<JoinSet<()>>,
 }
 
@@ -68,7 +90,7 @@ impl Forwarder {
             forwarding: AtomicBool::new(true),
             answers: std::sync::Mutex::new(Answers::Whole),
             recording: AtomicBool::new(false),
-            requests: Arc::default(),
+            recorded: Arc::default(),
             connections: Mutex::new(JoinSet::new()),
         });
         let serving = tokio::spawn(serve(listener, Arc::clone(&state)));
@@ -129,16 +151,39 @@ impl Forwarder {
     }
 
     /// Closes every connection through the forwarder; from now on it records every byte
-    /// clients send through new ones, from none.
+    /// clients send through new ones, and `target` answers, from none.
     pub async fn record_requests(&self) {
-        self.state.requests.lock().unwrap().clear();
+        *self.state.recorded.lock().unwrap() = Recording::default();
         self.state.recording.store(true, Ordering::SeqCst);
         self.close_all().await;
     }
 
     /// What clients sent since [`Forwarder::record_requests`], as text.
     pub fn requests(&self) -> String {
-        String::from_utf8_lossy(&self.state.requests.lock().unwrap()).into_owned()
+        String::from_utf8_lossy(&self.state.recorded.lock().unwrap().requests).into_owned()
+    }
+
+    /// How many answers `target` began since [`Forwarder::record_requests`]: once one began,
+    /// `target` has handled its request.
+    pub fn answered(&self) -> usize {
+        let recorded = self.state.recorded.lock().unwrap();
+        String::from_utf8_lossy(&recorded.responses)
+            .matches("HTTP/1.1 ")
+            .count()
+    }
+
+    /// Has the next request starting with `start` (method and path, e.g. `"GET /api/me "`)
+    /// reach `target` only `delay` later, on a connection opened since
+    /// [`Forwarder::record_requests`]. Closes nothing, so answers under way arrive whole.
+    pub fn delay_next_request(&self, start: impl Into<String>, delay: Duration) {
+        self.state.recorded.lock().unwrap().hold = Some((start.into(), Hold::Late(delay)));
+    }
+
+    /// Has the next request starting with `start` never reach `target` nor be answered, its
+    /// connection staying open, on a connection opened since [`Forwarder::record_requests`].
+    /// Closes nothing, so answers under way arrive whole.
+    pub fn stall_next_request(&self, start: impl Into<String>) {
+        self.state.recorded.lock().unwrap().hold = Some((start.into(), Hold::Never));
     }
 
     async fn close_all(&self) {
@@ -178,7 +223,7 @@ async fn serve(listener: TcpListener, state: Arc<State>) {
         let target = state.target.clone();
         let answers = *state.answers.lock().unwrap();
         let recording = state.recording.load(Ordering::SeqCst);
-        let requests = Arc::clone(&state.requests);
+        let recorded = Arc::clone(&state.recorded);
         connections.spawn(async move {
             if let Answers::Late(delay) = answers {
                 tokio::time::sleep(delay).await;
@@ -206,30 +251,52 @@ async fn serve(listener: TcpListener, state: Arc<State>) {
             let sending = async {
                 let mut buffer = [0; 8192];
                 while let Ok(read @ 1..) = from_client.read(&mut buffer).await {
-                    if recording {
-                        requests.lock().unwrap().extend_from_slice(&buffer[..read]);
+                    let request = &buffer[..read];
+                    let hold = if recording {
+                        let mut recorded = recorded.lock().unwrap();
+                        recorded.requests.extend_from_slice(request);
+                        let held =
+                            |(start, _): &mut (String, Hold)| request.starts_with(start.as_bytes());
+                        recorded.hold.take_if(held).map(|(_, hold)| hold)
+                    } else {
+                        None
+                    };
+                    let stalled = matches!(answers, Answers::StallRequests(start)
+                        if request.starts_with(start.as_bytes()));
+                    match hold {
+                        _ if stalled => return true,
+                        Some(Hold::Never) => return true,
+                        Some(Hold::Late(delay)) => tokio::time::sleep(delay).await,
+                        None => {}
                     }
-                    if let Answers::StallRequests(start) = answers
-                        && buffer[..read].starts_with(start.as_bytes())
-                    {
-                        return true;
-                    }
-                    if to_server.write_all(&buffer[..read]).await.is_err() {
+                    if to_server.write_all(request).await.is_err() {
                         break;
                     }
                 }
                 false
             };
+            let answering = async {
+                if recording {
+                    let mut buffer = [0; 8192];
+                    while let Ok(read @ 1..) = limited.read(&mut buffer).await {
+                        let answer = &buffer[..read];
+                        recorded.lock().unwrap().responses.extend_from_slice(answer);
+                        if to_client.write_all(answer).await.is_err() {
+                            break;
+                        }
+                    }
+                } else {
+                    let _ = copy(&mut limited, &mut to_client).await;
+                }
+                if stall {
+                    std::future::pending::<()>().await;
+                }
+            };
             // Whichever ends first ends the connection, unless a request was stalled: then it
             // stays open, whatever `target` does with its side.
             let stalled = tokio::select! {
                 stalled = sending => stalled,
-                () = async {
-                    let _ = copy(&mut limited, &mut to_client).await;
-                    if stall {
-                        std::future::pending::<()>().await;
-                    }
-                } => false,
+                () = answering => false,
             };
             if stalled {
                 std::future::pending::<()>().await;

@@ -261,10 +261,18 @@ pub fn single_audio_file(
 
 /// The length in seconds of Item `id` in `library_item`, as its screen shows it; none if
 /// unknown or `library_item` holds no such Item.
-pub fn item_duration(library_item: abs::LibraryItem, id: &ItemId) -> Option<f64> {
-    match select(library_item.media, id).ok()? {
-        Selected::Audiobook(book) => book_duration(&book.tracks, book.duration),
-        Selected::Episode { episode, .. } => episode_duration(&episode),
+pub fn item_duration(library_item: &abs::LibraryItem, id: &ItemId) -> Option<f64> {
+    // Mirrors `select` by reference (without its reasons): keep the two in step.
+    match (&library_item.media, &id.episode) {
+        (abs::Media::Book(book), None) if is_audiobook(book) => {
+            book_duration(&book.tracks, book.duration)
+        }
+        (abs::Media::Podcast(podcast), Some(episode_id)) => podcast
+            .episodes
+            .iter()
+            .find(|episode| &episode.id == episode_id)
+            .and_then(episode_duration),
+        _ => None,
     }
 }
 

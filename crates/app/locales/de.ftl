@@ -77,6 +77,7 @@ group-volume = Lautstärke { $volume }
 group-volume-down = Leiser
 group-volume-up = Lauter
 play-on = Abspielen auf…
+play-from-start = Von vorn abspielen…
 playing-on = Spielt auf { $group }
 
 date = { $day }. { $month ->

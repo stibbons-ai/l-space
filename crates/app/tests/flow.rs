@@ -3582,6 +3582,75 @@ fn play_on_lists_every_group_and_plays_the_episode_on_the_one_chosen() {
     });
 }
 
+/// Whether the picker shown starts the Item from its beginning.
+fn picker_from_start(app: &App) -> bool {
+    let Screen::PlayOn { from_start, .. } = app.screen() else {
+        panic!("{:?}", app.screen());
+    };
+    *from_start
+}
+
+#[test]
+fn play_on_starts_at_the_progress_and_play_from_start_at_0() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let office = household.add_player("Office");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    let seek = "AVTransport#Seek";
+    run(async || {
+        let seeded = abs.seeded();
+        let user = abs.new_user().await;
+        abs.set_progress(
+            &user,
+            &seeded.podcast,
+            Some(&seeded.episodes[1]),
+            754.6,
+            false,
+        )
+        .await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        open_episode(&mut app, &abs, 1).await;
+        assert!(app.can_play_on());
+
+        // "Play from start", then Kitchen: it plays from 0, sent no seek.
+        app.open_play_from_start().await;
+        assert!(picker_from_start(&app));
+        assert_eq!(picker_names(&app), ["Kitchen", "Office"]);
+        app.play_on(kitchen.uuid()).await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::PlayingOn("Kitchen".into()))
+        );
+        assert_eq!(household.transport_state(&kitchen), "PLAYING");
+        assert_eq!(household.position(&kitchen), Duration::ZERO);
+        assert!(
+            !household
+                .actions_of(&kitchen)
+                .iter()
+                .any(|action| action == seek)
+        );
+
+        // "Play on…" on the same Item, then Office: at the Progress, in whole seconds.
+        app.open_play_on().await;
+        assert!(!picker_from_start(&app));
+        app.play_on(office.uuid()).await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::PlayingOn("Office".into()))
+        );
+        assert_eq!(household.position(&office), Duration::from_secs(754));
+
+        // Back from a "Play from start" picker, "Play on…" starts at the Progress.
+        app.open_play_from_start().await;
+        app.go_back();
+        app.open_play_on().await;
+        assert!(!picker_from_start(&app));
+        app.play_on(kitchen.uuid()).await;
+        assert_eq!(household.position(&kitchen), Duration::from_secs(754));
+    });
+}
+
 #[test]
 fn choosing_a_busy_group_plays_there_at_once() {
     let (household, _) = Household::with_manual_clock();
