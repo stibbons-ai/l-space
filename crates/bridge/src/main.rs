@@ -5,6 +5,7 @@ mod app_api;
 mod browse;
 mod config;
 mod encryption_key;
+mod shutdown;
 mod stream;
 mod telemetry;
 
@@ -15,7 +16,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use store_sqlite::SqliteStore;
+use store_sqlite::{Closer, SqliteStore};
 use tokio::net::TcpListener;
 
 use crate::app_api::AppApi;
@@ -48,16 +49,47 @@ async fn listen(addr: SocketAddr) -> io::Result<(TcpListener, SocketAddr)> {
     Ok((listener, addr))
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     let args = Args::parse();
     telemetry::init();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("the Tokio runtime builds");
+    let served = runtime.block_on(run(args));
+    // Closes the store, letting a transaction already running commit, then cancels the tasks
+    // left (connections still open after the drain, detached Handoff starts); together at most
+    // `shutdown::RUNTIME_SHUTDOWN`.
+    shutdown::teardown(runtime, served.as_ref().ok());
+    match served {
+        Ok(_) => {
+            tracing::info!("stopped");
+            ExitCode::SUCCESS
+        }
+        Err(failed) => failed,
+    }
+}
+
+/// Starts the Bridge and serves until a signal asks it to stop, returning the store's closer
+/// for `shutdown::teardown`. Fails with the exit code when it cannot start, or if the server
+/// fails while serving (axum 0.8's graceful server never does; the path guards against a change
+/// there). A later slice whose teardown needs the App API (final Progress, for example) keeps
+/// an `Arc<AppApi>` clone before building the router and runs its teardown after
+/// `shutdown::serve` returns; `main` then closes the store and stops the runtime.
+async fn run(args: Args) -> Result<Closer, ExitCode> {
+    let signals = match shutdown::Signals::install() {
+        Ok(signals) => signals,
+        Err(error) => {
+            tracing::error!(%error, "cannot handle signals");
+            return Err(ExitCode::FAILURE);
+        }
+    };
 
     let config = match Config::load(&args.config) {
         Ok(config) => config,
         Err(error) => {
             tracing::error!(config = %args.config.display(), %error, "invalid configuration");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
 
@@ -65,7 +97,7 @@ async fn main() -> ExitCode {
         Ok(key) => key,
         Err(error) => {
             tracing::error!(%error, "cannot load the encryption key");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
 
@@ -74,15 +106,16 @@ async fn main() -> ExitCode {
         Err(error) => {
             let error = error_chain(&error);
             tracing::error!(database = %config.database.display(), %error, "cannot open the database");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
+    let closer = store.closer();
 
     let (listener, addr) = match listen(config.listen).await {
         Ok(bound) => bound,
         Err(error) => {
             tracing::error!(listen = %config.listen, %error, "cannot listen");
-            return ExitCode::FAILURE;
+            return Err(ExitCode::FAILURE);
         }
     };
     if addr.ip().is_loopback() {
@@ -104,9 +137,9 @@ async fn main() -> ExitCode {
     let router = api::server::router(app_api.clone()).merge(stream::router(app_api));
 
     tracing::info!(%addr, "listening");
-    if let Err(error) = axum::serve(listener, router).await {
+    if let Err(error) = shutdown::serve(listener, router, signals).await {
         tracing::error!(%error, "server stopped");
-        return ExitCode::FAILURE;
+        return Err(ExitCode::FAILURE);
     }
-    ExitCode::SUCCESS
+    Ok(closer)
 }

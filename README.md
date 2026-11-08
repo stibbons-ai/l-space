@@ -124,7 +124,7 @@ services:
   clacks:
     image: ghcr.io/stibbons-ai/clacks:main   # or a release tag, such as 0.1.0
     restart: unless-stopped
-    init: true   # passes `docker stop`'s SIGTERM on; the Bridge has no signal handling yet, so without it, stopping waits 10 s and kills it
+    init: true   # optional: the Bridge stops cleanly on `docker stop`'s SIGTERM without it too
     network_mode: host
     environment:
       BRIDGE_ENCRYPTION_KEY_FILE: /run/secrets/bridge_encryption_key
