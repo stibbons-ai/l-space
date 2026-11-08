@@ -458,6 +458,14 @@ async fn a_group_stopped_five_seconds_before_the_end_is_not_finished() {
         Some((595.0, false))
     );
     assert_eq!(setup.handoffs().await, 1);
+
+    // Past the end, the next tick finds it stopped all the same.
+    setup.advance_and_settle(30).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((595.0, false))
+    );
+    assert_eq!(setup.handoffs().await, 1);
 }
 
 #[tokio::test]
@@ -477,6 +485,46 @@ async fn a_group_stopped_three_seconds_before_the_end_is_not_finished() {
     setup.read_every_second(2).await;
     setup.household.stop(&setup.kitchen);
     setup.advance_and_settle(1).await;
+    setup.advance_and_settle(30).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((590.0, false))
+    );
+    assert_eq!(setup.handoffs().await, 1);
+}
+
+#[tokio::test]
+async fn a_group_stopped_after_failed_reads_near_the_end_is_not_finished() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup
+        .start(&setup.alices, &episode, Some(EPISODE_DURATIONS[0]))
+        .await;
+    setup.advance(590).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (590.0, false))
+        .await;
+
+    // Read playing at 595 and 596; Kitchen fails to tell what it plays at 597 and 598, and is
+    // stopped from the Sonos app at 598; found stopped at 599. Of the 3 seconds since it was
+    // last seen playing, at most 2 count as played: 596 + 2, plus a second of position
+    // granularity, falls short of the end at 600.
+    setup.advance_and_read(5).await;
+    setup.read_every_second(1).await;
+    setup
+        .household
+        .set_fault(&setup.kitchen, Fault::FailTransportInfo);
+    setup.read_every_second(2).await;
+    setup.household.stop(&setup.kitchen);
+    setup.household.set_fault(&setup.kitchen, Fault::None);
+    setup.advance_and_settle(1).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((590.0, false))
+    );
+    assert_eq!(setup.handoffs().await, 1);
+
+    // Past the end, the next tick finds it stopped all the same.
     setup.advance_and_settle(30).await;
     assert_eq!(
         setup.progress(&setup.alice, &episode).await,
@@ -516,6 +564,39 @@ async fn a_group_played_to_its_end_after_failed_reads_near_it_is_finished_at_onc
         .await;
     setup.wait_until_no_handoff().await;
     assert_eq!(setup.household.transport_state(&setup.kitchen), "STOPPED");
+}
+
+#[tokio::test]
+async fn near_the_end_the_group_is_read_without_asking_whom_the_key_acts_for_until_finished_is_due()
+{
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    let length = EPISODE_DURATIONS[0];
+    // Started 310 seconds in, Kitchen reaches the end 290 seconds later, between two ticks.
+    setup
+        .set_progress(&setup.alice, &episode, 310.0, false)
+        .await;
+    setup.start(&setup.alices, &episode, Some(length)).await;
+    setup.advance(270).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (580.0, false))
+        .await;
+    let asked = proxy.identity_requests();
+
+    // Read every second from 595 to 599 with no write due: the Library Server isn't asked
+    // whom the key acts for, so the reads stay a second apart however slow it is.
+    setup.advance_and_read(15).await;
+    setup.read_every_second(4).await;
+    assert_eq!(proxy.identity_requests(), asked);
+
+    // Found stopped at its end at 600, the Finished write is due: asked once, for that write
+    // (the key check that comes before each write), then nothing more is written.
+    setup.advance(1).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (length, true))
+        .await;
+    assert_eq!(proxy.identity_requests(), asked + 1);
+    setup.wait_until_no_handoff().await;
 }
 
 #[tokio::test]

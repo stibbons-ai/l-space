@@ -18,7 +18,7 @@
 //!
 //! Everything else, also every deeper path under an Item (its files, its cover), passes as it
 //! is. [`LibraryProxy::progress_writes`] counts the Progress writes that arrived, whatever
-//! the proxy answered them.
+//! the proxy answered them, and [`LibraryProxy::identity_requests`] every `GET /api/me`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -56,6 +56,8 @@ struct Faults {
     progress_writes_failed: AtomicUsize,
     /// How long, in milliseconds, each Progress write is held before it is passed on.
     progress_write_delay_ms: AtomicU64,
+    /// How many `GET /api/me` arrived so far.
+    identity_requests: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -144,6 +146,11 @@ impl LibraryProxy {
         self.faults.progress_writes.load(Ordering::SeqCst)
     }
 
+    /// How many `GET /api/me` (whom a key acts for) arrived so far, answered or not.
+    pub fn identity_requests(&self) -> usize {
+        self.faults.identity_requests.load(Ordering::SeqCst)
+    }
+
     /// From now on, each Progress write is passed on only after `delay`, in real time.
     pub fn delay_progress_writes(&self, delay: Duration) {
         let millis = u64::try_from(delay.as_millis()).expect("a delay in milliseconds");
@@ -199,11 +206,11 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         let delay = faults.progress_write_delay_ms.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
-    if parts.method == Method::GET
-        && parts.uri.path() == "/api/me"
-        && faults.hang_identity.load(Ordering::SeqCst)
-    {
-        std::future::pending::<()>().await;
+    if parts.method == Method::GET && parts.uri.path() == "/api/me" {
+        faults.identity_requests.fetch_add(1, Ordering::SeqCst);
+        if faults.hang_identity.load(Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
     }
     let hidden = item_lookup && faults.hide_lengths.load(Ordering::SeqCst);
     let body = to_bytes(body, MAX_BODY).await.expect("request body");
