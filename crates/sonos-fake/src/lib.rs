@@ -481,13 +481,11 @@ impl Household {
 
     /// `coordinator`'s Group pauses where it is.
     pub fn pause(&self, coordinator: &PlayerId) {
-        let now = self.shared.clock.now();
-        let mut state = self.shared.lock();
-        let transport = &mut state.coordinator_mut(coordinator).transport;
-        transport.settle(now);
-        transport.offset = transport.position(now);
-        transport.since = None;
-        transport.state = "PAUSED_PLAYBACK";
+        self.settled(coordinator, |transport, now| {
+            transport.offset = transport.position(now);
+            transport.since = None;
+            transport.state = "PAUSED_PLAYBACK";
+        });
     }
 
     /// `coordinator`'s Group stops; its track stays loaded, back at its start.
@@ -580,20 +578,26 @@ impl Household {
 
     /// `coordinator`'s Group's `CurrentTransportState`, such as `PLAYING`.
     pub fn transport_state(&self, coordinator: &PlayerId) -> &'static str {
-        let now = self.shared.clock.now();
-        let mut state = self.shared.lock();
-        let transport = &mut state.coordinator_mut(coordinator).transport;
-        transport.settle(now);
-        transport.state
+        self.settled(coordinator, |transport, _| transport.state)
     }
 
     /// How far into its track `coordinator`'s Group is, on the household's clock.
     pub fn position(&self, coordinator: &PlayerId) -> Duration {
+        self.settled(coordinator, |transport, now| transport.position(now))
+    }
+
+    /// What `act` does with `coordinator`'s Group's transport at the household's now, the
+    /// transport first stopped if it played to its end by then.
+    fn settled<T>(
+        &self,
+        coordinator: &PlayerId,
+        act: impl FnOnce(&mut Transport, Instant) -> T,
+    ) -> T {
         let now = self.shared.clock.now();
         let mut state = self.shared.lock();
         let transport = &mut state.coordinator_mut(coordinator).transport;
         transport.settle(now);
-        transport.position(now)
+        act(transport, now)
     }
 
     /// `coordinator`'s Group's volume, as `GetGroupVolume` reports it.

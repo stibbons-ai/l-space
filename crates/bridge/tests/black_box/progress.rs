@@ -101,20 +101,13 @@ impl Setup {
         self.abs.progress(user, &item.library_item, episode).await
     }
 
-    /// Waits until `user`'s Progress in `item` is `expected`, at most [`WITHIN`].
+    /// Waits until `user`'s Progress in `item` is `expected`.
     async fn wait_for_progress(&self, user: &AbsUser, item: &ItemId, expected: (f64, bool)) {
-        let deadline = Instant::now() + WITHIN;
-        loop {
-            let progress = self.progress(user, item).await;
-            if progress == Some(expected) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Progress {progress:?}, not {expected:?}"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        let what = format!("Progress never became {expected:?}");
+        eventually(&what, async || {
+            self.progress(user, item).await == Some(expected)
+        })
+        .await;
     }
 
     /// How often Kitchen was sent SOAP action `action`.
@@ -129,11 +122,8 @@ impl Setup {
     async fn advance_and_settle(&self, seconds: u64) {
         let before = self.asked(READ);
         self.advance(seconds).await;
-        let deadline = Instant::now() + WITHIN;
-        while self.asked(READ) == before {
-            assert!(Instant::now() < deadline, "the Bridge never read Kitchen");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let read = async || self.asked(READ) > before;
+        eventually("the Bridge never read Kitchen", read).await;
         assert_eq!(self.pause().await.state, TransportState::Paused);
     }
 
@@ -141,6 +131,16 @@ impl Setup {
     async fn pause(&self) -> Playback {
         let kitchen = self.kitchen.uuid();
         self.bridge.api().pause_group(&self.bobs, kitchen).await
+    }
+}
+
+/// Waits until `done`, checking every 20 ms, at most [`WITHIN`]; panics with `what` if it
+/// never is.
+async fn eventually(what: &str, mut done: impl AsyncFnMut() -> bool) {
+    let deadline = Instant::now() + WITHIN;
+    while !done().await {
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -193,11 +193,8 @@ async fn reaching_the_end_of_the_item_sets_finished_and_the_group_stops() {
         .wait_for_progress(&setup.alice, &episode, (length, true))
         .await;
     let api = setup.bridge.api();
-    let deadline = Instant::now() + WITHIN;
-    while !api.handoffs(&setup.bobs).await.is_empty() {
-        assert!(Instant::now() < deadline, "the Handoff never ended");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let ended = async || api.handoffs(&setup.bobs).await.is_empty();
+    eventually("the Handoff never ended", ended).await;
     let groups = api.groups(&setup.bobs).await;
     let kitchen = groups.iter().find(|group| group.name == "Kitchen").unwrap();
     assert_eq!(

@@ -25,7 +25,7 @@ use store::{ActiveHandoff, GroupHandoff, HandoffFile, LibraryUser, SessionId, St
 use crate::browse::{self, NoSingleFile};
 use crate::config::{LibraryServerConfig, LibraryServerUrl};
 use crate::stream::{self, StreamToken};
-use supervise::{Seen, Supervisor, Supervisors};
+use supervise::Supervisors;
 
 /// How many more Items in progress than the user has Progress records the Bridge asks the
 /// Library Server for, for Home. Audiobookshelf 2.37.2 lists one entry per Progress record
@@ -49,9 +49,9 @@ pub struct AppApi<S> {
     /// it ending again), a control from reading what the Group plays to writing Progress, a
     /// supervisor from reading what the Group plays to writing Progress.
     turns: Arc<Turns>,
-    /// What Handoff supervision is timed on: the system clock, or a test's (`test_clock`).
-    clock: Arc<dyn Clock>,
-    supervisors: Arc<Supervisors>,
+    /// Each active Handoff's supervisor, timed on the system clock or a test's
+    /// (`crate::test_clock`).
+    supervisors: Arc<Supervisors<S>>,
 }
 
 impl<S: Store> AppApi<S> {
@@ -69,15 +69,21 @@ impl<S: Store> AppApi<S> {
                 name: server.name,
             })
             .collect();
+        let (store, turns) = (Arc::new(store), Arc::default());
+        let controls = Controls {
+            abs: abs::Client::new(),
+            store: Arc::clone(&store),
+            sonos: Arc::clone(&sonos),
+            library_servers: Arc::clone(&library_servers),
+        };
         Self {
             library_servers,
-            abs: abs::Client::new(),
-            store: Arc::new(store),
+            abs: controls.abs.clone(),
+            store,
             sonos,
             listen,
-            turns: Arc::default(),
-            clock,
-            supervisors: Arc::default(),
+            turns: Arc::clone(&turns),
+            supervisors: Arc::new(Supervisors::new(controls, turns, clock)),
         }
     }
 
@@ -737,8 +743,7 @@ impl<S: Store> AppApi<S> {
         }
         let (store, sonos) = (Arc::clone(&self.store), Arc::clone(&self.sonos));
         let library_server = library_server.to_owned();
-        let (controls, turns) = (self.controls(), Arc::clone(&self.turns));
-        let (clock, supervisors) = (Arc::clone(&self.clock), Arc::clone(&self.supervisors));
+        let (controls, supervisors) = (self.controls(), Arc::clone(&self.supervisors));
         // On its own task, so no client hanging up can cut it off between storing the Handoff
         // and the Group playing it (or it ending again); a panic in it is handled below.
         // Dioxus runs server functions detached today as well, so a client hanging up doesn't
@@ -831,20 +836,12 @@ impl<S: Store> AppApi<S> {
                 });
                 return Err(sonos_error(error));
             }
-            let seen = Seen {
-                playing: true,
-                position,
-                at: clock.now(),
-            };
-            let supervisor = Supervisor {
-                controls,
-                turns,
-                clock,
-                group: handoff.group.clone(),
+            supervisors.start(
+                handoff.group.clone(),
                 stream,
-                length: known_length(length),
-            };
-            supervisors.start(supervisor, seen);
+                known_length(length),
+                position,
+            );
             tracing::info!(
                 group = handoff.group,
                 library_server,
@@ -892,7 +889,7 @@ impl<S: Store> AppApi<S> {
         }
         let turn = self.turns.of(&group);
         let controls = self.controls();
-        let (supervisors, clock) = (Arc::clone(&self.supervisors), Arc::clone(&self.clock));
+        let supervisors = Arc::clone(&self.supervisors);
         let task_group = group.clone();
         // On its own task, as a start is, so no client hanging up can cut it off between the
         // Group's action and the Progress write; a panic in it is handled below.
@@ -902,7 +899,7 @@ impl<S: Store> AppApi<S> {
             let controlled = controls.control(&task_group, control).await;
             // Still holding the turn, so the supervisor told is this Handoff's.
             if let Ok(playback) = &controlled {
-                supervisors.seen(&task_group, playback, clock.now());
+                supervisors.seen(&task_group, playback);
             }
             controlled
         })
@@ -1261,6 +1258,17 @@ struct Controls<S> {
     library_servers: Arc<[LibraryServer]>,
 }
 
+impl<S> Clone for Controls<S> {
+    fn clone(&self) -> Self {
+        Self {
+            abs: self.abs.clone(),
+            store: Arc::clone(&self.store),
+            sonos: Arc::clone(&self.sonos),
+            library_servers: Arc::clone(&self.library_servers),
+        }
+    }
+}
+
 impl<S: Store> Controls<S> {
     /// Has Group `group` do `control` on its Handoff; only while the Group plays the
     /// Handoff's stream, else no control is sent to it ([`ApiError::NoHandoff`]). A Group
@@ -1322,13 +1330,14 @@ impl<S: Store> Controls<S> {
                         duration,
                     });
                 };
-                let active = &found.active;
-                let checked = self
-                    .check(active, Wanted::optional(duration), &mut library_time)
-                    .await;
-                let duration = duration.or(checked.length.told());
-                let update = abs::ProgressUpdate::at(position, duration);
-                self.write_progress(active, checked.acting, update, "pause", &mut library_time)
+                let duration = self
+                    .check_and_write(
+                        &found.active,
+                        position,
+                        duration,
+                        "pause",
+                        &mut library_time,
+                    )
                     .await;
                 Ok(Playback {
                     state: TransportState::Paused,
@@ -1566,14 +1575,29 @@ impl<S: Store> Controls<S> {
             return;
         };
         let duration = told_length(&playback).or(length);
-        let active = &replaced.active;
-        let checked = self
-            .check(active, Wanted::optional(duration), &mut time)
+        let position = position.as_secs_f64();
+        self.check_and_write(&replaced.active, position, duration, "replaced", &mut time)
             .await;
+    }
+
+    /// Writes `position` (seconds) as unfinished Progress for `active`'s starter, with its key,
+    /// within `time`, once the starter's Library Server confirmed the key still acts for them
+    /// ([`Controls::check`], also telling the Item's length when `duration` is none), as
+    /// `cause` ([`Controls::write_progress`]). Returns the length written with, if any.
+    async fn check_and_write(
+        &self,
+        active: &ActiveHandoff,
+        position: f64,
+        duration: Option<f64>,
+        cause: &'static str,
+        time: &mut Budget,
+    ) -> Option<f64> {
+        let checked = self.check(active, Wanted::optional(duration), time).await;
         let duration = duration.or(checked.length.told());
-        let update = abs::ProgressUpdate::at(position.as_secs_f64(), duration);
-        self.write_progress(active, checked.acting, update, "replaced", &mut time)
+        let update = abs::ProgressUpdate::at(position, duration);
+        self.write_progress(active, checked.acting, update, cause, time)
             .await;
+        duration
     }
 
     /// What the starter's Library Server tells about `active` with the Handoff's key, within

@@ -54,16 +54,27 @@ const END_RECHECK: Duration = Duration::from_secs(1);
 /// Where a Group was last seen on its Handoff's stream, and whether it was playing on from
 /// there, on the Bridge's clock.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Seen {
-    pub(super) playing: bool,
-    pub(super) position: Duration,
-    pub(super) at: Instant,
+struct Seen {
+    playing: bool,
+    position: Duration,
+    at: Instant,
 }
 
-/// The supervisors running, one per Group with an active Handoff.
-#[derive(Debug, Default)]
-pub(super) struct Supervisors {
+/// The supervisors running, one per Group with an active Handoff, and what they act with.
+pub(super) struct Supervisors<S> {
     running: Mutex<HashMap<String, Running>>,
+    controls: Controls<S>,
+    turns: Arc<Turns>,
+    clock: Arc<dyn Clock>,
+}
+
+impl<S> std::fmt::Debug for Supervisors<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Supervisors")
+            .field("running", &self.running)
+            .field("clock", &self.clock)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -76,15 +87,41 @@ struct Running {
     task: tokio::task::AbortHandle,
 }
 
-impl Supervisors {
-    /// Starts `supervisor`, the Group last `seen` as given, stopping the Group's previous one.
-    pub(super) fn start<S: Store>(self: &Arc<Self>, supervisor: Supervisor<S>, seen: Seen) {
+impl<S: Store> Supervisors<S> {
+    /// None running yet; they act with `controls`, take `turns` and are timed on `clock`.
+    pub(super) fn new(controls: Controls<S>, turns: Arc<Turns>, clock: Arc<dyn Clock>) -> Self {
+        Self {
+            running: Mutex::default(),
+            controls,
+            turns,
+            clock,
+        }
+    }
+
+    /// Starts supervising `stream`'s Handoff on Group `group`, of an Item `length` seconds
+    /// long (if known), which the Group just started playing at `position`; stops the Group's
+    /// previous supervisor.
+    pub(super) fn start(
+        self: &Arc<Self>,
+        group: String,
+        stream: StreamId,
+        length: Option<f64>,
+        position: Duration,
+    ) {
+        let seen = Seen {
+            playing: true,
+            position,
+            at: self.clock.now(),
+        };
         let (sender, receiver) = watch::channel(seen);
-        let (group, stream, length) = (
-            supervisor.group.clone(),
-            supervisor.stream,
-            supervisor.length,
-        );
+        let supervisor = Supervisor {
+            controls: self.controls.clone(),
+            turns: Arc::clone(&self.turns),
+            clock: Arc::clone(&self.clock),
+            group: group.clone(),
+            stream,
+            length,
+        };
         // Held until the entry is in, so a supervisor ending at once forgets it after.
         let mut running = self.lock();
         let supervisors = Arc::clone(self);
@@ -120,9 +157,9 @@ impl Supervisors {
         running.length
     }
 
-    /// Tells the supervisor of Group `group`'s Handoff, if any, how a control left the Group
-    /// (`playback`) at `now`; nothing if it told no position.
-    pub(super) fn seen(&self, group: &str, playback: &Playback, now: Instant) {
+    /// Tells the supervisor of Group `group`'s Handoff, if any, how a control just left the
+    /// Group (`playback`); nothing if it told no position.
+    pub(super) fn seen(&self, group: &str, playback: &Playback) {
         let Some(position) = playback
             .position
             .and_then(|position| Duration::try_from_secs_f64(position).ok())
@@ -133,7 +170,7 @@ impl Supervisors {
             running.seen.send_replace(Seen {
                 playing: playback.state == TransportState::Playing,
                 position,
-                at: now,
+                at: self.clock.now(),
             });
         }
     }
@@ -155,14 +192,14 @@ impl Supervisors {
 }
 
 /// What one Handoff's supervisor acts with.
-pub(super) struct Supervisor<S> {
-    pub(super) controls: Controls<S>,
-    pub(super) turns: Arc<Turns>,
-    pub(super) clock: Arc<dyn Clock>,
-    pub(super) group: String,
-    pub(super) stream: StreamId,
+struct Supervisor<S> {
+    controls: Controls<S>,
+    turns: Arc<Turns>,
+    clock: Arc<dyn Clock>,
+    group: String,
+    stream: StreamId,
     /// The Item's length in seconds, as its Library Server told it at the start, if known.
-    pub(super) length: Option<f64>,
+    length: Option<f64>,
 }
 
 /// Whether a supervisor goes on after a visit to its Group.
