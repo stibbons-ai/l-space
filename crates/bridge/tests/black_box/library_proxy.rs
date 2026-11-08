@@ -196,7 +196,8 @@ pub struct HeldWrite {
 impl HeldWrite {
     /// Passes the held write on, and waits until the Library Server answered it. Panics if no
     /// write was answered within [`WITHIN`]: none was held (none arrived, or one failed or
-    /// rejected by the proxy answered first).
+    /// rejected by the proxy answered first); or at once if the held write was taken but
+    /// dropped unanswered (the proxy's task for it panicked on the upstream call).
     pub async fn release(self) {
         self.release
             .send(())
@@ -204,7 +205,7 @@ impl HeldWrite {
         tokio::time::timeout(WITHIN, self.answer)
             .await
             .expect("no held Progress write was answered: none arrived to be held")
-            .expect("the held write was answered");
+            .expect("the held write was dropped unanswered");
     }
 }
 

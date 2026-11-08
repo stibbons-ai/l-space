@@ -802,6 +802,84 @@ async fn the_ticks_write_again_once_the_group_plays_on_past_where_the_end_was_ex
     setup.advance(24).await;
     let wrote = async || proxy.progress_writes() > writes;
     eventually("the tick at 90 never wrote", WITHIN, wrote).await;
+    // Kitchen at 630, past the 600 seconds Audiobookshelf holds: Audiobookshelf 2.37.2 marks
+    // the Item Finished itself for a position past its length (see the README), though the
+    // Bridge's write leaves Finished unset.
+    setup
+        .wait_for_progress(&setup.alice, &episode, (630.0, true))
+        .await;
+}
+
+#[tokio::test]
+async fn a_tick_passing_while_a_near_end_visit_waits_for_the_turn_asks_nothing() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    setup
+        .set_progress(&setup.alice, &episode, 26.0, false)
+        .await;
+    setup
+        .start(&setup.alices, &episode, Some(EPISODE_DURATIONS[0]))
+        .await;
+    // The catch-up visit for the tick at 30, at 567.9, writes 593; the reads near the end then
+    // come at 569.9, 570.9, and so on.
+    setup.clock.advance(Duration::from_millis(567_900));
+    setup.household.clock_followed().await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (593.0, false))
+        .await;
+    setup.settle().await;
+
+    // Bob pauses with his write held, so he holds Kitchen's turn; the Sonos app resumes at
+    // once. The read near the end at 569.9 waits for the turn while the tick at 570 passes,
+    // and reads at 570.1 (Kitchen at 596.1), after the tick.
+    let held = proxy.hold_next_progress_write();
+    let writes = proxy.progress_writes();
+    let api = setup.bridge.api();
+    let pause = api.pause_group(&setup.bobs, setup.kitchen.uuid());
+    let rest = async {
+        let pause_write = async || proxy.progress_writes() > writes;
+        eventually("the pause's write never came", WITHIN, pause_write).await;
+        let sonos_app = sonos::Upnp::start(setup.household.ssdp(), Arc::new(clock::SystemClock));
+        sonos_app
+            .resume(setup.kitchen.uuid())
+            .await
+            .expect("resume");
+        setup.clock.advance(Duration::from_millis(2000));
+        setup.household.clock_followed().await;
+        // Real time for the visit at 569.9 to begin and wait for the turn.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        setup.clock.advance(Duration::from_millis(200));
+        setup.household.clock_followed().await;
+        let reads = setup.asked(READ_POSITION);
+        held.release().await;
+        let read = async || setup.asked(READ_POSITION) > reads;
+        eventually("the waiting visit never read Kitchen", WITHIN, read).await;
+    };
+    let (_, ()) = tokio::join!(pause, rest);
+    setup.settle().await;
+
+    // The Library Server takes 1.5 seconds to tell whom a key acts for. The next visit, at
+    // 570.9 with the tick at 570 due, is among the reads near the end for Kitchen as last
+    // seen (596.1 at 570.1, end expected at 574.1): it reads without asking first.
+    let before = (
+        proxy.identity_requests(),
+        setup.asked(READ),
+        setup.asked(READ_POSITION),
+    );
+    proxy.delay_next_identity(Duration::from_millis(1500));
+    setup.clock.advance(Duration::from_millis(800));
+    setup.household.clock_followed().await;
+    let acted = async || {
+        proxy.identity_requests() > before.0
+            || (setup.asked(READ) > before.1 && setup.asked(READ_POSITION) > before.2)
+    };
+    eventually("the Bridge did nothing at 570.9", WITHIN, acted).await;
+    assert_eq!(
+        proxy.identity_requests(),
+        before.0,
+        "asked at a tick among the reads near the end"
+    );
+    proxy.delay_next_identity(Duration::ZERO);
 }
 
 #[tokio::test]

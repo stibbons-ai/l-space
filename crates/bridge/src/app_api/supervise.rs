@@ -14,18 +14,23 @@
 //! of a single URL, as `sonos-fake` models it. It never relies on the position a stopped Group
 //! tells (real hardware may tell 0 then; unverified): from about [`END_SLACK`] before the
 //! expected end the Group is read every [`END_RECHECK`], without asking whom the key acts for
-//! first unless a Finished write is pending (a cadence tick among those reads is one of them,
-//! writing nothing), and a Group found stopped counts as played to its end only when the
-//! position it was last seen playing at, moved on by the time since (at most
-//! [`PLAYED_SINCE_MAX`]) and by [`POSITION_GRANULARITY`], reaches the end ([`played_to_end`]).
-//! A Group stopped earlier gets nothing written and keeps its Handoff; so may one played to
-//! its end whose reads failed for more than about two seconds before it: the time since it
-//! was last seen playing then can't tell a natural end from a stop. The Finished write for a
-//! Group found at its end is made at once: by the visit that found it when that one asked
-//! whom the key acts for first (a cadence visit before the reads near the end began), else by
-//! a visit right after it, which asks first. The end is known only with the Item's length: as
-//! its Library Server told it at the start, else as the Group first tells it; without either,
-//! the Handoff never ends this way.
+//! first unless a Finished write is pending (a cadence tick among those reads, judged at the
+//! tick or at the last sighting if that came after it, is one of them, writing nothing; a
+//! visit for a tick judged before them that runs late into them still asks, and writes), and a
+//! Group found stopped counts as played to its end only when the position it was last seen
+//! playing at, moved on by the time since (at most [`PLAYED_SINCE_MAX`]) and by
+//! [`POSITION_GRANULARITY`], reaches the end ([`played_to_end`]). A Group stopped earlier gets
+//! nothing written and keeps its Handoff; so may one played to its end whose reads failed for
+//! more than about two seconds before it: the time since it was last seen playing then can't
+//! tell a natural end from a stop. So, rarely, may one whose last cadence visit before those
+//! reads ran late into them: having asked first (up to [`CHECK_TIME`]), its read and write
+//! hold the turn up to [`GROUP_TIME`] + [`WRITE_TIME`], so the next read may come that long
+//! after its read, past [`PLAYED_SINCE_MAX`]. The Finished write for a Group found at its end
+//! is made at once: by the visit that found it when that one asked whom the key acts for
+//! first (a cadence visit before the reads near the end began), else by a visit right after
+//! it, which asks first. The end is known only with the Item's length: as its Library Server
+//! told it at the start, else as the Group first tells it; without either, the Handoff never
+//! ends this way.
 //!
 //! The Finished write at the end is tried at most [`FINISH_TRIES`] times, again at the next
 //! cadence tick after one that didn't land (failed, unconfirmed, or the key's user not known),
@@ -59,12 +64,15 @@ use super::{
 /// the Group playing without having asked whom the key acts for first (it wasn't seen playing
 /// before: resumed outside the App, say) has a visit right after it ask and write, unless the
 /// reads near the end of the Item have begun by then. A tick falling among those reads (from
-/// [`END_SLACK`] before the end, judged at the tick) neither asks nor writes, so those reads
-/// stay about [`END_RECHECK`] apart: Progress there comes from the Finished write at the end, a
-/// control, or the next tick once those reads stop (the Item's length was wrong). A failed
-/// Finished write at the end is tried again on these ticks too: the first retry at the next
-/// tick, anywhere from 1 second to a cadence after the try at the end, later ones a cadence
-/// apart.
+/// [`END_SLACK`] before the end, judged at the tick, or at the last sighting when that came
+/// after it) neither asks nor writes, so those reads stay about [`END_RECHECK`] apart:
+/// Progress there comes from the Finished write at the end, a control, or the next tick once
+/// those reads stop (the Item's length was wrong). A visit for a tick judged before those
+/// reads that runs late into them still asks and writes. A failed Finished write at the end
+/// is tried again on these ticks too: the first retry at the next tick, at most a cadence
+/// after the try at the end and at least [`END_RECHECK`] after the start of the visit that
+/// made it (which asked and read before trying, so the retry may follow the try almost at
+/// once), later ones a cadence apart.
 const CADENCE: Duration = Duration::from_secs(30);
 
 /// How long the starter's Library Server may take to tell whom the Handoff's key acts for,
@@ -454,9 +462,10 @@ impl<S: Store> Supervisor<S> {
         let mut then = Then::Wait;
         loop {
             let Known { ending, last, .. } = *self.known();
-            // The next read for the end of the Item, when that is all there is to do.
+            // The next read for the end of the Item, when that is all there is to do: also for
+            // a visit left to make a Finished write that a control dropped, the Group playing.
             let end = match (then, ending) {
-                (Then::Wait, None) => self.end_due(&last, not_before),
+                (Then::Wait | Then::Finish, None) => self.end_due(&last, not_before),
                 _ => None,
             };
             let wake = match (then, ending) {
@@ -465,7 +474,8 @@ impl<S: Store> Supervisor<S> {
                 (Then::Wait, None) => end.map_or(tick, |end| end.min(tick)),
             };
             tokio::select! {
-                () = self.clock.sleep_until(wake.max(not_before)) => {}
+                // A control's sighting first, so a visit on a passed wake acts on it.
+                biased;
                 changed = seen.changed() => {
                     if changed.is_err() {
                         return;
@@ -474,6 +484,7 @@ impl<S: Store> Supervisor<S> {
                     seen.mark_unchanged();
                     continue;
                 }
+                () = self.clock.sleep_until(wake.max(not_before)) => {}
             }
             let now = self.clock.now();
             // Whether the reads near the end began by `at`, for the Group as last seen.
@@ -481,12 +492,15 @@ impl<S: Store> Supervisor<S> {
             // A tick among the reads near the end is one of them, as is a revisit for a write
             // once they began: it neither asks whom the key acts for nor writes, so those reads
             // stay about a second apart. Judged at the tick, not at this visit's time, which
-            // falls after the tick unless the tick came on a read's time exactly.
+            // falls after the tick unless the tick came on a read's time exactly; or at the
+            // last sighting, when that came after the tick (a visit that began before the tick
+            // read after it, having waited for the Group's turn).
             let (wanted, cadence) = match then {
                 Then::Write => (true, !reading_end_by(now)),
                 Then::Wait | Then::Finish => {
                     let ticked = now >= tick;
-                    (ticked, ticked && !end.is_some_and(|_| reading_end_by(tick)))
+                    let at = tick.max(last.at);
+                    (ticked, ticked && !end.is_some_and(|_| reading_end_by(at)))
                 }
             };
             if wanted && !cadence {
@@ -535,15 +549,17 @@ impl<S: Store> Supervisor<S> {
     /// Reads what the Group plays, holding its turn, and acts on it. On a `cadence` visit, a
     /// Group playing the Handoff's stream gets its position written as Progress; one not seen
     /// playing when the visit began, so the key not asked about first, gets it written by the
-    /// next visit, at once ([`Then::Write`]). A Group that stopped there, having played to the
-    /// end of the Item ([`played_to_end`]), gets Progress at the end written Finished, and the
-    /// Handoff ends; on a visit that didn't check the key first, that write is left pending for
-    /// the next visit, which comes at once ([`Then::Finish`]). One still stopped there, not
-    /// seen playing since, gets what is left of that done, as it is once the visit holds the
-    /// turn. A Group paused, stopped elsewhere, or playing something else gets nothing written;
-    /// what was left of the end is dropped once it is seen playing or paused on the Handoff's
-    /// stream, or on something else, and kept while it is between states. Updates what was
-    /// last seen of the Group, unless the visit learned nothing; breaks once the Handoff ended.
+    /// next visit, at once ([`Then::Write`]), unless the reads near the end of the Item have
+    /// begun for it by then or a control paused it in between. A Group that stopped there,
+    /// having played to the end of the Item ([`played_to_end`]), gets Progress at the end
+    /// written Finished, and the Handoff ends; on a visit that didn't check the key first,
+    /// that write is left pending for the next visit, which comes at once ([`Then::Finish`]).
+    /// One still stopped there, not seen playing since, gets what is left of that done, as it
+    /// is once the visit holds the turn. A Group paused, stopped elsewhere, or playing
+    /// something else gets nothing written; what was left of the end is dropped once it is
+    /// seen playing or paused on the Handoff's stream, or on something else, and kept while it
+    /// is between states. Updates what was last seen of the Group, unless the visit learned
+    /// nothing; breaks once the Handoff ended.
     async fn visit(&self, cadence: bool) -> ControlFlow<(), Then> {
         let group = self.handoff.group.as_str();
         let Known { ending, last, .. } = *self.known();
