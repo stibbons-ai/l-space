@@ -244,19 +244,16 @@ fn progress_in(user: &abs::User, library_item: &str, episode: Option<&str>) -> O
         .map(progress)
 }
 
-/// The audio file of Item `id` in `library_item`, if it has exactly one; or why not.
-pub fn single_audio_file(
+/// The audio files of Item `id` in `library_item`, in playing order (none for an episode
+/// without one); or why `library_item` holds no such Item.
+pub fn item_audio_files(
     library_item: abs::LibraryItem,
     id: &ItemId,
-) -> Result<abs::Track, NoSingleFile> {
-    let mut tracks = match select(library_item.media, id).map_err(NoSingleFile::Missing)? {
+) -> Result<Vec<abs::Track>, Missing> {
+    Ok(match select(library_item.media, id)? {
         Selected::Audiobook(book) => book.tracks,
         Selected::Episode { episode, .. } => episode.audio_track.into_iter().collect(),
-    };
-    match tracks.len() {
-        1 => Ok(tracks.remove(0)),
-        files => Err(NoSingleFile::Files(files)),
-    }
+    })
 }
 
 /// The length in seconds of Item `id` in `library_item`, as its screen shows it; none if
@@ -276,13 +273,17 @@ pub fn item_duration(library_item: &abs::LibraryItem, id: &ItemId) -> Option<f64
     }
 }
 
-/// Why an Item has no single audio file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NoSingleFile {
-    /// The library item holds no such Item.
-    Missing(Missing),
-    /// It has this many audio files.
-    Files(usize),
+/// Where each chapter of Item `id` in `library_item` starts, in seconds into the whole Item,
+/// in the order the Library Server keeps them; none for an episode, an audiobook without
+/// chapters, or when `library_item` holds no such Item.
+pub fn chapter_starts(library_item: &abs::LibraryItem, id: &ItemId) -> Vec<f64> {
+    match (&library_item.media, &id.episode) {
+        (abs::Media::Book(book), None) if is_audiobook(book) => {
+            let chapters = book.chapters.entries.iter();
+            chapters.map(|chapter| chapter.start).collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// What an Item is in its library item.

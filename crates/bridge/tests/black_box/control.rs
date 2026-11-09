@@ -81,6 +81,20 @@ async fn setup_on(abs: Arc<Audiobookshelf>, url: &str) -> Setup {
     }
 }
 
+/// A [`Forwarder`] in front of a [`LibraryProxy`] that hides every Item's length, in front of
+/// the shared Audiobookshelf, and a [`Setup`] on it: an Item Alice starts there has no length
+/// known at its start (as one Audiobookshelf could not probe), and a Group tells none for a
+/// stream, so a control that needs the length asks the Library Server, which then tells none
+/// either unless the test calls [`LibraryProxy::show_lengths`].
+async fn setup_without_lengths() -> (Forwarder, LibraryProxy, Setup) {
+    let abs = Audiobookshelf::shared();
+    let proxy = LibraryProxy::to(abs.base_url()).await;
+    proxy.hide_lengths();
+    let forwarder = Forwarder::to(&proxy.address()).await;
+    let setup = setup_on(abs, &forwarder.url()).await;
+    (forwarder, proxy, setup)
+}
+
 impl Setup {
     /// Episode `n` (0-based) of the seeded podcast: 600, 900 and 3960 seconds long.
     fn episode(&self, n: usize) -> ItemId {
@@ -184,7 +198,8 @@ async fn anyone_pauses_and_resumes_a_handoff_and_the_pause_is_the_starters_progr
     assert_eq!(office.handoff, None);
 
     // Alice's own player moves her Progress on meanwhile. Bob resumes; it moves on from where
-    // it paused, and resuming writes nothing: her Progress stays as her player left it.
+    // it paused, and resuming writes nothing: her Progress stays as her player left it. The
+    // Item's length is the one its Library Server told at the start.
     let seeded = setup.abs.seeded();
     let (podcast, first) = (&seeded.podcast, Some(seeded.episodes[0].as_str()));
     setup
@@ -193,11 +208,7 @@ async fn anyone_pauses_and_resumes_a_handoff_and_the_pause_is_the_starters_progr
         .await;
     assert_eq!(
         api.resume_group(&setup.bobs, setup.kitchen.uuid()).await,
-        Playback {
-            state: TransportState::Playing,
-            position: Some(120.0),
-            duration: None,
-        }
+        playback(TransportState::Playing, 120.0, 600.0)
     );
     assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
     setup.clock.advance(seconds(30));
@@ -210,11 +221,12 @@ async fn anyone_pauses_and_resumes_a_handoff_and_the_pause_is_the_starters_progr
     assert_eq!(setup.progress(&setup.alice, &episode).await, Some(150.0));
     assert_eq!(setup.progress(&setup.bob, &episode).await, None);
 
-    // Only the coordinator was controlled (after the start's own Play); the member and Office
-    // were not.
+    // Only the coordinator was controlled (after the start's own Seek to its file and Play);
+    // the member and Office were not.
     assert_eq!(
         setup.playback_controls(&setup.kitchen),
         [
+            "AVTransport#Seek",
             "AVTransport#Play",
             "AVTransport#Pause",
             "AVTransport#Play",
@@ -402,7 +414,7 @@ async fn skips_move_15_seconds_back_and_30_forward_within_the_item() {
 }
 
 #[tokio::test]
-async fn a_groups_own_length_bounds_a_skip() {
+async fn the_length_known_at_the_start_bounds_a_skip_without_the_library_server() {
     let abs = Audiobookshelf::shared();
     let forwarder = Forwarder::to(abs.address()).await;
     let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
@@ -410,8 +422,36 @@ async fn a_groups_own_length_bounds_a_skip() {
     let office = setup.office.uuid();
     let episode = setup.episode(2);
     setup.start(&episode, &setup.office).await;
+    setup.clock.advance(seconds(100));
+
+    // With the Library Server down, "30 s forward" needs nothing from it: the Item's 3960 s
+    // were told at the start. The Group skips, and nothing is written.
+    forwarder.stop().await;
+    assert_eq!(
+        api.skip_group(&setup.bobs, office, Skip::Forward30).await,
+        playback(TransportState::Playing, 130.0, 3960.0)
+    );
+    assert_eq!(setup.position(&setup.office), seconds(130));
+    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
+    forwarder.resume();
+
+    setup.clock.advance(seconds(3950 - 130));
+    assert_eq!(
+        api.skip_group(&setup.bobs, office, Skip::Forward30).await,
+        playback(TransportState::Playing, 3960.0, 3960.0)
+    );
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(3960.0));
+}
+
+#[tokio::test]
+async fn a_groups_own_length_bounds_a_skip_of_an_item_of_unknown_length() {
+    let (_forwarder, _proxy, setup) = setup_without_lengths().await;
+    let api = setup.bridge.api();
+    let office = setup.office.uuid();
+    let episode = setup.episode(2);
+    setup.start(&episode, &setup.office).await;
     let stream = setup.household.uri(&setup.office).unwrap();
-    // The Group reports a length of its own for the stream, shorter than the Item's 3960 s.
+    // The Group reports a length of its own for the stream; the Library Server tells none.
     setup.household.play(
         &setup.office,
         FakeTrack {
@@ -419,20 +459,8 @@ async fn a_groups_own_length_bounds_a_skip() {
             ..FakeTrack::new("Episode 3", seconds(700))
         },
     );
-    setup.clock.advance(seconds(100));
+    setup.clock.advance(seconds(690));
 
-    // With the Library Server down, "30 s forward" needs nothing from it: the Group skips,
-    // and nothing is written.
-    forwarder.stop().await;
-    assert_eq!(
-        api.skip_group(&setup.bobs, office, Skip::Forward30).await,
-        playback(TransportState::Playing, 130.0, 700.0)
-    );
-    assert_eq!(setup.position(&setup.office), seconds(130));
-    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
-    forwarder.resume();
-
-    setup.clock.advance(seconds(690 - 130));
     assert_eq!(
         api.skip_group(&setup.bobs, office, Skip::Forward30).await,
         playback(TransportState::Playing, 700.0, 700.0)
@@ -699,9 +727,7 @@ async fn controls_need_a_session() {
 
 #[tokio::test]
 async fn a_library_server_down_at_write_time_doesnt_undo_the_control() {
-    let abs = Audiobookshelf::shared();
-    let forwarder = Forwarder::to(abs.address()).await;
-    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let (forwarder, _proxy, setup) = setup_without_lengths().await;
     let api = setup.bridge.api();
     let kitchen = setup.kitchen.uuid();
     let episode = setup.episode(0);
@@ -767,9 +793,7 @@ const LIBRARY_SERVER_BOUND: Duration = Duration::from_millis(8500);
 
 #[tokio::test]
 async fn a_library_server_that_hangs_doesnt_hold_a_control_up() {
-    let abs = Audiobookshelf::shared();
-    let forwarder = Forwarder::to(abs.address()).await;
-    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let (forwarder, _proxy, setup) = setup_without_lengths().await;
     let api = setup.bridge.api();
     let kitchen = setup.kitchen.uuid();
     let episode = setup.episode(0);
@@ -858,9 +882,7 @@ async fn a_progress_write_that_hangs_doesnt_hold_a_pause_up() {
 
 #[tokio::test]
 async fn a_slow_item_length_doesnt_keep_a_pause_from_writing_progress() {
-    let abs = Audiobookshelf::shared();
-    let forwarder = Forwarder::to(abs.address()).await;
-    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let (forwarder, _proxy, setup) = setup_without_lengths().await;
     let api = setup.bridge.api();
     let kitchen = setup.kitchen.uuid();
     let episode = setup.episode(0);
@@ -905,12 +927,12 @@ async fn a_slow_item_length_doesnt_keep_a_pause_from_writing_progress() {
 
 #[tokio::test]
 async fn a_forward_skip_waiting_for_the_length_skips_from_where_the_group_is_then() {
-    let abs = Audiobookshelf::shared();
-    let forwarder = Forwarder::to(abs.address()).await;
-    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let (forwarder, proxy, setup) = setup_without_lengths().await;
     let api = setup.bridge.api();
     let episode = setup.episode(0);
     setup.start(&episode, &setup.kitchen).await;
+    // Not at the start, but when the skip asks.
+    proxy.show_lengths();
     setup.clock.advance(seconds(200));
 
     // A slow Library Server: the Group plays on 20 seconds while the Bridge waits for the
@@ -945,6 +967,8 @@ async fn a_forward_skip_on_an_item_of_unknown_length_is_refused() {
     let api = setup.bridge.api();
     let kitchen = setup.kitchen.uuid();
     let episode = setup.episode(0);
+    // The Library Server knows no length, from the start on.
+    proxy.hide_lengths();
     setup.start(&episode, &setup.kitchen).await;
     setup.clock.advance(seconds(590));
     setup
@@ -960,7 +984,6 @@ async fn a_forward_skip_on_an_item_of_unknown_length_is_refused() {
 
     // The Group tells no length for a stream, and the Library Server knows none either: there
     // is no end to stop at, so "30 s forward" is refused, nothing sent, nothing written.
-    proxy.hide_lengths();
     let before = setup.playback_controls(&setup.kitchen);
     assert_eq!(
         api.control_error(&setup.bobs, kitchen, GroupControl::Skip(Skip::Forward30))
@@ -1027,9 +1050,10 @@ async fn a_starters_key_rejected_at_write_time_is_revoked_ending_the_handoff() {
         ));
     }
 
-    // "30 s forward" asks the Library Server for the length before it seeks: the rejected
-    // key is revoked then, and with the Handoff ended nothing is sent to the Group.
-    let setup = setup().await;
+    // "30 s forward" on an Item whose length wasn't known at the start asks the Library
+    // Server for it before it seeks: the rejected key is revoked then, and with the Handoff
+    // ended nothing is sent to the Group.
+    let (_forwarder, _proxy, setup) = setup_without_lengths().await;
     let api = setup.bridge.api();
     setup.start(&setup.episode(0), &setup.kitchen).await;
     setup.household.fetched(&setup.kitchen).await;
@@ -1075,6 +1099,8 @@ async fn a_rejected_length_lookup_revokes_the_key_while_whom_it_acts_for_is_not_
     let proxy = LibraryProxy::to(abs.base_url()).await;
     let setup = setup_on(Arc::clone(&abs), &proxy.url()).await;
     let episode = setup.episode(0);
+    // The Item's length is not known at the start.
+    proxy.hide_lengths();
     setup.start(&episode, &setup.kitchen).await;
     setup.household.fetched(&setup.kitchen).await;
     setup.clock.advance(seconds(100));
@@ -1166,11 +1192,7 @@ async fn a_group_already_as_asked_is_sent_nothing() {
     let before = setup.playback_controls(&setup.kitchen);
     assert_eq!(
         api.pause_group(&setup.bobs, kitchen).await,
-        Playback {
-            state: TransportState::Paused,
-            position: Some(60.0),
-            duration: None,
-        }
+        playback(TransportState::Paused, 60.0, 600.0)
     );
     assert_eq!(setup.playback_controls(&setup.kitchen), before);
     assert_eq!(setup.progress(&setup.alice, &episode).await, Some(42.0));
@@ -1181,11 +1203,7 @@ async fn a_group_already_as_asked_is_sent_nothing() {
     let before = setup.playback_controls(&setup.kitchen);
     assert_eq!(
         api.resume_group(&setup.bobs, kitchen).await,
-        Playback {
-            state: TransportState::Playing,
-            position: Some(65.0),
-            duration: None,
-        }
+        playback(TransportState::Playing, 65.0, 600.0)
     );
     assert_eq!(setup.playback_controls(&setup.kitchen), before);
     assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
@@ -1221,7 +1239,7 @@ async fn a_group_that_tells_no_position_is_not_skipped_and_its_pause_writes_noth
         Playback {
             state: TransportState::Paused,
             position: None,
-            duration: None,
+            duration: Some(600.0),
         }
     );
     assert_eq!(
@@ -1317,25 +1335,28 @@ async fn a_control_waits_for_its_turn_on_the_group_only_so_long() {
         seconds(3) <= waited && waited < Duration::from_millis(3900),
         "{waited:?}"
     );
-    // And sent nothing.
+    // And sent nothing: the only seek Kitchen got is the start's, to its one file.
     let actions = setup.household.actions_of(&setup.kitchen);
     let count = |action: &str| actions.iter().filter(|sent| *sent == action).count();
     assert_eq!(count("AVTransport#Pause"), 1);
-    assert_eq!(count("AVTransport#Seek"), 0);
+    let start = sonos_fake::Seek::new("TRACK_NR", "1");
+    assert_eq!(setup.household.sought(&setup.kitchen), [start]);
     assert_eq!(count("GroupRenderingControl#SnapshotGroupVolume"), 0);
     assert_eq!(count("GroupRenderingControl#SetGroupVolume"), 0);
 }
 
 #[tokio::test]
 async fn a_controls_calls_to_the_group_share_one_time_limit() {
-    let setup = setup().await;
+    let (_forwarder, proxy, setup) = setup_without_lengths().await;
     let api = setup.bridge.api();
     let episode = setup.episode(0);
     setup.start(&episode, &setup.kitchen).await;
+    proxy.show_lengths();
     setup.clock.advance(seconds(60));
     // Each call alone answers well within the 4 seconds a control has for the Group (a fresh
-    // 4 seconds per call would pass each), but a forward skip's three (read, read again after
-    // the length, seek) take 4.5 seconds together, so only one limit shared by all fails it.
+    // 4 seconds per call would pass each), but a forward skip's three on an Item whose length
+    // wasn't known at the start (read, read again after the length, seek) take 4.5 seconds
+    // together, so only one limit shared by all fails it.
     setup.household.set_fault(
         &setup.kitchen,
         Fault::SlowTransport(Duration::from_millis(1500)),
@@ -1358,12 +1379,11 @@ async fn a_controls_calls_to_the_group_share_one_time_limit() {
 
 #[tokio::test]
 async fn a_forward_skip_acts_only_if_the_group_still_plays_the_handoff_after_the_length() {
-    let abs = Audiobookshelf::shared();
-    let forwarder = Forwarder::to(abs.address()).await;
-    let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
+    let (forwarder, proxy, setup) = setup_without_lengths().await;
     let api = setup.bridge.api();
     let episode = setup.episode(0);
     setup.start(&episode, &setup.kitchen).await;
+    proxy.show_lengths();
     setup.clock.advance(seconds(60));
     // A slow Library Server: the Group changes while the Bridge waits for the Item's length.
     // Each skip on fresh connections, so none reuses one already through the delay.
@@ -1447,8 +1467,10 @@ async fn a_control_takes_turns_with_a_start_on_its_group() {
         order,
         [
             set_uri.as_str(),
+            "AVTransport#Seek",
             "AVTransport#Play",
             set_uri.as_str(),
+            "AVTransport#Seek",
             "AVTransport#Play",
             "AVTransport#Pause",
         ]

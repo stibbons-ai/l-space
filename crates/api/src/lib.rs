@@ -401,14 +401,16 @@ pub struct Handoff {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Playback {
     pub state: TransportState,
-    /// How far into the Item the Group is; none if its coordinator didn't say.
+    /// How far into the Item the Group is, in the whole Item also when it plays a later one of
+    /// the Item's audio files; none if its coordinator didn't say.
     pub position: Option<f64>,
-    /// The Item's length: as the Group tells it, else (pausing or skipping) as the Library
-    /// Server tells it; none if unknown.
+    /// The Item's length: from its audio files' lengths as the Library Server told them at the
+    /// start, else as the Group tells it, else (pausing or skipping) as the Library Server
+    /// tells it; none if unknown.
     pub duration: Option<f64>,
 }
 
-/// How far [`skip_group`] moves a Group's position.
+/// Where [`skip_group`] moves a Group in its Handoff's Item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Skip {
@@ -416,14 +418,21 @@ pub enum Skip {
     Back15,
     /// 30 seconds forward, but not past the end.
     Forward30,
+    /// To the start of the current chapter when more than 3 seconds into it, else to the start
+    /// of the chapter before; in the first chapter, to its start.
+    PreviousChapter,
+    /// To the start of the next chapter; in the last chapter, nowhere.
+    NextChapter,
 }
 
 impl Skip {
-    /// The seconds it moves by: negative back, positive forward.
-    pub fn seconds(self) -> i32 {
+    /// The seconds it moves by: negative back, positive forward; none for a chapter skip,
+    /// which moves by the Item's chapters.
+    pub fn seconds(self) -> Option<i32> {
         match self {
-            Self::Back15 => -15,
-            Self::Forward30 => 30,
+            Self::Back15 => Some(-15),
+            Self::Forward30 => Some(30),
+            Self::PreviousChapter | Self::NextChapter => None,
         }
     }
 }
@@ -490,8 +499,8 @@ pub enum ApiError {
     /// was busy with another start or control on it, and nothing was sent.
     #[error("group_failed")]
     GroupFailed,
-    /// The Item can't be played on a Group by this Bridge yet: it has more than one audio
-    /// file, none, or one in a format Sonos doesn't play.
+    /// The Item can't be played on a Group by this Bridge yet: it has no audio file, one in a
+    /// format Sonos doesn't play, or several of which one has no known length.
     #[error("item_not_playable")]
     ItemNotPlayable,
     /// The Group has no active Handoff to control, or plays something other than its
@@ -690,10 +699,11 @@ pub async fn groups() -> Result<Vec<Group>, ApiError> {
 /// that is Finished or absent, when its whole seconds lie at or past the Item's end, or when
 /// `from_start` ("Play from start"; an App that sends none gets the Progress). The Bridge
 /// streams the Item to the Group, which keeps playing without the App.
-/// Only an Item with exactly one audio file plays so far. Once the Item is found playable, the
-/// Group's Handoff is replaced before the Group is told to play and then, only when it starts
-/// past the beginning, to go to the start position: if it doesn't do what it is told (a Sonos
-/// error), the Group is left with no Handoff.
+/// An Item in several audio files plays them in order, from the one holding the start
+/// position. Once the Item is found playable, the Group's Handoff is replaced before the Group
+/// is told to play and then, only when it starts past the beginning of that file, to go to
+/// the start position: if it doesn't do what it is told (a Sonos error), the Group is left
+/// with no Handoff.
 #[post(
     "/api/handoffs/start",
     headers: dioxus_fullstack::HeaderMap,
@@ -760,17 +770,21 @@ pub async fn resume_group(group: String) -> Result<Playback, ApiError> {
         .await
 }
 
-/// Moves Group `group`'s Handoff, whoever started it, 15 seconds back or 30 forward from
-/// where it is now, kept between the Item's start and its end (as the Group tells its length,
-/// else the Library Server); playing or paused as it was. Writes the new position as Progress
-/// as [`pause_group`] does, and answers likewise. A forward skip on a Group that tells no
-/// length first asks the Library Server for it: if the Library Server doesn't tell it
-/// (unreachable, too slow, or the Item is gone there), the skip is refused with
-/// [`ApiError::LibraryServerUnreachable`]; if it knows no length either, with
-/// [`ApiError::LengthUnknown`]. If the Library Server rejects the starter's key there, or it
-/// now acts for another user, the key is revoked and the skip answers
-/// [`ApiError::NoHandoff`], or [`ApiError::Internal`] if storing the revoke failed. In each
-/// of these cases nothing is sent to the Group and nothing written.
+/// Moves Group `group`'s Handoff, whoever started it, as `skip` says: 15 seconds back or 30
+/// forward from where it is now, kept between the Item's start and its end (its length as
+/// [`Playback::duration`] tells it, else the Library Server's), or to the previous or next
+/// chapter (an Item without chapters, such as an episode, counts as one chapter), across the
+/// Item's audio files; playing or paused as it was. Writes the new position as Progress as
+/// [`pause_group`] does, and answers likewise. A next chapter in the last chapter sends the
+/// Group nothing and writes nothing, and answers with where the Group is. A chapter skip
+/// asks the Library Server for the Item's chapters, and a forward skip whose length is not
+/// known asks it for that: if the Library Server doesn't tell it (unreachable, too slow, or
+/// the Item is gone there), the skip is refused with [`ApiError::LibraryServerUnreachable`];
+/// if a forward skip finds no length there either, with [`ApiError::LengthUnknown`]. If the
+/// Library Server rejects the starter's key there, or it now acts for another user, the key
+/// is revoked and the skip answers [`ApiError::NoHandoff`], or [`ApiError::Internal`] if
+/// storing the revoke failed. In each of these cases nothing is sent to the Group and nothing
+/// written.
 #[post(
     "/api/groups/skip",
     headers: dioxus_fullstack::HeaderMap,

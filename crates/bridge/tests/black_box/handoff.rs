@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use api::{ApiError, CurrentUser, Handoff, ItemId, Session, TransportState};
 use reqwest::{Method, StatusCode};
-use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
+use sonos_fake::{FakeTrack, Fault, Household, PlayerId, Seek};
 
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
 use test_support::bridge::{
@@ -30,6 +30,15 @@ const SEEK: &str = "AVTransport#Seek";
 
 /// The SOAP action that pauses a Group, as `sonos-fake` records it.
 const PAUSE: &str = "AVTransport#Pause";
+
+/// The SOAP action that empties a Group's queue, the first a start sends, as `sonos-fake`
+/// records it.
+const CLEAR: &str = "AVTransport#RemoveAllTracksFromQueue";
+
+/// The SOAP actions a start sends a Group for an Item in one file, before any seek to its
+/// start position: the queue emptied, the file added, the queue given, its first track
+/// selected, play.
+const STARTED: [&str; 5] = [CLEAR, "AVTransport#AddURIToQueue", SET_URI, SEEK, PLAY];
 
 /// The WARN the Bridge logs when a Group doesn't go to a start's position.
 const NOT_SOUGHT: &str = "a Group did not go to a Handoff's start position";
@@ -145,12 +154,11 @@ impl Setup {
         self.abs.item_progress(user, item).await
     }
 
-    /// Where `group`'s Group is in its track, and whether it was sent a `Seek`.
+    /// Where `group`'s Group is in its track, and whether it was sent a `Seek` by time.
     fn position(&self, group: &PlayerId) -> (Duration, bool) {
-        (
-            self.household.position(group),
-            called(&self.household, group, SEEK),
-        )
+        let sought = self.household.sought(group);
+        let by_time = sought.iter().any(|seek| seek.unit == "REL_TIME");
+        (self.household.position(group), by_time)
     }
 }
 
@@ -216,6 +224,23 @@ fn assert_quiet(output: &[serde_json::Value], key: &str, stream_ids: &[&str]) {
     }
 }
 
+/// The AVTransport actions that change what `player` plays, in the order it was sent them.
+fn started(household: &Household, player: &PlayerId) -> Vec<String> {
+    let actions = household.actions_of(player).into_iter();
+    actions
+        .filter(|action| action.starts_with("AVTransport#") && !action.contains("#Get"))
+        .collect()
+}
+
+/// What a start of an Item in one file sends a Group when it starts `target` (`H:MM:SS`) into
+/// it: the actions, [`STARTED`] then a seek, and the seeks, to the file then into it.
+fn started_at(target: &str) -> (Vec<String>, Vec<Seek>) {
+    let mut actions: Vec<String> = STARTED.map(String::from).to_vec();
+    actions.push(SEEK.to_owned());
+    let sought = vec![Seek::new("TRACK_NR", "1"), Seek::new("REL_TIME", target)];
+    (actions, sought)
+}
+
 /// Whether `player` has been called with `action`.
 fn called(household: &Household, player: &PlayerId, action: &str) -> bool {
     household.asked(player, action) > 0
@@ -264,7 +289,9 @@ async fn choosing_a_group_plays_the_episode_there_from_the_bridges_stream() {
         url.starts_with(&format!("{}/stream/", setup.bridge.url())),
         "{url}"
     );
-    assert_eq!(path(&url).split('/').nth(3), Some("Episode%201.wav"));
+    assert_eq!(path(&url).split('/').nth(3), Some("1-Episode%201.wav"));
+    // Its one file is the Group's whole queue.
+    assert_eq!(setup.household.queue(&setup.kitchen), [url.clone()]);
     assert!(!url.contains(setup.abs.address()), "{url}");
     assert!(!url.contains(&setup.user.api_key.key), "{url}");
     // 256 random bits, hex-encoded.
@@ -288,7 +315,7 @@ async fn choosing_a_group_plays_the_episode_there_from_the_bridges_stream() {
         assert!(
             !started
                 .iter()
-                .any(|action| action.contains("AVTransportURI")),
+                .any(|action| action.contains("AVTransportURI") || action.contains("Queue")),
             "{started:?}"
         );
     }
@@ -314,7 +341,7 @@ async fn a_file_name_with_reserved_and_non_ascii_characters_streams() {
 
     assert_eq!(
         path(&url).split('/').nth(3),
-        Some("Folge%203%20%E2%80%93%20%C3%9Cber%20%26%20Co%20%231%20%2850%25%29.wav")
+        Some("1-Folge%203%20%E2%80%93%20%C3%9Cber%20%26%20Co%20%231%20%2850%25%29.wav")
     );
     let fetch = setup.household.fetched(&setup.kitchen).await;
     assert_eq!((fetch.status, &fetch.error), (Some(206), &None));
@@ -582,11 +609,6 @@ async fn a_start_that_fails_leaves_no_handoff() {
     let setup = setup().await;
     let api = setup.bridge.api();
     let episode = setup.episode(0);
-    let seeded = setup.abs.seeded();
-    let long_book = ItemId {
-        library_item: seeded.long_book.clone(),
-        episode: None,
-    };
     let no_such_episode = ItemId {
         episode: Some("no-such-episode".into()),
         ..episode.clone()
@@ -613,12 +635,6 @@ async fn a_start_that_fails_leaves_no_handoff() {
             ApiError::GroupNotFound,
         ),
         (
-            &long_book,
-            setup.kitchen.uuid(),
-            StatusCode::UNPROCESSABLE_ENTITY,
-            ApiError::ItemNotPlayable,
-        ),
-        (
             &no_such_episode,
             setup.kitchen.uuid(),
             StatusCode::NOT_FOUND,
@@ -637,7 +653,7 @@ async fn a_start_that_fails_leaves_no_handoff() {
     assert!(
         !started
             .iter()
-            .any(|action| action.contains("AVTransportURI")),
+            .any(|action| action.contains("AVTransportURI") || action.contains("Queue")),
         "{started:?}"
     );
 
@@ -681,15 +697,16 @@ async fn a_group_that_refuses_or_does_not_answer_keeps_no_handoff() {
     let at_least = sonos::PLAY_TIMEOUT - Duration::from_millis(500);
     let bound = sonos::PLAY_TIMEOUT + Duration::from_secs(3);
     assert!(elapsed >= at_least && elapsed < bound, "{elapsed:?}");
-    assert!(called(&setup.household, &setup.office, SET_URI));
+    assert!(called(&setup.household, &setup.office, CLEAR));
 
     assert_eq!(api.handoffs(&setup.session).await, []);
-    // Neither failed start's stream id shows in the log at INFO or above.
+    // The failed start's stream id Kitchen was given (Office hung before it was given one)
+    // doesn't show in the log at INFO or above.
     let offered: Vec<String> = [&setup.kitchen, &setup.office]
         .into_iter()
         .flat_map(|player| setup.household.offered(player))
         .collect();
-    assert_eq!(offered.len(), 2, "{offered:?}");
+    assert_eq!(offered.len(), 1, "{offered:?}");
     let ids: Vec<&str> = offered.iter().map(|uri| stream_id(uri)).collect();
     assert_quiet(&setup.bridge.stop(), &setup.user.api_key.key, &ids);
 }
@@ -734,14 +751,10 @@ async fn starts_on_one_group_take_turns() {
         (setup.office.uuid(), setup.office.uuid())
     );
 
-    // One start's URL and Play, then the other's: never both URLs before a Play.
-    let started: Vec<String> = setup
-        .household
-        .actions_of(&setup.office)
-        .into_iter()
-        .filter(|action| action == SET_URI || action == PLAY)
-        .collect();
-    assert_eq!(started, [SET_URI, PLAY, SET_URI, PLAY]);
+    // One start's queue and Play, then the other's: never one's queue changed before the
+    // other's Play.
+    let both: Vec<&str> = STARTED.iter().chain(&STARTED).copied().collect();
+    assert_eq!(started(&setup.household, &setup.office), both);
 
     // Office plays the stream of the Handoff listed for it.
     let listed = api.handoffs(&setup.session).await;
@@ -771,9 +784,9 @@ async fn a_start_on_a_hanging_group_doesnt_hold_up_another_group() {
         (failed, Instant::now())
     };
     let other = async {
-        // Once Kitchen has been told its URL and hangs on it, Office starts.
-        eventually("Kitchen was never given a URL", WITHIN, async || {
-            called(&setup.household, &setup.kitchen, SET_URI)
+        // Once Kitchen has been told to start and hangs on it, Office starts.
+        eventually("Kitchen was never told to start", WITHIN, async || {
+            called(&setup.household, &setup.kitchen, CLEAR)
         })
         .await;
         setup.start(&setup.episode(1), &setup.office).await;
@@ -1045,13 +1058,9 @@ async fn a_start_begins_at_the_users_progress_in_whole_seconds() {
     );
     assert_eq!(setup.position(&setup.office), (Duration::ZERO, false));
     // Told to play first, then to seek.
-    let started: Vec<String> = setup
-        .household
-        .actions_of(&setup.kitchen)
-        .into_iter()
-        .filter(|action| [SET_URI, PLAY, SEEK].contains(&action.as_str()))
-        .collect();
-    assert_eq!(started, [SET_URI, PLAY, SEEK]);
+    let (actions, sought) = started_at("0:12:34");
+    assert_eq!(started(&setup.household, &setup.kitchen), actions);
+    assert_eq!(setup.household.sought(&setup.kitchen), sought);
     assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
     // A start writes no Progress.
     assert_eq!(
@@ -1081,13 +1090,9 @@ async fn an_audiobook_starts_at_the_users_progress() {
         setup.position(&setup.kitchen),
         (Duration::from_secs(754), true)
     );
-    let started: Vec<String> = setup
-        .household
-        .actions_of(&setup.kitchen)
-        .into_iter()
-        .filter(|action| [SET_URI, PLAY, SEEK].contains(&action.as_str()))
-        .collect();
-    assert_eq!(started, [SET_URI, PLAY, SEEK]);
+    let (actions, sought) = started_at("0:12:34");
+    assert_eq!(started(&setup.household, &setup.kitchen), actions);
+    assert_eq!(setup.household.sought(&setup.kitchen), sought);
 }
 
 #[tokio::test]
@@ -1205,7 +1210,8 @@ async fn a_group_that_refuses_or_does_not_answer_the_seek_keeps_no_handoff() {
     );
     // It played, then failed at the refused seek.
     assert!(called(&setup.household, &setup.kitchen, PLAY));
-    assert!(called(&setup.household, &setup.kitchen, SEEK));
+    let sought = setup.household.sought(&setup.kitchen);
+    assert_eq!(sought.last(), Some(&Seek::new("REL_TIME", "0:12:34")));
     // Neither the replaced Handoff nor the new one is left.
     let refused = setup.household.uri(&setup.kitchen).expect("a URL");
     assert_ne!(stream_id(&refused), stream_id(&old));
@@ -1241,7 +1247,8 @@ async fn a_group_that_refuses_or_does_not_answer_the_seek_keeps_no_handoff() {
     let at_least = sonos::CONTROL_TIMEOUT - Duration::from_millis(500);
     let bound = sonos::CONTROL_TIMEOUT + Duration::from_secs(3);
     assert!(elapsed >= at_least && elapsed < bound, "{elapsed:?}");
-    assert!(called(&setup.household, &setup.office, SEEK));
+    let sought = setup.household.sought(&setup.office);
+    assert_eq!(sought.last(), Some(&Seek::new("REL_TIME", "0:12:34")));
 
     assert_eq!(api.handoffs(&setup.session).await, []);
     let output = setup.bridge.stop();
@@ -1277,7 +1284,7 @@ async fn a_start_left_too_little_time_to_seek_sends_nothing() {
         "{elapsed:?}"
     );
 
-    assert!(!called(&setup.household, &setup.kitchen, SET_URI));
+    assert!(!called(&setup.household, &setup.kitchen, CLEAR));
     assert_eq!(api.handoffs(&setup.session).await, []);
     assert!(output_contains(
         &setup.bridge.stop(),
@@ -1305,6 +1312,6 @@ async fn a_start_at_0_after_a_slow_resolve_still_has_time_to_play() {
 
     assert_eq!(handoff.item, episode);
     assert!(called(&setup.household, &setup.kitchen, SET_URI));
-    assert!(!called(&setup.household, &setup.kitchen, SEEK));
+    assert!(!setup.position(&setup.kitchen).1);
     assert_eq!(api.handoffs(&setup.session).await.len(), 1);
 }

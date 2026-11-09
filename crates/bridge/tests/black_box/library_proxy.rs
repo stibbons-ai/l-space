@@ -4,7 +4,7 @@
 //! - [`LibraryProxy::hide_lengths`]: every Item lookup (`GET /api/items/<id>`, exactly one path
 //!   segment after `/api/items/`, any query) with each `duration` in it set to `null`: an Item
 //!   whose length Audiobookshelf doesn't know (as for an audio file it could not probe),
-//!   without seeding one.
+//!   without seeding one; until [`LibraryProxy::show_lengths`].
 //! - [`LibraryProxy::reject_item_lookups`]: every Item lookup at once with 401, as for a
 //!   rejected key.
 //! - [`LibraryProxy::hang_identity`]: every `GET /api/me` never.
@@ -108,9 +108,19 @@ impl LibraryProxy {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// The proxy's `host:port`, for a forwarder in front of it.
+    pub fn address(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+
     /// From now on, Item lookups tell no length.
     pub fn hide_lengths(&self) {
         self.faults.hide_lengths.store(true, Ordering::SeqCst);
+    }
+
+    /// From now on, Item lookups pass as they are again.
+    pub fn show_lengths(&self) {
+        self.faults.hide_lengths.store(false, Ordering::SeqCst);
     }
 
     /// From now on, Item lookups are rejected with 401 at once.

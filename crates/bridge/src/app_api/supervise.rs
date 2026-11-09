@@ -10,9 +10,13 @@
 //! doesn't resume it. A supervisor that panics is logged and forgotten; its Handoff stays,
 //! unsupervised.
 //!
-//! End-of-Item detection assumes a Group stops (`STOPPED`) on the Handoff's stream at the end
-//! of a single URL, as `sonos-fake` models it. It never relies on the position a stopped Group
-//! tells (real hardware may tell 0 then; unverified): from about [`END_SLACK`] before the
+//! Positions are in the whole Item: a Group playing a later one of the Handoff's files is read
+//! at that file's start plus its position in it (`ItemFiles::whole`), so reaching the end of a
+//! file that isn't the last is not the end of the Item. End-of-Item detection assumes a Group
+//! stops (`STOPPED`) on one of the Handoff's files at the end of the last, as `sonos-fake`
+//! models it. It never relies on the position, or the file, a stopped Group tells (real
+//! hardware may tell 0 then, and its queue may be back at its first file; unverified): from
+//! about [`END_SLACK`] before the
 //! expected end the Group is read every [`END_RECHECK`], without asking whom the key acts for
 //! first unless a Finished write is pending (a cadence tick among those reads, judged at the
 //! tick or at the last sighting if that came after it, is one of them, writing nothing; a
@@ -57,7 +61,7 @@ use store::{GroupHandoff, Handoff, Store, StreamId};
 use tokio::sync::watch;
 
 use super::{
-    Acting, Budget, CONTROL_TURN_TIME, Controls, Turns, Wanted, Wrote, plays_stream, told_length,
+    Acting, Budget, CONTROL_TURN_TIME, Controls, ItemFiles, Turns, Wanted, Wrote, told_length,
 };
 
 /// How often a playing Handoff's Progress is written, on the Bridge's clock. A tick that finds
@@ -263,6 +267,7 @@ impl<S: Store> Supervisors<S> {
             clock: Arc::clone(&self.clock),
             handoff: handoff.clone(),
             stream,
+            files: ItemFiles::of(stream, &handoff.files),
             known: Arc::clone(&known),
         };
         let forget = Forget {
@@ -403,6 +408,8 @@ struct Supervisor<S> {
     /// The supervised Handoff, as it started.
     handoff: Handoff,
     stream: StreamId,
+    /// Its files, where they lie in the whole Item.
+    files: ItemFiles,
     known: Arc<Mutex<Known>>,
 }
 
@@ -603,7 +610,7 @@ impl<S: Store> Supervisor<S> {
             self.skipped(due, "the Group did not tell what it plays");
             return Continue(Then::Wait);
         };
-        if !plays_stream(&playback, &self.stream) {
+        if !self.files.plays(&playback) {
             tracing::debug!(
                 group,
                 "a supervised Group plays something other than its Handoff"
@@ -612,6 +619,7 @@ impl<S: Store> Supervisor<S> {
             self.saw(at, None);
             return Continue(Then::Wait);
         }
+        let playback = self.files.whole(playback);
         let length = {
             let mut known = self.known();
             known.length = known.length.or_else(|| told_length(&playback));
