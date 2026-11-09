@@ -540,10 +540,9 @@ impl App {
         .await;
     }
 
-    /// Whether the Item screen offers to play its Item on a Group: only an Item in one audio
-    /// file plays there so far.
+    /// Whether the Item screen offers to play its Item on a Group: one with audio files.
     pub fn can_play_on(&self) -> bool {
-        matches!(&self.screen, Screen::Item { item, .. } if item.audio_files.len() == 1)
+        matches!(&self.screen, Screen::Item { item, .. } if !item.audio_files.is_empty())
     }
 
     /// On the Item screen, marks its Item Finished (`finished`) or unfinished on the Library

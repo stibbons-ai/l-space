@@ -175,6 +175,8 @@ texts! {
     GroupResume => "group-resume",
     GroupBack15 => "group-back-15",
     GroupForward30 => "group-forward-30",
+    GroupPreviousChapter => "group-previous-chapter",
+    GroupNextChapter => "group-next-chapter",
     GroupVolumeDown => "group-volume-down",
     GroupVolumeUp => "group-volume-up",
     PlayOn => "play-on",
