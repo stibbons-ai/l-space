@@ -547,6 +547,10 @@ async fn a_group_without_a_handoff_or_playing_something_else_is_not_controlled()
     // Kitchen's Handoff was replaced by something played from the Sonos app.
     setup.start(&episode, &setup.kitchen).await;
     setup.clock.advance(seconds(60));
+    // Establish a reliable final position, rather than depending on initial event timing.
+    api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
+    api.resume_group(&setup.bobs, setup.kitchen.uuid()).await;
+    setup.set_progress(&setup.alice, &episode, 25.0).await;
     setup
         .household
         .play(&setup.kitchen, FakeTrack::new("Radio", seconds(3600)));
@@ -568,6 +572,7 @@ async fn a_group_without_a_handoff_or_playing_something_else_is_not_controlled()
         async || api.handoffs(&setup.bobs).await.is_empty(),
     )
     .await;
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(60.0));
 
     // A Group the stream of another Group's Handoff plays on is not that Handoff's.
     let other = setup.start(&setup.episode(1), &setup.office).await;
@@ -1369,6 +1374,8 @@ async fn a_forward_skip_acts_only_if_the_group_still_plays_the_handoff_after_the
     let episode = setup.episode(0);
     setup.start(&episode, &setup.kitchen).await;
     setup.clock.advance(seconds(60));
+    // Establish a reliable final position independent of initial snapshot timing.
+    api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
     // A slow Library Server: the Group changes while the Bridge waits for the Item's length.
     // Each skip on fresh connections, so none reuses one already through the delay.
     let skip_while = async |change: &dyn Fn()| {
@@ -1412,6 +1419,7 @@ async fn a_forward_skip_acts_only_if_the_group_still_plays_the_handoff_after_the
         async || api.handoffs(&setup.bobs).await.is_empty(),
     )
     .await;
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(60.0));
 }
 
 #[tokio::test]

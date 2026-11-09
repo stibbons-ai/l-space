@@ -50,14 +50,14 @@ Kind one pauses at the end of the current chapter (audiobook) or episode (podcas
 
 ## Takeover from the Sonos app
 
-1. Start a Handoff to a Group.
+1. Start a Handoff to a Group. Capture its stream URL from a local packet capture of the player's HTTP GET on the Bridge listen port (the path is a capability: keep the capture private and delete it afterward).
 2. In the Sonos app, play something else on that Group (for example a radio station), or regroup its speakers.
 
 - [ ] The Handoff ends: the App no longer shows the Item playing on that Group.
-- [ ] The Item's unfinished Progress is the last reliable old-stream position (normally within the 30-second cadence while playing; failed reads can widen the gap), never the new source's position. Repeat with the Handoff paused, and after subscription renewal.
+- [ ] The Item's unfinished Progress is the last reliable old-stream position (normally within the 30-second cadence while playing; failed reads can widen the gap), never the new source's position. Repeat paused. In a private local capture of SUBSCRIBE responses, record the granted TIMEOUT and confirm renewal before expiry (normally half the grant); repeat the Takeover after the original lease would have expired.
 - [ ] The Group plays what the Sonos app started; the Bridge doesn't take it back.
-- [ ] Repeat for membership changes and coordinator changes; unrelated Groups and other users' Progress remain unchanged. Old stream requests return `404`.
-- [ ] Pause/resume, seek, volume and replacing a Handoff from the App do not end the new Handoff. A concurrent external source change is still detected.
+- [ ] Repeat for membership changes and coordinator changes; unrelated Groups keep playing and continue cadence Progress writes, and other users' Progress remains unchanged. Fetch the captured old stream URL after Takeover: `404`.
+- [ ] After each App pause/resume, seek and volume change, the same Handoff remains active and has correct Progress. Replace it from the App: the replacement Handoff stays active. A concurrent external source change still ends the affected Handoff.
 
 ## A deep seek in a long audiobook
 

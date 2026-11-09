@@ -174,10 +174,13 @@ impl Drop for Upnp {
 impl Sonos for Upnp {
     fn topology(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>> {
         Box::pin(async {
-            let (_, topology) = self
+            let (players, topology) = self
                 .shared
                 .topology_by(tokio::time::Instant::now() + CONTROL_TIMEOUT)
                 .await?;
+            if players.is_empty() {
+                return Err(Error::SearchFailed);
+            }
             Ok(topology.iter().filter_map(visible).collect())
         })
     }
@@ -199,7 +202,7 @@ impl Sonos for Upnp {
         self.shared.events.changed.subscribe()
     }
 
-    fn notify(&self, sid: &str, seq: u32, body: &str) -> bool {
+    fn notify(&self, sid: &str, seq: u32, body: &str) -> crate::Notification {
         let now = self
             .shared
             .event_clock
@@ -1406,6 +1409,30 @@ mod tests {
         );
         // Nothing went to the member.
         assert_eq!(controls(&household, &bath), Vec::<String>::new());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_discovery_lapse_is_unknown_topology_even_after_an_event_wake() {
+        let (household, clock) = Household::with_manual_clock();
+        household.add_player("Kitchen");
+        let upnp = Upnp {
+            shared: Arc::new(knowing(&household, &clock).await),
+            discovery: tokio::spawn(async {}).abort_handle(),
+            event_task: Mutex::new(None),
+        };
+        assert_eq!(Sonos::topology(&upnp).await.unwrap().len(), 1);
+        let mut hints = upnp.shared.events.changed.subscribe();
+        clock.advance(EXPIRY + Duration::from_secs(1));
+        upnp.shared
+            .events
+            .changed
+            .send_modify(|version| *version += 1);
+        hints.changed().await.unwrap();
+        assert_eq!(Sonos::topology(&upnp).await, Err(Error::SearchFailed));
+        // Discovery recovers: current topology is available again.
+        upnp.shared
+            .saw(Ok(ssdp::search(household.ssdp()).await.unwrap()));
+        assert_eq!(Sonos::topology(&upnp).await.unwrap().len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

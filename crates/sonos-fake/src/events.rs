@@ -1,4 +1,4 @@
-//! Real HTTP GENA leases on the household's clock, including initial snapshots and renewal.
+//! Real HTTP GENA leases: SystemClock by default, or an explicitly supplied event clock.
 
 use std::borrow::Cow;
 
@@ -28,6 +28,7 @@ pub(super) struct StateData {
     pub(super) timeout: u32,
     pub(super) renewals: usize,
     pub(super) reject: bool,
+    pub(super) drop_notifications: bool,
     pub(super) clock: Arc<dyn clock::Clock>,
 }
 
@@ -42,6 +43,7 @@ impl Default for Events {
             timeout: 60,
             renewals: 0,
             reject: false,
+            drop_notifications: false,
             clock: Arc::new(clock::SystemClock),
         }))
     }
@@ -50,6 +52,14 @@ impl Default for Events {
 impl Events {
     pub(super) fn lock(&self) -> MutexGuard<'_, StateData> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(super) fn subscriptions(&self) -> Vec<(String, u32)> {
+        self.lock()
+            .leases
+            .iter()
+            .map(|(sid, lease)| (sid.clone(), lease.seq))
+            .collect()
     }
 }
 
@@ -124,6 +134,9 @@ pub(super) async fn subscribe(
 
 pub(super) async fn publish(shared: Arc<Shared>) {
     let now = shared.events.lock().clock.now();
+    if shared.events.lock().drop_notifications {
+        return;
+    }
     let messages: Vec<_> = {
         let state = shared.lock();
         let mut events = shared.events.lock();

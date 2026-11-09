@@ -677,6 +677,22 @@ impl<S: Store> AppApi<S> {
             listen: self.listen,
             path: stream_token.path(&name),
         };
+        // Resolve membership before waiting for the turn, with its own bounded read.
+        // The checks below still reserve the Group's calls after this read and any wait.
+        let members = tokio::time::timeout(sonos::CONTROL_TIMEOUT, self.sonos.topology())
+            .await
+            .map_err(|_| {
+                tracing::warn!(group, "topology for a Handoff start timed out");
+                ApiError::GroupFailed
+            })?
+            .map_err(sonos_error)?
+            .into_iter()
+            .find(|found| found.id == group)
+            .ok_or(ApiError::GroupNotFound)?
+            .members
+            .into_iter()
+            .map(|member| member.id)
+            .collect();
         let after_turn = if from_start {
             sonos::PLAY_TIMEOUT
         } else {
@@ -750,20 +766,6 @@ impl<S: Store> AppApi<S> {
         // stored or sent, so a cancelled call left nothing behind.
         let task_group = group.clone();
         let (logged_item, logged_episode) = (library_item_id.clone(), id.episode.clone());
-        let members_time = START_TIME
-            .saturating_sub(called.elapsed())
-            .saturating_sub(sonos::PLAY_TIMEOUT + seek_time);
-        let members = tokio::time::timeout(members_time, self.sonos.topology())
-            .await
-            .map_err(|_| ApiError::GroupFailed)?
-            .map_err(sonos_error)?
-            .into_iter()
-            .find(|found| found.id == group)
-            .ok_or(ApiError::GroupFailed)?
-            .members
-            .into_iter()
-            .map(|member| member.id)
-            .collect();
         let started = tokio::spawn(async move {
             // The Handoff this start replaces gets its Progress first, with what is left after
             // keeping the time to play and seek.
@@ -906,10 +908,10 @@ impl<S: Store> AppApi<S> {
             let _turn = turn.take(&task_group, CONTROL_TURN_TIME, not_done).await?;
             let controlled = controls.control(&task_group, control).await;
             // Still holding the turn, so the supervisor told is this Handoff's.
-            if let Ok(playback) = &controlled {
-                supervisors.seen(&task_group, playback);
+            if let Ok((playback, reliable)) = &controlled {
+                supervisors.seen(&task_group, playback, *reliable);
             }
-            controlled
+            controlled.map(|(playback, _)| playback)
         })
         .await;
         controlled.unwrap_or_else(|error| {
@@ -1290,75 +1292,84 @@ impl<S: Store> Controls<S> {
     /// requests to the Library Server [`CONTROL_LIBRARY_SERVER_TIME`]; a write that fails or
     /// runs out of time is logged and otherwise left alone, as the Group already did what was
     /// asked, except that a key the Library Server rejects is revoked, which ends the Handoff.
-    async fn control(&self, group: &str, control: Control) -> Result<Playback, ApiError> {
+    async fn control(&self, group: &str, control: Control) -> Result<(Playback, bool), ApiError> {
         let mut group_time = Budget(sonos::CONTROL_TIMEOUT);
         let mut library_time = Budget(CONTROL_LIBRARY_SERVER_TIME);
         let playback = self.playback(group, &mut group_time).await?;
-        let found = self.playing_handoff(group, &playback).await?;
-        let duration = told_length(&playback);
-        let position = playback.position.map(|position| position.as_secs_f64());
-        let asked = match control {
-            Control::Pause => Some(sonos::TransportState::Paused),
-            Control::Resume => Some(sonos::TransportState::Playing),
-            Control::Skip(_) => None,
-        };
-        if asked == Some(playback.state) {
-            tracing::info!(group, ?control, "a Group already as asked was sent nothing");
-            return Ok(Playback {
-                state: api_state(playback.state),
-                position,
-                duration,
-            });
-        }
-        match control {
-            Control::Resume => {
-                self.act(group, control, &mut group_time, self.sonos.resume(group))
-                    .await?;
-                Ok(Playback {
-                    state: TransportState::Playing,
+        // A resume reports the pre-action position. Stopped zero is not a reliable sighting.
+        let reliable = matches!(
+            playback.state,
+            sonos::TransportState::Playing | sonos::TransportState::Paused
+        ) || matches!(control, Control::Skip(_));
+        let controlled = async {
+            let found = self.playing_handoff(group, &playback).await?;
+            let duration = told_length(&playback);
+            let position = playback.position.map(|position| position.as_secs_f64());
+            let asked = match control {
+                Control::Pause => Some(sonos::TransportState::Paused),
+                Control::Resume => Some(sonos::TransportState::Playing),
+                Control::Skip(_) => None,
+            };
+            if asked == Some(playback.state) {
+                tracing::info!(group, ?control, "a Group already as asked was sent nothing");
+                return Ok(Playback {
+                    state: api_state(playback.state),
                     position,
                     duration,
-                })
+                });
             }
-            Control::Pause => {
-                self.act(group, control, &mut group_time, self.sonos.pause(group))
-                    .await?;
-                let position = self
-                    .paused_at(group, &found.stream, &mut group_time)
-                    .await
-                    .or(position);
-                let Some(position) = position else {
-                    tracing::warn!(
-                        group,
-                        reason = "the Group did not tell where it paused",
-                        "Progress not written"
-                    );
-                    return Ok(Playback {
+            match control {
+                Control::Resume => {
+                    self.act(group, control, &mut group_time, self.sonos.resume(group))
+                        .await?;
+                    Ok(Playback {
+                        state: TransportState::Playing,
+                        position,
+                        duration,
+                    })
+                }
+                Control::Pause => {
+                    self.act(group, control, &mut group_time, self.sonos.pause(group))
+                        .await?;
+                    let position = self
+                        .paused_at(group, &found.stream, &mut group_time)
+                        .await
+                        .or(position);
+                    let Some(position) = position else {
+                        tracing::warn!(
+                            group,
+                            reason = "the Group did not tell where it paused",
+                            "Progress not written"
+                        );
+                        return Ok(Playback {
+                            state: TransportState::Paused,
+                            position,
+                            duration,
+                        });
+                    };
+                    let duration = self
+                        .check_and_write(
+                            &found.active,
+                            position,
+                            duration,
+                            "pause",
+                            &mut library_time,
+                        )
+                        .await;
+                    Ok(Playback {
                         state: TransportState::Paused,
-                        position,
+                        position: Some(position),
                         duration,
-                    });
-                };
-                let duration = self
-                    .check_and_write(
-                        &found.active,
-                        position,
-                        duration,
-                        "pause",
-                        &mut library_time,
-                    )
-                    .await;
-                Ok(Playback {
-                    state: TransportState::Paused,
-                    position: Some(position),
-                    duration,
-                })
-            }
-            Control::Skip(skip) => {
-                self.skip(group, skip, &found, playback, group_time, library_time)
-                    .await
+                    })
+                }
+                Control::Skip(skip) => {
+                    self.skip(group, skip, &found, playback, group_time, library_time)
+                        .await
+                }
             }
         }
+        .await;
+        controlled.map(|playback| (playback, reliable))
     }
 
     /// Has Group `group` skip as `skip` says, kept within the Item; the Group plays `found`'s
