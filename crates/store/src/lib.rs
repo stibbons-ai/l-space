@@ -13,6 +13,10 @@
 //! A Handoff acts with the API key of the user who started it, stored like a session's, and
 //! ends when that key is revoked or can no longer be read; logging out doesn't end it. A Group
 //! has at most one: starting another on it replaces the one it had.
+//!
+//! File seeks are durably quarantined before sending them. Until their outcome is committed
+//! safe, Group lookups and listings exclude them (including after restart), but stream lookups
+//! still serve their files. Failed cleanup must never make uncertain playback into Progress.
 
 #[cfg(feature = "contract")]
 pub mod contract;
@@ -194,6 +198,7 @@ pub trait Store: Send + Sync + 'static {
     /// The active Handoff on Group `group` (its id), if any, with its stream and the key it
     /// acts with. As for [`Store::handoff`], a Handoff whose key can no longer be read is not
     /// active, and the implementation forgets that key, ending its sessions and Handoffs.
+    /// A Handoff marked seeking is excluded: its position is not yet safe for Progress.
     fn group_handoff(
         &self,
         group: &str,
@@ -202,7 +207,19 @@ pub trait Store: Send + Sync + 'static {
     /// Every active Handoff, the earliest started first (ties by Group id). As for
     /// [`Store::handoff`], a Handoff whose key can no longer be read is not listed, and the
     /// implementation forgets that key, ending its sessions and Handoffs.
+    /// Handoffs marked seeking are excluded, also after reopening.
     fn handoffs(&self) -> impl Future<Output = Result<Vec<Handoff>, Error>> + Send;
+
+    /// Durably marks whether `stream` is in a file seek. Returns whether the row exists.
+    /// Mark before sending any file selection; clear only after success or a confirmed
+    /// refusal to move. While marked, `group_handoff` and `handoffs` exclude it, so neither
+    /// controls, supervision nor replacement can attribute an uncertain position to it.
+    /// `handoff` still serves its files while seeking. A crash leaves the mark intact.
+    fn set_handoff_seeking(
+        &self,
+        stream: &StreamId,
+        seeking: bool,
+    ) -> impl Future<Output = Result<bool, Error>> + Send;
 
     /// Ends the Handoff whose stream is `stream`. Returns whether it was active.
     fn end_handoff(&self, stream: &StreamId) -> impl Future<Output = Result<bool, Error>> + Send;

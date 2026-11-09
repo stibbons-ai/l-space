@@ -832,3 +832,78 @@ async fn a_replacement_after_a_stop_at_the_last_files_end_marks_the_book_finishe
         .await;
     assert_eq!(setup.progress().await, Some((LENGTH, true)));
 }
+
+#[tokio::test]
+async fn failed_seek_quarantine_survives_cleanup_failure_recovery_and_restart() {
+    for restart in [false, true] {
+        let mut setup = setup().await;
+        setup.start(Some(2395.0)).await;
+        let db = rusqlite::Connection::open(setup.bridge.database_path()).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER refuse_cleanup BEFORE DELETE ON handoffs
+             BEGIN SELECT RAISE(FAIL, 'injected cleanup failure'); END;",
+        ).unwrap();
+        setup.household.set_fault(&setup.kitchen, sonos_fake::Fault::RefuseSeek);
+        assert_eq!(
+            setup.bridge.api().control_error(
+                &setup.bobs, setup.kitchen.uuid(), GroupControl::Skip(Skip::Forward30),
+            ).await,
+            (StatusCode::BAD_GATEWAY, ApiError::GroupFailed),
+        );
+        eventually("cleanup never paused", WITHIN, async || {
+            setup.household.transport_state(&setup.kitchen) == "PAUSED_PLAYBACK"
+        }).await;
+        assert_eq!(setup.track(), (Some(2), Duration::ZERO));
+        let retained: i64 = db.query_row("SELECT count(*) FROM handoffs", [], |row| row.get(0)).unwrap();
+        assert_eq!(retained, 1, "the test must exercise failed deletion");
+        if restart {
+            setup.bridge.restart();
+        }
+        // Recover storage and the Group, but never trust the retained failed seek again.
+        db.execute_batch("DROP TRIGGER refuse_cleanup;").unwrap();
+        setup.household.set_fault(&setup.kitchen, sonos_fake::Fault::None);
+        let api = setup.bridge.api();
+        assert_eq!(api.handoffs(&setup.bobs).await, []);
+        for control in [GroupControl::Resume, GroupControl::Pause, GroupControl::Skip(Skip::Back15)] {
+            assert_eq!(
+                api.control_error(&setup.bobs, setup.kitchen.uuid(), control).await,
+                test_support::bridge::NO_HANDOFF,
+            );
+            assert_eq!(setup.progress().await, Some((2395.0, false)));
+        }
+        setup.advance(31).await;
+        assert_eq!(setup.progress().await, Some((2395.0, false)));
+        // Replacement must not write the uncertain selected-file-start position for Alice.
+        let episode = setup.abs.seeded().episode(0);
+        api.start_handoff_from_start(&setup.bobs, &episode, setup.kitchen.uuid()).await;
+        assert_eq!(setup.progress().await, Some((2395.0, false)));
+        assert_eq!(api.handoffs(&setup.bobs).await[0].item, episode);
+        setup.advance(10).await;
+        let paused = api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
+        assert_eq!(paused.position, Some(10.0));
+        assert_eq!(setup.progress().await, Some((2395.0, false)));
+    }
+}
+
+#[tokio::test]
+async fn a_file_seek_is_not_sent_when_its_quarantine_cannot_be_persisted() {
+    let setup = setup().await;
+    setup.start(Some(2395.0)).await;
+    let db = rusqlite::Connection::open(setup.bridge.database_path()).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse_quarantine BEFORE UPDATE OF seeking ON handoffs
+         BEGIN SELECT RAISE(FAIL, 'injected quarantine failure'); END;",
+    ).unwrap();
+    assert_eq!(
+        setup.bridge.api().control_error(
+            &setup.bobs, setup.kitchen.uuid(), GroupControl::Skip(Skip::Forward30),
+        ).await,
+        (StatusCode::INTERNAL_SERVER_ERROR, ApiError::Internal),
+    );
+    assert_eq!(setup.track(), (Some(1), seconds(2395)));
+    assert_eq!(setup.progress().await, Some((2395.0, false)));
+    db.execute_batch("DROP TRIGGER refuse_quarantine;").unwrap();
+    assert_eq!(setup.skip(Skip::Forward30).await, playing(2425.0));
+    assert_eq!(setup.track(), (Some(2), seconds(25)));
+    assert_eq!(setup.progress().await, Some((2425.0, false)));
+}

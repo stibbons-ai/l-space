@@ -63,6 +63,7 @@ macro_rules! store_contract_tests {
             a_groups_handoff_outlives_the_session_that_started_it,
             a_handoff_keeps_all_its_files_in_order,
             an_empty_handoff_is_refused_without_replacing_the_active_one,
+            a_seeking_handoff_is_untrusted_after_reopening_but_still_streams,
         );
     };
     (@tests $backend:expr; $($test:ident),* $(,)?) => {
@@ -736,4 +737,27 @@ pub async fn an_empty_handoff_is_refused_without_replacing_the_active_one(backen
     );
     assert_eq!(listed(&store).await, [first]);
     assert_eq!(active(&store, stream(2)).await, None);
+}
+
+pub async fn a_seeking_handoff_is_untrusted_after_reopening_but_still_streams(backend: &impl Backend) {
+    let kitchen = handoff("RINCON_K", "ep-1", &alice(), 1_000);
+    let office = handoff("RINCON_O", "ep-2", &bob(), 2_000);
+    {
+        let store = backend.open().await;
+        start(&store, stream(1), &kitchen, "alice-key").await;
+        start(&store, stream(2), &office, "bob-key").await;
+        assert!(store.set_handoff_seeking(&stream(1), true).await.unwrap());
+    }
+    let store = backend.open().await;
+    assert_eq!(on_group(&store, "RINCON_K").await, None);
+    assert_eq!(listed(&store).await, [office]);
+    assert_eq!(active(&store, stream(1)).await, acting_with(&kitchen, "alice-key"));
+    assert!(store.set_handoff_seeking(&stream(1), false).await.unwrap());
+    assert_eq!(on_group(&store, "RINCON_K").await, on_stream(stream(1), &kitchen, "alice-key"));
+    assert!(!store.set_handoff_seeking(&stream(3), true).await.unwrap());
+    // Clearing the old stream's mark cannot affect a replacement.
+    let replacement = handoff("RINCON_K", "ep-3", &bob(), 3_000);
+    start(&store, stream(3), &replacement, "bob-key").await;
+    assert!(!store.set_handoff_seeking(&stream(1), false).await.unwrap());
+    assert_eq!(on_group(&store, "RINCON_K").await, on_stream(stream(3), &replacement, "bob-key"));
 }

@@ -70,6 +70,11 @@ Kind one pauses at the end of the current chapter (audiobook) or episode (podcas
 
 Use an audiobook in at least three files (MP3 or M4A/M4B, as Audiobookshelf lists it), with chapters, and give the Group a queue of its own in the Sonos app first.
 
+A failed file seek quarantines its Handoff before any Group action. If deleting it fails,
+the row stays excluded from controls, supervision and replacement Progress, including after a
+Bridge restart. Start a new Handoff to replace it after storage recovers; saved Progress stays
+at the last confirmed position. The stream can still serve files while quarantined.
+
 1. In Audiobookshelf, set the book's Progress to the middle of its second (or a later) file; start a Handoff of it to a Group.
 2. Let it play across the end of a file into the next; keep the App closed for a minute after the change.
 3. Under 15 seconds into the second or a later file, use "15 s back" from the App.

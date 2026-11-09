@@ -36,6 +36,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0002_encrypted_api_keys.sql"),
     include_str!("migrations/0003_handoffs.sql"),
     include_str!("migrations/0004_handoff_files.sql"),
+    include_str!("migrations/0005_handoff_seeking.sql"),
 ];
 
 /// A [`Store`] in one SQLite database file. It stays open until it, its [`Closer`]s and its
@@ -635,7 +636,7 @@ impl Store for SqliteStore {
     }
 
     async fn group_handoff(&self, group: &str) -> Result<Option<GroupHandoff>, Error> {
-        let query = select_handoffs!("WHERE h.group_id = ?1");
+        let query = select_handoffs!("WHERE h.group_id = ?1 AND h.seeking = 0");
         self.find_handoff(query, group.to_owned()).await
     }
 
@@ -644,7 +645,7 @@ impl Store for SqliteStore {
         let (handoffs, unreadable) = self
             .transaction(move |tx| {
                 let rows = tx
-                    .prepare_cached(select_handoffs!("ORDER BY h.started_at, h.group_id"))?
+                    .prepare_cached(select_handoffs!("WHERE h.seeking = 0 ORDER BY h.started_at, h.group_id"))?
                     .query_map([], handoff_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 let mut handoffs = Vec::new();
@@ -669,6 +670,15 @@ impl Store for SqliteStore {
             warn_unreadable(&key.user);
         }
         Ok(handoffs)
+    }
+
+    async fn set_handoff_seeking(&self, stream: &StreamId, seeking: bool) -> Result<bool, Error> {
+        let stream = *stream;
+        self.transaction(move |tx| {
+            let changed = tx.prepare_cached("UPDATE handoffs SET seeking = ?2 WHERE stream_id = ?1")?
+                .execute(params![stream.as_bytes(), seeking])?;
+            Ok(changed > 0)
+        }).await
     }
 
     async fn end_handoff(&self, stream: &StreamId) -> Result<bool, Error> {

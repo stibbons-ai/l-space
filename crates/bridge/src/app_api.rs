@@ -788,6 +788,11 @@ impl<S: Store> AppApi<S> {
                 .map_err(storage_error("start a Handoff"))?;
             // The replaced Handoff, if any, is gone: so is its supervision.
             supervisors.stop(&handoff.group);
+            if let Err(error) = store.set_handoff_seeking(&stream, true).await {
+                log_storage_error("quarantine a starting Handoff", &error);
+                end_unstarted(store.as_ref(), &stream, &handoff.group).await;
+                return Err(ApiError::Internal);
+            }
             // The stream answers from here on: the Group may fetch it as soon as it is told.
             if let Err(error) = sonos.play(&handoff.group, &targets, to.file).await {
                 tracing::warn!(group = handoff.group, %error, "a Group did not start a Handoff");
@@ -797,7 +802,7 @@ impl<S: Store> AppApi<S> {
             // Freeze multi-file playback while selecting its saved file and offset: a short
             // file can finish even between TRACK_NR and REL_TIME. Keep all these calls in
             // the existing initial-seek reservation.
-            let sought = if !to.within.is_zero() { async {
+            let mut sought = if !to.within.is_zero() { async {
                 let mut time = Budget(sonos::CONTROL_TIMEOUT);
                 let track = (handoff.files.len() > 1).then_some(to.file);
                 if track.is_some() {
@@ -816,6 +821,12 @@ impl<S: Store> AppApi<S> {
                 }
                 Ok::<(), sonos::Error>(())
             }.await } else { Ok(()) };
+            if sought.is_ok()
+                && let Err(error) = store.set_handoff_seeking(&stream, false).await
+            {
+                log_storage_error("restore a started Handoff", &error);
+                sought = Err(sonos::Error::GroupFailed);
+            }
             if let Err(error) = sought
             {
                 tracing::warn!(
@@ -1526,13 +1537,32 @@ impl<S: Store> Controls<S> {
         };
         let to = files.seek(target);
         let control = Control::Skip(skip);
+        // Persist uncertainty before TRACK_NR. Cleanup deletion can fail, and a crash must
+        // not turn a half-finished seek back into trusted Progress.
+        if to.track.is_some()
+            && !self.store.set_handoff_seeking(files.stream(), true).await
+                .map_err(storage_error("quarantine a file seek"))?
+        {
+            return Err(ApiError::NoHandoff);
+        }
         // The seek owns this remaining deadline so it can report whether TRACK_NR acted,
         // even on a timeout. An outer timeout would erase that information.
-        if let Err(error) = self
+        let mut sought = self
             .sonos
             .seek(group, to.track, to.within, group_time.0)
-            .await
-        {
+            .await;
+        if to.track.is_some() && sought != Err(sonos::Error::SeekMayHaveMoved) {
+            match self.store.set_handoff_seeking(files.stream(), false).await {
+                Ok(true) => {}
+                Ok(false) => return Err(ApiError::NoHandoff),
+                Err(error) => {
+                    log_storage_error("restore a safe file seek's Handoff", &error);
+                    // Keep the quarantine and stop supervision: the outcome wasn't committed.
+                    sought = Err(sonos::Error::SeekMayHaveMoved);
+                }
+            }
+        }
+        if let Err(error) = sought {
             tracing::warn!(group, ?control, %error, "a Group did not take a control");
             if error == sonos::Error::SeekMayHaveMoved {
                 supervisors.stop(group);
@@ -2638,13 +2668,11 @@ async fn end_unstarted<S: Store>(store: &S, stream: &store::StreamId, group: &st
         .ok()
 }
 
-/// End a Handoff after a seek may have changed its file, retrying a local storage failure.
+/// Removes a quarantined Handoff after failed playback or a seek. No retries: the durable
+/// seeking mark excludes controls, supervision and replacement Progress even after restart.
 async fn end_failed_seek<S: Store>(store: &S, stream: &store::StreamId, handoff: &store::Handoff) {
     let group = &handoff.group;
-    let ended = match end_unstarted(store, stream, group).await {
-        Some(ended) => Some(ended),
-        None => end_unstarted(store, stream, group).await,
-    };
+    let ended = end_unstarted(store, stream, group).await;
     match ended {
         Some(true) => tracing::info!(
             group,
@@ -2657,7 +2685,7 @@ async fn end_failed_seek<S: Store>(store: &S, stream: &store::StreamId, handoff:
             group,
             library_item = handoff.library_item,
             episode = handoff.episode,
-            "a Handoff stays listed but unsupervised until the Bridge restarts after a failed file seek; a pause or skip would overwrite Progress"
+            "a failed seek's Handoff could not be removed; its durable quarantine prevents controls and replacement Progress, also after restart"
         ),
     }
 }
