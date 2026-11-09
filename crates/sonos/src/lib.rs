@@ -2,10 +2,10 @@
 //! Control API can replace the local UPnP implementation, [`Upnp`], later.
 //!
 //! It reads every Group as set up in the Sonos app, with its members, what its coordinator
-//! plays and the Group's volume; starts a stream the Bridge serves on a Group
-//! ([`Sonos::play`]); and controls what a Group plays: pause, resume, seek, and the Group's
-//! volume. [`media_type`] tells which audio formats a Group plays; `play` doesn't check, the
-//! caller does. It never changes grouping.
+//! plays and the Group's volume; starts streams the Bridge serves on a Group, as the Group's
+//! queue ([`Sonos::play`]); and controls what a Group plays: pause, resume, seek (to another
+//! track of its queue too), and the Group's volume. [`media_type`] tells which audio formats a
+//! Group plays; `play` doesn't check, the caller does. It never changes grouping.
 //!
 //! Every SSDP datagram and SOAP body sent or received is logged at DEBUG under the target
 //! [`RAW`], and only there; INFO and above summarise without raw bodies.
@@ -43,8 +43,15 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// no player has none.
     fn groups(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>>;
 
-    /// Group `group` (its id) plays `stream` from its start, replacing what it played.
-    fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>>;
+    /// Group `group` (its id) plays `streams` as its queue, in order, from the start of
+    /// `streams[first]`, replacing what it played and what its queue held. Played to the end
+    /// of one, it goes on with the next; at the end of the last, it stops.
+    fn play<'a>(
+        &'a self,
+        group: &'a str,
+        streams: &'a [Stream],
+        first: usize,
+    ) -> BoxFuture<'a, Result<(), Error>>;
 
     /// What Group `group` plays now, as its coordinator tells it.
     fn playback<'a>(&'a self, group: &'a str) -> BoxFuture<'a, Result<Playback, Error>>;
@@ -55,9 +62,15 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// Group `group` plays on from where it is, at normal speed.
     fn resume<'a>(&'a self, group: &'a str) -> BoxFuture<'a, Result<(), Error>>;
 
-    /// Group `group` goes to `position` into its current track, in whole seconds (any
-    /// fraction is dropped), playing or paused as it was.
-    fn seek<'a>(&'a self, group: &'a str, position: Duration) -> BoxFuture<'a, Result<(), Error>>;
+    /// Group `group` goes to `position` into a track of its queue, in whole seconds (any
+    /// fraction is dropped), playing or paused as it was: into track `track` (0-based, in
+    /// queue order) when given, else into its current track.
+    fn seek<'a>(
+        &'a self,
+        group: &'a str,
+        track: Option<usize>,
+        position: Duration,
+    ) -> BoxFuture<'a, Result<(), Error>>;
 
     /// Group `group`'s volume becomes `volume`, at most [`MAX_VOLUME`]: every member's
     /// changes as the Sonos app's Group volume changes them.
