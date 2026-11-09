@@ -47,7 +47,9 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
 
     /// Current Group membership/coordinators without transport or volume requests.
     /// An empty result after healthy discovery means no known players, not authoritative
-    /// evidence that an active Group's membership changed. Failed discovery is SearchFailed.
+    /// evidence that an active Group's membership changed. Failed discovery returns
+    /// [`Error::SearchFailed`] only without unexpired known players; otherwise cached players
+    /// may still supply topology.
     fn topology(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>>;
 
     /// Group `group` (its id) plays `stream` from its start, replacing what it played.

@@ -1744,6 +1744,143 @@ async fn takeover_coordinator_disappearance_ends_both_affected_handoffs() {
 }
 
 #[tokio::test]
+async fn takeover_after_pause_keeps_the_recovered_post_pause_position() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    let old_stream = setup.household.fetched(&setup.kitchen).await.uri;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    setup.advance(7).await;
+    setup.household.set_fault(&setup.kitchen, Fault::NoPosition);
+    let mut gate = setup.household.hold_next_call(&setup.kitchen, "Pause");
+    let pause = async {
+        let playback = setup
+            .bridge
+            .api()
+            .pause_group(&setup.bobs, setup.kitchen.uuid())
+            .await;
+        assert_eq!(playback.position, Some(37.0));
+    };
+    let recover = async {
+        gate.arrived().await;
+        setup.household.set_fault(&setup.kitchen, Fault::None);
+        gate.release();
+    };
+    tokio::join!(pause, recover);
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((37.0, false))
+    );
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("Radio", Duration::from_secs(3600)),
+    );
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((37.0, false))
+    );
+    assert_eq!(
+        reqwest::get(&old_stream).await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn takeover_immediately_after_skip_keeps_the_seek_target() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    let old_stream = setup.household.fetched(&setup.kitchen).await.uri;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    setup.settle().await;
+    setup.household.drop_notifications(true);
+    let playback = setup
+        .bridge
+        .api()
+        .skip_group(&setup.bobs, setup.kitchen.uuid(), Skip::Forward30)
+        .await;
+    assert_eq!(playback.position, Some(60.0));
+    setup.household.drop_notifications(false);
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("Radio", Duration::from_secs(3600)),
+    );
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((60.0, false))
+    );
+    assert_eq!(
+        reqwest::get(&old_stream).await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn takeover_pending_identity_replacement_preserves_unfinished_progress() {
+    replacement_during_takeover(false).await;
+}
+
+#[tokio::test]
+async fn takeover_pending_identity_replacement_preserves_pending_finished() {
+    replacement_during_takeover(true).await;
+}
+
+async fn replacement_during_takeover(finished: bool) {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    let expected = if finished {
+        setup.ended_with_finished_failing(&proxy, 1).await;
+        (EPISODE_DURATIONS[0], true)
+    } else {
+        setup.start(&setup.alices, &episode, None).await;
+        setup.advance(30).await;
+        setup
+            .wait_for_progress(&setup.alice, &episode, (30.0, false))
+            .await;
+        setup.settle().await;
+        (30.0, false)
+    };
+    let old_stream = setup.household.fetched(&setup.kitchen).await.uri;
+    setup
+        .set_progress(&setup.alice, &episode, 11.0, false)
+        .await;
+    let identities = proxy.identity_requests();
+    proxy.delay_next_identity(Duration::from_millis(2400));
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("Radio", Duration::from_secs(3600)),
+    );
+    eventually(
+        "Takeover identity check never arrived",
+        WITHIN,
+        async || proxy.identity_requests() > identities,
+    )
+    .await;
+    let replacement = setup.episode(1);
+    setup.start(&setup.bobs, &replacement, None).await;
+    assert_bobs_handoff_listed(&setup).await;
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(expected));
+    assert_eq!(setup.progress(&setup.bob, &episode).await, None);
+    assert_eq!(
+        reqwest::get(&old_stream).await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.bob, &replacement, (30.0, false))
+        .await;
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(expected));
+}
+
+#[tokio::test]
 async fn takeover_after_renewal_preserves_own_controls_and_replacement() {
     let setup = setup().await;
     let episode = setup.episode(0);

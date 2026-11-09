@@ -1538,7 +1538,7 @@ impl<S: Store> Controls<S> {
         let mut library_time = Budget(CONTROL_LIBRARY_SERVER_TIME);
         let playback = self.playback(group, &mut group_time).await?;
         // A resume reports the pre-action position. Stopped zero is not a reliable sighting.
-        let reliable = supervise::reliable_position(&playback).is_some()
+        let mut reliable = supervise::reliable_position(&playback).is_some()
             || matches!(control, Control::Skip(_));
         let controlled = async {
             let found = self.playing_handoff(group, &playback).await?;
@@ -1570,10 +1570,9 @@ impl<S: Store> Controls<S> {
                 Control::Pause => {
                     self.act(group, control, &mut group_time, self.sonos.pause(group))
                         .await?;
-                    let position = self
-                        .paused_at(group, &found.stream, &mut group_time)
-                        .await
-                        .or(position);
+                    let paused = self.paused_at(group, &found.stream, &mut group_time).await;
+                    reliable = paused.is_some() || reliable;
+                    let position = paused.or(position);
                     let Some(position) = position else {
                         tracing::warn!(
                             group,
@@ -1813,8 +1812,10 @@ impl<S: Store> Controls<S> {
     /// Writes where Group `group` is on `replaced`'s stream as Progress for the replaced
     /// Handoff's starter, with its key ([`Controls::write_progress`]), within `time` in all:
     /// reading the Group, checking the key (and the Item's length, if neither the Group nor
-    /// its supervisor (`known`) tells it), writing. Only a Group playing or paused on that
-    /// stream, telling a position, gets it written; a stopped one may tell 0 there. A Group
+    /// its supervisor (`known`) tells it), writing. A Group playing or paused on that stream
+    /// supplies its current position; a stopped one may tell 0 there. A positive foreign
+    /// source uses the supervisor's pending Finished or cached reliable old-stream position
+    /// instead, unless Finished was already written. A Group
     /// stopped on that stream after playing to the end of the Item gets Progress at the end
     /// written Finished: the supervisor's pending Finished write, or, when it hadn't found the
     /// Group stopped yet, one by the supervisor's rule on what it last saw of the Group
@@ -1850,6 +1851,9 @@ impl<S: Store> Controls<S> {
                 );
             }
         };
+        if known.finished_written {
+            return;
+        }
         if time.is_zero() {
             tracing::info!(group, reason = "no time left", "{not_written}");
             lost(known.finished, "no time left");
@@ -1864,6 +1868,31 @@ impl<S: Store> Controls<S> {
             return;
         };
         let on_stream = plays_stream(&playback, &replaced.stream);
+        if !on_stream && playback.uri.is_some() {
+            // A replacement can hold the turn while Takeover checks identity. It owns the
+            // displaced Handoff's final write before stopping that supervisor.
+            let update = known.finished.or_else(|| {
+                known
+                    .position
+                    .map(|position| abs::ProgressUpdate::at(position.as_secs_f64(), known.length))
+            });
+            if let Some(update) = update {
+                let checked = self.check(&replaced.active, Wanted::No, &mut time).await;
+                let wrote = self
+                    .write_progress(
+                        &replaced.active,
+                        checked.acting,
+                        update,
+                        "replaced after Takeover",
+                        &mut time,
+                    )
+                    .await;
+                if !matches!(wrote, Wrote::Written) {
+                    lost(known.finished, "final replacement write did not land");
+                }
+            }
+            return;
+        }
         if on_stream && playback.state == sonos::TransportState::Stopped {
             let Some(update) = known.finished_at_stop(at, told_length(&playback)) else {
                 tracing::info!(

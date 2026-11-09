@@ -1,7 +1,7 @@
 //! GENA subscriptions. Bodies only wake readers: delayed notifications cannot apply old
 //! transport or topology to a newer Handoff. SIDs and URLs are never logged.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -16,13 +16,13 @@ const SERVICES: [&str; 2] = [
     "/ZoneGroupTopology/Event",
 ];
 const RETRY: Duration = Duration::from_secs(5);
+const MAX_ATTEMPTS: usize = 32;
 
 struct Subscription {
     sid: String,
     sequence: Option<u32>,
     expires: Option<Instant>,
     value: Option<String>,
-    renew: Option<Instant>,
 }
 
 impl std::fmt::Debug for Subscription {
@@ -30,7 +30,6 @@ impl std::fmt::Debug for Subscription {
         f.debug_struct("Subscription")
             .field("sequence", &self.sequence)
             .field("expires", &self.expires)
-            .field("renew", &self.renew)
             .finish_non_exhaustive()
     }
 }
@@ -158,9 +157,13 @@ fn grant(headers: &reqwest::header::HeaderMap) -> Result<(String, Option<Duratio
 
 pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn clock::Clock>) {
     let mut searched = shared.searched.subscribe();
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut running = BTreeMap::<_, (tokio::task::AbortHandle, Option<Instant>)>::new();
+    let mut due = BTreeMap::new();
+    let mut ready = Vec::new();
     loop {
         let now = clock.now();
-        let players: Vec<_> = shared
+        let players: BTreeSet<_> = shared
             .known()
             .players
             .values()
@@ -173,155 +176,230 @@ pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn 
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(addr, _), _| players.contains(addr));
-        let mut next = now + RETRY;
+        due.retain(|(addr, _), _| players.contains(addr));
         for addr in players {
             for path in SERVICES {
-                let sid = {
-                    let subscriptions = shared
-                        .events
-                        .subscriptions
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    match subscriptions.get(&(addr, path)) {
-                        Some(subscription) => {
-                            if subscription.renew.is_none_or(|renew| renew > clock.now()) {
-                                if let Some(renew) = subscription.renew {
-                                    next = next.min(renew);
-                                }
-                                continue;
-                            }
-                            subscription
-                                .expires
-                                .is_none_or(|expires| expires > now)
-                                .then(|| subscription.sid.clone())
-                        }
-                        None => None,
-                    }
-                };
-                // Renewal uses only the SID; callback routing is needed for a new lease.
-                let mut request = shared
-                    .http
-                    .request(
-                        reqwest::Method::from_bytes(b"SUBSCRIBE").expect("SUBSCRIBE is a method"),
-                        format!("http://{addr}{path}"),
-                    )
-                    .header("TIMEOUT", "Second-300");
-                if let Some(sid) = &sid {
-                    request = request.header("SID", sid);
-                } else {
-                    let host = if listen.ip().is_unspecified() {
-                        match route_to(addr.ip()) {
-                            Ok(host) => host,
-                            Err(_) => {
-                                tracing::warn!(%addr, "cannot route a Sonos event callback");
-                                continue;
-                            }
-                        }
-                    } else {
-                        listen.ip()
-                    };
-                    request = request.header("NT", "upnp:event").header(
-                        "CALLBACK",
-                        format!(
-                            "<http://{}/sonos/events>",
-                            SocketAddr::new(host, listen.port())
-                        ),
-                    );
-                }
-                // Count connection/response time against the granted lifetime too.
-                let began = clock.now();
-                let mut invalid_sid = false;
-                let mut status = None;
-                let granted = match request.send().await {
-                    Ok(answer) if answer.status().is_success() => grant(answer.headers()),
-                    Ok(answer) => {
-                        invalid_sid = answer.status() == reqwest::StatusCode::PRECONDITION_FAILED;
-                        status = Some(answer.status().as_u16());
-                        Err("HTTP status")
-                    }
-                    Err(error) => {
-                        // Never format reqwest's URL-bearing error: callback SIDs and stream
-                        // capabilities must not enter diagnostics.
-                        let kind = if error.is_timeout() {
-                            "timeout"
-                        } else if error.is_connect() {
-                            "connect"
-                        } else {
-                            "request"
-                        };
-                        Err(kind)
-                    }
-                };
-                if let Ok((new_sid, lifetime)) = granted {
-                    let renew = lifetime.map(|lifetime| began + lifetime / 2);
-                    let mut subscriptions = shared
-                        .events
-                        .subscriptions
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    let previous = subscriptions
-                        .remove(&(addr, path))
-                        .filter(|previous| previous.sid == new_sid);
-                    let fresh = previous.is_none();
-                    let (sequence, value) = previous
-                        .map_or((None, None), |previous| (previous.sequence, previous.value));
-                    subscriptions.insert(
-                        (addr, path),
-                        Subscription {
-                            sid: new_sid,
-                            sequence,
-                            value,
-                            expires: lifetime.map(|lifetime| began + lifetime),
-                            renew,
-                        },
-                    );
-                    drop(subscriptions);
-                    if let Some(renew) = renew {
-                        next = next.min(renew);
-                    }
-                    // Covers an initial snapshot delivered before the SUBSCRIBE response.
-                    if fresh {
-                        shared.events.wake();
-                    }
-                } else {
-                    // Only a publisher's invalid-SID response revokes a still-valid lease.
-                    // Transient failures keep accepting callbacks and retry at RETRY.
-                    let mut subscriptions = shared
-                        .events
-                        .subscriptions
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    let expired = subscriptions.get(&(addr, path)).is_some_and(|lease| {
-                        lease.expires.is_some_and(|expiry| expiry <= clock.now())
-                    });
-                    let dropped = invalid_sid || expired;
-                    if dropped {
-                        subscriptions.remove(&(addr, path));
-                    }
-                    let retained = subscriptions.contains_key(&(addr, path));
-                    let lease = if retained { "retained" } else { "absent" };
-                    let reason = if invalid_sid {
-                        "invalid SID"
-                    } else if expired {
-                        "expired"
-                    } else {
-                        granted.unwrap_err()
-                    };
-                    tracing::warn!(
-                        renewal = sid.is_some(),
-                        status,
-                        service = path,
-                        lease,
-                        dropped,
-                        reason,
-                        "Sonos subscription failed; retrying"
-                    );
-                }
+                due.entry((addr, path)).or_insert(Some(now));
             }
         }
+        // Renew the earliest expiring leases first. A saturated set of stalled requests
+        // must also yield a slot to a healthy short lease when its deadline arrives.
+        ready.clear();
+        {
+            let subscriptions = shared
+                .events
+                .subscriptions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            ready.extend(
+                due.iter()
+                    .filter(|(key, at)| {
+                        at.is_some_and(|at| at <= now) && !running.contains_key(*key)
+                    })
+                    .map(|(key, at)| {
+                        let expires = subscriptions.get(key).and_then(|lease| lease.expires);
+                        (expires.is_none(), expires, at.expect("due deadline"), *key)
+                    }),
+            );
+        }
+        ready.sort_unstable();
+        if attempts.len() == MAX_ATTEMPTS
+            && let Some((false, Some(expires), _, _)) = ready.first()
+            && let Some((handle, _)) = running
+                .values()
+                .filter(|(_, deadline)| deadline.is_none_or(|deadline| deadline > *expires))
+                .max_by_key(|(_, deadline)| (deadline.is_none(), *deadline))
+        {
+            handle.abort();
+        }
+        for (_, expires, _, key) in ready.iter().copied().take(MAX_ATTEMPTS - attempts.len()) {
+            let shared = Arc::clone(&shared);
+            let clock = Arc::clone(&clock);
+            let handle = attempts.spawn(async move {
+                let next = subscribe(&shared, listen, clock.as_ref(), key.0, key.1).await;
+                (key, next)
+            });
+            running.insert(key, (handle, expires));
+        }
+        let next = due
+            .iter()
+            .filter(|(key, _)| !running.contains_key(*key))
+            .filter_map(|(_, at)| *at)
+            .filter(|at| attempts.len() < MAX_ATTEMPTS || *at > now)
+            .min()
+            .unwrap_or(now + RETRY);
         tokio::select! {
             result = searched.changed() => { if result.is_err() { return; } }
+            result = attempts.join_next(), if !attempts.is_empty() => {
+                let (key, next) = match result.expect("subscription attempt exists") {
+                    Ok(completed) => completed,
+                    Err(error) => {
+                        let key = *running.iter()
+                            .find(|(_, (handle, _))| handle.id() == error.id())
+                            .expect("running subscription attempt").0;
+                        if !error.is_cancelled() {
+                            tracing::error!(service = key.1, "Sonos subscription attempt panicked; retrying");
+                        }
+                        (key, Some(clock.now() + RETRY))
+                    }
+                };
+                running.remove(&key);
+                if let Some(at) = due.get_mut(&key) {
+                    *at = next;
+                }
+            }
             () = clock.sleep_until(next.max(clock.now() + Duration::from_millis(100))) => {}
+        }
+    }
+}
+
+/// One bounded request per endpoint; dropping the owning JoinSet cancels all requests.
+async fn subscribe(
+    shared: &Shared,
+    listen: SocketAddr,
+    clock: &dyn clock::Clock,
+    addr: SocketAddr,
+    path: &'static str,
+) -> Option<Instant> {
+    let sid = {
+        let subscriptions = shared
+            .events
+            .subscriptions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        subscriptions
+            .get(&(addr, path))
+            .filter(|subscription| {
+                subscription
+                    .expires
+                    .is_none_or(|expires| expires > clock.now())
+            })
+            .map(|subscription| subscription.sid.clone())
+    };
+    // Renewal uses only the SID; callback routing is needed for a new lease.
+    let mut request = shared
+        .http
+        .request(
+            reqwest::Method::from_bytes(b"SUBSCRIBE").expect("SUBSCRIBE is a method"),
+            format!("http://{addr}{path}"),
+        )
+        .header("TIMEOUT", "Second-300");
+    if let Some(sid) = &sid {
+        request = request.header("SID", sid);
+    } else {
+        let host = if listen.ip().is_unspecified() {
+            match route_to(addr.ip()) {
+                Ok(host) => host,
+                Err(_) => {
+                    tracing::warn!(%addr, "cannot route a Sonos event callback");
+                    return Some(clock.now() + RETRY);
+                }
+            }
+        } else {
+            listen.ip()
+        };
+        request = request.header("NT", "upnp:event").header(
+            "CALLBACK",
+            format!(
+                "<http://{}/sonos/events>",
+                SocketAddr::new(host, listen.port())
+            ),
+        );
+    }
+    // Count connection/response time against the granted lifetime too.
+    let began = clock.now();
+    let mut invalid_sid = false;
+    let mut status = None;
+    let granted = match request.send().await {
+        Ok(answer) if answer.status().is_success() => grant(answer.headers()),
+        Ok(answer) => {
+            invalid_sid = answer.status() == reqwest::StatusCode::PRECONDITION_FAILED;
+            status = Some(answer.status().as_u16());
+            Err("HTTP status")
+        }
+        Err(error) => {
+            // Never format reqwest's URL-bearing error: callback SIDs and stream
+            // capabilities must not enter diagnostics.
+            let kind = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connect"
+            } else {
+                "request"
+            };
+            Err(kind)
+        }
+    };
+    // Discovery may have invalidated this endpoint while its request was in flight.
+    if !shared.known().players.values().any(|player| {
+        player.addr == addr && shared.clock.now().saturating_duration_since(player.seen) < EXPIRY
+    }) {
+        return Some(clock.now() + RETRY);
+    }
+    match granted {
+        Ok((new_sid, lifetime)) => {
+            let renew = lifetime.map(|lifetime| began + lifetime / 2);
+            let mut subscriptions = shared
+                .events
+                .subscriptions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let previous = subscriptions
+                .remove(&(addr, path))
+                .filter(|previous| previous.sid == new_sid);
+            let fresh = previous.is_none();
+            let (sequence, value) =
+                previous.map_or((None, None), |previous| (previous.sequence, previous.value));
+            subscriptions.insert(
+                (addr, path),
+                Subscription {
+                    sid: new_sid,
+                    sequence,
+                    value,
+                    expires: lifetime.map(|lifetime| began + lifetime),
+                },
+            );
+            drop(subscriptions);
+            // Covers an initial snapshot delivered before the SUBSCRIBE response.
+            if fresh {
+                shared.events.wake();
+            }
+            renew.map(|at| at.max(clock.now() + Duration::from_millis(100)))
+        }
+        Err(reason) => {
+            // Only a publisher's invalid-SID response revokes a still-valid lease.
+            // Transient failures keep accepting callbacks and retry at RETRY.
+            let mut subscriptions = shared
+                .events
+                .subscriptions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let expired = subscriptions
+                .get(&(addr, path))
+                .is_some_and(|lease| lease.expires.is_some_and(|expiry| expiry <= clock.now()));
+            let dropped = invalid_sid || expired;
+            if dropped {
+                subscriptions.remove(&(addr, path));
+            }
+            let retained = subscriptions.contains_key(&(addr, path));
+            let lease = if retained { "retained" } else { "absent" };
+            let reason = if invalid_sid {
+                "invalid SID"
+            } else if expired {
+                "expired"
+            } else {
+                reason
+            };
+            tracing::warn!(
+                renewal = sid.is_some(),
+                status,
+                service = path,
+                lease,
+                dropped,
+                reason,
+                "Sonos subscription failed; retrying"
+            );
+            Some(clock.now() + RETRY)
         }
     }
 }
@@ -341,7 +419,6 @@ mod tests {
                 sequence,
                 value: None,
                 expires: Some(now + Duration::from_secs(60)),
-                renew: Some(now + Duration::from_secs(30)),
             },
         );
         events
@@ -466,7 +543,6 @@ mod tests {
                 sequence: None,
                 value: None,
                 expires: lifetime.map(|time| now + time),
-                renew: lifetime.map(|time| now + time / 2),
             },
         );
         assert_eq!(

@@ -6149,6 +6149,7 @@ dependencies = [
 name = "sonos"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clock",
  "futures",
  "reqwest 0.12.28",

@@ -156,6 +156,10 @@ pub(super) struct Replaced {
     pub(super) length: Option<f64>,
     /// The Finished write at the end of the Item, if it is still to be made.
     pub(super) finished: Option<ProgressUpdate>,
+    /// Last reliable old-stream position; none without a supervisor.
+    pub(super) position: Option<Duration>,
+    /// Finished already persisted; only local Handoff removal remains.
+    pub(super) finished_written: bool,
     /// What the supervisor last saw of the Group; none without a supervisor.
     last: Option<Seen>,
 }
@@ -341,6 +345,8 @@ impl<S: Store> Supervisors<S> {
         Replaced {
             length: known.length,
             finished,
+            position: Some(known.position),
+            finished_written: matches!(known.ending, Some(Ending::Store)),
             last: Some(known.last),
         }
     }
