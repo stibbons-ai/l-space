@@ -53,7 +53,7 @@ impl Files {
     }
 
     /// Where file `file` (0-based) starts in the whole Item; none past the last file.
-    pub fn start(&self, file: usize) -> Option<Duration> {
+    fn start(&self, file: usize) -> Option<Duration> {
         match file {
             0 => Some(Duration::ZERO),
             file if file < self.ends.len() => Some(self.ends[file - 1]),
@@ -66,11 +66,8 @@ impl Files {
     /// begins is the next file's start; the Item's end is the end of its last file.
     pub fn locate(&self, position: Duration) -> FilePosition {
         let position = position.min(self.length());
-        let file = self
-            .ends
-            .iter()
-            .position(|end| *end > position)
-            .unwrap_or(self.ends.len() - 1);
+        let last = self.ends.len() - 1;
+        let file = self.ends.partition_point(|end| *end <= position).min(last);
         let start = self.start(file).expect("a file found above");
         FilePosition {
             file,
@@ -78,11 +75,12 @@ impl Files {
         }
     }
 
-    /// The position in the whole Item for `at`, kept within the Item's length; none for a
-    /// file past the last.
+    /// The position in the whole Item for `at`: the file's start plus how far into it; none
+    /// for a file past the last. Not kept within the Item: a file may play on past the length
+    /// it was told to have, and where it is then is past the end.
     pub fn position(&self, at: FilePosition) -> Option<Duration> {
         let start = self.start(at.file)?;
-        Some(start.saturating_add(at.within).min(self.length()))
+        Some(start.saturating_add(at.within))
     }
 }
 
@@ -196,12 +194,17 @@ mod tests {
     }
 
     #[test]
-    fn a_position_is_kept_within_the_item() {
+    fn a_position_to_go_to_is_kept_within_the_item() {
         let book = long_book();
         // The end is the end of the last file, not a file after it.
         assert_eq!(book.locate(s(4320)), at(2, s(120)));
         assert_eq!(book.locate(s(99_999)), at(2, s(120)));
-        assert_eq!(book.position(at(2, s(500))), Some(s(4320)));
+    }
+
+    #[test]
+    fn a_file_played_past_its_told_length_is_past_the_end_of_the_item() {
+        let book = long_book();
+        assert_eq!(book.position(at(2, s(500))), Some(s(4700)));
     }
 
     #[test]
