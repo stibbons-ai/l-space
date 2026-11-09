@@ -132,7 +132,7 @@ impl Chapters {
     }
 
     /// The chapter whose start is at or immediately before `position`.
-    /// Playback adapters must round seek targets up (Bridge `ItemFiles::locate`), not add tolerance here.
+    /// Sonos seeks in whole seconds; callers must round a target up, never down.
     fn current(&self, position: Duration) -> usize {
         self.starts.partition_point(|start| *start <= position) - 1
     }

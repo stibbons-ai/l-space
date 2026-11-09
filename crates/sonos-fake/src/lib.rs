@@ -228,7 +228,8 @@ pub enum Fault {
     /// not available), changing nothing, and everything else correctly (a `Seek` by track
     /// too).
     RefuseSeek,
-    /// It answers a queue-track `Seek` with a bare HTTP 500, without confirming a refusal.
+    /// It answers a queue-track `Seek` with a bare HTTP 500, without confirming a refusal,
+    /// changing nothing, and everything else correctly.
     BareTrackSeekFailure,
     /// It accepts `Seek` by time (`REL_TIME`) and never answers it, changing nothing, and
     /// answers everything else correctly (a `Seek` by track too).
@@ -1164,6 +1165,13 @@ async fn description(State(served): State<Served>) -> Response {
     xml(StatusCode::OK, body)
 }
 
+fn is_control(action: &str) -> bool {
+    matches!(
+        action,
+        "Pause" | "Play" | "Seek" | "SnapshotGroupVolume" | "SetGroupVolume"
+    )
+}
+
 /// Answers a SOAP call on any service by its `SOAPACTION` header.
 async fn control(State(served): State<Served>, headers: HeaderMap, request: String) -> Response {
     let soap_action = headers
@@ -1229,22 +1237,10 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             tokio::time::sleep(delay).await;
             true
         }
-        Some(Fault::RefuseControl)
-            if matches!(
-                action,
-                "Pause" | "Play" | "Seek" | "SnapshotGroupVolume" | "SetGroupVolume"
-            ) =>
-        {
+        Some(Fault::RefuseControl) if is_control(action) => {
             return upnp_fault(701);
         }
-        Some(Fault::HangControl)
-            if matches!(
-                action,
-                "Pause" | "Play" | "Seek" | "SnapshotGroupVolume" | "SetGroupVolume"
-            ) =>
-        {
-            std::future::pending().await
-        }
+        Some(Fault::HangControl) if is_control(action) => std::future::pending().await,
         Some(Fault::BareTrackSeekFailure) if action == "Seek" && !seek_by_time => {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }

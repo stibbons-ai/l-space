@@ -602,7 +602,8 @@ impl<S: Store> AppApi<S> {
     /// those, or the read fails, nothing is stored or played ([`ApiError::GroupFailed`], or the
     /// read's error).
     /// A file count that cannot fit even without a Progress reread is
-    /// [`ApiError::ItemNotPlayable`]; a reread-only admission failure is retryable.
+    /// [`ApiError::ItemNotPlayable`]; when a start waited or saw a turn end, a reread-only
+    /// admission failure is retryable [`ApiError::GroupFailed`].
     ///
     /// A start that found its Group's turn free, with none ended since before resolving, uses
     /// the Progress read while resolving, and needs only [`sonos::play_timeout`] (and
@@ -644,19 +645,22 @@ impl<S: Store> AppApi<S> {
             .map_err(|reason| missing(library_server, request, id.episode.as_deref(), reason))?;
         let files = playable_files(library_server, &id, tracks)?;
         let admit = |calls: StartCalls| {
-            if start_admission(files.len(), calls).is_ok() {
-                Ok(())
-            } else {
-                tracing::info!(
-                    group,
-                    library_item = id.library_item,
-                    files = files.len(),
-                    seek = calls.seek,
-                    reread = calls.reread,
-                    "an Item cannot fit the start's playback reservation"
-                );
-                Err(ApiError::ItemNotPlayable)
-            }
+            let admission = start_admission(files.len(), calls);
+            let error = match admission {
+                Admission::Fits => return Ok(()),
+                Admission::Retry => ApiError::GroupFailed,
+                Admission::Never => ApiError::ItemNotPlayable,
+            };
+            tracing::info!(
+                group,
+                library_item = id.library_item,
+                files = files.len(),
+                seek = calls.seek,
+                reread = calls.reread,
+                ?admission,
+                "a start's mandatory playback reservation was refused"
+            );
+            Err(error)
         };
         admit(StartCalls::default())?;
         if !is_group_id(&group) {
@@ -685,19 +689,7 @@ impl<S: Store> AppApi<S> {
             // then is current (a start `from_start` uses none).
             Some(turn) if from_start || group_turn.ended() == ended => (turn, position),
             free => {
-                match start_admission(files.len(), after_turn_calls) {
-                    Ok(()) => {}
-                    Err(ApiError::ItemNotPlayable) => admit(after_turn_calls)?,
-                    Err(_) => {
-                        return Err(too_little_time(
-                            called,
-                            &group,
-                            library_server,
-                            &id,
-                            position,
-                        ));
-                    }
-                }
+                admit(after_turn_calls)?;
                 // Whatever held the turn may have changed Progress (a pause writes it), so a
                 // start that may seek reads it again once it has its turn, and keeps time for
                 // that read and a seek even when Progress was none.
@@ -1112,15 +1104,27 @@ const START_PROGRESS_TIME: Duration = Duration::from_secs(2);
 /// Mandatory calls after resolving and waiting.
 #[derive(Clone, Copy, Default)]
 struct StartCalls {
+    /// The initially known position needs an in-file seek.
     seek: bool,
+    /// Progress must be read again; also reserves a seek in case that read requires one.
     reread: bool,
 }
 
-/// A reread may make an otherwise playable count retryable, never permanently unplayable.
-fn start_admission(files: usize, calls: StartCalls) -> Result<(), ApiError> {
+/// Whether the mandatory calls fit, require a retry without rereading, or can never fit
+/// for the initially known seek need. A reread-only failure is never permanent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Fits,
+    Retry,
+    Never,
+}
+
+/// Classifies the start's full reservation, distinguishing reread-only retries from
+/// counts that cannot fit even with the initially known position.
+fn start_admission(files: usize, calls: StartCalls) -> Admission {
     let play = sonos::play_timeout(files);
     if start_reservation(play, calls) < START_TIME {
-        Ok(())
+        Admission::Fits
     } else if calls.reread
         && start_reservation(
             play,
@@ -1130,13 +1134,13 @@ fn start_admission(files: usize, calls: StartCalls) -> Result<(), ApiError> {
             },
         ) < START_TIME
     {
-        Err(ApiError::GroupFailed)
+        Admission::Retry
     } else {
-        Err(ApiError::ItemNotPlayable)
+        Admission::Never
     }
 }
 
-/// The mandatory calls after resolving and waiting: play, an optional seek and Progress read.
+/// Play plus a seek when needed or rereading, and the Progress read when rereading.
 fn start_reservation(play_time: Duration, calls: StartCalls) -> Duration {
     play_time
         + if calls.seek || calls.reread {
@@ -1515,13 +1519,18 @@ impl<S: Store> Controls<S> {
             tracing::warn!(group, ?control, %error, "a Group did not take a control");
             if error == sonos::Error::SeekMayHaveMoved {
                 supervisors.stop(group);
-                end_failed_seek(self.store.as_ref(), files.stream(), &active.handoff).await;
                 let sonos = Arc::clone(&self.sonos);
                 let group = group.to_owned();
-                let held = turn.take();
-                tokio::spawn(async move {
+                let pause = tokio::spawn(async move {
                     if let Err(error) = sonos.pause(&group).await {
                         tracing::warn!(group, %error, "a Group was not paused after a failed file seek");
+                    }
+                });
+                end_failed_seek(self.store.as_ref(), files.stream(), &active.handoff).await;
+                let held = turn.take();
+                tokio::spawn(async move {
+                    if let Err(error) = pause.await {
+                        tracing::error!(%error, "a failed file seek's cleanup pause task failed");
                     }
                     drop(held);
                 });
@@ -1539,7 +1548,7 @@ impl<S: Store> Controls<S> {
                 checked.acting
             }
         };
-        let target = target.as_secs_f64();
+        let target = files.sought_position(to).as_secs_f64();
         let update = abs::ProgressUpdate::at(target, duration);
         self.write_progress(active, acting, update, "skip", &mut library_time)
             .await;
@@ -2626,12 +2635,12 @@ async fn end_failed_seek<S: Store>(store: &S, stream: &store::StreamId, handoff:
             episode = handoff.episode,
             "Handoff ended after a failed file seek"
         ),
-        Some(false) => {}
+        Some(false) => tracing::debug!(group, "a failed file seek's Handoff was already ended"),
         None => tracing::error!(
             group,
             library_item = handoff.library_item,
             episode = handoff.episode,
-            "a Handoff left active at the start of a file after a failed seek; a pause or skip would overwrite Progress"
+            "a Handoff stays listed but unsupervised until the Bridge restarts after a failed file seek; a pause or skip would overwrite Progress"
         ),
     }
 }
@@ -2642,21 +2651,39 @@ mod tests {
     #[test]
     fn starts_refuse_file_counts_that_cannot_fit_their_mandatory_calls() {
         for (files, seek, reread, expected) in [
-            (160, false, false, Ok(())),
-            (161, false, false, Err(ApiError::ItemNotPlayable)),
-            (96, true, false, Ok(())),
-            (97, true, false, Err(ApiError::ItemNotPlayable)),
-            (64, true, true, Ok(())),
-            (65, true, true, Err(ApiError::GroupFailed)),
-            (96, true, true, Err(ApiError::GroupFailed)),
-            (97, true, true, Err(ApiError::ItemNotPlayable)),
-            (97, false, true, Err(ApiError::GroupFailed)),
-            (160, false, true, Err(ApiError::GroupFailed)),
-            (161, false, true, Err(ApiError::ItemNotPlayable)),
+            (160, false, false, Admission::Fits),
+            (161, false, false, Admission::Never),
+            (96, true, false, Admission::Fits),
+            (97, true, false, Admission::Never),
+            (64, true, true, Admission::Fits),
+            (65, true, true, Admission::Retry),
+            (96, true, true, Admission::Retry),
+            (97, true, true, Admission::Never),
+            (97, false, true, Admission::Retry),
+            (160, false, true, Admission::Retry),
+            (161, false, true, Admission::Never),
         ] {
             assert_eq!(
                 start_admission(files, StartCalls { seek, reread }),
                 expected
+            );
+        }
+        for files in 1..=160 {
+            assert_eq!(
+                start_admission(files, StartCalls::default()),
+                Admission::Fits
+            );
+        }
+        for files in 97..=160 {
+            assert_eq!(
+                start_admission(
+                    files,
+                    StartCalls {
+                        seek: false,
+                        reread: true
+                    }
+                ),
+                Admission::Retry
             );
         }
     }

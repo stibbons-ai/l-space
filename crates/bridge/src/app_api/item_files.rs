@@ -85,7 +85,9 @@ pub(super) struct ItemPlayback {
 /// File selection and in-file time sent to Sonos for a whole-Item seek.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct FileSeek {
+    /// Queue file, 0-based; none for a single-file Handoff.
     pub track: Option<usize>,
+    /// In-file time rounded up to whole seconds, except at the last file's length cap.
     pub within: Duration,
 }
 
@@ -162,10 +164,25 @@ impl ItemFiles {
         }
     }
 
+    /// Whole-Item position of the file selection and time actually sent to the Group.
+    pub(super) fn sought_position(&self, to: FileSeek) -> Duration {
+        let within = Duration::from_secs(to.within.as_secs());
+        self.layout
+            .as_ref()
+            .and_then(|layout| {
+                layout.position(FilePosition {
+                    file: to.track.unwrap_or(0),
+                    within,
+                })
+            })
+            .unwrap_or(within)
+    }
+
     /// Where `position` in the whole Item lies among the files. Round within the file up to
     /// Sonos's whole-second resolution, advancing to the next file when rounding reaches a
     /// non-last file's end, and capping at the last file's length.
-    /// Rounding up keeps a chapter target at or past its exact `Chapters::current` boundary.
+    /// Rounding up keeps a chapter target at or past its exact `Chapters::current` boundary,
+    /// except where capped at the last file's length.
     pub(super) fn locate(&self, position: Duration) -> FilePosition {
         let mut at = match &self.layout {
             Some(layout) => layout.locate(position),
@@ -331,6 +348,10 @@ mod tests {
                     file: 1,
                     within: Duration::ZERO,
                 }
+            );
+            assert_eq!(
+                files.sought_position(files.seek(Duration::from_millis(target))),
+                Duration::from_millis(length)
             );
             assert_eq!(
                 files.locate(s(99_999)),

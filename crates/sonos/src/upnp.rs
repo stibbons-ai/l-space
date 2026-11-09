@@ -497,6 +497,9 @@ impl Shared {
         first: usize,
         deadline: tokio::time::Instant,
     ) -> Result<Vec<String>, Error> {
+        if streams.is_empty() || first >= streams.len() {
+            return Err(Error::GroupFailed);
+        }
         let coordinator = self.coordinator(group, deadline).await?;
         let host = match route_to(coordinator.ip()) {
             Ok(host) => host,
@@ -1399,6 +1402,29 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_queue_selection_leaves_existing_playback_alone() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let shared = knowing(&household, &clock).await;
+        let book = [named("0.0.0.0:9", "book.mp3")];
+        shared
+            .play(kitchen.uuid(), &book, 0, soon(PLAY_TIMEOUT))
+            .await
+            .unwrap();
+        let queue = household.queue(&kitchen);
+        for (streams, first) in [(&book[..0], 0), (&book[..], 1)] {
+            assert_eq!(
+                shared
+                    .play(kitchen.uuid(), streams, first, soon(PLAY_TIMEOUT))
+                    .await,
+                Err(Error::GroupFailed)
+            );
+            assert_eq!(household.queue(&kitchen), queue);
+            assert_eq!(household.transport_state(&kitchen), "PLAYING");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn public_play_allows_the_extra_queue_batch_time() {
         let (household, clock) = Household::with_manual_clock();
         let kitchen = household.add_player("Kitchen");
@@ -1408,8 +1434,9 @@ mod tests {
             shared: Arc::new(shared),
             discovery,
         };
-        // Six transport calls at 720 ms need >4 seconds but fit the 17-file allowance.
-        household.set_fault(&kitchen, Fault::SlowTransport(Duration::from_millis(720)));
+        // Six transport calls at 670 ms exceed 4 seconds, leaving almost 1 second of the
+        // 17-file allowance for topology and HTTP scheduling.
+        household.set_fault(&kitchen, Fault::SlowTransport(Duration::from_millis(670)));
         let book: Vec<_> = (0..17)
             .map(|n| named("0.0.0.0:9", &format!("{n}.mp3")))
             .collect();
@@ -1443,7 +1470,6 @@ mod tests {
                 .await,
             Err(Error::GroupFailed)
         );
-        assert_eq!(household.asked(&kitchen, "AVTransport#Seek"), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

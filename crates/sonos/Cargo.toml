@@ -19,7 +19,7 @@ url.workspace = true
 
 [dev-dependencies]
 sonos-fake.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

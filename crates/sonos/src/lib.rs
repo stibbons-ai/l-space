@@ -39,8 +39,8 @@ pub const MAX_VOLUME: u8 = 100;
 ///
 /// Every call on one Group acts on its coordinator as the topology read for that call names
 /// it: a Group the topology doesn't have is [`Error::UnknownGroup`]; a coordinator the
-/// searches didn't find, or that doesn't answer in time or refuses, is [`Error::GroupFailed`].
-/// Except as [`Sonos::seek`] says when file selection may have acted.
+/// searches didn't find, or that doesn't answer in time or refuses, is [`Error::GroupFailed`],
+/// except as [`Sonos::seek`] says when file selection may have acted.
 pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// Every Group as the Sonos app shows it, by name. A household where a working search found
     /// no player has none.
@@ -68,8 +68,9 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// Group `group` goes to `position` into a track of its queue, in whole seconds (any
     /// fraction is dropped), playing or paused as it was: into track `track` (0-based, in
     /// queue order) when given, else into its current track.
-    /// Takes at most `time` (capped at [`CONTROL_TIMEOUT`]). A failure after selecting the
-    /// queue track, or without confirmation of its refusal, is [`Error::SeekMayHaveMoved`].
+    /// Takes at most `time` (capped at [`CONTROL_TIMEOUT`]). A seek that selected its queue
+    /// track before failing at REL_TIME, or whose track selection was sent but not confirmed
+    /// or refused, is [`Error::SeekMayHaveMoved`].
     fn seek<'a>(
         &'a self,
         group: &'a str,
@@ -136,8 +137,8 @@ pub enum Error {
     #[error("no such Sonos Group")]
     UnknownGroup,
     /// The Group's coordinator was not found by the last searches, didn't answer in time, or
-    /// refused (a SOAP fault), or answered without what was asked for.
-    /// Except as [`Sonos::seek`] says when file selection may have acted.
+    /// refused (a SOAP fault), or answered without what was asked for, except as
+    /// [`Sonos::seek`] says when file selection may have acted.
     #[error("the Group's coordinator did not do what was asked")]
     GroupFailed,
     /// A seek selected its queue track before failing at REL_TIME, or the track selection

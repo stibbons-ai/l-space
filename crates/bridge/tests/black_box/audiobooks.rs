@@ -571,7 +571,7 @@ async fn a_refused_file_selection_keeps_its_handoff_and_progress() {
 }
 
 #[tokio::test]
-async fn an_unreachable_playback_read_keeps_its_handoff_and_progress() {
+async fn an_unreachable_household_keeps_its_handoff_and_progress() {
     let setup = setup().await;
     setup.start(Some(3005.0)).await;
     let api = setup.bridge.api();
@@ -597,7 +597,7 @@ async fn a_start_waits_for_the_failed_file_seeks_pause() {
     setup.start(Some(3005.0)).await;
     setup.household.set_fault(
         &setup.kitchen,
-        sonos_fake::Fault::RefuseSeekSlowPause(seconds(2)),
+        sonos_fake::Fault::RefuseSeekSlowPause(seconds(3)),
     );
     let api = setup.bridge.api();
     assert_eq!(
@@ -618,7 +618,7 @@ async fn a_start_waits_for_the_failed_file_seeks_pause() {
     let started = std::time::Instant::now();
     api.start_handoff_from_start(&setup.bobs, &episode, setup.kitchen.uuid())
         .await;
-    assert!(started.elapsed() >= Duration::from_millis(1700));
+    assert!(started.elapsed() >= Duration::from_millis(2500));
     assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
     assert_eq!(api.handoffs(&setup.bobs).await[0].item, episode);
 }
@@ -737,6 +737,15 @@ async fn next_chapter_twice_while_paused_advances_across_fractional_files() {
     );
     assert_eq!(abs.item_progress(&user, &book).await, Some((40.05, false)));
     assert_eq!(household.transport_state(&kitchen), "PAUSED_PLAYBACK");
+    // Forward30's whole-second target is 70; in file 2 it rounds up to 30 seconds,
+    // so both the answer and Progress must carry 40.05 + 30, not the raw target.
+    let skipped = api
+        .skip_group(&session, kitchen.uuid(), Skip::Forward30)
+        .await;
+    assert_eq!(skipped.position, Some(70.05));
+    assert_eq!(household.track_number(&kitchen), Some(2));
+    assert_eq!(household.position(&kitchen), seconds(30));
+    assert_eq!(abs.item_progress(&user, &book).await, Some((70.05, false)));
 }
 
 #[tokio::test]

@@ -485,14 +485,16 @@ pub enum ApiError {
     GroupNotFound,
     /// The Bridge could not complete or confirm what was asked of the Group: its coordinator
     /// refused, or didn't answer in time (the Group may then have acted all the same), or it
-    /// was busy with another start or control on it, and nothing was sent.
+    /// was busy with another start or control on it, or a start left too little time, and
+    /// nothing was sent.
     /// A failed skip that may have selected a file ends its Handoff without writing Progress
     /// and attempts to pause the Group. A refusal before file selection leaves it active.
     #[error("group_failed")]
     GroupFailed,
     /// The Item can't be played on a Group by this Bridge yet: it has no audio file, one in a
     /// format Sonos doesn't play, several of which one has no known length, or too many files
-    /// for this start's mandatory playback reservation.
+    /// for this start's mandatory playback reservation. The limit depends on whether the
+    /// start seeks: the same Item may play from the start but be refused mid-file.
     #[error("item_not_playable")]
     ItemNotPlayable,
     /// The Group has no active Handoff to control, or plays something other than its
