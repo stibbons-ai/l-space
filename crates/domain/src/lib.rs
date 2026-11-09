@@ -131,10 +131,9 @@ impl Chapters {
         self.starts.get(self.current(position) + 1).copied()
     }
 
-    /// The current chapter, allowing for a Group's one-second position resolution.
+    /// The chapter whose start is at or immediately before `position`.
     fn current(&self, position: Duration) -> usize {
-        let through = position.saturating_add(Duration::from_secs(1));
-        self.starts.partition_point(|start| *start <= through) - 1
+        self.starts.partition_point(|start| *start <= position) - 1
     }
 }
 
@@ -265,7 +264,7 @@ mod tests {
         let chapters = long_chapters();
         assert_eq!(chapters.next(s(0)), Some(s(2400)));
         assert_eq!(chapters.next(s(2398)), Some(s(2400)));
-        assert_eq!(chapters.next(s(2399)), Some(s(4200)));
+        assert_eq!(chapters.next(s(2399)), Some(s(2400)));
         // On a boundary, the chapter starting there is the current one.
         assert_eq!(chapters.next(s(2400)), Some(s(4200)));
     }
@@ -287,12 +286,32 @@ mod tests {
     }
 
     #[test]
-    fn chapter_readings_allow_one_second_before_the_unrounded_start() {
+    fn chapter_readings_before_a_start_stay_in_the_previous_chapter() {
         let chapters = Chapters::new([s(0), ms(123_400)], s(600));
         assert_eq!(chapters.next(s(0)), Some(ms(123_400)));
         assert_eq!(chapters.next(ms(122_399)), Some(ms(123_400)));
-        assert_eq!(chapters.next(ms(122_400)), None);
+        assert_eq!(chapters.next(ms(122_400)), Some(ms(123_400)));
         assert_eq!(chapters.previous(s(123)), s(0));
+    }
+
+    #[test]
+    fn short_chapters_remain_reachable_in_both_directions() {
+        let chapters = Chapters::new([s(0), s(100), ms(100_800), s(200)], s(600));
+        assert_eq!(chapters.next(ms(99_200)), Some(s(100)));
+        assert_eq!(chapters.next(ms(98_900)), Some(s(100)));
+        assert_eq!(chapters.next(s(100)), Some(ms(100_800)));
+        assert_eq!(chapters.previous(ms(100_800)), s(100));
+        assert_eq!(chapters.previous(s(200)), ms(100_800));
+    }
+
+    #[test]
+    fn file_lengths_are_available_only_for_existing_files() {
+        let files = long_book();
+        assert_eq!(files.file_length(0), Some(s(2400)));
+        assert_eq!(files.file_length(1), Some(s(1800)));
+        assert_eq!(files.file_length(2), Some(s(120)));
+        assert_eq!(files.file_length(3), None);
+        assert_eq!(files.file_length(usize::MAX), None);
     }
 
     #[test]

@@ -6,6 +6,9 @@
 //! never logged at INFO or above (the SOAP bodies at DEBUG under `sonos::raw` carry the URL).
 //! Anything that doesn't name an active Handoff's file is a bare `404`, alike for an unknown
 //! id, a known one with another file number or name, and a path that isn't UTF-8.
+//! Single-file Handoffs also accept `/stream/<id>/<file>`: migration 0004 preserves Handoffs
+//! whose Group still holds this pre-upgrade URL. Remove this form only when those persisted
+//! Handoffs no longer need to survive an upgrade.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -70,8 +73,8 @@ pub struct StreamFile {
     pub file: usize,
 }
 
-/// The stream file named in a Group's URL, accepting the legacy unnumbered name only for a
-/// single-file Handoff (`legacy_name`, already percent-encoded). Numbered URLs are otherwise checked for shape only.
+/// The stream file named in a Group's URL. The caller must supply `legacy_name` (already
+/// percent-encoded) only for a single-file Handoff. Numbered URLs are checked for shape only.
 pub fn stream_in_url(url: &str, legacy_name: Option<&str>) -> Option<StreamFile> {
     let (_, path) = url.strip_prefix("http://")?.split_once('/')?;
     let mut segments = path.split('/');

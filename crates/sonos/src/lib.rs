@@ -67,11 +67,14 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// Group `group` goes to `position` into a track of its queue, in whole seconds (any
     /// fraction is dropped), playing or paused as it was: into track `track` (0-based, in
     /// queue order) when given, else into its current track.
+    /// Takes at most `time` (capped at [`CONTROL_TIMEOUT`]). A failure after selecting the
+    /// queue track, or without confirmation of its refusal, is [`Error::SeekMayHaveMoved`].
     fn seek<'a>(
         &'a self,
         group: &'a str,
         track: Option<usize>,
         position: Duration,
+        time: Duration,
     ) -> BoxFuture<'a, Result<(), Error>>;
 
     /// Group `group`'s volume becomes `volume`, at most [`MAX_VOLUME`]: every member's
@@ -135,6 +138,10 @@ pub enum Error {
     /// refused (a SOAP fault), or answered without what was asked for.
     #[error("the Group's coordinator did not do what was asked")]
     GroupFailed,
+    /// A seek selected its queue track before failing at REL_TIME, or the track selection
+    /// was sent but not confirmed or refused. Playback may now be at that file's start.
+    #[error("a file seek failed after the queue track may have changed")]
+    SeekMayHaveMoved,
 }
 
 /// One or more players playing in sync, as grouped in the Sonos app.
@@ -229,5 +236,26 @@ impl std::fmt::Debug for Playback {
             .field("position", &self.position)
             .field("duration", &self.duration)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_debug_never_reveals_its_stream_capability() {
+        let track = Track {
+            uri: Some("http://bridge/stream/secret-capability/1-file.mp3".into()),
+            title: Some("Book".into()),
+            creator: None,
+            position: Some(Duration::from_secs(5)),
+            duration: None,
+        };
+        let debug = format!("{track:?}");
+        assert!(!debug.contains("secret-capability"));
+        assert!(!debug.contains("http://bridge"));
+        assert!(debug.contains("REDACTED"));
+        assert!(debug.contains("Book"));
     }
 }

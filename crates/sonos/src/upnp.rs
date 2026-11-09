@@ -2,8 +2,9 @@
 //! them (ZoneGroupTopology `GetZoneGroupState`), each Group's playback from its coordinator
 //! (AVTransport `GetTransportInfo` and `GetPositionInfo`) and its volume (GroupRenderingControl
 //! `GetGroupVolume`), streams started on a Group as its coordinator's queue (AVTransport
-//! `RemoveAllTracksFromQueue`, `AddMultipleURIsToQueue` in batches, `SetAVTransportURI` to the
-//! queue, `Seek` to the track to start in, then `Play`), and a Group controlled by its coordinator
+//! `RemoveAllTracksFromQueue`, `AddURIToQueue` for a batch of one or `AddMultipleURIsToQueue`
+//! otherwise, `SetAVTransportURI` to the queue, `Seek` to the starting track, then `Play`),
+//! and a Group controlled by its coordinator
 //! (AVTransport `Pause`, `Play` and `Seek`, by track and by time; GroupRenderingControl
 //! `SnapshotGroupVolume`, then `SetGroupVolume`).
 
@@ -205,8 +206,13 @@ impl Sonos for Upnp {
         group: &'a str,
         track: Option<usize>,
         position: Duration,
+        time: Duration,
     ) -> BoxFuture<'a, Result<(), Error>> {
-        Box::pin(self.control(group, Control::Seek { track, position }))
+        let deadline = tokio::time::Instant::now() + time.min(CONTROL_TIMEOUT);
+        Box::pin(
+            self.shared
+                .control(group, Control::Seek { track, position }, deadline),
+        )
     }
 
     fn set_volume<'a>(&'a self, group: &'a str, volume: u8) -> BoxFuture<'a, Result<(), Error>> {
@@ -480,7 +486,8 @@ impl Shared {
     /// Has Group `group` play `streams` as its queue from the start of `streams[first]`, by
     /// `deadline`: its coordinator, as the topology read now names it, clears its queue
     /// (`RemoveAllTracksFromQueue`), adds the stream URLs in order in batches of at most 16
-    /// (`AddMultipleURIsToQueue`, without metadata), and is given its queue
+    /// (`AddURIToQueue` for one, `AddMultipleURIsToQueue` otherwise, without metadata),
+    /// and is given its queue
     /// (`SetAVTransportURI` to `x-rincon-queue:<coordinator>#0`), goes to the first track to
     /// play (`Seek` `TRACK_NR`) and is told to play. Returns the URLs.
     async fn play(
@@ -514,6 +521,19 @@ impl Shared {
         };
         call("RemoveAllTracksFromQueue", &[]).await?;
         for batch in urls.chunks(QUEUE_BATCH) {
+            if let [uri] = batch {
+                call(
+                    "AddURIToQueue",
+                    &[
+                        ("EnqueuedURI", uri),
+                        ("EnqueuedURIMetaData", ""),
+                        ("DesiredFirstTrackNumberEnqueued", "0"),
+                        ("EnqueueAsNext", "0"),
+                    ],
+                )
+                .await?;
+                continue;
+            }
             let uris = batch.join(" ");
             let metadata = " ".repeat(batch.len().saturating_sub(1));
             let count = batch.len().to_string();
@@ -585,12 +605,54 @@ impl Shared {
         deadline: tokio::time::Instant,
     ) -> Result<(), Error> {
         let coordinator = self.coordinator(group, deadline).await?;
-        let at = (group, coordinator);
         let what = "control the Group";
-        for (service, action, arguments) in control.before().into_iter().chain([control.call()]) {
+        let mut moved = false;
+        let selects_track = matches!(control, Control::Seek { track: Some(_), .. });
+        for (step, (service, action, arguments)) in control
+            .before()
+            .into_iter()
+            .chain([control.call()])
+            .enumerate()
+        {
+            let selecting = selects_track && step == 0;
+            if tokio::time::Instant::now() >= deadline {
+                return Err(if moved {
+                    Error::SeekMayHaveMoved
+                } else {
+                    Error::GroupFailed
+                });
+            }
             let arguments = borrowed(&arguments);
-            self.call_coordinator(at, (service, action), &arguments, deadline, what)
-                .await?;
+            let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let answer = tokio::time::timeout_at(
+                deadline,
+                soap::call_with(
+                    &self.http,
+                    coordinator,
+                    service,
+                    action,
+                    &arguments,
+                    timeout,
+                ),
+            )
+            .await;
+            let refused = matches!(
+                &answer,
+                Ok(Err(CallError::NotSent(_)
+                    | CallError::Status {
+                        upnp_error: Some(_),
+                        ..
+                    }))
+            );
+            if !matches!(&answer, Ok(Ok(_))) {
+                tracing::warn!(group, action, ?answer, what, "a Group's coordinator failed");
+                return Err(if moved || (selecting && !refused) {
+                    Error::SeekMayHaveMoved
+                } else {
+                    Error::GroupFailed
+                });
+            }
+            moved |= selecting;
         }
         Ok(())
     }
@@ -859,7 +921,7 @@ mod tests {
     /// them.
     const STARTED: [&str; 5] = [
         "AVTransport#RemoveAllTracksFromQueue",
-        "AVTransport#AddMultipleURIsToQueue",
+        "AVTransport#AddURIToQueue",
         "AVTransport#SetAVTransportURI",
         "AVTransport#Seek",
         "AVTransport#Play",
@@ -1293,7 +1355,7 @@ mod tests {
         assert_eq!(household.transport_state(&kitchen), "PLAYING");
         assert_eq!(
             household.asked(&kitchen, "AVTransport#AddMultipleURIsToQueue"),
-            2
+            1
         );
         // Its playback tells which of them it plays.
         clock.advance(Duration::from_secs(7));
@@ -1320,10 +1382,38 @@ mod tests {
         assert_eq!(household.queue(&kitchen), urls);
         assert_eq!(
             household.asked(&kitchen, "AVTransport#AddMultipleURIsToQueue"),
-            2
+            1
         );
+        assert_eq!(household.asked(&kitchen, "AVTransport#AddURIToQueue"), 1);
         assert_eq!(household.track_number(&kitchen), Some(17));
         assert_eq!(household.uri(&kitchen).as_deref(), Some(urls[16].as_str()));
+    }
+
+    #[test]
+    fn queue_play_allowance_counts_batches_of_sixteen() {
+        for (files, seconds) in [(0, 4), (1, 4), (16, 4), (17, 5), (32, 5), (33, 6)] {
+            assert_eq!(play_timeout(files), Duration::from_secs(seconds));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sixteen_urls_load_in_one_batch() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let shared = knowing(&household, &clock).await;
+        let book: Vec<_> = (0..16)
+            .map(|n| named("0.0.0.0:9", &format!("{n}.mp3")))
+            .collect();
+        let urls = shared
+            .play(kitchen.uuid(), &book, 0, soon(play_timeout(book.len())))
+            .await
+            .unwrap();
+        assert_eq!(household.queue(&kitchen), urls);
+        assert_eq!(
+            household.asked(&kitchen, "AVTransport#AddMultipleURIsToQueue"),
+            1
+        );
+        assert_eq!(household.asked(&kitchen, "AVTransport#AddURIToQueue"), 0);
     }
 
     #[test]
@@ -1353,6 +1443,43 @@ mod tests {
                 ("Target", "0:01:01".to_owned())
             ]
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_seeks_report_whether_file_selection_may_have_acted() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let shared = knowing(&household, &clock).await;
+        shared
+            .play(
+                kitchen.uuid(),
+                &[stream("0.0.0.0:9")],
+                0,
+                soon(PLAY_TIMEOUT),
+            )
+            .await
+            .unwrap();
+        for (fault, track, error) in [
+            (Fault::RefuseControl, Some(0), Error::GroupFailed),
+            (Fault::RefuseSeek, Some(0), Error::SeekMayHaveMoved),
+            (Fault::HangControl, Some(0), Error::SeekMayHaveMoved),
+            (Fault::RefuseSeek, None, Error::GroupFailed),
+        ] {
+            household.set_fault(&kitchen, fault);
+            assert_eq!(
+                shared
+                    .control(
+                        kitchen.uuid(),
+                        Control::Seek {
+                            track,
+                            position: Duration::from_secs(5),
+                        },
+                        soon(Duration::from_millis(150))
+                    )
+                    .await,
+                Err(error)
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

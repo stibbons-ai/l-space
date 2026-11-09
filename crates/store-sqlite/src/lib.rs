@@ -1048,18 +1048,32 @@ mod tests {
     #[tokio::test]
     async fn a_handoff_from_before_its_files_were_listed_keeps_its_one_file() {
         let database = TempDatabase::new();
-        start_kitchen(&database.open_with(1), "stream-1", &alice(), "alice-key").await;
-        // Back to how a Bridge of schema version 3 left it: the file in the Handoff's row.
-        database
-            .raw()
-            .execute_batch(
-                "ALTER TABLE handoffs ADD COLUMN file_ino TEXT;
-                 ALTER TABLE handoffs ADD COLUMN file_name TEXT;
-                 UPDATE handoffs SET file_ino = '42', file_name = 'Episode 1.mp3';
-                 DROP TABLE handoff_files;
-                 PRAGMA user_version = 3;",
-            )
+        let v3 = database.raw();
+        for migration in &MIGRATIONS[..3] {
+            v3.execute_batch(migration).unwrap();
+        }
+        let user = alice();
+        let key = ApiKey::new("alice-key");
+        let sealing = super::Sealing::new(EncryptionKey::new(&[1; EncryptionKey::LEN]));
+        let fingerprint = sealing.fingerprint(&key);
+        let sealed = sealing
+            .seal(&super::Row::of(&user, &fingerprint), &key)
             .unwrap();
+        v3.execute(
+            "INSERT INTO api_keys (id, library_server, user_id, key_fingerprint, sealed_key, key_id)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+            params![user.library_server, user.user_id, fingerprint, sealed, sealing.key_id()],
+        ).unwrap();
+        v3.execute(
+            "INSERT INTO handoffs (group_id, stream_id, library_item, episode, file_ino,
+             file_name, username, api_key_id, started_at)
+             VALUES ('RINCON_K', ?1, 'podcast-id', 'episode-id', '42',
+             'Episode 1.mp3', 'alice', 1, 1000)",
+            params![StreamId::of("stream-1").as_bytes()],
+        )
+        .unwrap();
+        v3.pragma_update(None, "user_version", 3).unwrap();
+        drop(v3);
 
         let store = database.open_with(1);
         assert_eq!(schema_version(&database), MIGRATIONS.len() as i64);

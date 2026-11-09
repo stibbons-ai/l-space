@@ -608,7 +608,7 @@ impl<S: Store> Supervisor<S> {
             self.skipped(due, "the Group did not tell what it plays");
             return Continue(Then::Wait);
         };
-        if !self.files.plays(&playback) {
+        let Some(playback) = self.files.whole_if_plays(&playback) else {
             tracing::debug!(
                 group,
                 "a supervised Group plays something other than its Handoff"
@@ -616,8 +616,7 @@ impl<S: Store> Supervisor<S> {
             self.drop_ending("the Group plays something other than the Handoff");
             self.saw(at, None);
             return Continue(Then::Wait);
-        }
-        let playback = self.files.whole(playback);
+        };
         let length = {
             let mut known = self.known();
             known.length = known.length.or_else(|| told_length(&playback));

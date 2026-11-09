@@ -330,8 +330,8 @@ pub struct Group {
     /// What the Group's playback is doing; none if its coordinator was not found by the
     /// Bridge's searches, didn't answer, or answered too late.
     pub state: Option<TransportState>,
-    /// The track it has loaded, if any and if its coordinator said; none whenever `state` is
-    /// none.
+    /// What the Group has loaded, if its coordinator said; none whenever `state` is none.
+    /// Position and duration describe the whole Item during a Handoff.
     pub now_playing: Option<NowPlaying>,
     /// The Group's volume, 0 to [`MAX_VOLUME`]; none if its coordinator didn't tell it in
     /// time, refused to, or told something that isn't such a number (and from a Bridge that
@@ -486,18 +486,21 @@ pub enum ApiError {
     /// The Bridge could not complete or confirm what was asked of the Group: its coordinator
     /// refused, or didn't answer in time (the Group may then have acted all the same), or it
     /// was busy with another start or control on it, and nothing was sent.
+    /// A failed skip that may have selected a file ends its Handoff without writing Progress
+    /// and attempts to pause the Group. A refusal before file selection leaves it active.
     #[error("group_failed")]
     GroupFailed,
     /// The Item can't be played on a Group by this Bridge yet: it has no audio file, one in a
-    /// format Sonos doesn't play, or several of which one has no known length.
+    /// format Sonos doesn't play, several of which one has no known length, or too many files
+    /// for this start's mandatory playback reservation.
     #[error("item_not_playable")]
     ItemNotPlayable,
     /// The Group has no active Handoff to control, or plays something other than its
     /// Handoff's stream (switched in the Sonos app, for example: what is a Takeover once
     /// detected, #20, so the Handoff isn't ended yet). No control was sent to the Group and no
-    /// Progress written; a Handoff it still has goes on, except after a forward skip that
-    /// needed the Item's length: if the Library Server rejected the starter's key there, or it
-    /// now acts for another user, the key was revoked, which ended the Handoff (see [`skip_group`]).
+    /// Progress written; a Handoff it still has goes on, except after a forward skip needing
+    /// the Item's length or a chapter skip: if the Library Server rejected the starter's key
+    /// there, or it now acts for another user, revocation ends the Handoff (see [`skip_group`]).
     #[error("no_handoff")]
     NoHandoff,
     /// A forward skip was refused because neither the Group nor the Library Server knows the
@@ -774,6 +777,9 @@ pub async fn resume_group(group: String) -> Result<Playback, ApiError> {
 /// is revoked and the skip answers [`ApiError::NoHandoff`], or [`ApiError::Internal`] if
 /// storing the revoke failed. In each of these cases nothing is sent to the Group and nothing
 /// written.
+/// A refused or unconfirmed seek answers [`ApiError::GroupFailed`]. If file selection was
+/// acknowledged or may have acted, the Handoff ends without writing Progress and the Group
+/// is paused best-effort; a refusal before file selection leaves the Handoff active.
 #[post(
     "/api/groups/skip",
     headers: dioxus_fullstack::HeaderMap,

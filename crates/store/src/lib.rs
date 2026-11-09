@@ -101,7 +101,7 @@ pub struct Handoff {
 pub struct HandoffFile {
     /// Audiobookshelf's id for the file within its library item.
     pub ino: String,
-    /// Its name, with its extension: the end of the file's URL on the stream.
+    /// Its name, with extension, following `<n>-` in the file's numbered stream URL.
     pub name: String,
     /// Its length, as the Library Server told it at the start; none if it didn't (a
     /// Handoff stored before Handoffs held all of an Item's files has none either). Stored to

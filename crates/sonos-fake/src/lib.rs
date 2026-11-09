@@ -1,8 +1,9 @@
 //! A fake Sonos household for tests (PRD "Testing Decisions"): players on loopback that answer
 //! SSDP M-SEARCH and serve their device description and the UPnP subset the Bridge uses
 //! (ZoneGroupTopology `GetZoneGroupState`; AVTransport `GetTransportInfo`, `GetPositionInfo`,
-//! `RemoveAllTracksFromQueue`, `AddURIToQueue`, `AddMultipleURIsToQueue`, `SetAVTransportURI`, `Play`, `Pause` and
-//! `Seek`; GroupRenderingControl `GetGroupVolume`, `SnapshotGroupVolume` and
+//! `RemoveAllTracksFromQueue`, `AddURIToQueue`, `AddMultipleURIsToQueue`,
+//! `SetAVTransportURI`, `Play`, `Pause` and `Seek`; GroupRenderingControl
+//! `GetGroupVolume`, `SnapshotGroupVolume` and
 //! `SetGroupVolume`), with Groups, playback, volume and faults the test controls.
 //!
 //! Each coordinator has a queue: `RemoveAllTracksFromQueue` empties it; `AddURIToQueue` and
@@ -914,6 +915,10 @@ impl HouseholdState {
                     let count: usize = input(request, "NumberOfURIs")
                         .and_then(|n| n.parse().ok())
                         .ok_or(402u16)?;
+                    let metadata = input(request, "EnqueuedURIsMetaData").ok_or(402u16)?;
+                    if count == 0 || count > 16 || metadata.split(' ').count() != count {
+                        return Err(402);
+                    }
                     let uris: Vec<_> = uris.split_whitespace().map(str::to_owned).collect();
                     if uris.len() != count {
                         return Err(402);
@@ -1475,6 +1480,39 @@ fn escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queue_batches_require_one_metadata_entry_per_uri_and_at_most_sixteen() {
+        let household = Household::with_manual_clock().0;
+        let kitchen = household.add_player("Kitchen");
+        for (count, metadata, status) in [
+            (2, "", StatusCode::INTERNAL_SERVER_ERROR),
+            (2, " ", StatusCode::OK),
+            (16, "               ", StatusCode::OK),
+            (17, "                ", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let uris = (0..count)
+                .map(|n| format!("http://bridge/{n}.mp3"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let arguments = format!(
+                "<NumberOfURIs>{count}</NumberOfURIs><EnqueuedURIs>{uris}</EnqueuedURIs><EnqueuedURIsMetaData>{metadata}</EnqueuedURIsMetaData>"
+            );
+            let before = household.queue(&kitchen);
+            let response =
+                post_action(&household, &kitchen, "AddMultipleURIsToQueue", &arguments).await;
+            assert_eq!(response.status(), status);
+            if status == StatusCode::OK {
+                let expected: Vec<_> = before
+                    .into_iter()
+                    .chain(uris.split_whitespace().map(str::to_owned))
+                    .collect();
+                assert_eq!(household.queue(&kitchen), expected);
+            } else {
+                assert_eq!(household.queue(&kitchen), before);
+            }
+        }
+    }
 
     fn seconds(seconds: u64) -> Duration {
         Duration::from_secs(seconds)

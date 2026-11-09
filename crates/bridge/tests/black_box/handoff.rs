@@ -38,13 +38,7 @@ const CLEAR: &str = "AVTransport#RemoveAllTracksFromQueue";
 /// The SOAP actions a start sends a Group for an Item in one file, before any seek to its
 /// start position: the queue emptied, the file added, the queue given, its first track
 /// selected, play.
-const STARTED: [&str; 5] = [
-    CLEAR,
-    "AVTransport#AddMultipleURIsToQueue",
-    SET_URI,
-    SEEK,
-    PLAY,
-];
+const STARTED: [&str; 5] = [CLEAR, "AVTransport#AddURIToQueue", SET_URI, SEEK, PLAY];
 
 /// The WARN the Bridge logs when a Group doesn't go to a start's position.
 const NOT_SOUGHT: &str = "a Group did not go to a Handoff's start position";
@@ -460,6 +454,7 @@ async fn a_pre_upgrade_single_file_url_still_streams_and_can_be_paused() {
     let episode = setup.episode(0);
     let (_, current) = setup.start(&episode, &setup.kitchen).await;
     let legacy = current.replacen("/1-Episode", "/Episode", 1);
+    assert_ne!(legacy, current);
     setup.household.play(
         &setup.kitchen,
         sonos_fake::FakeTrack {

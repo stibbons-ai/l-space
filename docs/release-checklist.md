@@ -81,7 +81,10 @@ Use an audiobook in at least three files (MP3 or M4A/M4B, as Audiobookshelf list
 - [ ] Step 3: playback lands near the end of the file before, and Progress is that position in the whole book.
 - [ ] Step 4: each chapter skip lands at the chapter's start, in the right file; "Next chapter" in the last chapter does nothing; Progress follows each skip.
 - [ ] Step 5: the Group stops at the end of the last file, the book is Finished on the Library Server, and the App no longer shows a Handoff on the Group. Note where the Sonos app shows the queue after the stop (the last file or back at the first): the Bridge doesn't rely on it.
-- [ ] Start a book of 30+ files; record the measured start time and file count in `docs/research/`. Confirm batched `AddMultipleURIsToQueue` works on hardware (the 16-URI cap follows SoCo, not a hardware measurement); the play limit is `4 + ceil(files / 16) - 1` seconds, still within the Bridge's 14-second total and the App's 15.
+- [ ] Start a plain single-file Item: confirm `AddURIToQueue` works with empty metadata.
+- [ ] Start a two-file book: confirm `AddMultipleURIsToQueue` works with the two empty metadata entries, before trying a large queue.
+- [ ] Start a book of 30+ files; record measured start time and file count in `docs/research/`. Confirm batched `AddMultipleURIsToQueue` works on hardware (16-URI cap follows SoCo, not a hardware measurement); a final batch of one uses `AddURIToQueue`. Play allowance: `4 + ceil(files / 16) - 1` seconds within the Bridge's 14-second total and App's 15.
+- [ ] Check admission limits: at most 160 files without a seek, 96 with a seek, 64 when Progress must be reread and a seek reserved. Larger counts answer `item_not_playable` before changing playback; slow resolving/waiting can still cause `group_failed` within those limits. For books of roughly 80+ files, a replacement's Progress write may time out, leaving the previous listener at their last cadence write.
 
 ## Local playback while locked, with a phone call and with AirPlay
 
