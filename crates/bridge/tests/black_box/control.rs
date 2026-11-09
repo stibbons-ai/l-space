@@ -545,8 +545,12 @@ async fn a_group_without_a_handoff_or_playing_something_else_is_not_controlled()
     assert_eq!(setup.playback_controls(&setup.office), Vec::<String>::new());
 
     // Kitchen's Handoff was replaced by something played from the Sonos app.
-    let handoff = setup.start(&episode, &setup.kitchen).await;
+    setup.start(&episode, &setup.kitchen).await;
     setup.clock.advance(seconds(60));
+    // Establish a reliable final position, rather than depending on initial event timing.
+    api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
+    api.resume_group(&setup.bobs, setup.kitchen.uuid()).await;
+    setup.set_progress(&setup.alice, &episode, 25.0).await;
     setup
         .household
         .play(&setup.kitchen, FakeTrack::new("Radio", seconds(3600)));
@@ -561,9 +565,14 @@ async fn a_group_without_a_handoff_or_playing_something_else_is_not_controlled()
     }
     assert_eq!(setup.playback_controls(&setup.kitchen), before);
     assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
-    // Nothing written, and the Handoff isn't ended here.
-    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
-    assert_eq!(api.handoffs(&setup.bobs).await, [handoff]);
+    // Event reconciliation, not any of these refused controls, ends the taken-over Handoff.
+    eventually(
+        "the taken-over Handoff stayed active",
+        seconds(10),
+        async || api.handoffs(&setup.bobs).await.is_empty(),
+    )
+    .await;
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(60.0));
 
     // A Group the stream of another Group's Handoff plays on is not that Handoff's.
     let other = setup.start(&setup.episode(1), &setup.office).await;
@@ -580,8 +589,8 @@ async fn a_group_without_a_handoff_or_playing_something_else_is_not_controlled()
             .await,
         NO_HANDOFF
     );
-    assert_eq!(api.handoffs(&setup.bobs).await.len(), 2);
     assert_eq!(other.group, setup.office.uuid());
+    assert_eq!(api.handoffs(&setup.bobs).await, [other]);
 }
 
 #[tokio::test]
@@ -1365,6 +1374,8 @@ async fn a_forward_skip_acts_only_if_the_group_still_plays_the_handoff_after_the
     let episode = setup.episode(0);
     setup.start(&episode, &setup.kitchen).await;
     setup.clock.advance(seconds(60));
+    // Establish a reliable final position independent of initial snapshot timing.
+    api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
     // A slow Library Server: the Group changes while the Bridge waits for the Item's length.
     // Each skip on fresh connections, so none reuses one already through the delay.
     let skip_while = async |change: &dyn Fn()| {
@@ -1400,10 +1411,15 @@ async fn a_forward_skip_acts_only_if_the_group_still_plays_the_handoff_after_the
     };
     assert_eq!(skip_while(&radio).await, NO_HANDOFF);
 
-    // Neither was skipped or written; the Handoff isn't ended.
+    // Neither was skipped; event reconciliation independently ends the taken-over Handoff.
     assert_eq!(setup.playback_controls(&setup.kitchen), before);
-    assert_eq!(setup.progress(&setup.alice, &episode).await, None);
-    assert_eq!(api.handoffs(&setup.bobs).await.len(), 1);
+    eventually(
+        "the taken-over Handoff stayed active",
+        seconds(10),
+        async || api.handoffs(&setup.bobs).await.is_empty(),
+    )
+    .await;
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(60.0));
 }
 
 #[tokio::test]

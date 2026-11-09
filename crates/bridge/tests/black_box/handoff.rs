@@ -651,6 +651,34 @@ async fn a_start_that_fails_leaves_no_handoff() {
 }
 
 #[tokio::test]
+async fn a_start_with_no_players_is_not_found_but_failed_discovery_is_an_error() {
+    let abs = Audiobookshelf::shared();
+    let household = Household::start(Arc::new(clock::SystemClock));
+    let user = abs.new_user().await;
+    for (ssdp, expected) in [
+        (
+            household.ssdp(),
+            (StatusCode::NOT_FOUND, ApiError::GroupNotFound),
+        ),
+        (
+            "127.0.0.1:0".parse().unwrap(),
+            (StatusCode::BAD_GATEWAY, ApiError::SonosSearchFailed),
+        ),
+    ] {
+        let bridge = TestBridge::start(&home_with_sonos_toml(abs.base_url(), ssdp));
+        let session = bridge.api().login(abs.base_url(), &user.api_key.key).await;
+        assert_eq!(
+            bridge
+                .api()
+                .start_handoff_error(&session, &abs.seeded().episode(0), "RINCON_NOSUCH01400")
+                .await,
+            expected
+        );
+        assert!(bridge.api().handoffs(&session).await.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn a_group_that_refuses_or_does_not_answer_keeps_no_handoff() {
     let setup = setup().await;
     let api = setup.bridge.api();

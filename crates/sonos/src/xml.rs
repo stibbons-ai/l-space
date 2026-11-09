@@ -29,7 +29,7 @@ pub enum Malformed {
     Missing(&'static str),
 }
 
-fn parse(text: &str) -> Result<Document<'_>, Malformed> {
+pub(crate) fn parse(text: &str) -> Result<Document<'_>, Malformed> {
     let options = ParsingOptions {
         nodes_limit: MAX_NODES,
         ..ParsingOptions::default()

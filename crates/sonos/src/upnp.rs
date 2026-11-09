@@ -6,6 +6,7 @@
 //! `Pause`, `Play` and `Seek`; GroupRenderingControl `SnapshotGroupVolume`, then
 //! `SetGroupVolume`).
 
+mod events;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -60,6 +61,7 @@ const STAGGER: Duration = Duration::from_millis(500);
 pub struct Upnp {
     shared: Arc<Shared>,
     discovery: AbortHandle,
+    event_task: Mutex<Option<AbortHandle>>,
 }
 
 #[derive(Debug)]
@@ -69,6 +71,8 @@ struct Shared {
     known: Mutex<Known>,
     /// Whether the first search is over (or searching stopped for good).
     searched: watch::Sender<bool>,
+    events: events::Events,
+    event_clock: Mutex<Arc<dyn Clock>>,
 }
 
 /// What the searches and listings found out.
@@ -129,6 +133,7 @@ impl Upnp {
         Self {
             shared,
             discovery: handle,
+            event_task: Mutex::new(None),
         }
     }
 
@@ -137,9 +142,9 @@ impl Upnp {
         self.shared.groups(deadline).await
     }
 
-    async fn play(&self, group: &str, stream: &Stream) -> Result<(), Error> {
+    async fn play(&self, group: &str, stream: &Stream) -> Result<Group, Error> {
         let deadline = tokio::time::Instant::now() + PLAY_TIMEOUT;
-        self.shared.play(group, stream, deadline).await.map(drop)
+        self.shared.play(group, stream, deadline).await
     }
 
     async fn playback(&self, group: &str) -> Result<Playback, Error> {
@@ -156,15 +161,63 @@ impl Upnp {
 impl Drop for Upnp {
     fn drop(&mut self) {
         self.discovery.abort();
+        if let Some(task) = self
+            .event_task
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            task.abort();
+        }
     }
 }
 
 impl Sonos for Upnp {
+    fn topology(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>> {
+        Box::pin(async {
+            let (_, topology) = self
+                .shared
+                .topology_by(tokio::time::Instant::now() + CONTROL_TIMEOUT)
+                .await?;
+            Ok(topology.iter().filter_map(visible).collect())
+        })
+    }
+    fn events(&self, listen: SocketAddr, clock: Arc<dyn Clock>) -> watch::Receiver<u64> {
+        let mut task = self
+            .event_task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if task.is_none() {
+            *self
+                .shared
+                .event_clock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Arc::clone(&clock);
+            *task = Some(
+                tokio::spawn(events::run(Arc::clone(&self.shared), listen, clock)).abort_handle(),
+            );
+        }
+        self.shared.events.changed.subscribe()
+    }
+
+    fn notify(&self, sid: &str, seq: u32, body: &str) -> crate::Notification {
+        let now = self
+            .shared
+            .event_clock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .now();
+        self.shared.events.notify(sid, seq, body, now)
+    }
+
     fn groups(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>> {
         Box::pin(self.groups())
     }
 
-    fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>> {
+    fn play<'a>(
+        &'a self,
+        group: &'a str,
+        stream: &'a Stream,
+    ) -> BoxFuture<'a, Result<Group, Error>> {
         Box::pin(self.play(group, stream))
     }
 
@@ -247,10 +300,12 @@ impl Shared {
             .build()
             .expect("an HTTP client without TLS builds");
         Self {
+            event_clock: Mutex::new(Arc::clone(&clock)),
             http,
             clock,
             known: Mutex::default(),
             searched: watch::Sender::new(false),
+            events: events::Events::default(),
         }
     }
 
@@ -411,14 +466,27 @@ impl Shared {
 
     /// Has Group `group` play `stream` from its start, by `deadline`: its coordinator, as the
     /// topology read now names it, is given the stream's URL (`SetAVTransportURI`, without
-    /// metadata) and told to play. Returns the URL.
+    /// metadata) and told to play. Returns the Group snapshot used to resolve it.
     async fn play(
         &self,
         group: &str,
         stream: &Stream,
         deadline: tokio::time::Instant,
-    ) -> Result<String, Error> {
-        let coordinator = self.coordinator(group, deadline).await?;
+    ) -> Result<Group, Error> {
+        let (players, topology) = self.topology_by(deadline).await?;
+        let snapshot = topology
+            .iter()
+            .find(|zone| zone.coordinator == group)
+            .and_then(visible)
+            .ok_or(Error::UnknownGroup)?;
+        // Only an address announced by the coordinator itself, never a topology-supplied URL.
+        let coordinator = players.get(group).copied().ok_or_else(|| {
+            tracing::warn!(
+                group,
+                "a Group's coordinator did not answer the last searches"
+            );
+            Error::GroupFailed
+        })?;
         let host = match route_to(coordinator.ip()) {
             Ok(host) => host,
             Err(error) => {
@@ -446,7 +514,7 @@ impl Shared {
         )
         .await?;
         call("Play", &[("Speed", "1")]).await?;
-        Ok(url)
+        Ok(snapshot)
     }
 
     /// What Group `group` plays, as its coordinator tells it by `deadline`: its transport
@@ -1126,12 +1194,14 @@ mod tests {
         let shared = knowing(&household, &clock).await;
 
         // Listening on every address, the coordinator gets the one on its route: loopback.
-        let url = shared
+        shared
             .play(kitchen.uuid(), &stream("0.0.0.0:9"), soon(PLAY_TIMEOUT))
             .await
             .unwrap();
-        assert_eq!(url, "http://127.0.0.1:9/stream/abc/Episode%201.mp3");
-        assert_eq!(household.uri(&kitchen).as_deref(), Some(url.as_str()));
+        assert_eq!(
+            household.uri(&kitchen).as_deref(),
+            Some("http://127.0.0.1:9/stream/abc/Episode%201.mp3")
+        );
         assert_eq!(household.transport_state(&kitchen), "PLAYING");
         let started = [SET_URI, PLAY];
         let calls = household.actions_of(&kitchen);
@@ -1151,11 +1221,14 @@ mod tests {
         assert_eq!(household.uri(&office), None);
 
         // Listening on one address, that one.
-        let url = shared
+        shared
             .play(office.uuid(), &stream("127.0.0.2:9"), soon(PLAY_TIMEOUT))
             .await
             .unwrap();
-        assert_eq!(url, "http://127.0.0.2:9/stream/abc/Episode%201.mp3");
+        assert_eq!(
+            household.uri(&office).as_deref(),
+            Some("http://127.0.0.2:9/stream/abc/Episode%201.mp3")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1358,12 +1431,37 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_discovery_lapse_has_no_authoritative_topology_and_recovers() {
+        let (household, clock) = Household::with_manual_clock();
+        household.add_player("Kitchen");
+        let upnp = Upnp {
+            shared: Arc::new(knowing(&household, &clock).await),
+            discovery: tokio::spawn(async {}).abort_handle(),
+            event_task: Mutex::new(None),
+        };
+        assert_eq!(Sonos::topology(&upnp).await.unwrap().len(), 1);
+        let mut hints = upnp.shared.events.changed.subscribe();
+        clock.advance(EXPIRY + Duration::from_secs(1));
+        upnp.shared
+            .events
+            .changed
+            .send_modify(|version| *version += 1);
+        hints.changed().await.unwrap();
+        assert_eq!(Sonos::topology(&upnp).await, Ok(Vec::new()));
+        // Discovery recovers: current topology is available again.
+        upnp.shared
+            .saw(Ok(ssdp::search(household.ssdp()).await.unwrap()));
+        assert_eq!(Sonos::topology(&upnp).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn the_highest_volume_is_sent_for_anything_louder() {
         let (household, clock) = Household::with_manual_clock();
         let kitchen = household.add_player("Kitchen");
         let upnp = Upnp {
             shared: Arc::new(knowing(&household, &clock).await),
             discovery: tokio::spawn(async {}).abort_handle(),
+            event_task: Mutex::new(None),
         };
 
         Sonos::set_volume(&upnp, kitchen.uuid(), 255).await.unwrap();

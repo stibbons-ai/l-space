@@ -6,6 +6,8 @@
 //! ([`Sonos::play`]); and controls what a Group plays: pause, resume, seek, and the Group's
 //! volume. [`media_type`] tells which audio formats a Group plays; `play` doesn't check, the
 //! caller does. It never changes grouping.
+//! Source/topology events wake consumers to reconcile current state through this same trait;
+//! subscriptions renew on the clock passed to [`Sonos::events`].
 //!
 //! Every SSDP datagram and SOAP body sent or received is logged at DEBUG under the target
 //! [`RAW`], and only there; INFO and above summarise without raw bodies.
@@ -43,8 +45,19 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// no player has none.
     fn groups(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>>;
 
+    /// Current Group membership/coordinators without transport or volume requests.
+    /// An empty result after healthy discovery means no known players, not authoritative
+    /// evidence that an active Group's membership changed. Failed discovery is SearchFailed.
+    fn topology(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>>;
+
     /// Group `group` (its id) plays `stream` from its start, replacing what it played.
-    fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>>;
+    /// Returns the membership snapshot used to resolve its coordinator before playback,
+    /// without transport or volume fields. Later topology changes are not part of this start.
+    fn play<'a>(
+        &'a self,
+        group: &'a str,
+        stream: &'a Stream,
+    ) -> BoxFuture<'a, Result<Group, Error>>;
 
     /// What Group `group` plays now, as its coordinator tells it.
     fn playback<'a>(&'a self, group: &'a str) -> BoxFuture<'a, Result<Playback, Error>>;
@@ -62,6 +75,28 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// Group `group`'s volume becomes `volume`, at most [`MAX_VOLUME`]: every member's
     /// changes as the Sonos app's Group volume changes them.
     fn set_volume<'a>(&'a self, group: &'a str, volume: u8) -> BoxFuture<'a, Result<(), Error>>;
+
+    /// Starts event subscriptions using the Bridge's existing listener. Changes are hints:
+    /// consumers must read current state before acting, including on initial snapshots.
+    /// The first call fixes `listen` and `clock`; later calls only subscribe to hints.
+    fn events(
+        &self,
+        listen: SocketAddr,
+        clock: std::sync::Arc<dyn clock::Clock>,
+    ) -> tokio::sync::watch::Receiver<u64>;
+
+    /// Accepts a bounded GENA property set. Live duplicate/backward sequences are
+    /// acknowledged without applying them; unknown/expired subscriptions fail preconditions.
+    fn notify(&self, sid: &str, seq: u32, body: &str) -> Notification;
+}
+
+/// Result of validating an incoming GENA notification. Contains no subscription identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notification {
+    Accepted,
+    Ignored,
+    Malformed,
+    UnknownSubscription,
 }
 
 /// A stream the Bridge serves over plain HTTP, for a Group to play. Its path is a capability,
