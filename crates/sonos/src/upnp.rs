@@ -142,9 +142,9 @@ impl Upnp {
         self.shared.groups(deadline).await
     }
 
-    async fn play(&self, group: &str, stream: &Stream) -> Result<(), Error> {
+    async fn play(&self, group: &str, stream: &Stream) -> Result<Group, Error> {
         let deadline = tokio::time::Instant::now() + PLAY_TIMEOUT;
-        self.shared.play(group, stream, deadline).await.map(drop)
+        self.shared.play(group, stream, deadline).await
     }
 
     async fn playback(&self, group: &str) -> Result<Playback, Error> {
@@ -213,7 +213,11 @@ impl Sonos for Upnp {
         Box::pin(self.groups())
     }
 
-    fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>> {
+    fn play<'a>(
+        &'a self,
+        group: &'a str,
+        stream: &'a Stream,
+    ) -> BoxFuture<'a, Result<Group, Error>> {
         Box::pin(self.play(group, stream))
     }
 
@@ -462,14 +466,27 @@ impl Shared {
 
     /// Has Group `group` play `stream` from its start, by `deadline`: its coordinator, as the
     /// topology read now names it, is given the stream's URL (`SetAVTransportURI`, without
-    /// metadata) and told to play. Returns the URL.
+    /// metadata) and told to play. Returns the Group snapshot used to resolve it.
     async fn play(
         &self,
         group: &str,
         stream: &Stream,
         deadline: tokio::time::Instant,
-    ) -> Result<String, Error> {
-        let coordinator = self.coordinator(group, deadline).await?;
+    ) -> Result<Group, Error> {
+        let (players, topology) = self.topology_by(deadline).await?;
+        let snapshot = topology
+            .iter()
+            .find(|zone| zone.coordinator == group)
+            .and_then(visible)
+            .ok_or(Error::UnknownGroup)?;
+        // Only an address announced by the coordinator itself, never a topology-supplied URL.
+        let coordinator = players.get(group).copied().ok_or_else(|| {
+            tracing::warn!(
+                group,
+                "a Group's coordinator did not answer the last searches"
+            );
+            Error::GroupFailed
+        })?;
         let host = match route_to(coordinator.ip()) {
             Ok(host) => host,
             Err(error) => {
@@ -497,7 +514,7 @@ impl Shared {
         )
         .await?;
         call("Play", &[("Speed", "1")]).await?;
-        Ok(url)
+        Ok(snapshot)
     }
 
     /// What Group `group` plays, as its coordinator tells it by `deadline`: its transport
@@ -1177,12 +1194,14 @@ mod tests {
         let shared = knowing(&household, &clock).await;
 
         // Listening on every address, the coordinator gets the one on its route: loopback.
-        let url = shared
+        shared
             .play(kitchen.uuid(), &stream("0.0.0.0:9"), soon(PLAY_TIMEOUT))
             .await
             .unwrap();
-        assert_eq!(url, "http://127.0.0.1:9/stream/abc/Episode%201.mp3");
-        assert_eq!(household.uri(&kitchen).as_deref(), Some(url.as_str()));
+        assert_eq!(
+            household.uri(&kitchen).as_deref(),
+            Some("http://127.0.0.1:9/stream/abc/Episode%201.mp3")
+        );
         assert_eq!(household.transport_state(&kitchen), "PLAYING");
         let started = [SET_URI, PLAY];
         let calls = household.actions_of(&kitchen);
@@ -1202,11 +1221,14 @@ mod tests {
         assert_eq!(household.uri(&office), None);
 
         // Listening on one address, that one.
-        let url = shared
+        shared
             .play(office.uuid(), &stream("127.0.0.2:9"), soon(PLAY_TIMEOUT))
             .await
             .unwrap();
-        assert_eq!(url, "http://127.0.0.2:9/stream/abc/Episode%201.mp3");
+        assert_eq!(
+            household.uri(&office).as_deref(),
+            Some("http://127.0.0.2:9/stream/abc/Episode%201.mp3")
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

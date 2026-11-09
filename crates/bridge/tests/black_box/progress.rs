@@ -156,6 +156,28 @@ impl Setup {
         );
     }
 
+    /// Delivers a distinct household hint and waits for the callback to accept it. Tests using
+    /// this seam drop fake notifications so its explicit sequence cannot race their publisher.
+    async fn hint(&self, offset: u32) {
+        let (sid, seq) = self.household.transport_subscription(&self.office).unwrap();
+        let response = reqwest::Client::new()
+            .request(
+                reqwest::Method::from_bytes(b"NOTIFY").unwrap(),
+                format!("{}/sonos/events", self.bridge.url()),
+            )
+            .header("NT", "upnp:event")
+            .header("NTS", "upnp:propchange")
+            .header("SID", sid)
+            .header("SEQ", seq.wrapping_add(offset).to_string())
+            .body(format!(
+                r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><ZoneGroupState>hint-{offset}</ZoneGroupState></e:property></e:propertyset>"#
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+    }
+
     /// Defence in depth that nothing supervises Kitchen any more: Bob starts a witness Handoff
     /// on Office, time moves on to its first tick, and once the witness's Progress is written
     /// and Kitchen's turn is free, Kitchen must not have been read since. It catches a Kitchen
@@ -349,21 +371,15 @@ async fn a_household_hint_cannot_consume_an_externally_resumed_cadence_write() {
     setup.advance_and_settle(30).await;
     let sonos_app = sonos::Upnp::start(setup.household.ssdp(), Arc::new(clock::SystemClock));
     sonos_app.resume(setup.kitchen.uuid()).await.unwrap();
-    setup.household.set_fault(
-        &setup.kitchen,
-        Fault::SlowPosition(Duration::from_millis(300)),
-    );
-    let reads = setup.asked(READ_POSITION);
+    setup.household.drop_notifications(true);
+    let mut held = setup
+        .household
+        .hold_next_call(&setup.kitchen, "GetPositionInfo");
     setup.advance(30).await;
-    eventually("resumed cadence never read position", WITHIN, async || {
-        setup.asked(READ_POSITION) > reads
-    })
-    .await;
-    // Deliver a household hint while the unchecked cadence read is still in flight.
-    setup.household.play(
-        &setup.office,
-        FakeTrack::new("External", Duration::from_secs(3600)),
-    );
+    held.arrived().await;
+    // The hint has reached the Bridge before the unchecked cadence read can return.
+    setup.hint(0).await;
+    held.release();
     setup
         .wait_for_progress(&setup.alice, &episode, (60.0, false))
         .await;
@@ -1518,6 +1534,135 @@ async fn takeover_source_writes_only_old_stream_progress_and_revokes_its_url() {
         .find(|group| group.id == setup.kitchen.uuid())
         .unwrap();
     assert!(group.handoff.is_none());
+}
+
+#[tokio::test]
+async fn takeover_start_baselines_membership_at_play_not_before_replaced_progress() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let old = setup.episode(0);
+    let new = setup.episode(1);
+    setup.start(&setup.alices, &old, None).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &old, (30.0, false))
+        .await;
+    setup.household.drop_notifications(true);
+    let held = proxy.hold_next_progress_write();
+    let writes = proxy.progress_writes();
+    let api = setup.bridge.api();
+    let start = api.start_handoff(&setup.alices, &new, setup.kitchen.uuid());
+    let regroup = async {
+        eventually("replacement never wrote old Progress", WITHIN, async || {
+            proxy.progress_writes() > writes
+        })
+        .await;
+        // Validation has already captured the old topology, but play has not resolved it.
+        setup.household.join(&setup.office, &setup.kitchen);
+        let initial = setup
+            .household
+            .hold_next_call(&setup.kitchen, "GetPositionInfo");
+        held.release().await;
+        initial
+    };
+    let (_, mut initial) = tokio::join!(start, regroup);
+    initial.arrived().await;
+    initial.release();
+    setup.settle().await;
+    assert_eq!(
+        setup.handoffs().await,
+        1,
+        "initial reconciliation ended own start"
+    );
+    let stream = setup.household.uri(&setup.kitchen).unwrap();
+    assert!(reqwest::get(&stream).await.unwrap().status().is_success());
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &new, (30.0, false))
+        .await;
+    assert_eq!(setup.handoffs().await, 1, "cadence ended own start");
+    assert_eq!(
+        setup.progress(&setup.alice, &old).await,
+        Some((30.0, false))
+    );
+    assert!(reqwest::get(&stream).await.unwrap().status().is_success());
+}
+
+#[tokio::test]
+async fn takeover_initial_reconcile_detects_regroup_after_play_before_start_finishes() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup
+        .set_progress(&setup.alice, &episode, 60.0, false)
+        .await;
+    setup.household.drop_notifications(true);
+    let mut seek = setup.household.hold_next_call(&setup.kitchen, "Seek");
+    let api = setup.bridge.api();
+    let start = api.start_handoff(&setup.alices, &episode, setup.kitchen.uuid());
+    let regroup = async {
+        seek.arrived().await;
+        // Play succeeded with the old membership. No callback or clock tick can expose this
+        // change: only the new supervisor's initial reconciliation can end it immediately.
+        assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+        setup.household.join(&setup.office, &setup.kitchen);
+        seek.release();
+    };
+    let (_, ()) = tokio::join!(start, regroup);
+    let stream = setup.household.fetched(&setup.kitchen).await.uri;
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((60.0, false))
+    );
+    assert_eq!(
+        reqwest::get(&stream).await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn takeover_event_taking_a_cadence_does_not_write_again_on_the_deferred_wake() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    setup
+        .set_progress(&setup.alice, &episode, 580.0, false)
+        .await;
+    setup.start(&setup.alices, &episode, None).await;
+    setup.advance_and_settle(25).await;
+    let mut late = setup
+        .household
+        .hold_next_call(&setup.kitchen, "GetPositionInfo");
+    // A late near-end read discovers the length was too short and stops end polling, but
+    // spaces the next scheduled wake to 30.5, later than the cadence tick at 30.
+    setup.clock.advance(Duration::from_millis(4500));
+    late.arrived().await;
+    late.release();
+    setup.household.clock_followed().await;
+    setup.settle().await;
+    setup.household.drop_notifications(true);
+    let mut first = setup
+        .household
+        .hold_next_call(&setup.kitchen, "GetPositionInfo");
+    setup.clock.advance(Duration::from_millis(500));
+    setup.household.clock_followed().await;
+    setup.hint(0).await;
+    first.arrived().await;
+    first.release();
+    setup
+        // Audiobookshelf itself marks Progress past the Item's known length Finished.
+        .wait_for_progress(&setup.alice, &episode, (610.0, true))
+        .await;
+    setup.settle().await;
+    let writes = proxy.progress_writes();
+    let mut deferred = setup
+        .household
+        .hold_next_call(&setup.kitchen, "GetPositionInfo");
+    setup.clock.advance(Duration::from_millis(500));
+    setup.household.clock_followed().await;
+    setup.hint(1).await;
+    deferred.arrived().await;
+    deferred.release();
+    setup.settle().await;
+    assert_eq!(proxy.progress_writes(), writes, "cadence was taken twice");
 }
 
 #[tokio::test]
