@@ -35,6 +35,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_sessions.sql"),
     include_str!("migrations/0002_encrypted_api_keys.sql"),
     include_str!("migrations/0003_handoffs.sql"),
+    include_str!("migrations/0004_handoff_files.sql"),
 ];
 
 /// A [`Store`] in one SQLite database file. It stays open until it, its [`Closer`]s and its
@@ -151,16 +152,14 @@ impl SqliteStore {
         let sealing = Arc::clone(&self.sealing);
         let lookup = self
             .transaction(move |tx| {
-                let Some((stream, (handoff, key))) = tx
+                let Some((stream, mut handoff, key)) = tx
                     .prepare_cached(query)?
-                    .query_row(params![param], |row| {
-                        let stream: [u8; 32] = row.get(12)?;
-                        Ok((StreamId::from_bytes(stream), handoff_row(row)?))
-                    })
+                    .query_row(params![param], handoff_row)
                     .optional()?
                 else {
                     return Ok(Lookup::Unknown);
                 };
+                handoff.files = handoff_files(tx, &stream)?;
                 Ok(match key.open(tx, &sealing)? {
                     Some(api_key) => Lookup::Open(GroupHandoff {
                         stream,
@@ -427,34 +426,51 @@ fn warn_unreadable(user: &LibraryUser) {
 }
 
 /// A query of Handoffs with their keys, ending in `$rest`: from `handoffs h` joined with
-/// `api_keys k`, the columns [`handoff_row`] reads, then the stream's id (column 12).
+/// `api_keys k`, the columns [`handoff_row`] reads.
 macro_rules! select_handoffs {
     ($rest:literal) => {
         concat!(
-            "SELECT h.group_id, h.library_item, h.episode, h.file_ino, h.file_name, h.username, \
-             h.started_at, k.id, k.library_server, k.user_id, k.key_fingerprint, k.sealed_key, \
-             h.stream_id FROM handoffs h JOIN api_keys k ON k.id = h.api_key_id ",
+            "SELECT h.group_id, h.library_item, h.episode, h.username, h.started_at, k.id, \
+             k.library_server, k.user_id, k.key_fingerprint, k.sealed_key, h.stream_id \
+             FROM handoffs h JOIN api_keys k ON k.id = h.api_key_id ",
             $rest
         )
     };
 }
 
-/// A Handoff and its stored key, from a row of [`select_handoffs`].
-fn handoff_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Handoff, StoredKey)> {
-    let key = StoredKey::read(row, 7)?;
+/// A Handoff's stream, the Handoff without its files ([`handoff_files`] reads them) and its
+/// stored key, from a row of [`select_handoffs`].
+fn handoff_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(StreamId, Handoff, StoredKey)> {
+    let key = StoredKey::read(row, 5)?;
+    let stream: [u8; 32] = row.get(10)?;
     let handoff = Handoff {
         group: row.get(0)?,
         library_item: row.get(1)?,
         episode: row.get(2)?,
-        file: HandoffFile {
-            ino: row.get(3)?,
-            name: row.get(4)?,
-        },
+        files: Vec::new(),
         started_by: key.user.clone(),
-        username: row.get(5)?,
-        started_at: row.get(6)?,
+        username: row.get(3)?,
+        started_at: row.get(4)?,
     };
-    Ok((handoff, key))
+    Ok((StreamId::from_bytes(stream), handoff, key))
+}
+
+/// The files of the Handoff whose stream is `stream`, in playing order.
+fn handoff_files(tx: &Transaction<'_>, stream: &StreamId) -> rusqlite::Result<Vec<HandoffFile>> {
+    tx.prepare_cached(
+        "SELECT ino, name, duration_ns FROM handoff_files WHERE stream_id = ?1
+         ORDER BY file_index",
+    )?
+    .query_map(params![stream.as_bytes()], |row| {
+        let duration: Option<i64> = row.get(2)?;
+        Ok(HandoffFile {
+            ino: row.get(0)?,
+            name: row.get(1)?,
+            // The column holds no negative length.
+            duration: duration.map(|nanos| Duration::from_nanos(nanos.unsigned_abs())),
+        })
+    })?
+    .collect()
 }
 
 /// A session or Handoff looked up in the database.
@@ -572,21 +588,35 @@ impl Store for SqliteStore {
             tx.prepare_cached("DELETE FROM handoffs WHERE group_id = ?1")?
                 .execute(params![handoff.group])?;
             tx.prepare_cached(
-                "INSERT INTO handoffs (group_id, stream_id, library_item, episode, file_ino,
-                     file_name, username, api_key_id, started_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO handoffs (group_id, stream_id, library_item, episode, username,
+                     api_key_id, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?
             .execute(params![
                 handoff.group,
                 stream.as_bytes(),
                 handoff.library_item,
                 handoff.episode,
-                handoff.file.ino,
-                handoff.file.name,
                 handoff.username,
                 api_key_id,
                 handoff.started_at,
             ])?;
+            let mut insert = tx.prepare_cached(
+                "INSERT INTO handoff_files (stream_id, file_index, ino, name, duration_ns)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for (index, file) in (0_i64..).zip(&handoff.files) {
+                let duration = file
+                    .duration
+                    .map(|duration| i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX));
+                insert.execute(params![
+                    stream.as_bytes(),
+                    index,
+                    file.ino,
+                    file.name,
+                    duration
+                ])?;
+            }
             Ok(())
         })
         .await
@@ -613,13 +643,16 @@ impl Store for SqliteStore {
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 let mut handoffs = Vec::new();
                 let mut unreadable: Vec<StoredKey> = Vec::new();
-                for (handoff, key) in rows {
+                for (stream, mut handoff, key) in rows {
                     // Handoffs may share a key; once it was removed, the others went with it.
                     if unreadable.iter().any(|removed| removed.id == key.id) {
                         continue;
                     }
                     match key.open(tx, &sealing)? {
-                        Some(_) => handoffs.push(handoff),
+                        Some(_) => {
+                            handoff.files = handoff_files(tx, &stream)?;
+                            handoffs.push(handoff);
+                        }
                         None => unreadable.push(key),
                     }
                 }
@@ -862,10 +895,11 @@ mod tests {
             group: "RINCON_K".into(),
             library_item: "podcast-id".into(),
             episode: Some("episode-id".into()),
-            file: HandoffFile {
+            files: vec![HandoffFile {
                 ino: "42".into(),
                 name: "Episode 1.mp3".into(),
-            },
+                duration: Some(std::time::Duration::from_secs(600)),
+            }],
             started_by: user.clone(),
             username: "alice".into(),
             started_at: 1_000,
@@ -992,13 +1026,45 @@ mod tests {
         // Back to how a Bridge of schema version 2 left it.
         database
             .raw()
-            .execute_batch("DROP TABLE handoffs; PRAGMA user_version = 2;")
+            .execute_batch(
+                "DROP TABLE handoff_files; DROP TABLE handoffs; PRAGMA user_version = 2;",
+            )
             .unwrap();
 
         let store = database.open_with(1);
         assert_eq!(schema_version(&database), MIGRATIONS.len() as i64);
         assert_eq!(api_key(&store, 1).await, Some(ApiKey::new("alice-key")));
         assert_eq!(store.handoffs().await.unwrap(), []);
+    }
+
+    /// A Handoff stored by a Bridge of schema version 3, with one file, keeps it, of unknown
+    /// length.
+    #[tokio::test]
+    async fn a_handoff_from_before_its_files_were_listed_keeps_its_one_file() {
+        let database = TempDatabase::new();
+        start_kitchen(&database.open_with(1), "stream-1", &alice(), "alice-key").await;
+        // Back to how a Bridge of schema version 3 left it: the file in the Handoff's row.
+        database
+            .raw()
+            .execute_batch(
+                "ALTER TABLE handoffs ADD COLUMN file_ino TEXT;
+                 ALTER TABLE handoffs ADD COLUMN file_name TEXT;
+                 UPDATE handoffs SET file_ino = '42', file_name = 'Episode 1.mp3';
+                 DROP TABLE handoff_files;
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+
+        let store = database.open_with(1);
+        assert_eq!(schema_version(&database), MIGRATIONS.len() as i64);
+        let active = store.handoff(&StreamId::of("stream-1")).await.unwrap();
+        let files = active.map(|active| active.handoff.files);
+        let file = HandoffFile {
+            ino: "42".into(),
+            name: "Episode 1.mp3".into(),
+            duration: None,
+        };
+        assert_eq!(files, Some(vec![file]));
     }
 
     /// Writes a database as the Bridge before encryption (schema version 1) left it: plain-text

@@ -17,6 +17,8 @@
 #[cfg(feature = "contract")]
 pub mod contract;
 
+use std::time::Duration;
+
 use abs::ApiKey;
 use sha2::{Digest, Sha256};
 
@@ -84,8 +86,8 @@ pub struct Handoff {
     pub library_item: String,
     /// The episode, for a podcast's.
     pub episode: Option<String>,
-    /// The audio file the stream serves.
-    pub file: HandoffFile,
+    /// The Item's audio files the stream serves, in playing order; at least one.
+    pub files: Vec<HandoffFile>,
     /// Who started it, and acts for it.
     pub started_by: LibraryUser,
     /// The starter's username when they started it.
@@ -94,13 +96,17 @@ pub struct Handoff {
     pub started_at: i64,
 }
 
-/// The audio file a Handoff's stream serves.
+/// An audio file a Handoff's stream serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandoffFile {
     /// Audiobookshelf's id for the file within its library item.
     pub ino: String,
-    /// Its name, with its extension: the last segment of the stream's URL.
+    /// Its name, with its extension: the end of the file's URL on the stream.
     pub name: String,
+    /// Its length, as the Library Server told it at the start; none if it didn't (a
+    /// Handoff stored before Handoffs held all of an Item's files has none either). Stored to
+    /// the nanosecond.
+    pub duration: Option<Duration>,
 }
 
 /// A Handoff as its stream needs it: with the API key it acts with.
