@@ -76,6 +76,7 @@ impl<S: Store> AppApi<S> {
             sonos: Arc::clone(&sonos),
             library_servers: Arc::clone(&library_servers),
         };
+        let events = sonos.events(listen, Arc::clone(&clock));
         Self {
             library_servers,
             abs: controls.abs.clone(),
@@ -83,7 +84,7 @@ impl<S: Store> AppApi<S> {
             sonos,
             listen,
             turns: Arc::clone(&turns),
-            supervisors: Arc::new(Supervisors::new(controls, turns, clock)),
+            supervisors: Arc::new(Supervisors::new(controls, turns, clock, events)),
         }
     }
 
@@ -749,6 +750,20 @@ impl<S: Store> AppApi<S> {
         // stored or sent, so a cancelled call left nothing behind.
         let task_group = group.clone();
         let (logged_item, logged_episode) = (library_item_id.clone(), id.episode.clone());
+        let members_time = START_TIME
+            .saturating_sub(called.elapsed())
+            .saturating_sub(sonos::PLAY_TIMEOUT + seek_time);
+        let members = tokio::time::timeout(members_time, self.sonos.topology())
+            .await
+            .map_err(|_| ApiError::GroupFailed)?
+            .map_err(sonos_error)?
+            .into_iter()
+            .find(|found| found.id == group)
+            .ok_or(ApiError::GroupFailed)?
+            .members
+            .into_iter()
+            .map(|member| member.id)
+            .collect();
         let started = tokio::spawn(async move {
             // The Handoff this start replaces gets its Progress first, with what is left after
             // keeping the time to play and seek.
@@ -834,7 +849,7 @@ impl<S: Store> AppApi<S> {
                 });
                 return Err(sonos_error(error));
             }
-            supervisors.start(&handoff, stream, known_length(length), position);
+            supervisors.start(&handoff, stream, known_length(length), position, members);
             tracing::info!(
                 group = handoff.group,
                 library_server,

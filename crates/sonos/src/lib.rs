@@ -6,6 +6,8 @@
 //! ([`Sonos::play`]); and controls what a Group plays: pause, resume, seek, and the Group's
 //! volume. [`media_type`] tells which audio formats a Group plays; `play` doesn't check, the
 //! caller does. It never changes grouping.
+//! Source/topology events wake consumers to reconcile current state through this same trait;
+//! subscriptions renew on the clock passed to [`Sonos::events`].
 //!
 //! Every SSDP datagram and SOAP body sent or received is logged at DEBUG under the target
 //! [`RAW`], and only there; INFO and above summarise without raw bodies.
@@ -43,6 +45,9 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// no player has none.
     fn groups(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>>;
 
+    /// Current Group membership/coordinators without transport or volume requests.
+    fn topology(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>>;
+
     /// Group `group` (its id) plays `stream` from its start, replacing what it played.
     fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>>;
 
@@ -62,6 +67,18 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// Group `group`'s volume becomes `volume`, at most [`MAX_VOLUME`]: every member's
     /// changes as the Sonos app's Group volume changes them.
     fn set_volume<'a>(&'a self, group: &'a str, volume: u8) -> BoxFuture<'a, Result<(), Error>>;
+
+    /// Starts event subscriptions using the Bridge's existing listener. Changes are hints:
+    /// consumers must read current state before acting, including on initial snapshots.
+    fn events(
+        &self,
+        listen: SocketAddr,
+        clock: std::sync::Arc<dyn clock::Clock>,
+    ) -> tokio::sync::watch::Receiver<u64>;
+
+    /// Accepts a bounded GENA property set for a current subscription, in sequence order.
+    /// Returns false for unknown subscriptions, stale sequences or malformed input.
+    fn notify(&self, sid: &str, seq: u32, body: &str) -> bool;
 }
 
 /// A stream the Bridge serves over plain HTTP, for a Group to play. Its path is a capability,

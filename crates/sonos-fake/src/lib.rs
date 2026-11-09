@@ -44,6 +44,8 @@
 //! clock.advance(Duration::from_secs(30));     // Kitchen's position is now 0:00:30
 //! ```
 
+mod events;
+
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -218,6 +220,7 @@ struct Shared {
     state: Mutex<HouseholdState>,
     /// How players fetch the URLs they play.
     http: reqwest::Client,
+    events: events::Events,
 }
 
 #[derive(Debug, Default)]
@@ -316,6 +319,7 @@ impl Household {
             clock,
             state: Mutex::default(),
             http,
+            events: events::Events::default(),
         });
         let clock_listener =
             std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the clock");
@@ -434,6 +438,14 @@ impl Household {
                 "/MediaRenderer/GroupRenderingControl/Control",
                 post(control),
             )
+            .route(
+                "/MediaRenderer/AVTransport/Event",
+                axum::routing::any(events::subscribe),
+            )
+            .route(
+                "/ZoneGroupTopology/Event",
+                axum::routing::any(events::subscribe),
+            )
             .with_state(Served {
                 shared: Arc::clone(&self.shared),
                 uuid: uuid.clone(),
@@ -460,11 +472,14 @@ impl Household {
         );
         let group = state.player(coordinator).group.clone();
         state.regroup(&member.0, &group);
+        drop(state);
+        self.changed();
     }
 
     /// Takes `member` (with the speakers bonded to it) out of its Group into one of its own.
     pub fn leave(&self, member: &PlayerId) {
         self.shared.lock().regroup(&member.0, &member.0);
+        self.changed();
     }
 
     /// `coordinator`'s Group starts playing `track` from its start.
@@ -477,6 +492,8 @@ impl Household {
             offset: Duration::ZERO,
             since: Some(now),
         };
+        drop(state);
+        self.changed();
     }
 
     /// `coordinator`'s Group pauses where it is.
@@ -486,6 +503,7 @@ impl Household {
             transport.since = None;
             transport.state = "PAUSED_PLAYBACK";
         });
+        self.changed();
     }
 
     /// `coordinator`'s Group stops; its track stays loaded, back at its start.
@@ -495,6 +513,8 @@ impl Household {
         transport.offset = Duration::ZERO;
         transport.since = None;
         transport.state = "STOPPED";
+        drop(state);
+        self.changed();
     }
 
     /// Each URL `coordinator` is given from now on (`SetAVTransportURI`) is `length` long, as
@@ -534,6 +554,34 @@ impl Household {
                     .unwrap_or_else(|| other.uuid.clone());
             }
         }
+        drop(state);
+        self.changed();
+    }
+
+    fn changed(&self) {
+        self.runtime()
+            .spawn(events::publish(Arc::clone(&self.shared)));
+    }
+
+    /// GENA leases normally use real time, like a Bridge without the test-clock hook.
+    /// Set the same manual clock as a Bridge following that hook, before subscribing.
+    pub fn set_event_clock(&self, clock: Arc<dyn Clock>) {
+        self.shared.events.lock().clock = clock;
+    }
+
+    /// Whether new and renewed subscriptions fail (existing leases keep delivering).
+    pub fn reject_subscriptions(&self, reject: bool) {
+        self.shared.events.lock().reject = reject;
+    }
+
+    /// Successful GENA renewals received by the household.
+    pub fn renewals(&self) -> usize {
+        self.shared.events.lock().renewals
+    }
+
+    /// Sends current GENA snapshots again. Used to exercise delayed and duplicate hints.
+    pub fn notify(&self) {
+        self.changed();
     }
 
     /// Every SOAP action the household was called with, in order, as `Service#Action`, such as
@@ -1164,6 +1212,9 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         _ => return invalid_action(),
     };
     drop(state);
+    if matches!(action, "SetAVTransportURI" | "Play" | "Pause" | "Seek") {
+        tokio::spawn(events::publish(Arc::clone(&served.shared)));
+    }
     let mut body = String::new();
     for (name, value) in arguments {
         body.push_str(&format!("<{name}>{}</{name}>", escape(&value)));

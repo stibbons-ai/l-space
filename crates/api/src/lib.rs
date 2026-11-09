@@ -495,11 +495,10 @@ pub enum ApiError {
     #[error("item_not_playable")]
     ItemNotPlayable,
     /// The Group has no active Handoff to control, or plays something other than its
-    /// Handoff's stream (switched in the Sonos app, for example: what is a Takeover once
-    /// detected, #20, so the Handoff isn't ended yet). No control was sent to the Group and no
-    /// Progress written; a Handoff it still has goes on, except after a forward skip that
-    /// needed the Item's length: if the Library Server rejected the starter's key there, or it
-    /// now acts for another user, the key was revoked, which ended the Handoff (see [`skip_group`]).
+    /// Handoff's stream (for example, before a Takeover event has been reconciled).
+    /// No control was sent and this control wrote no Progress. Takeover reconciliation ends
+    /// the Handoff independently. A forward skip that needed the Item's length can also
+    /// have revoked its starter's key, ending the Handoff (see [`skip_group`]).
     #[error("no_handoff")]
     NoHandoff,
     /// A forward skip was refused because neither the Group nor the Library Server knows the
