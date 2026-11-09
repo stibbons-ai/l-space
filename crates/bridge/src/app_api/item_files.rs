@@ -1,23 +1,73 @@
-//! Where a Handoff's audio files lie in its whole Item (`domain::Files`): what a Group plays
-//! of a Handoff, read as a position in the whole Item, and where in which file a position in
-//! the whole Item is, to send the Group there.
+//! A Handoff's audio files: which of an Item's files a Handoff plays ([`playable_files`]),
+//! and where they lie in the whole Item (`domain::Files`): what a Group plays of a Handoff,
+//! read as a position in the whole Item, and where in which file a position in the whole
+//! Item is, to send the Group there.
 
 use std::time::Duration;
 
+use api::{ApiError, ItemId};
 use domain::FilePosition;
 use store::{HandoffFile, StreamId};
 
+use super::known_length;
 use crate::stream;
+
+/// The files a Handoff of Item `id` (from `library_server`) plays, from the Item's audio
+/// files `tracks` in playing order: each named, in a format a Group plays
+/// ([`sonos::media_type`]), with its length when the Library Server knows it.
+/// [`ApiError::ItemNotPlayable`] (logged) for an Item without an audio file, with one in
+/// another format or unnamed, or with more than one and any of unknown length: the Bridge
+/// can't place a position in the whole Item without them (lead's decision D4).
+pub(super) fn playable_files(
+    library_server: &str,
+    id: &ItemId,
+    tracks: Vec<abs::Track>,
+) -> Result<Vec<HandoffFile>, ApiError> {
+    let not_playable = |reason: &str| {
+        tracing::info!(
+            library_server,
+            library_item = id.library_item,
+            episode = id.episode,
+            reason,
+            "an Item can't be played on a Group"
+        );
+        ApiError::ItemNotPlayable
+    };
+    if tracks.is_empty() {
+        return Err(not_playable("it has no audio file"));
+    }
+    let several = tracks.len() > 1;
+    tracks
+        .into_iter()
+        .map(|track| {
+            let name = track
+                .metadata
+                .map(|metadata| metadata.filename)
+                .filter(|name| sonos::media_type(name).is_some())
+                .ok_or_else(|| {
+                    not_playable("an audio file in a format Sonos doesn't play, or unnamed")
+                })?;
+            let duration = known_length(track.duration)
+                .and_then(|length| Duration::try_from_secs_f64(length).ok());
+            if several && duration.is_none() {
+                return Err(not_playable("one of its audio files has no known length"));
+            }
+            Ok(HandoffFile {
+                ino: track.ino,
+                name,
+                duration,
+            })
+        })
+        .collect()
+}
 
 /// A Handoff's stream, and where its files lie in its whole Item.
 #[derive(Debug, Clone)]
 pub(super) struct ItemFiles {
     stream: StreamId,
-    /// How many files the Handoff has.
-    count: usize,
-    /// Where they lie; none unless every file's length is known. Only a Handoff stored before
-    /// Handoffs held their files' lengths lacks one: it has a single file, which starts at 0,
-    /// its length what the Group tells.
+    /// Where they lie; none unless every file's length is known, which only a Handoff of a
+    /// single file lacks ([`playable_files`]; also one stored before Handoffs held their
+    /// files' lengths): that file starts at 0, its length what the Group tells.
     layout: Option<domain::Files>,
 }
 
@@ -27,16 +77,21 @@ impl ItemFiles {
         let lengths: Option<Vec<Duration>> = files.iter().map(|file| file.duration).collect();
         Self {
             stream,
-            count: files.len(),
             layout: lengths.and_then(domain::Files::new),
         }
+    }
+
+    /// The Handoff's stream.
+    pub(super) fn stream(&self) -> &StreamId {
+        &self.stream
     }
 
     /// The file (0-based) of the Handoff that `playback` plays, if it plays one: its URL is
     /// one of the Handoff's stream's.
     pub(super) fn playing(&self, playback: &sonos::Playback) -> Option<usize> {
         let named = stream::stream_in_url(playback.uri.as_deref()?)?;
-        (named.stream == self.stream && named.file < self.count).then_some(named.file)
+        let count = self.layout.as_ref().map_or(1, domain::Files::count);
+        (named.stream == self.stream && named.file < count).then_some(named.file)
     }
 
     /// Whether `playback` plays one of the Handoff's files.
@@ -46,29 +101,22 @@ impl ItemFiles {
 
     /// `playback` read in the whole Item when it plays one of the Handoff's files: its
     /// position is the file's start plus the position in the file, its length the Item's, from
-    /// its files' lengths (as the Group tells it for a Handoff of one file of unknown length).
-    /// Anything else as it is.
+    /// its files' lengths (as the Group tells them for a Handoff of one file of unknown
+    /// length). Anything else as it is.
     pub(super) fn whole(&self, mut playback: sonos::Playback) -> sonos::Playback {
-        let Some(file) = self.playing(&playback) else {
+        let (Some(file), Some(layout)) = (self.playing(&playback), &self.layout) else {
             return playback;
         };
-        match &self.layout {
-            Some(layout) => {
-                playback.position = playback
-                    .position
-                    .and_then(|within| layout.position(FilePosition { file, within }));
-                playback.duration = Some(layout.length());
-            }
-            // The first file starts at 0: the Group's figures are the Item's.
-            None if file == 0 => {}
-            None => playback.position = None,
-        }
+        playback.position = playback
+            .position
+            .and_then(|within| layout.position(FilePosition { file, within }));
+        playback.duration = Some(layout.length());
         playback
     }
 
-    /// Where a Group that plays `playback` (as read, not [`ItemFiles::whole`]) goes for
-    /// `target` in the whole Item: the file to go to, none when it is the one it plays, and
-    /// how far into that file.
+    /// Where a Group that plays `playback` (read as is or [`ItemFiles::whole`]: only which
+    /// file it plays counts) goes for `target` in the whole Item: the file to go to, none when
+    /// it is the one it plays, and how far into that file.
     pub(super) fn seek(
         &self,
         playback: &sonos::Playback,

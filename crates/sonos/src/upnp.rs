@@ -276,6 +276,14 @@ fn track_seek(track: usize) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// `arguments` (name, owned value) as [`soap::call_with`] takes them.
+fn borrowed<'a>(arguments: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    let arguments = arguments.iter();
+    arguments
+        .map(|(name, value)| (*name, value.as_str()))
+        .collect()
+}
+
 /// Searches for players now and then every [`REFRESH`], forever.
 async fn discover(shared: Arc<Shared>, target: SocketAddr) {
     loop {
@@ -513,12 +521,7 @@ impl Shared {
             &[("CurrentURI", &queue), ("CurrentURIMetaData", "")],
         )
         .await?;
-        let select = track_seek(first);
-        let select: Vec<(&str, &str)> = select
-            .iter()
-            .map(|(name, value)| (*name, value.as_str()))
-            .collect();
-        call("Seek", &select).await?;
+        call("Seek", &borrowed(&track_seek(first))).await?;
         call("Play", &[("Speed", "1")]).await?;
         Ok(urls)
     }
@@ -568,10 +571,7 @@ impl Shared {
         let at = (group, coordinator);
         let what = "control the Group";
         for (service, action, arguments) in control.before().into_iter().chain([control.call()]) {
-            let arguments: Vec<(&str, &str)> = arguments
-                .iter()
-                .map(|(name, value)| (*name, value.as_str()))
-                .collect();
+            let arguments = borrowed(&arguments);
             self.call_coordinator(at, (service, action), &arguments, deadline, what)
                 .await?;
         }

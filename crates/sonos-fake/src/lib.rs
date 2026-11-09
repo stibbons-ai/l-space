@@ -68,6 +68,9 @@ use tokio::runtime::Runtime;
 /// The `Range` a player asks for when it starts a URL: everything, from the start.
 const FETCH_RANGE: &str = "bytes=0-";
 
+/// How a URL that names a queue (`x-rincon-queue:<coordinator UUID>#0`) starts.
+const QUEUE: &str = "x-rincon-queue:";
+
 /// How long `GET /clock?after=…` waits at most, in real time, for the clock to move.
 pub const CLOCK_POLL: Duration = Duration::from_secs(10);
 
@@ -128,6 +131,16 @@ impl FakeTrack {
     pub fn by(mut self, creator: &str) -> Self {
         self.creator = Some(creator.to_owned());
         self
+    }
+
+    /// A URL a Group was given, without metadata, `duration` long if the test set a length.
+    fn given(uri: String, duration: Option<Duration>) -> Self {
+        Self {
+            title: None,
+            creator: None,
+            uri,
+            duration,
+        }
     }
 }
 
@@ -897,12 +910,8 @@ impl HouseholdState {
                 let uri = input(request, "EnqueuedURI").ok_or(402u16)?;
                 let place = player.queue.len();
                 let duration = player.queue_lengths.get(place).copied();
-                player.queue.push(FakeTrack {
-                    title: None,
-                    creator: None,
-                    uri,
-                    duration: duration.or(player.url_length),
-                });
+                let length = duration.or(player.url_length);
+                player.queue.push(FakeTrack::given(uri, length));
                 let length = player.queue.len().to_string();
                 return Ok(vec![
                     ("FirstTrackNumberEnqueued", length.clone()),
@@ -913,17 +922,12 @@ impl HouseholdState {
             }
             "SetAVTransportURI" => {
                 let uri = input(request, "CurrentURI").ok_or(402u16)?;
-                *transport = match uri.strip_prefix("x-rincon-queue:") {
+                *transport = match uri.strip_prefix(QUEUE) {
                     Some(queue) if queue == format!("{}#0", served.uuid) => {
                         Transport::loaded(player.queue.clone())
                     }
                     Some(_) => return Err(714),
-                    None => Transport::loaded(vec![FakeTrack {
-                        title: None,
-                        creator: None,
-                        uri,
-                        duration: player.url_length,
-                    }]),
+                    None => Transport::loaded(vec![FakeTrack::given(uri, player.url_length)]),
                 };
             }
             "Play" => {
@@ -1157,7 +1161,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             .push((served.uuid.clone(), format!("{service}#{action}")));
         let given = match action {
             "SetAVTransportURI" => {
-                input(&request, "CurrentURI").filter(|uri| !uri.starts_with("x-rincon-queue:"))
+                input(&request, "CurrentURI").filter(|uri| !uri.starts_with(QUEUE))
             }
             "AddURIToQueue" => input(&request, "EnqueuedURI"),
             _ => None,

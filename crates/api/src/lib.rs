@@ -425,18 +425,6 @@ pub enum Skip {
     NextChapter,
 }
 
-impl Skip {
-    /// The seconds it moves by: negative back, positive forward; none for a chapter skip,
-    /// which moves by the Item's chapters.
-    pub fn seconds(self) -> Option<i32> {
-        match self {
-            Self::Back15 => Some(-15),
-            Self::Forward30 => Some(30),
-            Self::PreviousChapter | Self::NextChapter => None,
-        }
-    }
-}
-
 /// An error code the App translates for the user.
 ///
 /// On the wire this is the `data` member of the error body, for example

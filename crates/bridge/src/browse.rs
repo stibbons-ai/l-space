@@ -2,6 +2,7 @@
 //! into the App API's types for the session's user.
 
 use std::cmp::Reverse;
+use std::time::Duration;
 
 use api::{
     AudioFile, Chapter, Episode, EpisodeFilter, HomeEntry, Item, ItemId, Library, LibraryEntry,
@@ -273,14 +274,16 @@ pub fn item_duration(library_item: &abs::LibraryItem, id: &ItemId) -> Option<f64
     }
 }
 
-/// Where each chapter of Item `id` in `library_item` starts, in seconds into the whole Item,
-/// in the order the Library Server keeps them; none for an episode, an audiobook without
-/// chapters, or when `library_item` holds no such Item.
-pub fn chapter_starts(library_item: &abs::LibraryItem, id: &ItemId) -> Vec<f64> {
+/// Where each chapter of Item `id` in `library_item` starts in the whole Item, in the order
+/// the Library Server keeps them; none for an episode, an audiobook without chapters, or when
+/// `library_item` holds no such Item. A start that is no time (negative, say) is left out.
+pub fn chapter_starts(library_item: &abs::LibraryItem, id: &ItemId) -> Vec<Duration> {
     match (&library_item.media, &id.episode) {
         (abs::Media::Book(book), None) if is_audiobook(book) => {
             let chapters = book.chapters.entries.iter();
-            chapters.map(|chapter| chapter.start).collect()
+            chapters
+                .filter_map(|chapter| Duration::try_from_secs_f64(chapter.start).ok())
+                .collect()
         }
         _ => Vec::new(),
     }

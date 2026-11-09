@@ -266,7 +266,6 @@ impl<S: Store> Supervisors<S> {
             turns: Arc::clone(&self.turns),
             clock: Arc::clone(&self.clock),
             handoff: handoff.clone(),
-            stream,
             files: ItemFiles::of(stream, &handoff.files),
             known: Arc::clone(&known),
         };
@@ -407,8 +406,7 @@ struct Supervisor<S> {
     clock: Arc<dyn Clock>,
     /// The supervised Handoff, as it started.
     handoff: Handoff,
-    stream: StreamId,
-    /// Its files, where they lie in the whole Item.
+    /// Its stream and files, where they lie in the whole Item.
     files: ItemFiles,
     known: Arc<Mutex<Known>>,
 }
@@ -831,7 +829,7 @@ impl<S: Store> Supervisor<S> {
     /// failed (logged). Breaks once the Handoff is gone: ended, or another on the Group.
     async fn active(&self) -> ControlFlow<(), Option<GroupHandoff>> {
         match self.controls.store.group_handoff(&self.handoff.group).await {
-            Ok(Some(found)) if found.stream == self.stream => Continue(Some(found)),
+            Ok(Some(found)) if found.stream == *self.files.stream() => Continue(Some(found)),
             Ok(_) => Break(()),
             Err(error) => {
                 self.storage_failed("look up a supervised Group's Handoff", &error);

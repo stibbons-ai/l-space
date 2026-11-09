@@ -148,7 +148,7 @@ async fn serve<S: Store>(
     let Some((index, name)) = numbered(&segment) else {
         return not_found();
     };
-    let (library_server, store::ActiveHandoff { handoff, api_key }) =
+    let (library_server, store::ActiveHandoff { handoff, api_key }, served) =
         match app.active_handoff(&StreamToken::new(id), index, name).await {
             Ok(Some(active)) => active,
             Ok(None) => return not_found(),
@@ -157,9 +157,6 @@ async fn serve<S: Store>(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-    let Some(served) = handoff.files.get(index) else {
-        return not_found();
-    };
     let Some(content_type) = sonos::media_type(&served.name) else {
         tracing::warn!(
             group = handoff.group,
