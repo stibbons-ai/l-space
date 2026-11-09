@@ -337,6 +337,40 @@ async fn a_resume_from_outside_the_app_has_the_next_tick_write() {
 }
 
 #[tokio::test]
+async fn a_household_hint_cannot_consume_an_externally_resumed_cadence_write() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    setup.pause().await;
+    setup.advance_and_settle(30).await;
+    let sonos_app = sonos::Upnp::start(setup.household.ssdp(), Arc::new(clock::SystemClock));
+    sonos_app.resume(setup.kitchen.uuid()).await.unwrap();
+    setup.household.set_fault(
+        &setup.kitchen,
+        Fault::SlowPosition(Duration::from_millis(300)),
+    );
+    let reads = setup.asked(READ_POSITION);
+    setup.advance(30).await;
+    eventually("resumed cadence never read position", WITHIN, async || {
+        setup.asked(READ_POSITION) > reads
+    })
+    .await;
+    // Deliver a household hint while the unchecked cadence read is still in flight.
+    setup.household.play(
+        &setup.office,
+        FakeTrack::new("External", Duration::from_secs(3600)),
+    );
+    setup
+        .wait_for_progress(&setup.alice, &episode, (60.0, false))
+        .await;
+    assert_eq!(setup.handoffs().await, 1);
+}
+
+#[tokio::test]
 async fn a_skip_while_a_cadence_write_is_on_its_way_goes_after_it() {
     let (proxy, setup) = setup_with_proxy().await;
     let episode = setup.episode(0);
@@ -1503,6 +1537,8 @@ async fn takeover_membership_change_ends_only_the_affected_group() {
     setup
         .wait_for_progress(&setup.bob, &setup.episode(1), (30.0, false))
         .await;
+    // The final read must beat the cached/persisted cadence position.
+    setup.advance(7).await;
     setup.household.join(&third, &setup.kitchen);
     eventually(
         "affected Handoffs stayed active after regrouping",
@@ -1515,13 +1551,13 @@ async fn takeover_membership_change_ends_only_the_affected_group() {
     .await;
     assert_eq!(
         setup.progress(&setup.alice, &setup.episode(0)).await,
-        Some((30.0, false))
+        Some((37.0, false))
     );
     assert_eq!(
         setup.progress(&setup.bob, &setup.episode(1)).await,
         Some((30.0, false))
     );
-    setup.advance(30).await;
+    setup.advance(23).await;
     setup
         .wait_for_progress(&setup.bob, &setup.episode(1), (60.0, false))
         .await;
@@ -1543,6 +1579,13 @@ async fn takeover_coordinator_disappearance_ends_both_affected_handoffs() {
     setup
         .wait_for_progress(&setup.bob, &setup.episode(1), (30.0, false))
         .await;
+    setup
+        .set_progress(&setup.alice, &setup.episode(0), 11.0, false)
+        .await;
+    setup
+        .set_progress(&setup.bob, &setup.episode(1), 12.0, false)
+        .await;
+    setup.advance(7).await;
     setup.household.join(&setup.kitchen, &setup.office);
     setup.wait_until_no_handoff().await;
     assert_eq!(
@@ -1551,7 +1594,7 @@ async fn takeover_coordinator_disappearance_ends_both_affected_handoffs() {
     );
     assert_eq!(
         setup.progress(&setup.bob, &setup.episode(1)).await,
-        Some((30.0, false))
+        Some((37.0, false))
     );
 }
 
@@ -1622,12 +1665,31 @@ async fn takeover_after_renewal_preserves_own_controls_and_replacement() {
 async fn takeover_subscription_failure_recovers_and_never_counts_as_a_source_change() {
     let setup = setup().await;
     setup.start(&setup.alices, &setup.episode(0), None).await;
+    eventually("no transport lease", WITHIN, async || {
+        setup
+            .household
+            .transport_subscription(&setup.kitchen)
+            .is_some()
+    })
+    .await;
+    let (sid, seq) = setup
+        .household
+        .transport_subscription(&setup.kitchen)
+        .unwrap();
     setup.household.reject_subscriptions(true);
     setup.advance(31).await;
     setup
         .wait_for_progress(&setup.alice, &setup.episode(0), (31.0, false))
         .await;
     assert_eq!(setup.handoffs().await, 1);
+    // A refused renewal (503, not invalid SID) must not revoke the unexpired callback lease.
+    let response = reqwest::Client::new()
+        .request(reqwest::Method::from_bytes(b"NOTIFY").unwrap(), format!("{}/sonos/events", setup.bridge.url()))
+        .header("NT", "upnp:event").header("NTS", "upnp:propchange")
+        .header("SID", sid).header("SEQ", seq.wrapping_sub(1).to_string())
+        .body(r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><ZoneGroupState>hint</ZoneGroupState></e:property></e:propertyset>"#)
+        .send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     setup.household.reject_subscriptions(false);
     setup.advance(6).await;
     setup.household.play(
@@ -1737,7 +1799,7 @@ async fn takeover_failed_state_read_retries_without_ending_on_the_failure() {
     setup.settle().await;
     assert_eq!(setup.handoffs().await, 1);
     setup.household.set_fault(&setup.kitchen, Fault::None);
-    // Retry shares the next normal cadence; no independent one-second polling.
+    // Retry shares the next normal cadence; the failure itself preserved the Handoff.
     setup.advance(30).await;
     setup.wait_until_no_handoff().await;
     assert_eq!(
@@ -1796,6 +1858,9 @@ async fn takeover_of_a_stopped_stream_retains_its_last_reliable_position() {
     setup.household.stop(&setup.kitchen);
     setup.advance_and_settle(30).await;
     assert_eq!(setup.handoffs().await, 1);
+    setup
+        .set_progress(&setup.alice, &episode, 11.0, false)
+        .await;
     setup.household.join(&setup.office, &setup.kitchen);
     setup.wait_until_no_handoff().await;
     assert_eq!(
@@ -1813,6 +1878,9 @@ async fn takeover_topology_read_failure_keeps_the_handoff_and_recovers() {
     setup
         .wait_for_progress(&setup.alice, &episode, (30.0, false))
         .await;
+    setup
+        .set_progress(&setup.alice, &episode, 11.0, false)
+        .await;
     let reads = setup
         .household
         .asked(&setup.kitchen, "ZoneGroupTopology#GetZoneGroupState");
@@ -1826,15 +1894,27 @@ async fn takeover_topology_read_failure_keeps_the_handoff_and_recovers() {
             > reads
     })
     .await;
+    // Complete a turn-taking request while topology still fails; the failure is expected.
+    let authorization = format!("Bearer {}", setup.bobs.token.expose());
+    let response = setup
+        .bridge
+        .api()
+        .post(
+            "/api/groups/volume",
+            Some(&authorization),
+            serde_json::json!({"group": setup.kitchen.uuid(), "volume": 20}),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_GATEWAY);
     assert_eq!(setup.handoffs().await, 1);
-    setup.household.leave(&setup.office);
     setup.household.set_fault(&setup.kitchen, Fault::None);
     setup.household.set_fault(&setup.office, Fault::None);
     setup.advance(30).await;
-    setup
-        .wait_for_progress(&setup.alice, &episode, (60.0, false))
-        .await;
-    assert_eq!(setup.handoffs().await, 1);
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((60.0, false))
+    );
 }
 
 #[tokio::test]
@@ -1902,9 +1982,52 @@ async fn takeover_cadence_detects_a_lost_notification_even_while_transitioning()
 }
 
 #[tokio::test]
+async fn takeover_cadence_detects_membership_and_coordinator_changes_without_notifications() {
+    for coordinator in [false, true] {
+        let setup = setup().await;
+        let episode = setup.episode(0);
+        setup.start(&setup.alices, &episode, None).await;
+        setup.advance(30).await;
+        setup
+            .wait_for_progress(&setup.alice, &episode, (30.0, false))
+            .await;
+        assert_eq!(setup.handoffs().await, 1);
+        setup
+            .set_progress(&setup.alice, &episode, 11.0, false)
+            .await;
+        setup.household.drop_notifications(true);
+        if coordinator {
+            setup.household.join(&setup.kitchen, &setup.office);
+        } else {
+            setup.household.join(&setup.office, &setup.kitchen);
+        }
+        setup.advance(30).await;
+        setup.wait_until_no_handoff().await;
+        let expected = if coordinator { 30.0 } else { 60.0 };
+        assert_eq!(
+            setup.progress(&setup.alice, &episode).await,
+            Some((expected, false))
+        );
+    }
+}
+
+#[tokio::test]
 async fn takeover_preserves_a_due_finished_update_after_a_failed_write() {
     let (proxy, setup) = setup_with_proxy().await;
     setup.ended_with_finished_failing(&proxy, 1).await;
+    let mut cleared = FakeTrack::new("Cleared queue", Duration::from_secs(3600));
+    cleared.uri.clear();
+    setup.household.play(&setup.kitchen, cleared);
+    setup.advance_and_settle(30).await;
+    assert_eq!(
+        setup.handoffs().await,
+        1,
+        "empty URI is not Takeover evidence"
+    );
+    assert_ne!(
+        setup.progress(&setup.alice, &setup.episode(0)).await,
+        Some((EPISODE_DURATIONS[0], true))
+    );
     setup.household.play(
         &setup.kitchen,
         FakeTrack::new("External", Duration::from_secs(3600)),
@@ -1944,17 +2067,23 @@ async fn takeover_callback_boundary_rejects_bad_input_and_preserves_replacement(
     let setup = setup().await;
     setup.start(&setup.alices, &setup.episode(0), None).await;
     eventually("no GENA lease", WITHIN, async || {
-        !setup.household.subscriptions().is_empty()
+        setup
+            .household
+            .transport_subscription(&setup.kitchen)
+            .is_some()
     })
     .await;
-    let (sid, seq) = setup.household.subscriptions().pop().unwrap();
+    let (sid, seq) = setup
+        .household
+        .transport_subscription(&setup.kitchen)
+        .unwrap();
     let old_uri = setup.household.uri(&setup.kitchen).unwrap();
     setup.start(&setup.bobs, &setup.episode(1), None).await;
     let replacement = setup.bridge.api().handoffs(&setup.bobs).await;
     let url = format!("{}/sonos/events", setup.bridge.url());
     let client = reqwest::Client::new();
     let body = format!(
-        r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><ZoneGroupState>{old_uri}</ZoneGroupState></e:property></e:propertyset>"#
+        r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><LastChange>&lt;Event&gt;&lt;InstanceID val="0"&gt;&lt;CurrentTrackURI val="{old_uri}"/&gt;&lt;/InstanceID&gt;&lt;/Event&gt;</LastChange></e:property></e:propertyset>"#
     );
     let notify = |sid: &str, seq: &str, body: String| {
         client
@@ -2012,6 +2141,8 @@ async fn takeover_callback_boundary_rejects_bad_input_and_preserves_replacement(
     );
     // A delayed pre-replacement value is only a hint. Current state is still the replacement.
     let forward = seq.wrapping_add(100);
+    setup.settle().await;
+    let reads = setup.asked(READ);
     for sequence in [forward, forward, forward - 1] {
         assert_eq!(
             notify(&sid, &sequence.to_string(), body.clone())
@@ -2022,6 +2153,14 @@ async fn takeover_callback_boundary_rejects_bad_input_and_preserves_replacement(
             StatusCode::OK
         );
     }
+    eventually(
+        "delayed LastChange was not reconciled",
+        WITHIN,
+        async || setup.asked(READ) > reads,
+    )
+    .await;
+    setup.settle().await;
+    assert_eq!(setup.bridge.api().handoffs(&setup.bobs).await, replacement);
     setup.advance_and_settle(30).await;
     assert_eq!(setup.bridge.api().handoffs(&setup.bobs).await, replacement);
     setup

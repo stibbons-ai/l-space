@@ -1098,17 +1098,16 @@ const CONTROL_TURN_TIME: Duration = Duration::from_secs(3);
 /// storage), within the App's 15.
 const CONTROL_LIBRARY_SERVER_TIME: Duration = Duration::from_secs(7);
 
-/// How long a start may take in all, about (plus local storage): resolving the Item, waiting
-/// for its turn on the Group, then, when it may seek and had to wait or saw a turn end while
-/// resolving, [`START_PROGRESS_TIME`] to read the user's Progress again, then, when it
-/// replaces a Handoff, that Handoff's Progress write, with only what is left beyond the
-/// Group's calls (at most [`REPLACED_PROGRESS_TIME`]), then [`sonos::PLAY_TIMEOUT`] for the
-/// Group to play and, starting past 0, [`sonos::CONTROL_TIMEOUT`] for it to seek. Its turn
-/// waits only for what the others leave: at most 14 − 4 = 10 seconds less resolving for a
-/// start `from_start`, 14 − 2 − 4 − 4 = 4 for any other (which keeps the seek's time even
-/// without Progress, as the read may find some); a start left after its turn with less than
-/// it needs for that read (when it reads again) and the Group's calls sends nothing. One
-/// second under the App's 15.
+/// How long a start may take in all, about (plus local storage): resolving the Item,
+/// capturing topology (up to [`sonos::CONTROL_TIMEOUT`]) before waiting for its turn,
+/// then, when it may seek and had to wait or saw a turn end while resolving,
+/// [`START_PROGRESS_TIME`] to read Progress again. Replacement Progress gets only the
+/// remaining time beyond the Group's calls (at most [`REPLACED_PROGRESS_TIME`]).
+/// Playing takes [`sonos::PLAY_TIMEOUT`], seeking [`sonos::CONTROL_TIMEOUT`].
+/// Turn wait is the remaining 14 seconds less elapsed resolution/topology and reserved
+/// calls: 4 seconds for a start `from_start`, or 2 + 4 + 4 seconds otherwise (reserving a
+/// seek even without Progress). Insufficient remaining time sends nothing to the Group.
+/// One second under the App's 15.
 const START_TIME: Duration = Duration::from_secs(14);
 
 /// The most a start gives the Progress write of the Handoff it replaces: reading where the
@@ -1119,8 +1118,8 @@ const REPLACED_PROGRESS_TIME: Duration = Duration::from_secs(4);
 
 /// How long a start may take to read the user's Progress again after its turn: one `/api/me`
 /// the Library Server already answered while resolving, so 2 seconds are ample, and still
-/// leave such a start at most 4 seconds of [`START_TIME`], less resolving, to wait for its
-/// turn.
+/// leave at most 4 seconds of [`START_TIME`], less resolution and topology capture, to
+/// wait for its turn.
 const START_PROGRESS_TIME: Duration = Duration::from_secs(2);
 
 /// What a start that fails before the Group is told anything leaves undone, as logged.
@@ -1292,15 +1291,17 @@ impl<S: Store> Controls<S> {
     /// requests to the Library Server [`CONTROL_LIBRARY_SERVER_TIME`]; a write that fails or
     /// runs out of time is logged and otherwise left alone, as the Group already did what was
     /// asked, except that a key the Library Server rejects is revoked, which ends the Handoff.
-    async fn control(&self, group: &str, control: Control) -> Result<(Playback, bool), ApiError> {
+    async fn control(
+        &self,
+        group: &str,
+        control: Control,
+    ) -> Result<(Playback, Option<Duration>), ApiError> {
         let mut group_time = Budget(sonos::CONTROL_TIMEOUT);
         let mut library_time = Budget(CONTROL_LIBRARY_SERVER_TIME);
         let playback = self.playback(group, &mut group_time).await?;
         // A resume reports the pre-action position. Stopped zero is not a reliable sighting.
-        let reliable = matches!(
-            playback.state,
-            sonos::TransportState::Playing | sonos::TransportState::Paused
-        ) || matches!(control, Control::Skip(_));
+        let reliable = supervise::reliable_position(&playback).is_some()
+            || matches!(control, Control::Skip(_));
         let controlled = async {
             let found = self.playing_handoff(group, &playback).await?;
             let duration = told_length(&playback);
@@ -1369,7 +1370,19 @@ impl<S: Store> Controls<S> {
             }
         }
         .await;
-        controlled.map(|playback| (playback, reliable))
+        controlled.map(|playback| {
+            let position = playback
+                .position
+                .filter(|_| reliable)
+                .filter(|_| {
+                    matches!(
+                        playback.state,
+                        TransportState::Playing | TransportState::Paused
+                    )
+                })
+                .and_then(|position| Duration::try_from_secs_f64(position).ok());
+            (playback, position)
+        })
     }
 
     /// Has Group `group` skip as `skip` says, kept within the Item; the Group plays `found`'s

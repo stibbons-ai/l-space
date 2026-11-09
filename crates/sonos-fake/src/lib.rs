@@ -594,6 +594,11 @@ impl Household {
         self.shared.events.subscriptions()
     }
 
+    /// AVTransport callback lease for a player, for realistic LastChange protocol tests.
+    pub fn transport_subscription(&self, player: &PlayerId) -> Option<(String, u32)> {
+        self.shared.events.transport_subscription(player.uuid())
+    }
+
     /// Every SOAP action the household was called with, in order, as `Service#Action`, such as
     /// `ZoneGroupTopology#GetZoneGroupState`.
     pub fn actions(&self) -> Vec<String> {
