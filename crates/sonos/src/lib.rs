@@ -70,15 +70,25 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
 
     /// Starts event subscriptions using the Bridge's existing listener. Changes are hints:
     /// consumers must read current state before acting, including on initial snapshots.
+    /// The first call fixes `listen` and `clock`; later calls only subscribe to hints.
     fn events(
         &self,
         listen: SocketAddr,
         clock: std::sync::Arc<dyn clock::Clock>,
     ) -> tokio::sync::watch::Receiver<u64>;
 
-    /// Accepts a bounded GENA property set for a current subscription, in sequence order.
-    /// Returns false for unknown subscriptions, stale sequences or malformed input.
-    fn notify(&self, sid: &str, seq: u32, body: &str) -> bool;
+    /// Accepts a bounded GENA property set. Live duplicate/backward sequences are
+    /// acknowledged without applying them; unknown/expired subscriptions fail preconditions.
+    fn notify(&self, sid: &str, seq: u32, body: &str) -> Notification;
+}
+
+/// Result of validating an incoming GENA notification. Contains no subscription identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Notification {
+    Accepted,
+    Ignored,
+    Malformed,
+    UnknownSubscription,
 }
 
 /// A stream the Bridge serves over plain HTTP, for a Group to play. Its path is a capability,

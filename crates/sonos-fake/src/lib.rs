@@ -584,6 +584,16 @@ impl Household {
         self.changed();
     }
 
+    /// Drops NOTIFY deliveries without affecting subscription and renewal responses.
+    pub fn drop_notifications(&self, drop: bool) {
+        self.shared.events.lock().drop_notifications = drop;
+    }
+
+    /// Current public callback lease identities and next sequences, for HTTP protocol tests.
+    pub fn subscriptions(&self) -> Vec<(String, u32)> {
+        self.shared.events.subscriptions()
+    }
+
     /// Every SOAP action the household was called with, in order, as `Service#Action`, such as
     /// `ZoneGroupTopology#GetZoneGroupState`.
     pub fn actions(&self) -> Vec<String> {

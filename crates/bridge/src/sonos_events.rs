@@ -35,9 +35,9 @@ async fn notify(
     ) else {
         return StatusCode::BAD_REQUEST;
     };
-    if sonos.notify(sid, seq, &body) {
-        StatusCode::OK
-    } else {
-        StatusCode::PRECONDITION_FAILED
+    match sonos.notify(sid, seq, &body) {
+        sonos::Notification::Accepted | sonos::Notification::Ignored => StatusCode::OK,
+        sonos::Notification::Malformed => StatusCode::BAD_REQUEST,
+        sonos::Notification::UnknownSubscription => StatusCode::PRECONDITION_FAILED,
     }
 }

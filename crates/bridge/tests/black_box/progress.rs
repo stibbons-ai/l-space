@@ -1468,14 +1468,13 @@ async fn takeover_source_writes_only_old_stream_progress_and_revokes_its_url() {
         reqwest::StatusCode::NOT_FOUND
     );
     let upnp = sonos::Upnp::start(setup.household.ssdp(), Arc::new(clock::SystemClock));
-    assert_eq!(
-        upnp.playback(setup.kitchen.uuid())
-            .await
-            .unwrap()
-            .uri
-            .as_deref(),
-        Some(other.uri.as_str())
-    );
+    let external = upnp.playback(setup.kitchen.uuid()).await.unwrap();
+    assert_eq!(external.uri.as_deref(), Some(other.uri.as_str()));
+    assert_eq!(external.state, sonos::TransportState::Playing);
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.bob, &other_item, (37.0, false))
+        .await;
     let group = setup
         .bridge
         .api()
@@ -1488,7 +1487,7 @@ async fn takeover_source_writes_only_old_stream_progress_and_revokes_its_url() {
 }
 
 #[tokio::test]
-async fn takeover_regrouping_ends_both_affected_groups_but_not_an_unrelated_group() {
+async fn takeover_membership_change_ends_only_the_affected_group() {
     let setup = setup().await;
     let third = setup.household.add_player("Bedroom");
     setup.start(&setup.alices, &setup.episode(0), None).await;
@@ -1522,6 +1521,10 @@ async fn takeover_regrouping_ends_both_affected_groups_but_not_an_unrelated_grou
         setup.progress(&setup.bob, &setup.episode(1)).await,
         Some((30.0, false))
     );
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.bob, &setup.episode(1), (60.0, false))
+        .await;
 }
 
 #[tokio::test]
@@ -1553,36 +1556,65 @@ async fn takeover_coordinator_disappearance_ends_both_affected_handoffs() {
 }
 
 #[tokio::test]
-async fn takeover_after_renewal_ignores_bridge_controls_replacement_and_snapshots() {
+async fn takeover_after_renewal_preserves_own_controls_and_replacement() {
     let setup = setup().await;
-    setup.start(&setup.alices, &setup.episode(0), None).await;
-    setup.pause().await;
-    setup.resume().await;
-    setup
-        .bridge
-        .api()
-        .skip_group(&setup.bobs, setup.kitchen.uuid(), Skip::Forward30)
-        .await;
-    setup.settle().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    let original = setup.bridge.api().handoffs(&setup.bobs).await;
+    for action in 0..4 {
+        match action {
+            0 => setup.pause().await,
+            1 => setup.resume().await,
+            2 => {
+                setup
+                    .bridge
+                    .api()
+                    .skip_group(&setup.bobs, setup.kitchen.uuid(), Skip::Forward30)
+                    .await;
+            }
+            _ => {
+                setup
+                    .bridge
+                    .api()
+                    .set_group_volume(&setup.bobs, setup.kitchen.uuid(), 45)
+                    .await;
+            }
+        }
+        setup.household.notify();
+        // A cadence visit is a meaningful current-state reconciliation even if URI snapshots
+        // are deduplicated. Volume has no RenderingControl subscription.
+        setup.advance_and_settle(30).await;
+        assert_eq!(setup.bridge.api().handoffs(&setup.bobs).await, original);
+        let expected = match action {
+            0 => 0.0,
+            1 => 30.0,
+            2 => 90.0,
+            _ => 120.0,
+        };
+        setup
+            .wait_for_progress(&setup.alice, &episode, (expected, false))
+            .await;
+    }
+    assert!(setup.household.renewals() >= 12);
     setup.start(&setup.bobs, &setup.episode(1), None).await;
+    let replacement = setup.bridge.api().handoffs(&setup.bobs).await;
     setup.household.notify();
-    setup.advance(31).await;
-    eventually("GENA subscriptions did not renew", WITHIN, async || {
-        setup.household.renewals() >= 4
-    })
-    .await;
-    setup
-        .wait_for_progress(&setup.bob, &setup.episode(1), (31.0, false))
-        .await;
-    assert_eq!(setup.handoffs().await, 1);
+    setup.advance_and_settle(30).await;
+    assert_eq!(setup.bridge.api().handoffs(&setup.bobs).await, replacement);
+    // At 150 seconds the original 60-second leases have expired. This end needs delivery
+    // through a renewed lease: the next cadence remains 30 seconds away.
     setup.household.play(
         &setup.kitchen,
         FakeTrack::new("External", Duration::from_secs(3600)),
     );
     setup.wait_until_no_handoff().await;
     assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((120.0, false))
+    );
+    assert_eq!(
         setup.progress(&setup.bob, &setup.episode(1)).await,
-        Some((31.0, false))
+        Some((30.0, false))
     );
 }
 
@@ -1705,7 +1737,8 @@ async fn takeover_failed_state_read_retries_without_ending_on_the_failure() {
     setup.settle().await;
     assert_eq!(setup.handoffs().await, 1);
     setup.household.set_fault(&setup.kitchen, Fault::None);
-    setup.advance(1).await;
+    // Retry shares the next normal cadence; no independent one-second polling.
+    setup.advance(30).await;
     setup.wait_until_no_handoff().await;
     assert_eq!(
         setup.progress(&setup.alice, &episode).await,
@@ -1769,6 +1802,246 @@ async fn takeover_of_a_stopped_stream_retains_its_last_reliable_position() {
         setup.progress(&setup.alice, &episode).await,
         Some((30.0, false))
     );
+}
+
+#[tokio::test]
+async fn takeover_topology_read_failure_keeps_the_handoff_and_recovers() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    let reads = setup
+        .household
+        .asked(&setup.kitchen, "ZoneGroupTopology#GetZoneGroupState");
+    setup.household.set_fault(&setup.kitchen, Fault::Garbage);
+    setup.household.set_fault(&setup.office, Fault::Garbage);
+    setup.household.join(&setup.office, &setup.kitchen);
+    eventually("no topology reconciliation", WITHIN, async || {
+        setup
+            .household
+            .asked(&setup.kitchen, "ZoneGroupTopology#GetZoneGroupState")
+            > reads
+    })
+    .await;
+    assert_eq!(setup.handoffs().await, 1);
+    setup.household.leave(&setup.office);
+    setup.household.set_fault(&setup.kitchen, Fault::None);
+    setup.household.set_fault(&setup.office, Fault::None);
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (60.0, false))
+        .await;
+    assert_eq!(setup.handoffs().await, 1);
+}
+
+#[tokio::test]
+async fn takeover_slow_valid_identity_keeps_the_final_write_and_does_not_hold_controls() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    setup
+        .set_progress(&setup.alice, &episode, 11.0, false)
+        .await;
+    let before = proxy.identity_requests();
+    proxy.delay_next_identity(Duration::from_millis(1400));
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("External", Duration::from_secs(3600)),
+    );
+    eventually("Takeover never checked identity", WITHIN, async || {
+        proxy.identity_requests() > before
+    })
+    .await;
+    let began = Instant::now();
+    setup
+        .bridge
+        .api()
+        .set_group_volume(&setup.bobs, setup.kitchen.uuid(), 42)
+        .await;
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "identity check held the Group turn"
+    );
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
+}
+
+#[tokio::test]
+async fn takeover_cadence_detects_a_lost_notification_even_while_transitioning() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    setup.household.drop_notifications(true);
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("External", Duration::from_secs(3600)),
+    );
+    setup
+        .household
+        .set_transport_state(&setup.kitchen, "TRANSITIONING");
+    setup.advance(30).await;
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
+}
+
+#[tokio::test]
+async fn takeover_preserves_a_due_finished_update_after_a_failed_write() {
+    let (proxy, setup) = setup_with_proxy().await;
+    setup.ended_with_finished_failing(&proxy, 1).await;
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("External", Duration::from_secs(3600)),
+    );
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &setup.episode(0)).await,
+        Some((EPISODE_DURATIONS[0], true))
+    );
+}
+
+#[tokio::test]
+async fn takeover_after_stopped_resume_retains_the_last_reliable_position() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    setup.household.stop(&setup.kitchen);
+    setup.resume().await;
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("External", Duration::from_secs(3600)),
+    );
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
+}
+
+#[tokio::test]
+async fn takeover_callback_boundary_rejects_bad_input_and_preserves_replacement() {
+    use reqwest::{Method, StatusCode};
+    let setup = setup().await;
+    setup.start(&setup.alices, &setup.episode(0), None).await;
+    eventually("no GENA lease", WITHIN, async || {
+        !setup.household.subscriptions().is_empty()
+    })
+    .await;
+    let (sid, seq) = setup.household.subscriptions().pop().unwrap();
+    let old_uri = setup.household.uri(&setup.kitchen).unwrap();
+    setup.start(&setup.bobs, &setup.episode(1), None).await;
+    let replacement = setup.bridge.api().handoffs(&setup.bobs).await;
+    let url = format!("{}/sonos/events", setup.bridge.url());
+    let client = reqwest::Client::new();
+    let body = format!(
+        r#"<e:propertyset xmlns:e="urn:schemas-upnp-org:event-1-0"><e:property><ZoneGroupState>{old_uri}</ZoneGroupState></e:property></e:propertyset>"#
+    );
+    let notify = |sid: &str, seq: &str, body: String| {
+        client
+            .request(Method::from_bytes(b"NOTIFY").unwrap(), &url)
+            .header("NT", "upnp:event")
+            .header("NTS", "upnp:propchange")
+            .header("SID", sid)
+            .header("SEQ", seq)
+            .body(body)
+    };
+    assert_eq!(
+        client.get(&url).send().await.unwrap().status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert_eq!(
+        client
+            .request(Method::from_bytes(b"NOTIFY").unwrap(), &url)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        notify(&sid, "invalid", body.clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        notify(&sid, &seq.to_string(), "<broken>".to_owned())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        notify(&sid, &seq.to_string(), "x".repeat(sonos::MAX_BODY + 1))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        notify("uuid:retired", "0", body.clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::PRECONDITION_FAILED
+    );
+    // A delayed pre-replacement value is only a hint. Current state is still the replacement.
+    let forward = seq.wrapping_add(100);
+    for sequence in [forward, forward, forward - 1] {
+        assert_eq!(
+            notify(&sid, &sequence.to_string(), body.clone())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    setup.advance_and_settle(30).await;
+    assert_eq!(setup.bridge.api().handoffs(&setup.bobs).await, replacement);
+    setup
+        .wait_for_progress(&setup.bob, &setup.episode(1), (30.0, false))
+        .await;
+    setup.household.reject_subscriptions(true);
+    setup.advance(61).await;
+    eventually("expired SID still accepted", WITHIN, async || {
+        notify(&sid, &forward.to_string(), body.clone())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            == StatusCode::PRECONDITION_FAILED
+    })
+    .await;
+    assert_eq!(setup.bridge.api().handoffs(&setup.bobs).await, replacement);
+    setup
+        .wait_for_progress(&setup.bob, &setup.episode(1), (91.0, false))
+        .await;
 }
 
 /// Asserts that Bob's start, which replaced Alice's Handoff at 110 seconds after taking

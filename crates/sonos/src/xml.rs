@@ -10,7 +10,7 @@ use roxmltree::{Document, Node, ParsingOptions};
 use crate::{RAW, TransportState, ssdp};
 
 /// More than a household of dozens of players needs.
-pub(crate) const MAX_NODES: u32 = 100_000;
+const MAX_NODES: u32 = 100_000;
 
 /// Dublin Core, which DIDL-Lite uses for an item's title and creator.
 const DC: &str = "http://purl.org/dc/elements/1.1/";
@@ -29,7 +29,7 @@ pub enum Malformed {
     Missing(&'static str),
 }
 
-fn parse(text: &str) -> Result<Document<'_>, Malformed> {
+pub(crate) fn parse(text: &str) -> Result<Document<'_>, Malformed> {
     let options = ParsingOptions {
         nodes_limit: MAX_NODES,
         ..ParsingOptions::default()
