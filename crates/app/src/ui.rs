@@ -9,7 +9,7 @@ use api::{
 };
 use dioxus::prelude::*;
 
-use crate::flow::{App, Notice, Screen, volume_step};
+use crate::flow::{App, Notice, Screen, offers_chapters, volume_step};
 use crate::i18n::{self, LanguageChoice, Text};
 use crate::storage::FileStore;
 
@@ -710,10 +710,7 @@ fn GroupControls(app: Signal<App>, busy: Signal<bool>, group: Group) -> Element 
     } else {
         (Control::Resume, Text::GroupResume)
     };
-    let audiobook = group
-        .handoff
-        .as_ref()
-        .is_some_and(|handoff| handoff.item.episode.is_none());
+    let chapters = offers_chapters(&group);
     let id = group.id.clone();
     let control = move |action: Control| {
         let id = id.clone();
@@ -750,7 +747,7 @@ fn GroupControls(app: Signal<App>, busy: Signal<bool>, group: Group) -> Element 
                     onclick: control(Control::Skip(Skip::Forward30)),
                     {text(Text::GroupForward30)}
                 }
-                if audiobook {
+                if chapters {
                     button {
                         r#type: "button",
                         class: "secondary",

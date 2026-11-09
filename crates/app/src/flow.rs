@@ -1109,6 +1109,13 @@ pub fn volume_step(volume: u8, louder: bool) -> u8 {
     }
 }
 
+/// Whether the Groups screen offers previous and next chapter on `group`: for a Handoff of an
+/// audiobook (an Item without an episode).
+pub fn offers_chapters(group: &Group) -> bool {
+    let handoff = group.handoff.as_ref();
+    handoff.is_some_and(|handoff| handoff.item.episode.is_none())
+}
+
 /// Shows `playback`, a control's answer, on `group`'s row: its state and position, and the
 /// length if the answer tells one.
 fn show_playback(group: &mut Group, playback: Playback) {
