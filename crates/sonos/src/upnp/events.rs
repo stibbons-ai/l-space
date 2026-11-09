@@ -17,13 +17,22 @@ const SERVICES: [&str; 2] = [
 ];
 const RETRY: Duration = Duration::from_secs(5);
 
-#[derive(Debug)]
 struct Subscription {
     sid: String,
     sequence: Option<u32>,
     expires: Option<Instant>,
     value: Option<String>,
     renew: Option<Instant>,
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscription")
+            .field("sequence", &self.sequence)
+            .field("expires", &self.expires)
+            .field("renew", &self.renew)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -189,17 +198,7 @@ pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn 
                         None => None,
                     }
                 };
-                let host = if listen.ip().is_unspecified() {
-                    match route_to(addr.ip()) {
-                        Ok(host) => host,
-                        Err(_) => {
-                            tracing::warn!(%addr, "cannot route a Sonos event callback");
-                            continue;
-                        }
-                    }
-                } else {
-                    listen.ip()
-                };
+                // Renewal uses only the SID; callback routing is needed for a new lease.
                 let mut request = shared
                     .http
                     .request(
@@ -210,6 +209,17 @@ pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn 
                 if let Some(sid) = &sid {
                     request = request.header("SID", sid);
                 } else {
+                    let host = if listen.ip().is_unspecified() {
+                        match route_to(addr.ip()) {
+                            Ok(host) => host,
+                            Err(_) => {
+                                tracing::warn!(%addr, "cannot route a Sonos event callback");
+                                continue;
+                            }
+                        }
+                    } else {
+                        listen.ip()
+                    };
                     request = request.header("NT", "upnp:event").header(
                         "CALLBACK",
                         format!(
@@ -220,9 +230,13 @@ pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn 
                 }
                 // Count connection/response time against the granted lifetime too.
                 let began = clock.now();
+                let mut invalid_sid = false;
+                let mut diagnosed = false;
                 let granted = match request.send().await {
                     Ok(answer) if answer.status().is_success() => grant(answer.headers()),
                     Ok(answer) => {
+                        invalid_sid = answer.status() == reqwest::StatusCode::PRECONDITION_FAILED;
+                        diagnosed = true;
                         tracing::warn!(
                             status = answer.status().as_u16(),
                             service = path,
@@ -231,6 +245,7 @@ pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn 
                         Err("HTTP status")
                     }
                     Err(error) => {
+                        diagnosed = true;
                         let kind = if error.is_timeout() {
                             "timeout"
                         } else if error.is_connect() {
@@ -274,18 +289,27 @@ pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn 
                         shared.events.wake();
                     }
                 } else {
-                    tracing::warn!(
-                        reason = granted.unwrap_err(),
-                        service = path,
-                        "Sonos event subscription failed; retrying"
-                    );
-                    // A refused SID must not be renewed forever: establish a new subscription.
-                    shared
+                    if !diagnosed {
+                        tracing::warn!(
+                            reason = granted.unwrap_err(),
+                            service = path,
+                            "invalid Sonos subscription grant; retrying"
+                        );
+                    }
+                    // Only a publisher's invalid-SID response revokes a still-valid lease.
+                    // Transient failures keep accepting callbacks and retry at RETRY.
+                    let mut subscriptions = shared
                         .events
                         .subscriptions
                         .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&(addr, path));
+                        .unwrap_or_else(PoisonError::into_inner);
+                    if invalid_sid
+                        || subscriptions.get(&(addr, path)).is_some_and(|lease| {
+                            lease.expires.is_some_and(|expiry| expiry <= clock.now())
+                        })
+                    {
+                        subscriptions.remove(&(addr, path));
+                    }
                 }
             }
         }
@@ -315,6 +339,22 @@ mod tests {
             },
         );
         events
+    }
+
+    #[test]
+    fn subscription_debug_redacts_the_sid_and_stream_capability() {
+        let events = subscribed(Instant::now(), None);
+        events
+            .subscriptions
+            .lock()
+            .unwrap()
+            .values_mut()
+            .next()
+            .unwrap()
+            .value = Some("http://bridge/stream/secret-capability/file.mp3".to_owned());
+        let rendered = format!("{events:?}");
+        assert!(!rendered.contains("uuid:current"));
+        assert!(!rendered.contains("secret-capability"));
     }
 
     #[test]

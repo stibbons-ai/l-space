@@ -61,6 +61,14 @@ impl Events {
             .map(|(sid, lease)| (sid.clone(), lease.seq))
             .collect()
     }
+
+    pub(super) fn transport_subscription(&self, player: &str) -> Option<(String, u32)> {
+        self.lock()
+            .leases
+            .iter()
+            .find(|(_, lease)| lease.player == player && !lease.topology)
+            .map(|(sid, lease)| (sid.clone(), lease.seq))
+    }
 }
 
 pub(super) async fn subscribe(

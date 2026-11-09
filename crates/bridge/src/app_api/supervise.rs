@@ -39,11 +39,12 @@
 //!
 //! The Finished write at the end is tried at most [`FINISH_TRIES`] times, again at the next
 //! cadence tick after one that didn't land (failed, unconfirmed, or the key's user not known),
-//! and each time only while the Group is still found stopped on the Handoff's stream, not
-//! seen playing there since: found playing or paused there again, the Handoff goes on as
-//! before, without it (and so on something else, logged). After the last failure the Handoff
-//! ends all the same (logged as an error, the Finished lost). A key revoked meanwhile ends it
-//! same rule. A control that leaves the Group playing drops what is left of the end at once,
+//! and each ordinary retry only while the Group is still found stopped on the Handoff's
+//! stream, not seen playing there since: found playing or paused there again, the Handoff
+//! goes on without it. A settled empty URI preserves the pending Finished without retrying
+//! its write; positive Takeover evidence makes one final attempt before ending. After the
+//! last ordinary failure the Handoff ends all the same (logged as an error, Finished lost).
+//! A revoked key ends it too. A control that leaves the Group playing drops the ending,
 //! under the Group's turn ([`Supervisors::seen`]), and a visit acts only on what is left of it
 //! once it holds the turn. A start replacing a Handoff whose Finished write is still pending
 //! makes that write itself; one replacing a Handoff whose Group stopped on its stream since
@@ -348,7 +349,7 @@ impl<S: Store> Supervisors<S> {
     /// the Group from now on, until a visit reads it again; playing, it drops what was left of
     /// the end of the Item at once (logged), so neither a visit waiting for the turn nor a
     /// start replacing the Handoff acts on it.
-    pub(super) fn seen(&self, group: &str, playback: &Playback, reliable: bool) {
+    pub(super) fn seen(&self, group: &str, playback: &Playback, position: Option<Duration>) {
         // The resulting state still schedules cadence writes after resume. Only the
         // reliable old-stream cache below rejects a pre-resume stopped position.
         let playing = playback
@@ -362,17 +363,7 @@ impl<S: Store> Supervisors<S> {
             };
             let mut known = lock(&running.known);
             known.last = seen;
-            if let Some(position) = playback
-                .position
-                .filter(|_| {
-                    reliable
-                        && matches!(
-                            playback.state,
-                            TransportState::Playing | TransportState::Paused
-                        )
-                })
-                .and_then(|position| Duration::try_from_secs_f64(position).ok())
-            {
+            if let Some(position) = position {
                 known.position = position;
             }
             if playback.state == TransportState::Playing {
@@ -405,7 +396,7 @@ impl<S: Store> Supervisors<S> {
 
 /// Stopped transports may report zero on hardware (unverified). Conservatively retain the
 /// earlier playing/paused observation instead.
-fn reliable_position(playback: &sonos::Playback) -> Option<Duration> {
+pub(super) fn reliable_position(playback: &sonos::Playback) -> Option<Duration> {
     playback.position.filter(|_| {
         matches!(
             playback.state,
@@ -479,7 +470,7 @@ enum Then {
     /// asking nor writing. Nor if a control paused the Group in between: that visit, not
     /// seeing it playing when it began, neither asks nor writes.
     Write,
-    /// A current read found a foreign source: reconcile topology and end at once.
+    /// A foreign source schedules current-state reconciliation; it may keep or end the Handoff.
     Reconcile,
 }
 
@@ -512,8 +503,9 @@ impl<S: Store> Supervisor<S> {
         let mut tick = started + CADENCE;
         let mut not_before = started;
         let mut then = Then::Wait;
-        let mut event_due: Option<Instant> = None;
-        let mut reconcile = false;
+        // Reconcile once after start: hints may have arrived since membership was captured.
+        let mut event_due: Option<Instant> = Some(started);
+        let mut reconcile = true;
         loop {
             let Known { ending, last, .. } = *self.known();
             // The next read for the end of the Item, when that is all there is to do: also for
@@ -551,10 +543,15 @@ impl<S: Store> Supervisor<S> {
                 () = self.clock.sleep_until(wake) => {}
             }
             let now = self.clock.now();
-            if reconcile {
+            let reading_end_by = |at: Instant| self.end_due(&last, at) == Some(at);
+            if reconcile || now >= tick {
                 // A failed hint is retried on the existing cadence/end-read schedule,
                 // instead of starting an independent one-second polling loop.
-                let cadence = now >= tick && end.is_none_or(|due| due > now);
+                let cadence = if then == Then::Write {
+                    !reading_end_by(now)
+                } else {
+                    now >= tick && !end.is_some_and(|_| reading_end_by(tick.max(last.at)))
+                };
                 if event_due.is_none() || scheduled <= now {
                     while tick <= now {
                         tick += CADENCE;
@@ -574,8 +571,6 @@ impl<S: Store> Supervisor<S> {
                 }
                 continue;
             }
-            // Whether the reads near the end began by `at`, for the Group as last seen.
-            let reading_end_by = |at: Instant| self.end_due(&last, at) == Some(at);
             // A tick among the reads near the end is one of them, as is a revisit for a write
             // once they began: it neither asks whom the key acts for nor writes, so those reads
             // stay about a second apart. Judged at the tick, not at this visit's time, which
@@ -621,6 +616,32 @@ impl<S: Store> Supervisor<S> {
         }
     }
 
+    /// Revalidate the exact stream and read playback after every turn acquisition, including
+    /// after an out-of-turn identity check. A replacement stops this supervisor in active().
+    async fn takeover_read(
+        &self,
+    ) -> ControlFlow<(), Option<(super::Turn, GroupHandoff, Instant, Option<sonos::Playback>)>>
+    {
+        let group = &self.handoff.group;
+        let turn = self.turns.of(group);
+        let Ok(held) = turn
+            .take(group, CONTROL_TURN_TIME, "a Takeover check not made")
+            .await
+        else {
+            return Continue(None);
+        };
+        let Some(found) = self.active().await? else {
+            return Continue(None);
+        };
+        let at = self.clock.now();
+        let playback = self
+            .controls
+            .playback(group, &mut Budget(GROUP_TIME))
+            .await
+            .ok();
+        Continue(Some((held, found, at, playback)))
+    }
+
     /// Reads topology before the turn, then reconciles current playback under the turn.
     /// Notification payloads never identify which Handoff ends; stale snapshots are harmless.
     async fn event(&self, cadence: bool) -> ControlFlow<(), (bool, Then)> {
@@ -649,8 +670,9 @@ impl<S: Store> Supervisor<S> {
         let Some(before) = self.active().await? else {
             return Continue((true, Then::Wait));
         };
-        let needs_check =
-            cadence || regrouped || matches!(self.known().ending, Some(Ending::Finish { .. }));
+        let needs_check = (cadence && self.known().last.playing.is_some())
+            || regrouped
+            || matches!(self.known().ending, Some(Ending::Finish { .. }));
         let mut checked = if needs_check {
             Some(
                 self.controls
@@ -664,23 +686,10 @@ impl<S: Store> Supervisor<S> {
         if matches!(checked, Some(Acting::Revoked)) {
             return Break(());
         }
-        let turn = self.turns.of(group);
-        let Ok(_turn) = turn
-            .take(group, CONTROL_TURN_TIME, "a Takeover check not made")
-            .await
-        else {
+        let Some((turn, mut found, mut at, mut playback)) = self.takeover_read().await? else {
             return Continue((true, Then::Wait));
         };
-        let Some(mut found) = self.active().await? else {
-            return Continue((true, Then::Wait));
-        };
-        let mut held = Some(_turn);
-        let mut at = self.clock.now();
-        let mut playback = self
-            .controls
-            .playback(group, &mut Budget(GROUP_TIME))
-            .await
-            .ok();
+        let mut held = Some(turn);
         let mut changed_source = playback.as_ref().is_some_and(|playback| {
             playback.uri.is_some() && !plays_stream(playback, &self.stream)
         });
@@ -697,23 +706,14 @@ impl<S: Store> Supervisor<S> {
             if matches!(checked, Some(Acting::Revoked)) {
                 return Break(());
             }
-            let Ok(turn) = turn
-                .take(group, CONTROL_TURN_TIME, "a Takeover check not made")
-                .await
+            let Some((turn, current, current_at, current_playback)) = self.takeover_read().await?
             else {
                 return Continue((true, Then::Wait));
             };
             held = Some(turn);
-            let Some(current) = self.active().await? else {
-                return Continue((true, Then::Wait));
-            };
             found = current;
-            at = self.clock.now();
-            playback = self
-                .controls
-                .playback(group, &mut Budget(GROUP_TIME))
-                .await
-                .ok();
+            at = current_at;
+            playback = current_playback;
             changed_source = playback.as_ref().is_some_and(|playback| {
                 playback.uri.is_some() && !plays_stream(playback, &self.stream)
             });
@@ -723,7 +723,8 @@ impl<S: Store> Supervisor<S> {
                 return Continue((true, Then::Wait));
             };
             if !plays_stream(&playback, &self.stream) {
-                return Continue((true, Then::Wait));
+                self.empty_source(at, cadence);
+                return Continue((false, Then::Wait));
             }
             return self
                 .observed(&found, &playback, at, cadence, checked)
@@ -747,7 +748,16 @@ impl<S: Store> Supervisor<S> {
                 Some(Ending::Store) => unreachable!(),
             };
             if let Some(acting) = checked {
-                self.write(&found, acting, update, "Takeover").await;
+                match self.write(&found, acting, update, "Takeover").await {
+                    Wrote::Revoked => return Break(()),
+                    Wrote::Not if matches!(ending, Some(Ending::Finish { .. })) => {
+                        tracing::error!(
+                            group,
+                            "Finished at the end of a Handoff's Item was never written: lost on Takeover"
+                        );
+                    }
+                    Wrote::Written | Wrote::Not => {}
+                }
             }
         }
         let _held = held;
@@ -788,12 +798,11 @@ impl<S: Store> Supervisor<S> {
     /// having played to the end of the Item ([`played_to_end`]), gets Progress at the end
     /// written Finished, and the Handoff ends; on a visit that didn't check the key first,
     /// that write is left pending for the next visit, which comes at once ([`Then::Finish`]).
-    /// One still stopped there, not seen playing since, gets what is left of that done, as it
-    /// is once the visit holds the turn. A Group paused, stopped elsewhere, or playing
-    /// something else gets nothing written; what was left of the end is dropped once it is
-    /// seen playing or paused on the Handoff's stream, or on something else, and kept while it
-    /// is between states. Updates what was last seen of the Group, unless the visit learned
-    /// nothing; breaks once the Handoff ended.
+    /// One still stopped there, not seen playing since, gets what is left of that done.
+    /// A foreign URI schedules reconciliation without applying the event payload. A settled
+    /// empty URI clears the sighting but preserves a known Finished for a later Takeover or
+    /// return to the old stream; neither missing URI nor discovery alone proves Takeover.
+    /// Updates sightings on successful reads; breaks once the Handoff ended.
     async fn visit(&self, cadence: bool) -> ControlFlow<(), Then> {
         let group = self.handoff.group.as_str();
         let Known { ending, last, .. } = *self.known();
@@ -845,9 +854,18 @@ impl<S: Store> Supervisor<S> {
                 );
                 return Continue(Then::Reconcile);
             }
+            self.empty_source(at, cadence);
             return Continue(Then::Wait);
         }
         self.observed(&found, &playback, at, cadence, checked).await
+    }
+
+    /// No source is positive evidence of neither playback nor Takeover. Preserve an already
+    /// known Finished, but stop scheduling writes from an obsolete playing sighting.
+    fn empty_source(&self, at: Instant, cadence: bool) {
+        let due = cadence && self.known().last.playing.is_some();
+        self.saw(at, None);
+        self.skipped(due, "the Group tells no source");
     }
 
     /// Applies a successful old-stream read while the caller still holds the Group's turn.

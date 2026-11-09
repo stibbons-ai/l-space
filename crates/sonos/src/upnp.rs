@@ -174,13 +174,10 @@ impl Drop for Upnp {
 impl Sonos for Upnp {
     fn topology(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>> {
         Box::pin(async {
-            let (players, topology) = self
+            let (_, topology) = self
                 .shared
                 .topology_by(tokio::time::Instant::now() + CONTROL_TIMEOUT)
                 .await?;
-            if players.is_empty() {
-                return Err(Error::SearchFailed);
-            }
             Ok(topology.iter().filter_map(visible).collect())
         })
     }
@@ -1412,7 +1409,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_discovery_lapse_is_unknown_topology_even_after_an_event_wake() {
+    async fn a_discovery_lapse_has_no_authoritative_topology_and_recovers() {
         let (household, clock) = Household::with_manual_clock();
         household.add_player("Kitchen");
         let upnp = Upnp {
@@ -1428,7 +1425,7 @@ mod tests {
             .changed
             .send_modify(|version| *version += 1);
         hints.changed().await.unwrap();
-        assert_eq!(Sonos::topology(&upnp).await, Err(Error::SearchFailed));
+        assert_eq!(Sonos::topology(&upnp).await, Ok(Vec::new()));
         // Discovery recovers: current topology is available again.
         upnp.shared
             .saw(Ok(ssdp::search(household.ssdp()).await.unwrap()));
