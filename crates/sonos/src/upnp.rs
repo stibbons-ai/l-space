@@ -267,8 +267,8 @@ impl Control {
     /// The call that must come right before [`Control::call`], if any: a fresh
     /// `SnapshotGroupVolume` before a volume is set (`SetGroupVolume` changes the members'
     /// volumes in proportion to the last snapshot, which may predate a member's volume changed
-    /// on its own), and selecting the track before a seek into another one (`REL_TIME` seeks
-    /// only within the current track).
+    /// on its own), and selecting the given track before a time seek, even for the current
+    /// track (`REL_TIME` seeks only within the selected track).
     fn before(self) -> Option<Call> {
         match self {
             Self::SetVolume(_) => Some((
@@ -867,7 +867,9 @@ fn track(answer: &[(String, String)]) -> Option<Track> {
     let (title, creator) =
         xml::title_and_creator(argument(answer, "TrackMetaData").unwrap_or_default());
     Some(Track {
-        uri: argument(answer, "TrackURI").map(str::to_owned),
+        uri: argument(answer, "TrackURI")
+            .map(str::trim)
+            .map(str::to_owned),
         title,
         creator,
         position: argument(answer, "RelTime").and_then(xml::duration),
@@ -1397,6 +1399,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn public_play_allows_the_extra_queue_batch_time() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let shared = knowing(&household, &clock).await;
+        let discovery = tokio::spawn(std::future::pending::<()>()).abort_handle();
+        let upnp = Upnp {
+            shared: Arc::new(shared),
+            discovery,
+        };
+        // Six transport calls at 720 ms need >4 seconds but fit the 17-file allowance.
+        household.set_fault(&kitchen, Fault::SlowTransport(Duration::from_millis(720)));
+        let book: Vec<_> = (0..17)
+            .map(|n| named("0.0.0.0:9", &format!("{n}.mp3")))
+            .collect();
+        upnp.play(kitchen.uuid(), &book, 16).await.unwrap();
+        assert_eq!(household.track_number(&kitchen), Some(17));
+        assert_eq!(household.transport_state(&kitchen), "PLAYING");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_track_seek_to_a_closed_port_cannot_have_moved() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let office = household.add_player("Office");
+        household.join(&office, &kitchen);
+        let shared = knowing(&household, &clock).await;
+        // Office still tells the topology; Kitchen's known coordinator address is closed.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = closed.local_addr().unwrap();
+        shared.known().players.get_mut(kitchen.uuid()).unwrap().addr = addr;
+        drop(closed);
+        assert_eq!(
+            shared
+                .control(
+                    kitchen.uuid(),
+                    Control::Seek {
+                        track: Some(0),
+                        position: Duration::from_secs(5)
+                    },
+                    soon(CONTROL_TIMEOUT)
+                )
+                .await,
+            Err(Error::GroupFailed)
+        );
+        assert_eq!(household.asked(&kitchen, "AVTransport#Seek"), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn sixteen_urls_load_in_one_batch() {
         let (household, clock) = Household::with_manual_clock();
         let kitchen = household.add_player("Kitchen");
@@ -1463,6 +1513,11 @@ mod tests {
             (Fault::RefuseControl, Some(0), Error::GroupFailed),
             (Fault::RefuseSeek, Some(0), Error::SeekMayHaveMoved),
             (Fault::HangControl, Some(0), Error::SeekMayHaveMoved),
+            (
+                Fault::BareTrackSeekFailure,
+                Some(0),
+                Error::SeekMayHaveMoved,
+            ),
             (Fault::RefuseSeek, None, Error::GroupFailed),
         ] {
             household.set_fault(&kitchen, fault);

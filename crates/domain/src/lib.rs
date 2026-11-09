@@ -94,7 +94,7 @@ impl Files {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chapters {
     /// Where each chapter starts, ascending, without duplicates; the first is always 0 and
-    /// none lies at or past the end.
+    /// none lies at or past the end, except 0 when the Item has zero length.
     starts: Vec<Duration>,
 }
 
@@ -132,6 +132,7 @@ impl Chapters {
     }
 
     /// The chapter whose start is at or immediately before `position`.
+    /// Playback adapters must round seek targets up (Bridge `ItemFiles::locate`), not add tolerance here.
     fn current(&self, position: Duration) -> usize {
         self.starts.partition_point(|start| *start <= position) - 1
     }
@@ -291,6 +292,8 @@ mod tests {
         assert_eq!(chapters.next(s(0)), Some(ms(123_400)));
         assert_eq!(chapters.next(ms(122_399)), Some(ms(123_400)));
         assert_eq!(chapters.next(ms(122_400)), Some(ms(123_400)));
+        assert_eq!(chapters.next(s(123)), Some(ms(123_400)));
+        assert_eq!(chapters.next(ms(123_399)), Some(ms(123_400)));
         assert_eq!(chapters.previous(s(123)), s(0));
     }
 

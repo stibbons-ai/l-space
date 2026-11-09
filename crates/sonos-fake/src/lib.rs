@@ -228,6 +228,8 @@ pub enum Fault {
     /// not available), changing nothing, and everything else correctly (a `Seek` by track
     /// too).
     RefuseSeek,
+    /// It answers a queue-track `Seek` with a bare HTTP 500, without confirming a refusal.
+    BareTrackSeekFailure,
     /// It accepts `Seek` by time (`REL_TIME`) and never answers it, changing nothing, and
     /// answers everything else correctly (a `Seek` by track too).
     HangSeek,
@@ -1243,6 +1245,9 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         {
             std::future::pending().await
         }
+        Some(Fault::BareTrackSeekFailure) if action == "Seek" && !seek_by_time => {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
         Some(Fault::RefuseSeek | Fault::RefuseSeekSlowPause(_)) if seek_by_time => {
             return upnp_fault(701);
         }
@@ -1268,6 +1273,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             | Fault::RefuseControl
             | Fault::HangControl
             | Fault::RefuseSeek
+            | Fault::BareTrackSeekFailure
             | Fault::HangSeek
             | Fault::RefuseSeekSlowPause(_)
             | Fault::FailGroupVolume

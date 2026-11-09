@@ -174,6 +174,30 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn a_connection_dropped_after_reading_the_request_may_have_sent_it() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let player = listener.local_addr().unwrap();
+        let received = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+        });
+        let client = Client::builder().no_proxy().build().unwrap();
+        let error = call_with(
+            &client,
+            player,
+            Service::AvTransport,
+            "Seek",
+            &[("Unit", "TRACK_NR"), ("Target", "1")],
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        received.await.unwrap();
+        assert!(matches!(error, CallError::Http(_)), "{error:?}");
+    }
+    #[tokio::test]
     async fn a_refused_connection_cannot_have_sent_a_control() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let player = listener.local_addr().unwrap();

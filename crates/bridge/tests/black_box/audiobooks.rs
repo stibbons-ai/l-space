@@ -571,7 +571,7 @@ async fn a_refused_file_selection_keeps_its_handoff_and_progress() {
 }
 
 #[tokio::test]
-async fn an_unreachable_group_keeps_its_handoff_and_progress() {
+async fn an_unreachable_playback_read_keeps_its_handoff_and_progress() {
     let setup = setup().await;
     setup.start(Some(3005.0)).await;
     let api = setup.bridge.api();
@@ -615,8 +615,10 @@ async fn a_start_waits_for_the_failed_file_seeks_pause() {
         .household
         .set_fault(&setup.kitchen, sonos_fake::Fault::None);
     let episode = setup.abs.seeded().episode(0);
+    let started = std::time::Instant::now();
     api.start_handoff_from_start(&setup.bobs, &episode, setup.kitchen.uuid())
         .await;
+    assert!(started.elapsed() >= Duration::from_millis(1700));
     assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
     assert_eq!(api.handoffs(&setup.bobs).await[0].item, episode);
 }

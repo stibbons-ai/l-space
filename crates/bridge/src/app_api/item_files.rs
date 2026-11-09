@@ -74,12 +74,19 @@ pub(super) struct ItemFiles {
     layout: Option<domain::Files>,
 }
 
-/// A recognized Handoff reading in whole-Item coordinates, never a stream capability.
+/// A recognized Handoff's state and whole-Item times, without the Group's stream URL.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct ItemPlayback {
     pub state: sonos::TransportState,
     pub position: Option<Duration>,
     pub duration: Option<Duration>,
+}
+
+/// File selection and in-file time sent to Sonos for a whole-Item seek.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct FileSeek {
+    pub track: Option<usize>,
+    pub within: Duration,
 }
 
 impl ItemFiles {
@@ -96,7 +103,18 @@ impl ItemFiles {
 
     /// The files of a Handoff read from storage.
     pub(super) fn stored(found: &store::GroupHandoff) -> Self {
-        Self::of(found.stream, &found.active.handoff.files)
+        let files = Self::of(found.stream, &found.active.handoff.files);
+        if files.count > 1 && files.layout.is_none() {
+            let handoff = &found.active.handoff;
+            tracing::warn!(
+                group = handoff.group,
+                user_id = handoff.started_by.user_id,
+                library_item = handoff.library_item,
+                episode = handoff.episode,
+                "a stored multi-file Handoff has incomplete file lengths"
+            );
+        }
+        files
     }
 
     /// The Handoff's stream.
@@ -108,15 +126,14 @@ impl ItemFiles {
     /// one of the Handoff's stream's.
     pub(super) fn playing(&self, playback: &sonos::Playback) -> Option<usize> {
         if self.count > 1 && self.layout.is_none() {
-            tracing::warn!("a stored multi-file Handoff has incomplete file lengths");
             return None;
         }
         let named = stream::stream_in_url(playback.uri.as_deref()?, self.legacy_name.as_deref())?;
         (named.stream == self.stream && named.file < self.count).then_some(named.file)
     }
 
-    /// A recognized reading converted once to whole-Item coordinates. A single file of
-    /// unknown length uses the Group's length; another stream is not an Item reading.
+    /// A recognized reading in whole-Item coordinates. A single file of unknown length
+    /// uses the Group's length; another stream is not an Item reading.
     pub(super) fn whole_if_plays(&self, playback: &sonos::Playback) -> Option<ItemPlayback> {
         let file = self.playing(playback)?;
         Some(ItemPlayback {
@@ -137,15 +154,18 @@ impl ItemFiles {
 
     /// Where a recognized Handoff goes for `target` in the whole Item. Always select a file
     /// in a multi-file Item: the Group may have advanced since it was read.
-    pub(super) fn seek(&self, target: Duration) -> (Option<usize>, Duration) {
+    pub(super) fn seek(&self, target: Duration) -> FileSeek {
         let to = self.locate(target);
-        let track = (self.count > 1).then_some(to.file);
-        (track, to.within)
+        FileSeek {
+            track: (self.count > 1).then_some(to.file),
+            within: to.within,
+        }
     }
 
     /// Where `position` in the whole Item lies among the files. Round within the file up to
     /// Sonos's whole-second resolution, advancing to the next file when rounding reaches a
     /// non-last file's end, and capping at the last file's length.
+    /// Rounding up keeps a chapter target at or past its exact `Chapters::current` boundary.
     pub(super) fn locate(&self, position: Duration) -> FilePosition {
         let mut at = match &self.layout {
             Some(layout) => layout.locate(position),
@@ -225,9 +245,27 @@ mod tests {
         let token = StreamToken::new("ab12".into());
         let book = [file("a", Some(s(2400))), file("b", Some(s(1800)))];
         let files = ItemFiles::of(token.hash(), &book);
-        assert_eq!(files.seek(s(2390)), (Some(0), s(2390)));
-        assert_eq!(files.seek(s(2420)), (Some(1), s(20)));
-        assert_eq!(files.seek(s(2400)), (Some(1), s(0)));
+        assert_eq!(
+            files.seek(s(2390)),
+            FileSeek {
+                track: Some(0),
+                within: s(2390)
+            }
+        );
+        assert_eq!(
+            files.seek(s(2420)),
+            FileSeek {
+                track: Some(1),
+                within: s(20)
+            }
+        );
+        assert_eq!(
+            files.seek(s(2400)),
+            FileSeek {
+                track: Some(1),
+                within: s(0)
+            }
+        );
     }
 
     #[test]
@@ -236,7 +274,13 @@ mod tests {
         let files = ItemFiles::of(token.hash(), &[file("a", None)]);
         let read = files.whole_if_plays(&playing(&token, 0, 90)).unwrap();
         assert_eq!((read.position, read.duration), (Some(s(90)), Some(s(1))));
-        assert_eq!(files.seek(s(120)), (None, s(120)));
+        assert_eq!(
+            files.seek(s(120)),
+            FileSeek {
+                track: None,
+                within: s(120)
+            }
+        );
     }
 
     #[test]
@@ -293,6 +337,25 @@ mod tests {
                 FilePosition {
                     file: 1,
                     within: s(last),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_fractional_last_file_caps_rounding_at_its_length() {
+        let token = StreamToken::new("ab12".into());
+        let length = Duration::from_millis(120_400);
+        let files = ItemFiles::of(
+            token.hash(),
+            &[file("a", Some(s(40))), file("b", Some(length))],
+        );
+        for target in [s(40) + length, s(999)] {
+            assert_eq!(
+                files.locate(target),
+                FilePosition {
+                    file: 1,
+                    within: length
                 }
             );
         }

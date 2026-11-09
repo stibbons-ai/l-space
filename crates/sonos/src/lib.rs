@@ -40,6 +40,7 @@ pub const MAX_VOLUME: u8 = 100;
 /// Every call on one Group acts on its coordinator as the topology read for that call names
 /// it: a Group the topology doesn't have is [`Error::UnknownGroup`]; a coordinator the
 /// searches didn't find, or that doesn't answer in time or refuses, is [`Error::GroupFailed`].
+/// Except as [`Sonos::seek`] says when file selection may have acted.
 pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// Every Group as the Sonos app shows it, by name. A household where a working search found
     /// no player has none.
@@ -136,6 +137,7 @@ pub enum Error {
     UnknownGroup,
     /// The Group's coordinator was not found by the last searches, didn't answer in time, or
     /// refused (a SOAP fault), or answered without what was asked for.
+    /// Except as [`Sonos::seek`] says when file selection may have acted.
     #[error("the Group's coordinator did not do what was asked")]
     GroupFailed,
     /// A seek selected its queue track before failing at REL_TIME, or the track selection

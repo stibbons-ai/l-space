@@ -11,7 +11,7 @@
 //! unsupervised.
 //!
 //! Positions are in the whole Item: a Group playing a later one of the Handoff's files is read
-//! at that file's start plus its position in it (`ItemFiles::whole`), so reaching the end of a
+//! at that file's start plus its position in it (`ItemFiles::whole_if_plays`), so reaching the end of a
 //! file that isn't the last is not the end of the Item. End-of-Item detection assumes a Group
 //! stops (`STOPPED`) on one of the Handoff's files at the end of the last, as `sonos-fake`
 //! models it. It never relies on the position, or the file, a stopped Group tells (real

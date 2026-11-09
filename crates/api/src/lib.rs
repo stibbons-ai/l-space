@@ -331,7 +331,7 @@ pub struct Group {
     /// Bridge's searches, didn't answer, or answered too late.
     pub state: Option<TransportState>,
     /// What the Group has loaded, if its coordinator said; none whenever `state` is none.
-    /// Position and duration describe the whole Item during a Handoff.
+    /// Position and duration describe the whole Item only while playing the Handoff's stream.
     pub now_playing: Option<NowPlaying>,
     /// The Group's volume, 0 to [`MAX_VOLUME`]; none if its coordinator didn't tell it in
     /// time, refused to, or told something that isn't such a number (and from a Bridge that
