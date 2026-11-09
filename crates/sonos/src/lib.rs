@@ -24,7 +24,9 @@ use futures::future::BoxFuture;
 pub use media::media_type;
 pub use soap::MAX_BODY;
 pub use ssdp::MULTICAST;
-pub use upnp::{CONTROL_TIMEOUT, EXPIRY, LISTING_TIMEOUT, PLAY_TIMEOUT, REFRESH, Upnp};
+pub use upnp::{
+    CONTROL_TIMEOUT, EXPIRY, LISTING_TIMEOUT, PLAY_TIMEOUT, REFRESH, Upnp, play_timeout,
+};
 
 /// The `tracing` target of the raw UPnP traffic: each SSDP datagram and SOAP request and
 /// response body, at DEBUG. Enable it with `RUST_LOG=sonos::raw=debug`.
@@ -180,8 +182,10 @@ pub enum TransportState {
 }
 
 /// The track a Group has loaded.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Track {
+    /// The loaded URL. Debug omits it because stream URLs carry capabilities.
+    pub uri: Option<String>,
     /// From the track's metadata, if it has one.
     pub title: Option<String>,
     pub creator: Option<String>,
@@ -189,6 +193,18 @@ pub struct Track {
     pub position: Option<Duration>,
     /// The track's length; none when unknown, as for a stream.
     pub duration: Option<Duration>,
+}
+
+impl std::fmt::Debug for Track {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Track")
+            .field("uri", &self.uri.as_ref().map(|_| "REDACTED"))
+            .field("title", &self.title)
+            .field("creator", &self.creator)
+            .field("position", &self.position)
+            .field("duration", &self.duration)
+            .finish()
+    }
 }
 
 /// What a Group plays, as [`Sonos::playback`] reads it from its coordinator.

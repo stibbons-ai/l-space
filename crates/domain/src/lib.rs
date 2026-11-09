@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 /// How far into a chapter a previous chapter restarts it rather than going to the chapter
-/// before (lead's decision D2).
+/// before, allowing a second tap near the start to go back again.
 pub const RESTART_GRACE: Duration = Duration::from_secs(3);
 
 /// An Item's audio files in playing order, by their lengths: where in the whole Item each one
@@ -82,26 +82,28 @@ impl Files {
         let start = self.start(at.file)?;
         Some(start.saturating_add(at.within))
     }
+
+    /// The length of one file, 0-based; none past the last file.
+    pub fn file_length(&self, file: usize) -> Option<Duration> {
+        Some(*self.ends.get(file)? - self.start(file)?)
+    }
 }
 
 /// An Item's chapters by where they start, for moving to the previous or next one. An Item
-/// without chapters counts as one chapter spanning it (lead's decision D3).
+/// without chapters counts as one chapter spanning it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chapters {
-    /// Where each chapter starts, in whole seconds rounded up, ascending, without duplicates;
-    /// the first is always 0 and none lies at or past the end.
+    /// Where each chapter starts, ascending, without duplicates; the first is always 0 and
+    /// none lies at or past the end.
     starts: Vec<Duration>,
 }
 
 impl Chapters {
-    /// The chapters starting at `starts` (any order) in an Item `length` long. Each start is
-    /// rounded up to a whole second, as Groups go to whole seconds: rounded down, a move to a
-    /// chapter would land in the one before it. A start at or past the end (once rounded) is
-    /// left out. The part of the Item before its first chapter counts as a chapter of its own.
+    /// The chapters starting at `starts` (any order) in an Item `length` long. A start at or
+    /// past the end is left out. The part before its first chapter counts as a chapter.
     pub fn new(starts: impl IntoIterator<Item = Duration>, length: Duration) -> Self {
         let mut starts: Vec<Duration> = starts
             .into_iter()
-            .map(whole_seconds_up)
             .filter(|start| *start < length)
             .chain([Duration::ZERO])
             .collect();
@@ -124,22 +126,16 @@ impl Chapters {
     }
 
     /// Where the next chapter goes from `position`: the start of the chapter after the one
-    /// `position` is in; none in the last chapter (lead's decision D2).
+    /// `position` is in; none in the last chapter, so a stray tap cannot end the Item.
     pub fn next(&self, position: Duration) -> Option<Duration> {
         self.starts.get(self.current(position) + 1).copied()
     }
 
-    /// The index of the chapter `position` is in: the last one starting at or before it.
+    /// The current chapter, allowing for a Group's one-second position resolution.
     fn current(&self, position: Duration) -> usize {
-        // The first start is 0, so at least one starts at or before any position.
-        self.starts.partition_point(|start| *start <= position) - 1
+        let through = position.saturating_add(Duration::from_secs(1));
+        self.starts.partition_point(|start| *start <= through) - 1
     }
-}
-
-/// `time` rounded up to a whole second.
-fn whole_seconds_up(time: Duration) -> Duration {
-    let up = u64::from(time.subsec_nanos() > 0);
-    Duration::from_secs(time.as_secs().saturating_add(up))
 }
 
 #[cfg(test)]
@@ -268,7 +264,8 @@ mod tests {
     fn next_goes_to_the_start_of_the_chapter_after() {
         let chapters = long_chapters();
         assert_eq!(chapters.next(s(0)), Some(s(2400)));
-        assert_eq!(chapters.next(s(2399)), Some(s(2400)));
+        assert_eq!(chapters.next(s(2398)), Some(s(2400)));
+        assert_eq!(chapters.next(s(2399)), Some(s(4200)));
         // On a boundary, the chapter starting there is the current one.
         assert_eq!(chapters.next(s(2400)), Some(s(4200)));
     }
@@ -290,12 +287,11 @@ mod tests {
     }
 
     #[test]
-    fn a_chapter_start_rounds_up_to_a_whole_second() {
+    fn chapter_readings_allow_one_second_before_the_unrounded_start() {
         let chapters = Chapters::new([s(0), ms(123_400)], s(600));
-        // Rounded down to 123, a Group sent there would still be in the first chapter, and a
-        // next chapter from there would land there again.
-        assert_eq!(chapters.next(s(0)), Some(s(124)));
-        assert_eq!(chapters.next(s(124)), None);
+        assert_eq!(chapters.next(s(0)), Some(ms(123_400)));
+        assert_eq!(chapters.next(ms(122_399)), Some(ms(123_400)));
+        assert_eq!(chapters.next(ms(122_400)), None);
         assert_eq!(chapters.previous(s(123)), s(0));
     }
 

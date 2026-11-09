@@ -62,6 +62,7 @@ macro_rules! store_contract_tests {
             a_groups_handoff_ends_with_its_stream_or_its_key,
             a_groups_handoff_outlives_the_session_that_started_it,
             a_handoff_keeps_all_its_files_in_order,
+            an_empty_handoff_is_refused_without_replacing_the_active_one,
         );
     };
     (@tests $backend:expr; $($test:ident),* $(,)?) => {
@@ -719,4 +720,20 @@ pub async fn a_handoff_keeps_all_its_files_in_order(backend: &impl Backend) {
         active(&store, stream(1)).await,
         acting_with(&book, "alice-key")
     );
+}
+
+pub async fn an_empty_handoff_is_refused_without_replacing_the_active_one(backend: &impl Backend) {
+    let store = backend.open().await;
+    let first = handoff("RINCON_K", "ep-1", &alice(), 1000);
+    start(&store, stream(1), &first, "alice-key").await;
+    let mut empty = book_handoff("RINCON_K", &bob());
+    empty.files.clear();
+    assert!(
+        store
+            .start_handoff(&stream(2), &empty, &key("bob-key"))
+            .await
+            .is_err()
+    );
+    assert_eq!(listed(&store).await, [first]);
+    assert_eq!(active(&store, stream(2)).await, None);
 }

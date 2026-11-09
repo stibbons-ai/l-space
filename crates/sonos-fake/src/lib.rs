@@ -1,12 +1,12 @@
 //! A fake Sonos household for tests (PRD "Testing Decisions"): players on loopback that answer
 //! SSDP M-SEARCH and serve their device description and the UPnP subset the Bridge uses
 //! (ZoneGroupTopology `GetZoneGroupState`; AVTransport `GetTransportInfo`, `GetPositionInfo`,
-//! `RemoveAllTracksFromQueue`, `AddURIToQueue`, `SetAVTransportURI`, `Play`, `Pause` and
+//! `RemoveAllTracksFromQueue`, `AddURIToQueue`, `AddMultipleURIsToQueue`, `SetAVTransportURI`, `Play`, `Pause` and
 //! `Seek`; GroupRenderingControl `GetGroupVolume`, `SnapshotGroupVolume` and
 //! `SetGroupVolume`), with Groups, playback, volume and faults the test controls.
 //!
-//! Each coordinator has a queue: `RemoveAllTracksFromQueue` empties it, `AddURIToQueue` adds a
-//! URL at its end. A Group told to play a URL (`SetAVTransportURI` with the URL), or its queue
+//! Each coordinator has a queue: `RemoveAllTracksFromQueue` empties it; `AddURIToQueue` and
+//! `AddMultipleURIsToQueue` append URLs. A Group told to play a URL, or its queue
 //! (`SetAVTransportURI` with `x-rincon-queue:<its UUID>#0`, the queue as it is then), is at
 //! the first track of it; `Seek` with `TRACK_NR` (1-based) goes to the start of another track
 //! of it. Told to `Play`, it plays like a speaker: its transport is Playing, its position in
@@ -271,7 +271,7 @@ struct HouseholdState {
     /// got.
     fetches: Vec<(String, Fetch)>,
     /// Every URL a player was given to play, as the UUID of the player and the URL, recorded on
-    /// arrival, also when it then misbehaves: with `AddURIToQueue`, or with
+    /// arrival, also when it then misbehaves: with either queue-add action, or with
     /// `SetAVTransportURI` unless it names a queue.
     offered: Vec<(String, String)>,
     /// Every `Seek` a player was called with, as the UUID of the player and its `Unit` and
@@ -581,7 +581,7 @@ impl Household {
         transport.state = "STOPPED";
     }
 
-    /// Each URL `coordinator` is given from now on (`SetAVTransportURI`, `AddURIToQueue`) is
+    /// Each URL `coordinator` is given from now on (directly or queued) is
     /// `length` long, as `GetPositionInfo` then tells, unless [`Household::set_queue_lengths`]
     /// sets another: played to its end, the Group goes on with the next track, if any, or
     /// stops.
@@ -589,7 +589,7 @@ impl Household {
         self.shared.lock().player_mut(coordinator).url_length = Some(length);
     }
 
-    /// Each URL `coordinator` adds to its queue from now on (`AddURIToQueue`) is as long as
+    /// Each URL `coordinator` adds to its queue from now on is as long as
     /// `lengths` says for its place in the queue (0-based); one placed past them is as
     /// [`Household::set_url_length`] says.
     pub fn set_queue_lengths(&self, coordinator: &PlayerId, lengths: &[Duration]) {
@@ -658,7 +658,7 @@ impl Household {
     }
 
     /// Every URL `player` was given to play, in order, also those it then refused or never
-    /// answered: those it added to its queue (`AddURIToQueue`), and those given with
+    /// answered: those it added to its queue, and those given with
     /// `SetAVTransportURI` other than a queue's.
     pub fn offered(&self, player: &PlayerId) -> Vec<String> {
         let state = self.shared.lock();
@@ -883,7 +883,7 @@ impl HouseholdState {
         Ok(player)
     }
 
-    /// `RemoveAllTracksFromQueue`, `AddURIToQueue`, `SetAVTransportURI`, `Play`, `Pause` or
+    /// `RemoveAllTracksFromQueue`, either queue-add action, `SetAVTransportURI`, `Play`, `Pause` or
     /// `Seek` (with the SOAP `request`) on `served`'s player, which must coordinate its Group,
     /// at `now`; the output arguments. `SetAVTransportURI` with `x-rincon-queue:<its UUID>#0`
     /// loads the queue as it is then, any other URL alone. `Play` on a stopped Group starts
@@ -906,17 +906,33 @@ impl HouseholdState {
         let transport = &mut player.transport;
         match action {
             "RemoveAllTracksFromQueue" => player.queue.clear(),
-            "AddURIToQueue" => {
-                let uri = input(request, "EnqueuedURI").ok_or(402u16)?;
-                let place = player.queue.len();
-                let duration = player.queue_lengths.get(place).copied();
-                let length = duration.or(player.url_length);
-                player.queue.push(FakeTrack::given(uri, length));
-                let length = player.queue.len().to_string();
+            "AddURIToQueue" | "AddMultipleURIsToQueue" => {
+                let uris = if action == "AddURIToQueue" {
+                    vec![input(request, "EnqueuedURI").ok_or(402u16)?]
+                } else {
+                    let uris = input(request, "EnqueuedURIs").ok_or(402u16)?;
+                    let count: usize = input(request, "NumberOfURIs")
+                        .and_then(|n| n.parse().ok())
+                        .ok_or(402u16)?;
+                    let uris: Vec<_> = uris.split_whitespace().map(str::to_owned).collect();
+                    if uris.len() != count {
+                        return Err(402);
+                    }
+                    uris
+                };
+                let first = player.queue.len() + 1;
+                let count = uris.len();
+                for uri in uris {
+                    let place = player.queue.len();
+                    let duration = player.queue_lengths.get(place).copied();
+                    player
+                        .queue
+                        .push(FakeTrack::given(uri, duration.or(player.url_length)));
+                }
                 return Ok(vec![
-                    ("FirstTrackNumberEnqueued", length.clone()),
-                    ("NumTracksAdded", "1".to_owned()),
-                    ("NewQueueLength", length),
+                    ("FirstTrackNumberEnqueued", first.to_string()),
+                    ("NumTracksAdded", count.to_string()),
+                    ("NewQueueLength", player.queue.len().to_string()),
                     ("NewUpdateID", "0".to_owned()),
                 ]);
             }
@@ -1169,6 +1185,14 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         if let Some(uri) = given {
             state.offered.push((served.uuid.clone(), uri));
         }
+        if action == "AddMultipleURIsToQueue"
+            && let Some(uris) = input(&request, "EnqueuedURIs")
+        {
+            state.offered.extend(
+                uris.split_whitespace()
+                    .map(|uri| (served.uuid.clone(), uri.to_owned())),
+            );
+        }
         if action == "Seek" {
             let argument = |name| input(&request, name).unwrap_or_default();
             let seek = Seek {
@@ -1293,6 +1317,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             AV_TRANSPORT,
             "RemoveAllTracksFromQueue"
             | "AddURIToQueue"
+            | "AddMultipleURIsToQueue"
             | "SetAVTransportURI"
             | "Play"
             | "Pause"
@@ -1455,10 +1480,15 @@ mod tests {
         Duration::from_secs(seconds)
     }
 
-    /// Calls AVTransport `action` on `player` with `arguments`, as the Bridge does.
-    async fn call(household: &Household, player: &PlayerId, action: &str, arguments: &str) {
+    /// Posts an AVTransport action, including actions the player should refuse.
+    async fn post_action(
+        household: &Household,
+        player: &PlayerId,
+        action: &str,
+        arguments: &str,
+    ) -> reqwest::Response {
         let addr = household.shared.lock().player(player).addr;
-        let response = reqwest::Client::new()
+        reqwest::Client::new()
             .post(format!("http://{addr}/MediaRenderer/AVTransport/Control"))
             .header("soapaction", format!("\"{AV_TRANSPORT}#{action}\""))
             .body(format!(
@@ -1466,7 +1496,12 @@ mod tests {
             ))
             .send()
             .await
-            .expect("the player answers");
+            .expect("the player answers")
+    }
+
+    /// Calls AVTransport `action` on `player` with `arguments`, as the Bridge does.
+    async fn call(household: &Household, player: &PlayerId, action: &str, arguments: &str) {
+        let response = post_action(household, player, action, arguments).await;
         assert!(
             response.status().is_success(),
             "{action}: {}",
@@ -1609,21 +1644,12 @@ mod tests {
         assert_eq!(household.position(&kitchen), seconds(25));
 
         // A track it doesn't have, or a time past the current one's end, is refused.
-        let addr = household.shared.lock().player(&kitchen).addr;
         for arguments in [
             track("4"),
             track("0"),
             "<Unit>REL_TIME</Unit><Target>0:00:31</Target>".into(),
         ] {
-            let response = reqwest::Client::new()
-                .post(format!("http://{addr}/MediaRenderer/AVTransport/Control"))
-                .header("soapaction", format!("\"{AV_TRANSPORT}#Seek\""))
-                .body(format!(
-                    r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:Seek xmlns:u="{AV_TRANSPORT}"><InstanceID>0</InstanceID>{arguments}</u:Seek></s:Body></s:Envelope>"#
-                ))
-                .send()
-                .await
-                .unwrap();
+            let response = post_action(&household, &kitchen, "Seek", &arguments).await;
             assert_eq!(
                 response.status(),
                 StatusCode::INTERNAL_SERVER_ERROR,

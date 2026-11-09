@@ -16,8 +16,8 @@
 //! stops (`STOPPED`) on one of the Handoff's files at the end of the last, as `sonos-fake`
 //! models it. It never relies on the position, or the file, a stopped Group tells (real
 //! hardware may tell 0 then, and its queue may be back at its first file; unverified): from
-//! about [`END_SLACK`] before the
-//! expected end the Group is read every [`END_RECHECK`], without asking whom the key acts for
+//! about [`END_SLACK`] before the expected end the Group is read every [`END_RECHECK`],
+//! without asking whom the key acts for
 //! first unless a Finished write is pending (a cadence tick among those reads, judged at the
 //! tick or at the last sighting if that came after it, is one of them, writing nothing; a
 //! visit for a tick judged before them that runs late into them still asks, and writes), and a

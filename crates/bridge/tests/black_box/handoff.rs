@@ -38,7 +38,13 @@ const CLEAR: &str = "AVTransport#RemoveAllTracksFromQueue";
 /// The SOAP actions a start sends a Group for an Item in one file, before any seek to its
 /// start position: the queue emptied, the file added, the queue given, its first track
 /// selected, play.
-const STARTED: [&str; 5] = [CLEAR, "AVTransport#AddURIToQueue", SET_URI, SEEK, PLAY];
+const STARTED: [&str; 5] = [
+    CLEAR,
+    "AVTransport#AddMultipleURIsToQueue",
+    SET_URI,
+    SEEK,
+    PLAY,
+];
 
 /// The WARN the Bridge logs when a Group doesn't go to a start's position.
 const NOT_SOUGHT: &str = "a Group did not go to a Handoff's start position";
@@ -433,18 +439,46 @@ async fn a_stream_serves_only_its_handoffs_file() {
 
     // A made-up id, a real one with another file name, and a path that isn't UTF-8 name
     // nothing: alike, down to the headers.
-    let made_up = format!("/stream/{}/Episode%201.wav", "ab".repeat(32));
-    let other_file = format!("/stream/{}/Episode%202.wav", stream_id(&kitchen));
-    let short = "/stream/x/Episode%201.wav".to_owned();
+    let made_up = format!("/stream/{}/1-Episode%201.wav", "ab".repeat(32));
+    let other_file = format!("/stream/{}/1-Episode%202.wav", stream_id(&kitchen));
+    let out_of_range = format!("/stream/{}/2-Episode%201.wav", stream_id(&kitchen));
+    let short = "/stream/x/1-Episode%201.wav".to_owned();
     let not_utf8 = format!("/stream/{}/%FF.wav", stream_id(&kitchen));
     let (_, names, _) = get(&made_up).await;
-    for path in [made_up, other_file, short, not_utf8] {
+    for path in [made_up, other_file, out_of_range, short, not_utf8] {
         assert_eq!(
             get(&path).await,
             (StatusCode::NOT_FOUND, names.clone(), Vec::new()),
             "{path}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_pre_upgrade_single_file_url_still_streams_and_can_be_paused() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    let (_, current) = setup.start(&episode, &setup.kitchen).await;
+    let legacy = current.replacen("/1-Episode", "/Episode", 1);
+    setup.household.play(
+        &setup.kitchen,
+        sonos_fake::FakeTrack {
+            uri: legacy.clone(),
+            ..sonos_fake::FakeTrack::new("Legacy", Duration::from_secs(600))
+        },
+    );
+    let api = setup.bridge.api();
+    let response = api
+        .fetch(Method::GET, path(&legacy), Some("bytes=0-15"))
+        .await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response.bytes().await.unwrap().as_ref(),
+        &setup.file(&episode).await[..16]
+    );
+    let paused = api.pause_group(&setup.session, setup.kitchen.uuid()).await;
+    assert_eq!(paused.state, api::TransportState::Paused);
+    assert_eq!(api.handoffs(&setup.session).await.len(), 1);
 }
 
 #[tokio::test]
@@ -688,7 +722,9 @@ async fn a_group_that_refuses_or_does_not_answer_keeps_no_handoff() {
     assert!(called(&setup.household, &setup.kitchen, SET_URI));
 
     // Office hangs; Kitchen still tells the topology.
-    setup.household.set_fault(&setup.office, Fault::Hang);
+    setup
+        .household
+        .set_fault(&setup.office, Fault::SlowPlayback(Duration::from_secs(20)));
     let start = Instant::now();
     assert_eq!(
         api.start_handoff_error(&setup.session, &episode, setup.office.uuid())
@@ -700,16 +736,15 @@ async fn a_group_that_refuses_or_does_not_answer_keeps_no_handoff() {
     let at_least = sonos::PLAY_TIMEOUT - Duration::from_millis(500);
     let bound = sonos::PLAY_TIMEOUT + Duration::from_secs(3);
     assert!(elapsed >= at_least && elapsed < bound, "{elapsed:?}");
-    assert!(called(&setup.household, &setup.office, CLEAR));
+    assert!(called(&setup.household, &setup.office, SET_URI));
 
     assert_eq!(api.handoffs(&setup.session).await, []);
-    // The failed start's stream id Kitchen was given (Office hung before it was given one)
-    // doesn't show in the log at INFO or above.
+    // Both failed starts' stream ids were queued, and neither shows in the INFO+ log.
     let offered: Vec<String> = [&setup.kitchen, &setup.office]
         .into_iter()
         .flat_map(|player| setup.household.offered(player))
         .collect();
-    assert_eq!(offered.len(), 1, "{offered:?}");
+    assert_eq!(offered.len(), 2, "{offered:?}");
     let ids: Vec<&str> = offered.iter().map(|uri| stream_id(uri)).collect();
     assert_quiet(&setup.bridge.stop(), &setup.user.api_key.key, &ids);
 }

@@ -274,18 +274,24 @@ pub fn item_duration(library_item: &abs::LibraryItem, id: &ItemId) -> Option<f64
     }
 }
 
-/// Where each chapter of Item `id` in `library_item` starts in the whole Item, in the order
-/// the Library Server keeps them; none for an episode, an audiobook without chapters, or when
-/// `library_item` holds no such Item. A start that is no time (negative, say) is left out.
-pub fn chapter_starts(library_item: &abs::LibraryItem, id: &ItemId) -> Vec<Duration> {
+/// Where chapters start in the whole Item; empty for an episode or audiobook without
+/// chapters, none when the library item no longer holds the Item. Invalid starts are omitted.
+pub fn chapter_starts(library_item: &abs::LibraryItem, id: &ItemId) -> Option<Vec<Duration>> {
     match (&library_item.media, &id.episode) {
         (abs::Media::Book(book), None) if is_audiobook(book) => {
             let chapters = book.chapters.entries.iter();
-            chapters
-                .filter_map(|chapter| Duration::try_from_secs_f64(chapter.start).ok())
-                .collect()
+            Some(
+                chapters
+                    .filter_map(|chapter| Duration::try_from_secs_f64(chapter.start).ok())
+                    .collect(),
+            )
         }
-        _ => Vec::new(),
+        (abs::Media::Podcast(podcast), Some(episode))
+            if podcast.episodes.iter().any(|held| held.id == *episode) =>
+        {
+            Some(Vec::new())
+        }
+        _ => None,
     }
 }
 

@@ -371,15 +371,16 @@ pub enum TransportState {
     Unknown,
 }
 
-/// The track a Group has loaded. Times are seconds.
+/// What a Group has loaded. Times are whole-Item seconds while it plays its Handoff;
+/// otherwise they describe the loaded track.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NowPlaying {
     /// From the track's metadata, if it has one.
     pub title: Option<String>,
     pub creator: Option<String>,
-    /// How far into the track playback is.
+    /// How far into the Item (or external track) playback is.
     pub position: Option<f64>,
-    /// The track's length; none when unknown, as for a stream.
+    /// The Item's (or external track's) length; none when unknown.
     pub duration: Option<f64>,
 }
 

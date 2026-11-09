@@ -576,6 +576,12 @@ impl Store for SqliteStore {
         handoff: &Handoff,
         api_key: &ApiKey,
     ) -> Result<(), Error> {
+        if handoff.files.is_empty() {
+            return Err(Error::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a Handoff must have at least one file",
+            )));
+        }
         let (stream, handoff) = (*stream, handoff.clone());
         let fingerprint = self.sealing.fingerprint(api_key);
         let sealed = self

@@ -17,7 +17,7 @@ use crate::stream;
 /// ([`sonos::media_type`]), with its length when the Library Server knows it.
 /// [`ApiError::ItemNotPlayable`] (logged) for an Item without an audio file, with one in
 /// another format or unnamed, or with more than one and any of unknown length: the Bridge
-/// can't place a position in the whole Item without them (lead's decision D4).
+/// can't place a position in the whole Item without them.
 pub(super) fn playable_files(
     library_server: &str,
     id: &ItemId,
@@ -65,6 +65,9 @@ pub(super) fn playable_files(
 #[derive(Debug, Clone)]
 pub(super) struct ItemFiles {
     stream: StreamId,
+    count: usize,
+    /// The single file's percent-encoded legacy path segment.
+    legacy_name: Option<String>,
     /// Where they lie; none unless every file's length is known, which only a Handoff of a
     /// single file lacks ([`playable_files`]; also one stored before Handoffs held their
     /// files' lengths): that file starts at 0, its length what the Group tells.
@@ -77,6 +80,8 @@ impl ItemFiles {
         let lengths: Option<Vec<Duration>> = files.iter().map(|file| file.duration).collect();
         Self {
             stream,
+            count: files.len(),
+            legacy_name: (files.len() == 1).then(|| stream::path_segment(&files[0].name)),
             layout: lengths.and_then(domain::Files::new),
         }
     }
@@ -89,9 +94,8 @@ impl ItemFiles {
     /// The file (0-based) of the Handoff that `playback` plays, if it plays one: its URL is
     /// one of the Handoff's stream's.
     pub(super) fn playing(&self, playback: &sonos::Playback) -> Option<usize> {
-        let named = stream::stream_in_url(playback.uri.as_deref()?)?;
-        let count = self.layout.as_ref().map_or(1, domain::Files::count);
-        (named.stream == self.stream && named.file < count).then_some(named.file)
+        let named = stream::stream_in_url(playback.uri.as_deref()?, self.legacy_name.as_deref())?;
+        (named.stream == self.stream && named.file < self.count).then_some(named.file)
     }
 
     /// Whether `playback` plays one of the Handoff's files.
@@ -114,29 +118,40 @@ impl ItemFiles {
         playback
     }
 
-    /// Where a Group that plays `playback` (read as is or [`ItemFiles::whole`]: only which
-    /// file it plays counts) goes for `target` in the whole Item: the file to go to, none when
-    /// it is the one it plays, and how far into that file.
+    /// Where the Group goes for `target` in the whole Item. Always select a file in a
+    /// multi-file Item: the Group may have advanced since `playback` was read.
     pub(super) fn seek(
         &self,
         playback: &sonos::Playback,
         target: Duration,
     ) -> (Option<usize>, Duration) {
         let to = self.locate(target);
-        let track = (self.playing(playback) != Some(to.file)).then_some(to.file);
+        let track = (self.count > 1 || self.playing(playback) != Some(to.file)).then_some(to.file);
         (track, to.within)
     }
 
-    /// Where `position` in the whole Item lies among the files (kept within the Item); in the
-    /// first file when their lengths aren't known.
+    /// Where `position` in the whole Item lies among the files. Round within the file up to
+    /// Sonos's whole-second resolution, capped at its length, rather than landing before a
+    /// chapter or saved Progress.
     pub(super) fn locate(&self, position: Duration) -> FilePosition {
-        match &self.layout {
+        let mut at = match &self.layout {
             Some(layout) => layout.locate(position),
             None => FilePosition {
                 file: 0,
                 within: position,
             },
-        }
+        };
+        let rounded = Duration::from_secs(
+            at.within
+                .as_secs()
+                .saturating_add(u64::from(at.within.subsec_nanos() > 0)),
+        );
+        let length = self
+            .layout
+            .as_ref()
+            .and_then(|layout| layout.file_length(at.file));
+        at.within = length.map_or(rounded, |length| rounded.min(length));
+        at
     }
 }
 
@@ -189,14 +204,14 @@ mod tests {
     }
 
     #[test]
-    fn a_seek_selects_the_file_only_when_it_changes() {
+    fn a_multi_file_seek_always_selects_its_file() {
         let token = StreamToken::new("ab12".into());
         let book = [file("a", Some(s(2400))), file("b", Some(s(1800)))];
         let files = ItemFiles::of(token.hash(), &book);
         let in_second = playing(&token, 1, 5);
         assert_eq!(files.seek(&in_second, s(2390)), (Some(0), s(2390)));
-        assert_eq!(files.seek(&in_second, s(2420)), (None, s(20)));
-        assert_eq!(files.seek(&in_second, s(2400)), (None, s(0)));
+        assert_eq!(files.seek(&in_second, s(2420)), (Some(1), s(20)));
+        assert_eq!(files.seek(&in_second, s(2400)), (Some(1), s(0)));
     }
 
     #[test]
@@ -205,5 +220,43 @@ mod tests {
         let files = ItemFiles::of(token.hash(), &[file("a", None)]);
         assert_eq!(files.whole(playing(&token, 0, 90)), playing(&token, 0, 90));
         assert_eq!(files.seek(&playing(&token, 0, 90), s(120)), (None, s(120)));
+    }
+
+    #[test]
+    fn fractional_chapters_advance_and_restart_from_paused_readbacks() {
+        let token = StreamToken::new("ab12".into());
+        let start = Duration::from_millis(2_400_052);
+        let middle = Duration::from_millis(3_000_400);
+        let files = ItemFiles::of(
+            token.hash(),
+            &[file("a", Some(start)), file("b", Some(s(1800)))],
+        );
+        let chapters = domain::Chapters::new([Duration::ZERO, start, middle], s(4200));
+        let readback = |target| {
+            let to = files.locate(target);
+            files
+                .whole(playing(&token, to.file, to.within.as_secs()))
+                .position
+                .unwrap()
+        };
+        let second = readback(chapters.next(Duration::ZERO).unwrap());
+        assert!(second >= start);
+        let third = readback(chapters.next(second).unwrap());
+        assert!(third >= middle);
+        assert_eq!(chapters.next(third), None);
+        assert_eq!(chapters.previous(third), start);
+        assert_eq!(chapters.previous(readback(start)), Duration::ZERO);
+        assert_eq!(chapters.previous(third + s(4)), middle);
+        let resumed = readback(Duration::from_millis(3_000_900));
+        assert!(resumed >= Duration::from_millis(3_000_900));
+        assert!(resumed < Duration::from_millis(3_001_900));
+    }
+
+    #[test]
+    fn unknown_stored_lengths_do_not_hide_later_files() {
+        let token = StreamToken::new("ab12".into());
+        let files = ItemFiles::of(token.hash(), &[file("a", Some(s(10))), file("b", None)]);
+        assert_eq!(files.playing(&playing(&token, 1, 5)), Some(1));
+        assert_eq!(files.playing(&playing(&token, 2, 5)), None);
     }
 }

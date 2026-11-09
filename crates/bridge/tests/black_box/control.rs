@@ -154,9 +154,7 @@ impl Setup {
     }
 }
 
-fn seconds(seconds: u64) -> Duration {
-    Duration::from_secs(seconds)
-}
+use crate::seconds;
 
 fn playback(state: TransportState, position: f64, duration: f64) -> Playback {
     Playback {

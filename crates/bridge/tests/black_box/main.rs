@@ -19,3 +19,7 @@ mod login;
 mod progress;
 mod shutdown;
 mod startup;
+
+fn seconds(seconds: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(seconds)
+}

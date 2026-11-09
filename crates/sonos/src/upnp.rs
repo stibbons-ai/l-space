@@ -2,8 +2,8 @@
 //! them (ZoneGroupTopology `GetZoneGroupState`), each Group's playback from its coordinator
 //! (AVTransport `GetTransportInfo` and `GetPositionInfo`) and its volume (GroupRenderingControl
 //! `GetGroupVolume`), streams started on a Group as its coordinator's queue (AVTransport
-//! `RemoveAllTracksFromQueue`, `AddURIToQueue` per stream, `SetAVTransportURI` to the queue,
-//! `Seek` to the first track, then `Play`), and a Group controlled by its coordinator
+//! `RemoveAllTracksFromQueue`, `AddMultipleURIsToQueue` in batches, `SetAVTransportURI` to the
+//! queue, `Seek` to the track to start in, then `Play`), and a Group controlled by its coordinator
 //! (AVTransport `Pause`, `Play` and `Seek`, by track and by time; GroupRenderingControl
 //! `SnapshotGroupVolume`, then `SetGroupVolume`).
 
@@ -37,9 +37,20 @@ pub const EXPIRY: Duration = Duration::from_secs(3 * 60);
 /// than the App's limit for a call to the Bridge.
 pub const LISTING_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// How long [`Upnp::play`] may take in all, waiting for the first search included. A start
-/// in the Bridge keeps this much of its time budget for it (see the Bridge's `START_TIME`).
+/// Base allowance for [`Upnp::play`], including discovery and one queue batch. See
+/// [`play_timeout`] for the allowance shared with the Bridge's start reservation.
 pub const PLAY_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Queue batches follow SoCo's 16-URI convention; the hardware cap is still unverified.
+const QUEUE_BATCH: usize = 16;
+
+/// Deadline allowance for a start: four seconds for topology, one queue batch and transport
+/// setup, plus one second for each additional batch. Batching bounds sequential SOAP work;
+/// the extra allowance lets larger queues load without stealing the subsequent seek's time.
+pub fn play_timeout(files: usize) -> Duration {
+    let extra = files.div_ceil(QUEUE_BATCH).saturating_sub(1);
+    PLAY_TIMEOUT.saturating_add(Duration::from_secs(extra as u64))
+}
 
 /// How long each of [`Upnp`]'s calls controlling one Group may take in all (reading its
 /// playback, pausing, resuming, seeking, setting its volume), waiting for the first search
@@ -139,7 +150,7 @@ impl Upnp {
     }
 
     async fn play(&self, group: &str, streams: &[Stream], first: usize) -> Result<(), Error> {
-        let deadline = tokio::time::Instant::now() + PLAY_TIMEOUT;
+        let deadline = tokio::time::Instant::now() + play_timeout(streams.len());
         self.shared
             .play(group, streams, first, deadline)
             .await
@@ -468,9 +479,8 @@ impl Shared {
 
     /// Has Group `group` play `streams` as its queue from the start of `streams[first]`, by
     /// `deadline`: its coordinator, as the topology read now names it, clears its queue
-    /// (`RemoveAllTracksFromQueue`), adds each stream's URL at its end in order
-    /// (`AddURIToQueue`, without metadata; one call per URL, as the most URLs one
-    /// `AddMultipleURIsToQueue` takes is unverified), is given its queue
+    /// (`RemoveAllTracksFromQueue`), adds the stream URLs in order in batches of at most 16
+    /// (`AddMultipleURIsToQueue`, without metadata), and is given its queue
     /// (`SetAVTransportURI` to `x-rincon-queue:<coordinator>#0`), goes to the first track to
     /// play (`Seek` `TRACK_NR`) and is told to play. Returns the URLs.
     async fn play(
@@ -503,12 +513,19 @@ impl Shared {
             .await
         };
         call("RemoveAllTracksFromQueue", &[]).await?;
-        for url in &urls {
+        for batch in urls.chunks(QUEUE_BATCH) {
+            let uris = batch.join(" ");
+            let metadata = " ".repeat(batch.len().saturating_sub(1));
+            let count = batch.len().to_string();
             call(
-                "AddURIToQueue",
+                "AddMultipleURIsToQueue",
                 &[
-                    ("EnqueuedURI", url),
-                    ("EnqueuedURIMetaData", ""),
+                    ("UpdateID", "0"),
+                    ("NumberOfURIs", &count),
+                    ("EnqueuedURIs", &uris),
+                    ("EnqueuedURIsMetaData", &metadata),
+                    ("ContainerURI", ""),
+                    ("ContainerMetaData", ""),
                     ("DesiredFirstTrackNumberEnqueued", "0"),
                     ("EnqueueAsNext", "0"),
                 ],
@@ -788,6 +805,7 @@ fn track(answer: &[(String, String)]) -> Option<Track> {
     let (title, creator) =
         xml::title_and_creator(argument(answer, "TrackMetaData").unwrap_or_default());
     Some(Track {
+        uri: argument(answer, "TrackURI").map(str::to_owned),
         title,
         creator,
         position: argument(answer, "RelTime").and_then(xml::duration),
@@ -841,7 +859,7 @@ mod tests {
     /// them.
     const STARTED: [&str; 5] = [
         "AVTransport#RemoveAllTracksFromQueue",
-        "AVTransport#AddURIToQueue",
+        "AVTransport#AddMultipleURIsToQueue",
         "AVTransport#SetAVTransportURI",
         "AVTransport#Seek",
         "AVTransport#Play",
@@ -1274,8 +1292,8 @@ mod tests {
         assert_eq!(household.uri(&kitchen).as_ref(), Some(&urls[1]));
         assert_eq!(household.transport_state(&kitchen), "PLAYING");
         assert_eq!(
-            household.asked(&kitchen, "AVTransport#AddURIToQueue"),
-            1 + 3
+            household.asked(&kitchen, "AVTransport#AddMultipleURIsToQueue"),
+            2
         );
         // Its playback tells which of them it plays.
         clock.advance(Duration::from_secs(7));
@@ -1285,6 +1303,27 @@ mod tests {
             .unwrap();
         assert_eq!(playback.uri.as_ref(), Some(&urls[1]));
         assert_eq!(playback.position, Some(Duration::from_secs(7)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn seventeen_queue_urls_load_in_two_batches_and_keep_their_order() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let shared = knowing(&household, &clock).await;
+        let book: Vec<_> = (0..17)
+            .map(|n| named("0.0.0.0:9", &format!("{n}-a&b.mp3")))
+            .collect();
+        let urls = shared
+            .play(kitchen.uuid(), &book, 16, soon(play_timeout(book.len())))
+            .await
+            .unwrap();
+        assert_eq!(household.queue(&kitchen), urls);
+        assert_eq!(
+            household.asked(&kitchen, "AVTransport#AddMultipleURIsToQueue"),
+            2
+        );
+        assert_eq!(household.track_number(&kitchen), Some(17));
+        assert_eq!(household.uri(&kitchen).as_deref(), Some(urls[16].as_str()));
     }
 
     #[test]

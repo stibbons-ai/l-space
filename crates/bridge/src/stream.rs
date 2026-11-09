@@ -70,15 +70,21 @@ pub struct StreamFile {
     pub file: usize,
 }
 
-/// The stream file named in `url`, if it is a stream's URL as a Group holds it:
-/// `http://<host>/stream/<id>/<n>-<file>`, on whatever address and port. Only the shape is
-/// checked; whether it names a Handoff's file is the store's to say.
-pub fn stream_in_url(url: &str) -> Option<StreamFile> {
+/// The stream file named in a Group's URL, accepting the legacy unnumbered name only for a
+/// single-file Handoff (`legacy_name`, already percent-encoded). Numbered URLs are otherwise checked for shape only.
+pub fn stream_in_url(url: &str, legacy_name: Option<&str>) -> Option<StreamFile> {
     let (_, path) = url.strip_prefix("http://")?.split_once('/')?;
     let mut segments = path.split('/');
     let (stream, id, file) = (segments.next()?, segments.next()?, segments.next()?);
     let shaped = stream == "stream" && !id.is_empty() && segments.next().is_none();
-    let (file, _) = shaped.then(|| numbered(file)).flatten()?;
+    if !shaped {
+        return None;
+    }
+    let file = if legacy_name == Some(file) {
+        0
+    } else {
+        numbered(file)?.0
+    };
     Some(StreamFile {
         stream: store::StreamId::of(id),
         file,
@@ -94,9 +100,20 @@ fn numbered(segment: &str) -> Option<(usize, &str)> {
     (!name.is_empty()).then_some((number.checked_sub(1)?, name))
 }
 
+/// The file named by a decoded path segment. Try the numbered form first, then the
+/// pre-upgrade unnumbered name, only for a Handoff with exactly one file.
+pub(crate) fn file_in_segment(segment: &str, files: &[store::HandoffFile]) -> Option<usize> {
+    if let Some((index, name)) = numbered(segment)
+        && files.get(index).is_some_and(|file| file.name == name)
+    {
+        return Some(index);
+    }
+    (files.len() == 1 && files[0].name == segment).then_some(0)
+}
+
 /// `text` as one URL path segment: ASCII letters, digits and `-._~` as they are, every other
 /// byte percent-encoded.
-fn path_segment(text: &str) -> String {
+pub(crate) fn path_segment(text: &str) -> String {
     let mut segment = String::with_capacity(text.len());
     for byte in text.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -145,11 +162,8 @@ async fn serve<S: Store>(
             return not_found();
         }
     };
-    let Some((index, name)) = numbered(&segment) else {
-        return not_found();
-    };
     let (library_server, store::ActiveHandoff { handoff, api_key }, served) =
-        match app.active_handoff(&StreamToken::new(id), index, name).await {
+        match app.active_handoff(&StreamToken::new(id), &segment).await {
             Ok(Some(active)) => active,
             Ok(None) => return not_found(),
             Err(error) => {
@@ -273,7 +287,7 @@ mod tests {
                     stream: token.hash(),
                     file,
                 };
-                assert_eq!(stream_in_url(&url), Some(named), "{url}");
+                assert_eq!(stream_in_url(&url, None), Some(named), "{url}");
             }
         }
         for other in [
@@ -293,7 +307,37 @@ mod tests {
             "http://127.0.0.1:9",
             "",
         ] {
-            assert_eq!(stream_in_url(other), None, "{other}");
+            assert_eq!(stream_in_url(other, None), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_single_files_legacy_name_is_accepted_even_when_it_looks_numbered() {
+        for name in ["Episode 1.mp3", "1-Intro.mp3", "2-Intro.mp3"] {
+            let file = store::HandoffFile {
+                ino: "a".into(),
+                name: name.into(),
+                duration: None,
+            };
+            assert_eq!(
+                super::file_in_segment(name, std::slice::from_ref(&file)),
+                Some(0)
+            );
+            let url = format!("http://localhost/stream/ab12/{}", super::path_segment(name));
+            let expected = Some(StreamFile {
+                stream: StreamToken::new("ab12".into()).hash(),
+                file: 0,
+            });
+            assert_eq!(
+                stream_in_url(&url, Some(&super::path_segment(name))),
+                expected
+            );
+            let numbered = format!("1-{name}");
+            assert_eq!(
+                super::file_in_segment(&numbered, std::slice::from_ref(&file)),
+                Some(0)
+            );
+            assert_eq!(super::file_in_segment(name, &[file.clone(), file]), None);
         }
     }
 

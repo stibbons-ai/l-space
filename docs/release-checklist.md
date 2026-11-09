@@ -72,16 +72,16 @@ Use an audiobook in at least three files (MP3 or M4A/M4B, as Audiobookshelf list
 
 1. In Audiobookshelf, set the book's Progress to the middle of its second (or a later) file; start a Handoff of it to a Group.
 2. Let it play across the end of a file into the next; keep the App closed for a minute after the change.
-3. A few seconds into a file, use "15 s back" from the App.
-4. Use "Previous chapter" more than 3 seconds into a chapter, again at once, then "Next chapter" twice, and "Next chapter" in the last chapter.
-5. Start the book about a minute before its end and let it play to the end of the last file.
+3. Under 15 seconds into the second or a later file, use "15 s back" from the App.
+4. Use "Previous chapter" more than 3 seconds into a chapter (restart it), again at once (the chapter before), then "Next chapter" twice (each following chapter's start). Also try Previous in the first chapter (its start), and Next in the last chapter (nothing).
+5. Start the book about a minute before its end and let it play to the end of the last file. Record the queue's position after stopping in `docs/research/`.
 
-- [ ] Step 1: the Group starts in the right file at the right offset (the Sonos app shows that file and its elapsed time), within the App's 15 seconds; the Group's queue holds the book's files in order, and what it held before is gone.
+- [ ] Step 1: the Group starts in the right file at the right offset (the Sonos app shows that file and its elapsed time), within the Bridge's 14-second start budget; its play call has 4 seconds for up to 16 files plus 1 second per additional batch of at most 16. The queue holds the book's files in order, and what it held before is gone.
 - [ ] Step 2: the Group moves on to the next file by itself without a gap the listener notices, and the Item's Progress on the Library Server keeps advancing in the whole book (past the first file's length), not back at the start of the file.
 - [ ] Step 3: playback lands near the end of the file before, and Progress is that position in the whole book.
 - [ ] Step 4: each chapter skip lands at the chapter's start, in the right file; "Next chapter" in the last chapter does nothing; Progress follows each skip.
 - [ ] Step 5: the Group stops at the end of the last file, the book is Finished on the Library Server, and the App no longer shows a Handoff on the Group. Note where the Sonos app shows the queue after the stop (the last file or back at the first): the Bridge doesn't rely on it.
-- [ ] A start of a book with many files (dozens) still answers within the App's 15 seconds (one `AddURIToQueue` per file is sent).
+- [ ] Start a book of 30+ files; record the measured start time and file count in `docs/research/`. Confirm batched `AddMultipleURIsToQueue` works on hardware (the 16-URI cap follows SoCo, not a hardware measurement); the play limit is `4 + ceil(files / 16) - 1` seconds, still within the Bridge's 14-second total and the App's 15.
 
 ## Local playback while locked, with a phone call and with AirPlay
 

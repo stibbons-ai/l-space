@@ -52,6 +52,7 @@ pub struct LibraryProxy {
 struct Faults {
     hide_lengths: AtomicBool,
     reject_item_lookups: AtomicBool,
+    hide_episodes: AtomicBool,
     hang_identity: AtomicBool,
     reject_progress_writes: AtomicBool,
     /// How many Progress writes arrived so far.
@@ -128,6 +129,11 @@ impl LibraryProxy {
         self.faults
             .reject_item_lookups
             .store(true, Ordering::SeqCst);
+    }
+
+    /// Item lookups still answer, but no longer contain any podcast episodes.
+    pub fn hide_episodes(&self) {
+        self.faults.hide_episodes.store(true, Ordering::SeqCst);
     }
 
     /// From now on, `GET /api/me` is never answered.
@@ -316,9 +322,15 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         // Dropped by now if the test no longer waits for it.
         let _ = answered.send(());
     }
-    if hidden && status.is_success() {
+    let episodes_hidden = item_lookup && faults.hide_episodes.load(Ordering::SeqCst);
+    if (hidden || episodes_hidden) && status.is_success() {
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("Item JSON");
-        hide_durations(&mut json);
+        if hidden {
+            hide_durations(&mut json);
+        }
+        if episodes_hidden {
+            json["media"]["episodes"] = serde_json::json!([]);
+        }
         bytes = serde_json::to_vec(&json).expect("Item JSON");
     }
     let mut response = Response::builder().status(status);

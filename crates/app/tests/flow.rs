@@ -3498,7 +3498,7 @@ fn a_session_ended_elsewhere_leads_from_the_groups_to_login() {
 }
 
 /// Opens episode `n` (0-based) of the seeded podcast through its Library from Home; its Item
-/// screen offers "Play on…": an episode is one audio file.
+/// screen offers "Play on…" for its playable audio.
 async fn open_episode(app: &mut App, abs: &Audiobookshelf, n: usize) {
     let seeded = abs.seeded();
     app.open_library(podcasts(abs)).await;
@@ -3763,6 +3763,37 @@ fn an_item_in_several_files_is_offered_and_plays_on_a_group() {
         assert_eq!(household.queue(&kitchen).len(), 3);
         assert_eq!(household.transport_state(&kitchen), "PLAYING");
         assert_eq!(bridge.api().handoffs(&session(&app)).await.len(), 1);
+    });
+}
+
+#[test]
+fn a_mixed_format_book_explains_why_it_cannot_play_on_a_group() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let mixed = abs.mixed_format_book().await;
+        let user = abs.new_user_seeing(&[&mixed.library]).await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.open_library(Library {
+            id: mixed.library,
+            name: "Mixed".into(),
+            kind: LibraryKind::Audiobooks,
+        })
+        .await;
+        app.open_entry(&mixed.book).await;
+        app.open_play_on().await;
+        app.play_on(kitchen.uuid()).await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::Api(ApiError::ItemNotPlayable))
+        );
+        assert_eq!(
+            notice_texts(&mut app).await,
+            both(Text::ErrorItemNotPlayable)
+        );
+        assert_eq!(bridge.api().handoffs(&session(&app)).await, []);
     });
 }
 
