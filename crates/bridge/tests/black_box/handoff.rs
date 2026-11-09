@@ -291,7 +291,10 @@ async fn choosing_a_group_plays_the_episode_there_from_the_bridges_stream() {
     );
     assert_eq!(path(&url).split('/').nth(3), Some("1-Episode%201.wav"));
     // Its one file is the Group's whole queue.
-    assert_eq!(setup.household.queue(&setup.kitchen), [url.clone()]);
+    assert_eq!(
+        setup.household.queue(&setup.kitchen),
+        std::slice::from_ref(&url)
+    );
     assert!(!url.contains(setup.abs.address()), "{url}");
     assert!(!url.contains(&setup.user.api_key.key), "{url}");
     // 256 random bits, hex-encoded.

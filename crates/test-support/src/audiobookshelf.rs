@@ -8,9 +8,9 @@
 //! ([`Audiobookshelf::set_progress`]). The seeded Libraries are shared by all tests, and users
 //! are never deleted while the container runs. A test user sees only the seeded Libraries,
 //! explicit content included, unless the test says otherwise; so a test may add a Library
-//! ([`Audiobookshelf::crowded_podcast`], [`Audiobookshelf::resumable_book`]) or mark a seeded
-//! Item explicit or tag it without hiding or showing anything to other tests' users, as long
-//! as it undoes the mark or tags.
+//! ([`Audiobookshelf::crowded_podcast`], [`Audiobookshelf::resumable_book`],
+//! [`Audiobookshelf::mixed_format_book`]) or mark a seeded Item explicit or tag it without
+//! hiding or showing anything to other tests' users, as long as it undoes the mark or tags.
 //!
 //! Setup goes through Audiobookshelf's REST API as its root user, the way an admin would,
 //! never through its database: users are created there, API keys created, moved and deleted,
@@ -90,6 +90,23 @@ const RESUMABLE_FILE: (&str, u32) = ("/resumable/L-Space/Resumed/Resumed.wav", 1
 /// The Library [`Audiobookshelf::resumable_book`] created, and its audiobook.
 #[derive(Debug, Clone)]
 pub struct Resumable {
+    pub library: String,
+    pub book: String,
+}
+
+/// The folder of [`Audiobookshelf::mixed_format_book`], in no Library until a test asks for it.
+const MIXED_FOLDER: &str = "/mixed";
+
+/// [`Audiobookshelf::mixed_format_book`]'s audio files: path in the container, length in
+/// seconds. The second is WAV audio named as Ogg Opus, a format Sonos doesn't play.
+const MIXED_FILES: [(&str, u32); 2] = [
+    ("/mixed/L-Space/Mixed/01 - Plays.wav", 60),
+    ("/mixed/L-Space/Mixed/02 - Does Not.opus", 60),
+];
+
+/// The Library [`Audiobookshelf::mixed_format_book`] created, and its audiobook.
+#[derive(Debug, Clone)]
+pub struct Mixed {
     pub library: String,
     pub book: String,
 }
@@ -397,6 +414,21 @@ impl Audiobookshelf {
         Resumable { library, book }
     }
 
+    /// Creates the audiobook Library "Mixed", holding "Mixed" by L-Space, two audio files of
+    /// a minute each, the second named as Ogg Opus (`.opus`), and waits until a scan has
+    /// found both: an audiobook one of whose files is in a format Sonos doesn't play. No test
+    /// user sees it unless created to ([`Audiobookshelf::new_user_seeing`]). At most one test
+    /// per test run may call this: the folder takes one Library, so a second call panics.
+    pub async fn mixed_format_book(&self) -> Mixed {
+        let library = self.new_library("Mixed", MIXED_FOLDER, "book").await;
+        let book = self
+            .scanned_alone(&library, "the mixed-format book", |book| {
+                book["media"]["numAudioFiles"] == MIXED_FILES.len()
+            })
+            .await;
+        Mixed { library, book }
+    }
+
     /// The id of the one library item in Library `library` once a scan found it `ready`;
     /// panics, naming it `what`, if that takes longer than [`SCAN_TIMEOUT`].
     async fn scanned_alone(
@@ -640,6 +672,9 @@ impl Audiobookshelf {
         }
         let (path, seconds) = RESUMABLE_FILE;
         image = image.with_copy_to(path, silence(seconds));
+        for (path, seconds) in MIXED_FILES {
+            image = image.with_copy_to(path, silence(seconds));
+        }
         let container = image
             .with_startup_timeout(STARTUP_TIMEOUT)
             .start()

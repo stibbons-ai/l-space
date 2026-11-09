@@ -105,7 +105,7 @@ impl LibraryProxy {
 
     /// The proxy's URL, as an operator would configure it.
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        format!("http://{}", self.address())
     }
 
     /// The proxy's `host:port`, for a forwarder in front of it.
