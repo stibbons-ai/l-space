@@ -495,10 +495,11 @@ pub enum ApiError {
     #[error("item_not_playable")]
     ItemNotPlayable,
     /// The Group has no active Handoff to control, or plays something other than its
-    /// Handoff's stream (for example, before a Takeover event has been reconciled).
-    /// No control was sent and this control wrote no Progress. Takeover reconciliation ends
-    /// the Handoff independently. A forward skip that needed the Item's length can also
-    /// have revoked its starter's key, ending the Handoff (see [`skip_group`]).
+    /// Handoff's stream, including when it reports no URI. No control was sent and this
+    /// control wrote no Progress. Reconciliation ends the Handoff only with positive foreign
+    /// source or membership/coordinator evidence; an empty URI alone may retain it indefinitely.
+    /// A forward skip that needed the Item's length can also have revoked its starter's key,
+    /// ending the Handoff (see [`skip_group`]).
     #[error("no_handoff")]
     NoHandoff,
     /// A forward skip was refused because neither the Group nor the Library Server knows the

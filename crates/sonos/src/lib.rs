@@ -51,7 +51,13 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     fn topology(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>>;
 
     /// Group `group` (its id) plays `stream` from its start, replacing what it played.
-    fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>>;
+    /// Returns the membership snapshot used to resolve its coordinator before playback,
+    /// without transport or volume fields. Later topology changes are not part of this start.
+    fn play<'a>(
+        &'a self,
+        group: &'a str,
+        stream: &'a Stream,
+    ) -> BoxFuture<'a, Result<Group, Error>>;
 
     /// What Group `group` plays now, as its coordinator tells it.
     fn playback<'a>(&'a self, group: &'a str) -> BoxFuture<'a, Result<Playback, Error>>;

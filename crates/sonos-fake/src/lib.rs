@@ -149,6 +149,35 @@ impl Fetch {
     }
 }
 
+/// One SOAP call held before it acts, until the test releases it.
+#[derive(Debug)]
+pub struct HeldCall {
+    arrived: tokio::sync::oneshot::Receiver<()>,
+    release: tokio::sync::oneshot::Sender<()>,
+}
+
+impl HeldCall {
+    /// Waits until the selected call has arrived and is held.
+    pub async fn arrived(&mut self) {
+        tokio::time::timeout(FOLLOW_TIMEOUT, &mut self.arrived)
+            .await
+            .expect("the held SOAP call arrived in time")
+            .expect("the held SOAP call arrived");
+    }
+
+    /// Allows the call to act and answer. Dropping the gate also releases it.
+    pub fn release(self) {
+        let _ = self.release.send(());
+    }
+}
+
+#[derive(Debug)]
+struct CallGate {
+    action: &'static str,
+    arrived: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
 /// How a player misbehaves over HTTP.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Fault {
@@ -256,6 +285,7 @@ struct Player {
     /// Its Group's volume, while it coordinates the Group.
     volume: u8,
     fault: Fault,
+    gate: Option<CallGate>,
     /// The length of each URL it is given from now on, if the test set one.
     url_length: Option<Duration>,
 }
@@ -425,6 +455,7 @@ impl Household {
                 },
                 volume: DEFAULT_VOLUME,
                 fault: Fault::None,
+                gate: None,
                 url_length: None,
             });
             uuid
@@ -536,6 +567,25 @@ impl Household {
     /// `player` misbehaves as `fault` from now on.
     pub fn set_fault(&self, player: &PlayerId, fault: Fault) {
         self.shared.lock().player_mut(player).fault = fault;
+    }
+
+    /// Holds the next SOAP `action` (without the service prefix) on `player` before it acts.
+    /// Only one gate may be armed per player; faults still apply after release.
+    pub fn hold_next_call(&self, player: &PlayerId, action: &'static str) -> HeldCall {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut state = self.shared.lock();
+        let gate = &mut state.player_mut(player).gate;
+        assert!(gate.is_none(), "a SOAP call gate is already armed");
+        *gate = Some(CallGate {
+            action,
+            arrived,
+            release: released,
+        });
+        HeldCall {
+            arrived: arrival,
+            release,
+        }
     }
 
     /// Takes `player` (with the speakers bonded to it) out of the household, as if unplugged:
@@ -1074,7 +1124,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
     let (urn, action) = soap_action.split_once('#').unwrap_or(("", soap_action));
     let service = urn.rsplit(':').nth(1).unwrap_or_default();
     // When the call came: what it answers and does then, unless a fault delays it.
-    let (fault, received) = {
+    let (fault, received, gate) = {
         let mut state = served.shared.lock();
         let received = served.shared.clock.now();
         state
@@ -1085,11 +1135,31 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         {
             state.offered.push((served.uuid.clone(), uri));
         }
-        (
-            state.find(&served.uuid).map(|player| player.fault),
-            received,
-        )
+        match state
+            .players
+            .iter_mut()
+            .find(|player| player.uuid == served.uuid)
+        {
+            Some(player) => {
+                let gate = if player
+                    .gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.action == action)
+                {
+                    player.gate.take()
+                } else {
+                    None
+                };
+                (Some(player.fault), received, gate)
+            }
+            None => (None, received, None),
+        }
     };
+    let gated = gate.is_some();
+    if let Some(gate) = gate {
+        let _ = gate.arrived.send(());
+        let _ = gate.release.await;
+    }
     // Whether a fault held the call up: it then answers and acts as of when it is let go.
     let delayed = match fault {
         Some(Fault::Hang) => std::future::pending().await,
@@ -1155,7 +1225,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         // Removed from the household: as good as unplugged.
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let now = if delayed {
+    let now = if delayed || gated {
         served.shared.clock.now()
     } else {
         received

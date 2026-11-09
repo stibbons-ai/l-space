@@ -585,17 +585,23 @@ impl<S: Store> AppApi<S> {
     /// Group's turn until the pause is done (at most [`sonos::CONTROL_TIMEOUT`]) without
     /// holding up the answer.
     ///
+    /// Before waiting, validates topology within [`sonos::CONTROL_TIMEOUT`]: healthy absence
+    /// answers [`ApiError::GroupNotFound`], timeout [`ApiError::GroupFailed`], search or read
+    /// failure the corresponding Sonos error. No Handoff is replaced on that failure.
+    /// Playback resolves topology again within its existing budget; that snapshot, not the
+    /// earlier validation, baselines supervision, so a pre-play regroup is not a Takeover.
+    ///
     /// Starts take turns with starts, controls and supervisors on the Group. A start that had
     /// to wait for its turn, or whose Group had a turn end while it resolved (a start, control
     /// or supervisor visit that was under way, or came and went), reads the user's Progress
     /// again once it has its turn (unless `from_start`), as those may have changed it (a pause
     /// or the cadence writes it), within [`START_PROGRESS_TIME`], checking again that the
     /// session's key acts for its user. It waits for its turn only as long as [`START_TIME`]
-    /// leaves after resolving, less [`START_PROGRESS_TIME`] for that read,
-    /// [`sonos::PLAY_TIMEOUT`] and [`sonos::CONTROL_TIMEOUT`] for a seek (just
-    /// [`sonos::PLAY_TIMEOUT`] when `from_start`); past that, or when resolving left less than
-    /// those, or the read fails, nothing is stored or played ([`ApiError::GroupFailed`], or the
-    /// read's error).
+    /// leaves after resolving and topology validation, less [`START_PROGRESS_TIME`] for that
+    /// read, [`sonos::PLAY_TIMEOUT`] and [`sonos::CONTROL_TIMEOUT`] for a seek (just
+    /// [`sonos::PLAY_TIMEOUT`] when `from_start`); past that, or when earlier work left less
+    /// than those, or the read fails, nothing is stored or played ([`ApiError::GroupFailed`],
+    /// or the read's error).
     ///
     /// A start that found its Group's turn free, with none ended since before resolving, uses
     /// the Progress read while resolving, and needs only [`sonos::PLAY_TIMEOUT`] (and
@@ -677,22 +683,21 @@ impl<S: Store> AppApi<S> {
             listen: self.listen,
             path: stream_token.path(&name),
         };
-        // Resolve membership before waiting for the turn, with its own bounded read.
-        // The checks below still reserve the Group's calls after this read and any wait.
-        let members = tokio::time::timeout(sonos::CONTROL_TIMEOUT, self.sonos.topology())
+        // Validate the Group before waiting for the turn, with its own bounded read.
+        // Playback resolves it again; only that snapshot baselines the new Handoff.
+        let groups = tokio::time::timeout(sonos::CONTROL_TIMEOUT, self.sonos.topology())
             .await
             .map_err(|_| {
                 tracing::warn!(group, "topology for a Handoff start timed out");
                 ApiError::GroupFailed
             })?
-            .map_err(sonos_error)?
-            .into_iter()
-            .find(|found| found.id == group)
-            .ok_or(ApiError::GroupNotFound)?
-            .members
-            .into_iter()
-            .map(|member| member.id)
-            .collect();
+            .map_err(|error| {
+                tracing::warn!(group, %error, "topology for a Handoff start failed");
+                sonos_error(error)
+            })?;
+        if !groups.iter().any(|found| found.id == group) {
+            return Err(ApiError::GroupNotFound);
+        }
         let after_turn = if from_start {
             sonos::PLAY_TIMEOUT
         } else {
@@ -802,11 +807,14 @@ impl<S: Store> AppApi<S> {
             // The replaced Handoff, if any, is gone: so is its supervision.
             supervisors.stop(&handoff.group);
             // The stream answers from here on: the Group may fetch it as soon as it is told.
-            if let Err(error) = sonos.play(&handoff.group, &target).await {
-                tracing::warn!(group = handoff.group, %error, "a Group did not start a Handoff");
-                end_unstarted(store.as_ref(), &stream, &handoff.group).await;
-                return Err(sonos_error(error));
-            }
+            let played = match sonos.play(&handoff.group, &target).await {
+                Ok(played) => played,
+                Err(error) => {
+                    tracing::warn!(group = handoff.group, %error, "a Group did not start a Handoff");
+                    end_unstarted(store.as_ref(), &stream, &handoff.group).await;
+                    return Err(sonos_error(error));
+                }
+            };
             // Seek after Play: the smoke test (docs/research/sonos-smoke-2026-11-04.md) sought
             // Groups already playing; a Seek right after Play is unverified on hardware.
             if !position.is_zero()
@@ -851,6 +859,7 @@ impl<S: Store> AppApi<S> {
                 });
                 return Err(sonos_error(error));
             }
+            let members = played.members.into_iter().map(|member| member.id).collect();
             supervisors.start(&handoff, stream, known_length(length), position, members);
             tracing::info!(
                 group = handoff.group,
@@ -908,8 +917,8 @@ impl<S: Store> AppApi<S> {
             let _turn = turn.take(&task_group, CONTROL_TURN_TIME, not_done).await?;
             let controlled = controls.control(&task_group, control).await;
             // Still holding the turn, so the supervisor told is this Handoff's.
-            if let Ok((playback, reliable)) = &controlled {
-                supervisors.seen(&task_group, playback, *reliable);
+            if let Ok((playback, position)) = &controlled {
+                supervisors.seen(&task_group, playback, *position);
             }
             controlled.map(|(playback, _)| playback)
         })
@@ -1104,9 +1113,9 @@ const CONTROL_LIBRARY_SERVER_TIME: Duration = Duration::from_secs(7);
 /// [`START_PROGRESS_TIME`] to read Progress again. Replacement Progress gets only the
 /// remaining time beyond the Group's calls (at most [`REPLACED_PROGRESS_TIME`]).
 /// Playing takes [`sonos::PLAY_TIMEOUT`], seeking [`sonos::CONTROL_TIMEOUT`].
-/// Turn wait is the remaining 14 seconds less elapsed resolution/topology and reserved
-/// calls: 4 seconds for a start `from_start`, or 2 + 4 + 4 seconds otherwise (reserving a
-/// seek even without Progress). Insufficient remaining time sends nothing to the Group.
+/// Reserved calls take 4 seconds for `from_start`, or 2 + 4 + 4 seconds otherwise (reserving
+/// a seek even without Progress). Maximum turn wait is therefore about 10 or 4 seconds,
+/// respectively, less elapsed resolution/topology. Insufficient remaining time sends nothing.
 /// One second under the App's 15.
 const START_TIME: Duration = Duration::from_secs(14);
 
