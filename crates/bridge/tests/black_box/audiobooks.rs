@@ -52,6 +52,7 @@ struct Setup {
     office: PlayerId,
     bridge: TestBridge,
     alice: AbsUser,
+    bob: AbsUser,
     alices: Session,
     bobs: Session,
 }
@@ -83,6 +84,7 @@ async fn setup() -> Setup {
         office,
         bridge,
         alice,
+        bob,
         alices,
         bobs,
     }
@@ -268,12 +270,17 @@ async fn initial_resume_keeps_its_file_when_a_short_file_advances_during_start()
         // Natural advancement after Play, before the initial seek has acted.
         eventually("Play never acted", WITHIN, async || {
             household.transport_state(&kitchen) == "PLAYING"
-        }).await;
+        })
+        .await;
         clock.advance(seconds(2));
         assert_eq!(household.track_number(&kitchen), Some(2));
         eventually("initial REL_TIME never arrived", WITHIN, async || {
-            household.sought(&kitchen).iter().any(|seek| seek.unit == "REL_TIME")
-        }).await;
+            household
+                .sought(&kitchen)
+                .iter()
+                .any(|seek| seek.unit == "REL_TIME")
+        })
+        .await;
         // It must not advance again while REL_TIME is in flight.
         clock.advance(seconds(2));
     });
@@ -842,31 +849,50 @@ async fn failed_seek_quarantine_survives_cleanup_failure_recovery_and_restart() 
         db.execute_batch(
             "CREATE TRIGGER refuse_cleanup BEFORE DELETE ON handoffs
              BEGIN SELECT RAISE(FAIL, 'injected cleanup failure'); END;",
-        ).unwrap();
-        setup.household.set_fault(&setup.kitchen, sonos_fake::Fault::RefuseSeek);
+        )
+        .unwrap();
+        setup
+            .household
+            .set_fault(&setup.kitchen, sonos_fake::Fault::RefuseSeek);
         assert_eq!(
-            setup.bridge.api().control_error(
-                &setup.bobs, setup.kitchen.uuid(), GroupControl::Skip(Skip::Forward30),
-            ).await,
+            setup
+                .bridge
+                .api()
+                .control_error(
+                    &setup.bobs,
+                    setup.kitchen.uuid(),
+                    GroupControl::Skip(Skip::Forward30),
+                )
+                .await,
             (StatusCode::BAD_GATEWAY, ApiError::GroupFailed),
         );
         eventually("cleanup never paused", WITHIN, async || {
             setup.household.transport_state(&setup.kitchen) == "PAUSED_PLAYBACK"
-        }).await;
+        })
+        .await;
         assert_eq!(setup.track(), (Some(2), Duration::ZERO));
-        let retained: i64 = db.query_row("SELECT count(*) FROM handoffs", [], |row| row.get(0)).unwrap();
+        let retained: i64 = db
+            .query_row("SELECT count(*) FROM handoffs", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(retained, 1, "the test must exercise failed deletion");
         if restart {
             setup.bridge.restart();
         }
         // Recover storage and the Group, but never trust the retained failed seek again.
         db.execute_batch("DROP TRIGGER refuse_cleanup;").unwrap();
-        setup.household.set_fault(&setup.kitchen, sonos_fake::Fault::None);
+        setup
+            .household
+            .set_fault(&setup.kitchen, sonos_fake::Fault::None);
         let api = setup.bridge.api();
         assert_eq!(api.handoffs(&setup.bobs).await, []);
-        for control in [GroupControl::Resume, GroupControl::Pause, GroupControl::Skip(Skip::Back15)] {
+        for control in [
+            GroupControl::Resume,
+            GroupControl::Pause,
+            GroupControl::Skip(Skip::Back15),
+        ] {
             assert_eq!(
-                api.control_error(&setup.bobs, setup.kitchen.uuid(), control).await,
+                api.control_error(&setup.bobs, setup.kitchen.uuid(), control)
+                    .await,
                 test_support::bridge::NO_HANDOFF,
             );
             assert_eq!(setup.progress().await, Some((2395.0, false)));
@@ -875,13 +901,22 @@ async fn failed_seek_quarantine_survives_cleanup_failure_recovery_and_restart() 
         assert_eq!(setup.progress().await, Some((2395.0, false)));
         // Replacement must not write the uncertain selected-file-start position for Alice.
         let episode = setup.abs.seeded().episode(0);
-        api.start_handoff_from_start(&setup.bobs, &episode, setup.kitchen.uuid()).await;
+        api.start_handoff_from_start(&setup.bobs, &episode, setup.kitchen.uuid())
+            .await;
         assert_eq!(setup.progress().await, Some((2395.0, false)));
         assert_eq!(api.handoffs(&setup.bobs).await[0].item, episode);
         setup.advance(10).await;
         let paused = api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
         assert_eq!(paused.position, Some(10.0));
         assert_eq!(setup.progress().await, Some((2395.0, false)));
+        assert_eq!(
+            setup.abs.item_progress(&setup.bob, &episode).await,
+            Some((10.0, false)),
+        );
+        assert_eq!(
+            setup.abs.item_progress(&setup.bob, &setup.book()).await,
+            None
+        );
     }
 }
 
@@ -893,11 +928,18 @@ async fn a_file_seek_is_not_sent_when_its_quarantine_cannot_be_persisted() {
     db.execute_batch(
         "CREATE TRIGGER refuse_quarantine BEFORE UPDATE OF seeking ON handoffs
          BEGIN SELECT RAISE(FAIL, 'injected quarantine failure'); END;",
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(
-        setup.bridge.api().control_error(
-            &setup.bobs, setup.kitchen.uuid(), GroupControl::Skip(Skip::Forward30),
-        ).await,
+        setup
+            .bridge
+            .api()
+            .control_error(
+                &setup.bobs,
+                setup.kitchen.uuid(),
+                GroupControl::Skip(Skip::Forward30),
+            )
+            .await,
         (StatusCode::INTERNAL_SERVER_ERROR, ApiError::Internal),
     );
     assert_eq!(setup.track(), (Some(1), seconds(2395)));
@@ -906,4 +948,93 @@ async fn a_file_seek_is_not_sent_when_its_quarantine_cannot_be_persisted() {
     assert_eq!(setup.skip(Skip::Forward30).await, playing(2425.0));
     assert_eq!(setup.track(), (Some(2), seconds(25)));
     assert_eq!(setup.progress().await, Some((2425.0, false)));
+}
+
+#[tokio::test]
+async fn starts_override_repeat_and_shuffle_to_play_files_in_order_then_finish() {
+    for mode in [
+        sonos_fake::PlayMode::RepeatOne,
+        sonos_fake::PlayMode::RepeatAll,
+        sonos_fake::PlayMode::ShuffleNoRepeat,
+    ] {
+        let setup = setup().await;
+        setup.household.set_play_mode(&setup.kitchen, mode);
+        setup.start(None).await;
+        assert_eq!(setup.track(), (Some(1), Duration::ZERO), "{mode:?}");
+        setup.advance(2405).await;
+        assert_eq!(setup.track(), (Some(2), seconds(5)), "{mode:?}");
+        setup.wait_for_progress((2405.0, false)).await;
+        setup.advance(1800).await;
+        assert_eq!(setup.track(), (Some(3), seconds(5)), "{mode:?}");
+        setup.wait_for_progress((4205.0, false)).await;
+        setup.advance_and_read(110).await;
+        setup.read_every_second(5).await;
+        assert_eq!(
+            setup.household.transport_state(&setup.kitchen),
+            "STOPPED",
+            "{mode:?}"
+        );
+        setup.wait_for_progress((LENGTH, true)).await;
+        eventually("the finished Handoff never ended", WITHIN, async || {
+            setup.bridge.api().handoffs(&setup.bobs).await.is_empty()
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_refused_normal_mode_fails_start_without_playing_or_writing_progress() {
+    let setup = setup().await;
+    setup
+        .abs
+        .set_item_progress(&setup.alice, &setup.book(), 2395.0, false)
+        .await;
+    setup
+        .household
+        .set_play_mode(&setup.kitchen, sonos_fake::PlayMode::RepeatAll);
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::RefusePlayMode);
+    let api = setup.bridge.api();
+    assert_eq!(
+        api.start_handoff_error(&setup.alices, &setup.book(), setup.kitchen.uuid())
+            .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed),
+    );
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "STOPPED");
+    assert_eq!(api.handoffs(&setup.bobs).await, []);
+    setup.advance(31).await;
+    assert_eq!(setup.progress().await, Some((2395.0, false)));
+    let queue = setup.household.queue(&setup.kitchen);
+    let path = &queue[0][queue[0].find("/stream/").unwrap()..];
+    assert_eq!(
+        api.fetch(reqwest::Method::GET, path, None).await.status(),
+        StatusCode::NOT_FOUND,
+    );
+}
+
+#[tokio::test]
+async fn supervision_survives_a_successful_file_seek_overlapping_its_cadence() {
+    let setup = setup().await;
+    setup.start(Some(2395.0)).await;
+    setup.household.set_fault(
+        &setup.kitchen,
+        sonos_fake::Fault::SlowTransport(Duration::from_millis(500)),
+    );
+    let before = setup.household.sought(&setup.kitchen).len();
+    let (playback, ()) = tokio::join!(setup.skip(Skip::Forward30), async {
+        eventually("the file seek never arrived", WITHIN, async || {
+            setup.household.sought(&setup.kitchen).len() > before
+        })
+        .await;
+        // Wake the supervisor while the seek's durable uncertainty mark is still set.
+        setup.advance(31).await;
+    });
+    assert_eq!(playback.position, Some(2425.0));
+    assert_eq!(setup.track(), (Some(2), seconds(25)));
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::None);
+    setup.advance(31).await;
+    setup.wait_for_progress((2456.0, false)).await;
 }

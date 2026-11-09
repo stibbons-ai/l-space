@@ -87,6 +87,8 @@ at the last confirmed position. The stream can still serve files while quarantin
 - [ ] Step 3: playback lands near the end of the file before, and Progress is that position in the whole book.
 - [ ] Step 4: each chapter skip lands at the chapter's start, in the right file; "Next chapter" in the last chapter does nothing; Progress follows each skip.
 - [ ] Step 5: the Group stops at the end of the last file, the book is Finished on the Library Server, and the App no longer shows a Handoff on the Group. Note where the Sonos app shows the queue after the stop (the last file or back at the first): the Bridge doesn't rely on it.
+- [ ] Before each run, enable repeat-one, repeat-all or shuffle in the Sonos app. Starting the Handoff must disable them (`SetPlayMode NORMAL` after activating the queue), preserve ordered file advances and stop after the last file.
+- [ ] Also start with crossfade enabled: record whether narration overlaps across file boundaries after queue replacement. Crossfade behavior remains hardware-unverified; the Bridge does not change it.
 - [ ] Start a plain single-file Item: confirm `AddURIToQueue` works with empty metadata.
 - [ ] Start a two-file book: confirm `AddMultipleURIsToQueue` works with the two empty metadata entries, before trying a large queue.
 - [ ] Start a book of 17 or 33 files; record measured start time and file count in `docs/research/`. Confirm batched `AddMultipleURIsToQueue` works on hardware (16-URI cap follows SoCo, not a hardware measurement); a final batch of one uses `AddURIToQueue`. Play allowance: `4 + ceil(files / 16) - 1` seconds within the Bridge's 14-second total and App's 15.

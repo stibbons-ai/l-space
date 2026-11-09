@@ -2,7 +2,7 @@
 //! SSDP M-SEARCH and serve their device description and the UPnP subset the Bridge uses
 //! (ZoneGroupTopology `GetZoneGroupState`; AVTransport `GetTransportInfo`, `GetPositionInfo`,
 //! `RemoveAllTracksFromQueue`, `AddURIToQueue`, `AddMultipleURIsToQueue`,
-//! `SetAVTransportURI`, `Play`, `Pause` and `Seek`; GroupRenderingControl
+//! `SetAVTransportURI`, `SetPlayMode`, `Play`, `Pause` and `Seek`; GroupRenderingControl
 //! `GetGroupVolume`, `SnapshotGroupVolume` and
 //! `SetGroupVolume`), with Groups, playback, volume and faults the test controls.
 //!
@@ -19,13 +19,17 @@
 //! a volume, [`DEFAULT_VOLUME`] until set (`SetGroupVolume`, or [`Household::set_volume`]);
 //! `SnapshotGroupVolume` is accepted and only recorded, as the fake has no member volumes.
 //!
-//! A track of known length plays to its end; the Group then goes on with the next track
-//! (playing it from its start, without fetching it), and after the last one it stops, as a
-//! Sonos Group does at the end of a single URL or of its queue: Stopped, at its first track,
+//! In NORMAL mode a track of known length plays to its end; the Group then goes on with the
+//! next track (playing it from its start, without fetching it), and after the last one it stops,
+//! as a Sonos Group does at the end of a single URL or of its queue: Stopped, at its first track,
 //! its position back at 0. (Where real Sonos leaves a queue played to its end is unverified;
 //! back at its first track is the case a caller must not be misled by.) A URL the Group is
 //! given has no known length (it plays on without end) unless the test sets one with
 //! [`Household::set_url_length`] or [`Household::set_queue_lengths`].
+//! `SetPlayMode` persists across queue replacement. Repeat-one loops the current track;
+//! repeat-all loops the queue; shuffle-no-repeat uses a deterministic permutation (first
+//! track, then the rest in reverse order), then stops. [`Household::set_play_mode`] seeds
+//! these modes as the Sonos app would.
 //!
 //! The household runs on its own Tokio runtime, so it answers whatever the test's runtime is
 //! doing (also while a test blocks on starting a Bridge). Each player listens on its own
@@ -91,6 +95,29 @@ const GROUP_RENDERING: &str = "urn:schemas-upnp-org:service:GroupRenderingContro
 
 /// A Group's volume until it is set.
 pub const DEFAULT_VOLUME: u8 = 20;
+
+/// Queue modes modeled by the fake, named as AVTransport's `NewPlayMode` values.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlayMode {
+    #[default]
+    Normal,
+    RepeatOne,
+    RepeatAll,
+    /// A deterministic shuffle: first track, then all remaining tracks in reverse order.
+    ShuffleNoRepeat,
+}
+
+impl PlayMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "NORMAL" => Some(Self::Normal),
+            "REPEAT_ONE" => Some(Self::RepeatOne),
+            "REPEAT_ALL" => Some(Self::RepeatAll),
+            "SHUFFLE_NOREPEAT" => Some(Self::ShuffleNoRepeat),
+            _ => None,
+        }
+    }
+}
 
 /// The highest volume `SetGroupVolume` takes; the lowest is 0.
 pub const MAX_VOLUME: u8 = 100;
@@ -240,6 +267,8 @@ pub enum Fault {
     /// It answers every AVTransport call correctly, but only after this long (in real time),
     /// and acts only then.
     SlowTransport(Duration),
+    /// It refuses `SetPlayMode`, leaving the previous queue mode unchanged.
+    RefusePlayMode,
     /// It answers `GetGroupVolume` with a SOAP fault, and everything else correctly.
     FailGroupVolume,
 }
@@ -324,6 +353,7 @@ struct Transport {
     offset: Duration,
     /// When playback last started (in the current track), while it is playing.
     since: Option<Instant>,
+    mode: PlayMode,
 }
 
 impl Transport {
@@ -340,6 +370,7 @@ impl Transport {
             current: 0,
             offset: Duration::ZERO,
             since: None,
+            mode: PlayMode::Normal,
         }
     }
 
@@ -373,8 +404,20 @@ impl Transport {
             }
             moved -= left;
             self.offset = Duration::ZERO;
-            if self.current + 1 < self.tracks.len() {
-                self.current += 1;
+            let next = match self.mode {
+                PlayMode::Normal => {
+                    (self.current + 1 < self.tracks.len()).then_some(self.current + 1)
+                }
+                PlayMode::RepeatOne => Some(self.current),
+                PlayMode::RepeatAll => Some((self.current + 1) % self.tracks.len()),
+                PlayMode::ShuffleNoRepeat => match self.current {
+                    0 if self.tracks.len() > 1 => Some(self.tracks.len() - 1),
+                    n if n > 1 => Some(n - 1),
+                    _ => None,
+                },
+            };
+            if let Some(next) = next {
+                self.current = next;
                 self.since = Some(now.checked_sub(moved).unwrap_or(now));
             } else {
                 self.state = "STOPPED";
@@ -598,6 +641,11 @@ impl Household {
     /// [`Household::set_url_length`] says.
     pub fn set_queue_lengths(&self, coordinator: &PlayerId, lengths: &[Duration]) {
         self.shared.lock().player_mut(coordinator).queue_lengths = lengths.to_vec();
+    }
+
+    /// Changes the queue mode as if the listener set it in the Sonos app.
+    pub fn set_play_mode(&self, coordinator: &PlayerId, mode: PlayMode) {
+        self.settled(coordinator, |transport, _| transport.mode = mode);
     }
 
     /// `coordinator`'s Group reports `state` as its `CurrentTransportState`, as is, such as
@@ -946,6 +994,7 @@ impl HouseholdState {
             }
             "SetAVTransportURI" => {
                 let uri = input(request, "CurrentURI").ok_or(402u16)?;
+                let mode = transport.mode;
                 *transport = match uri.strip_prefix(QUEUE) {
                     Some(queue) if queue == format!("{}#0", served.uuid) => {
                         Transport::loaded(player.queue.clone())
@@ -953,6 +1002,13 @@ impl HouseholdState {
                     Some(_) => return Err(714),
                     None => Transport::loaded(vec![FakeTrack::given(uri, player.url_length)]),
                 };
+                transport.mode = mode;
+            }
+            "SetPlayMode" => {
+                transport.mode = input(request, "NewPlayMode")
+                    .as_deref()
+                    .and_then(PlayMode::parse)
+                    .ok_or(402u16)?;
             }
             "Play" => {
                 let uri = transport.track().ok_or(701u16)?.uri.clone();
@@ -1233,6 +1289,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         Some(Fault::RefusePlayback) if matches!(action, "SetAVTransportURI" | "Play") => {
             return upnp_fault(714);
         }
+        Some(Fault::RefusePlayMode) if action == "SetPlayMode" => return upnp_fault(701),
         Some(Fault::SlowPlayback(delay)) if action == "SetAVTransportURI" => {
             tokio::time::sleep(delay).await;
             true
@@ -1265,6 +1322,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             | Fault::NoPosition
             | Fault::FailTransportInfo
             | Fault::RefusePlayback
+            | Fault::RefusePlayMode
             | Fault::SlowPlayback(_)
             | Fault::RefuseControl
             | Fault::HangControl
@@ -1326,6 +1384,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             | "AddURIToQueue"
             | "AddMultipleURIsToQueue"
             | "SetAVTransportURI"
+            | "SetPlayMode"
             | "Play"
             | "Pause"
             | "Seek",
@@ -1697,6 +1756,34 @@ mod tests {
             );
         }
         assert_eq!(household.track_number(&kitchen), Some(2));
+    }
+
+    #[tokio::test]
+    async fn queue_modes_survive_loading_and_change_natural_advancement() {
+        for (mode, next, final_state, final_position) in [
+            (PlayMode::Normal, 2, "STOPPED", 0),
+            (PlayMode::RepeatOne, 1, "PLAYING", 40),
+            (PlayMode::RepeatAll, 2, "PLAYING", 0),
+            (PlayMode::ShuffleNoRepeat, 3, "STOPPED", 0),
+        ] {
+            let (household, clock) = Household::with_manual_clock();
+            let kitchen = household.add_player("Kitchen");
+            household.set_queue_lengths(&kitchen, &[seconds(60), seconds(30), seconds(10)]);
+            household.set_play_mode(&kitchen, mode);
+            queue_three(&household, &kitchen).await;
+            call(&household, &kitchen, "Play", "<Speed>1</Speed>").await;
+            clock.advance(seconds(65));
+            assert_eq!(household.track_number(&kitchen), Some(next), "{mode:?}");
+            assert_eq!(household.position(&kitchen), seconds(5), "{mode:?}");
+            clock.advance(seconds(35));
+            assert_eq!(household.transport_state(&kitchen), final_state, "{mode:?}");
+            assert_eq!(household.track_number(&kitchen), Some(1), "{mode:?}");
+            assert_eq!(
+                household.position(&kitchen),
+                seconds(final_position),
+                "{mode:?}"
+            );
+        }
     }
 
     #[tokio::test]

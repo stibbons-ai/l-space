@@ -575,15 +575,19 @@ impl<S: Store> Supervisor<S> {
         // near the end, read the Group without, so their reads stay about a second apart
         // ([`PLAYED_SINCE_MAX`]).
         let checked = if due || matches!(ending, Some(Ending::Finish { .. })) {
-            let Some(found) = self.active().await? else {
-                self.skipped(due, "storage failed");
-                return Continue(Then::Wait);
+            // A control holding the turn may have temporarily quarantined this stream.
+            // Only check its key here; trust its position only after taking the turn below.
+            let found = match self.controls.store.handoff(self.files.stream()).await {
+                Ok(Some(found)) => found,
+                Ok(None) => return Break(()),
+                Err(error) => {
+                    self.storage_failed("look up a supervised stream's key", &error);
+                    self.skipped(due, "storage failed");
+                    return Continue(Then::Wait);
+                }
             };
             let mut time = Budget(CHECK_TIME);
-            let checked = self
-                .controls
-                .check(&found.active, Wanted::No, &mut time)
-                .await;
+            let checked = self.controls.check(&found, Wanted::No, &mut time).await;
             if let Acting::Revoked = checked.acting {
                 return Break(());
             }

@@ -488,8 +488,9 @@ impl Shared {
     /// (`RemoveAllTracksFromQueue`), adds the stream URLs in order in batches of at most 16
     /// (`AddURIToQueue` for one, `AddMultipleURIsToQueue` otherwise, without metadata),
     /// and is given its queue
-    /// (`SetAVTransportURI` to `x-rincon-queue:<coordinator>#0`), goes to the first track to
-    /// play (`Seek` `TRACK_NR`) and is told to play. Returns the URLs.
+    /// (`SetAVTransportURI` to `x-rincon-queue:<coordinator>#0`), establishes NORMAL mode
+    /// (no shuffle or repeat), goes to the first track to play (`Seek` `TRACK_NR`) and is
+    /// told to play. Returns the URLs.
     async fn play(
         &self,
         group: &str,
@@ -561,6 +562,7 @@ impl Shared {
             &[("CurrentURI", &queue), ("CurrentURIMetaData", "")],
         )
         .await?;
+        call("SetPlayMode", &[("NewPlayMode", "NORMAL")]).await?;
         call("Seek", &borrowed(&track_seek(first))).await?;
         call("Play", &[("Speed", "1")]).await?;
         Ok(urls)
@@ -924,10 +926,11 @@ mod tests {
 
     /// The SOAP actions that start a Group on a queue of one URL, as `sonos-fake` records
     /// them.
-    const STARTED: [&str; 5] = [
+    const STARTED: [&str; 6] = [
         "AVTransport#RemoveAllTracksFromQueue",
         "AVTransport#AddURIToQueue",
         "AVTransport#SetAVTransportURI",
+        "AVTransport#SetPlayMode",
         "AVTransport#Seek",
         "AVTransport#Play",
     ];

@@ -645,7 +645,9 @@ impl Store for SqliteStore {
         let (handoffs, unreadable) = self
             .transaction(move |tx| {
                 let rows = tx
-                    .prepare_cached(select_handoffs!("WHERE h.seeking = 0 ORDER BY h.started_at, h.group_id"))?
+                    .prepare_cached(select_handoffs!(
+                        "WHERE h.seeking = 0 ORDER BY h.started_at, h.group_id"
+                    ))?
                     .query_map([], handoff_row)?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
                 let mut handoffs = Vec::new();
@@ -675,10 +677,12 @@ impl Store for SqliteStore {
     async fn set_handoff_seeking(&self, stream: &StreamId, seeking: bool) -> Result<bool, Error> {
         let stream = *stream;
         self.transaction(move |tx| {
-            let changed = tx.prepare_cached("UPDATE handoffs SET seeking = ?2 WHERE stream_id = ?1")?
+            let changed = tx
+                .prepare_cached("UPDATE handoffs SET seeking = ?2 WHERE stream_id = ?1")?
                 .execute(params![stream.as_bytes(), seeking])?;
             Ok(changed > 0)
-        }).await
+        })
+        .await
     }
 
     async fn end_handoff(&self, stream: &StreamId) -> Result<bool, Error> {

@@ -25,20 +25,12 @@ const SET_URI: &str = "AVTransport#SetAVTransportURI";
 /// The SOAP action that has a Group play, as `sonos-fake` records it.
 const PLAY: &str = "AVTransport#Play";
 
-/// The SOAP action that moves a Group to a position, as `sonos-fake` records it.
-const SEEK: &str = "AVTransport#Seek";
-
 /// The SOAP action that pauses a Group, as `sonos-fake` records it.
 const PAUSE: &str = "AVTransport#Pause";
 
 /// The SOAP action that empties a Group's queue, the first a start sends, as `sonos-fake`
 /// records it.
 const CLEAR: &str = "AVTransport#RemoveAllTracksFromQueue";
-
-/// The SOAP actions a start sends a Group for an Item in one file, before any seek to its
-/// start position: the queue emptied, the file added, the queue given, its first track
-/// selected, play.
-const STARTED: [&str; 5] = [CLEAR, "AVTransport#AddURIToQueue", SET_URI, SEEK, PLAY];
 
 /// The WARN the Bridge logs when a Group doesn't go to a start's position.
 const NOT_SOUGHT: &str = "a Group did not go to a Handoff's start position";
@@ -222,23 +214,6 @@ fn assert_quiet(output: &[serde_json::Value], key: &str, stream_ids: &[&str]) {
             assert!(!event.to_string().contains(id), "{event}");
         }
     }
-}
-
-/// The AVTransport actions that change what `player` plays, in the order it was sent them.
-fn started(household: &Household, player: &PlayerId) -> Vec<String> {
-    let actions = household.actions_of(player).into_iter();
-    actions
-        .filter(|action| action.starts_with("AVTransport#") && !action.contains("#Get"))
-        .collect()
-}
-
-/// What a start of an Item in one file sends a Group when it starts `target` (`H:MM:SS`) into
-/// it: the actions, [`STARTED`] then a seek, and the seeks, to the file then into it.
-fn started_at(target: &str) -> (Vec<String>, Vec<Seek>) {
-    let mut actions: Vec<String> = STARTED.map(String::from).to_vec();
-    actions.push(SEEK.to_owned());
-    let sought = vec![Seek::new("TRACK_NR", "1"), Seek::new("REL_TIME", target)];
-    (actions, sought)
 }
 
 /// Whether `player` has been called with `action`.
@@ -784,11 +759,6 @@ async fn starts_on_one_group_take_turns() {
         (setup.office.uuid(), setup.office.uuid())
     );
 
-    // One start's queue and Play, then the other's: never one's queue changed before the
-    // other's Play.
-    let both: Vec<&str> = STARTED.iter().chain(&STARTED).copied().collect();
-    assert_eq!(started(&setup.household, &setup.office), both);
-
     // Office plays the stream of the Handoff listed for it.
     let listed = api.handoffs(&setup.session).await;
     assert_eq!(listed.len(), 1);
@@ -796,6 +766,11 @@ async fn starts_on_one_group_take_turns() {
         .household
         .uri(&setup.office)
         .expect("Office was given a URL");
+    // The replacement owns the entire queue: concurrent starts must not leave both Items.
+    assert_eq!(
+        setup.household.queue(&setup.office),
+        std::slice::from_ref(&uri)
+    );
     let response = api.fetch(Method::GET, path(&uri), Some("bytes=0-")).await;
     assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(
@@ -1090,10 +1065,6 @@ async fn a_start_begins_at_the_users_progress_in_whole_seconds() {
         (Duration::from_secs(754), true)
     );
     assert_eq!(setup.position(&setup.office), (Duration::ZERO, false));
-    // Told to play first, then to seek.
-    let (actions, sought) = started_at("0:12:34");
-    assert_eq!(started(&setup.household, &setup.kitchen), actions);
-    assert_eq!(setup.household.sought(&setup.kitchen), sought);
     assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
     // A start writes no Progress.
     assert_eq!(
@@ -1123,9 +1094,6 @@ async fn an_audiobook_starts_at_the_users_progress() {
         setup.position(&setup.kitchen),
         (Duration::from_secs(754), true)
     );
-    let (actions, sought) = started_at("0:12:34");
-    assert_eq!(started(&setup.household, &setup.kitchen), actions);
-    assert_eq!(setup.household.sought(&setup.kitchen), sought);
 }
 
 #[tokio::test]

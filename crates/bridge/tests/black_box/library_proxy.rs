@@ -330,8 +330,10 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         let _ = answered.send(());
     }
     let episodes_hidden = item_lookup && faults.hide_episodes.load(Ordering::SeqCst);
-    let lengths = faults.file_lengths.lock().expect("file lengths").clone();
-    if (hidden || episodes_hidden || (item_lookup && lengths.is_some())) && status.is_success() {
+    let lengths = (item_lookup && status.is_success())
+        .then(|| faults.file_lengths.lock().expect("file lengths").clone())
+        .flatten();
+    if (hidden || episodes_hidden || lengths.is_some()) && status.is_success() {
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("Item JSON");
         if hidden {
             hide_durations(&mut json);

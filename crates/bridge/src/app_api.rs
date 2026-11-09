@@ -802,33 +802,36 @@ impl<S: Store> AppApi<S> {
             // Freeze multi-file playback while selecting its saved file and offset: a short
             // file can finish even between TRACK_NR and REL_TIME. Keep all these calls in
             // the existing initial-seek reservation.
-            let mut sought = if !to.within.is_zero() { async {
-                let mut time = Budget(sonos::CONTROL_TIMEOUT);
-                let track = (handoff.files.len() > 1).then_some(to.file);
-                if track.is_some() {
-                    time.spend(sonos.pause(&handoff.group))
+            let sought = async {
+                if !to.within.is_zero() {
+                    let mut time = Budget(sonos::CONTROL_TIMEOUT);
+                    let track = (handoff.files.len() > 1).then_some(to.file);
+                    if track.is_some() {
+                        time.spend(sonos.pause(&handoff.group))
+                            .await
+                            .ok_or(sonos::Error::GroupFailed)??;
+                    }
+                    let left = time.0;
+                    time.spend(sonos.seek(&handoff.group, track, to.within, left))
                         .await
                         .ok_or(sonos::Error::GroupFailed)??;
+                    if track.is_some() {
+                        time.spend(sonos.resume(&handoff.group))
+                            .await
+                            .ok_or(sonos::Error::GroupFailed)??;
+                    }
                 }
-                let left = time.0;
-                time.spend(sonos.seek(&handoff.group, track, to.within, left))
+                store
+                    .set_handoff_seeking(&stream, false)
                     .await
-                    .ok_or(sonos::Error::GroupFailed)??;
-                if track.is_some() {
-                    time.spend(sonos.resume(&handoff.group))
-                        .await
-                        .ok_or(sonos::Error::GroupFailed)??;
-                }
+                    .map_err(|error| {
+                        log_storage_error("restore a started Handoff", &error);
+                        sonos::Error::GroupFailed
+                    })?;
                 Ok::<(), sonos::Error>(())
-            }.await } else { Ok(()) };
-            if sought.is_ok()
-                && let Err(error) = store.set_handoff_seeking(&stream, false).await
-            {
-                log_storage_error("restore a started Handoff", &error);
-                sought = Err(sonos::Error::GroupFailed);
             }
-            if let Err(error) = sought
-            {
+            .await;
+            if let Err(error) = sought {
                 tracing::warn!(
                     group = handoff.group,
                     position = position.as_secs(),
@@ -1540,7 +1543,10 @@ impl<S: Store> Controls<S> {
         // Persist uncertainty before TRACK_NR. Cleanup deletion can fail, and a crash must
         // not turn a half-finished seek back into trusted Progress.
         if to.track.is_some()
-            && !self.store.set_handoff_seeking(files.stream(), true).await
+            && !self
+                .store
+                .set_handoff_seeking(files.stream(), true)
+                .await
                 .map_err(storage_error("quarantine a file seek"))?
         {
             return Err(ApiError::NoHandoff);
