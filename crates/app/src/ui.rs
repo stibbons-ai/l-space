@@ -9,7 +9,7 @@ use api::{
 };
 use dioxus::prelude::*;
 
-use crate::flow::{App, Notice, Screen, volume_step};
+use crate::flow::{App, Notice, Screen, offers_chapters, volume_step};
 use crate::i18n::{self, LanguageChoice, Text};
 use crate::storage::FileStore;
 
@@ -695,8 +695,8 @@ fn GroupsScreen(
 }
 
 /// A Group's controls: for its Handoff, Pause or Resume (by its state), 15 s back and 30 s
-/// forward; its volume with a step down and up, if it told one. All are off while any action
-/// runs, this Group's included.
+/// forward, and for an audiobook's, the previous and next chapter; its volume with a step down
+/// and up, if it told one. All are off while any action runs, this Group's included.
 #[component]
 fn GroupControls(app: Signal<App>, busy: Signal<bool>, group: Group) -> Element {
     let text = |text| app.read().text(text);
@@ -710,6 +710,7 @@ fn GroupControls(app: Signal<App>, busy: Signal<bool>, group: Group) -> Element 
     } else {
         (Control::Resume, Text::GroupResume)
     };
+    let chapters = offers_chapters(&group);
     let id = group.id.clone();
     let control = move |action: Control| {
         let id = id.clone();
@@ -745,6 +746,22 @@ fn GroupControls(app: Signal<App>, busy: Signal<bool>, group: Group) -> Element 
                     disabled: busy(),
                     onclick: control(Control::Skip(Skip::Forward30)),
                     {text(Text::GroupForward30)}
+                }
+                if chapters {
+                    button {
+                        r#type: "button",
+                        class: "secondary",
+                        disabled: busy(),
+                        onclick: control(Control::Skip(Skip::PreviousChapter)),
+                        {text(Text::GroupPreviousChapter)}
+                    }
+                    button {
+                        r#type: "button",
+                        class: "secondary",
+                        disabled: busy(),
+                        onclick: control(Control::Skip(Skip::NextChapter)),
+                        {text(Text::GroupNextChapter)}
+                    }
                 }
             }
         }

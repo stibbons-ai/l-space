@@ -3,6 +3,7 @@
 //! Audiobookshelf in a container. The harness is the `test-support` crate; add new areas as
 //! modules here so they share one binary.
 
+mod audiobooks;
 mod browse;
 mod control;
 mod encryption;
@@ -18,3 +19,7 @@ mod login;
 mod progress;
 mod shutdown;
 mod startup;
+
+fn seconds(seconds: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(seconds)
+}

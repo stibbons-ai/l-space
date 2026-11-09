@@ -589,6 +589,7 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "clock",
+ "domain",
  "futures",
  "getrandom 0.4.3",
  "reqwest 0.12.28",
@@ -2135,6 +2136,10 @@ dependencies = [
  "selectors",
  "tendril",
 ]
+
+[[package]]
+name = "domain"
+version = "0.1.0"
 
 [[package]]
 name = "dpi"

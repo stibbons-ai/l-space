@@ -8,9 +8,9 @@
 //! ([`Audiobookshelf::set_progress`]). The seeded Libraries are shared by all tests, and users
 //! are never deleted while the container runs. A test user sees only the seeded Libraries,
 //! explicit content included, unless the test says otherwise; so a test may add a Library
-//! ([`Audiobookshelf::crowded_podcast`], [`Audiobookshelf::resumable_book`]) or mark a seeded
-//! Item explicit or tag it without hiding or showing anything to other tests' users, as long
-//! as it undoes the mark or tags.
+//! ([`Audiobookshelf::crowded_podcast`], [`Audiobookshelf::resumable_book`],
+//! [`Audiobookshelf::mixed_format_book`]) or mark a seeded Item explicit or tag it without
+//! hiding or showing anything to other tests' users, as long as it undoes the mark or tags.
 //!
 //! Setup goes through Audiobookshelf's REST API as its root user, the way an admin would,
 //! never through its database: users are created there, API keys created, moved and deleted,
@@ -90,6 +90,30 @@ const RESUMABLE_FILE: (&str, u32) = ("/resumable/L-Space/Resumed/Resumed.wav", 1
 /// The Library [`Audiobookshelf::resumable_book`] created, and its audiobook.
 #[derive(Debug, Clone)]
 pub struct Resumable {
+    pub library: String,
+    pub book: String,
+}
+
+/// The folder of [`Audiobookshelf::mixed_format_book`], in no Library until a test asks for it.
+const MIXED_FOLDER: &str = "/mixed";
+
+/// [`Audiobookshelf::mixed_format_book`]'s audio files: path in the container, length in
+/// seconds. The second is WAV audio named as Ogg Opus, a format Sonos doesn't play.
+const MIXED_FILES: [(&str, u32); 2] = [
+    ("/mixed/L-Space/Mixed/01 - Plays.wav", 60),
+    ("/mixed/L-Space/Mixed/02 - Does Not.opus", 60),
+];
+
+/// The Library [`Audiobookshelf::mixed_format_book`] created, and its audiobook.
+#[derive(Debug, Clone)]
+pub struct Mixed {
+    pub library: String,
+    pub book: String,
+}
+
+/// The Library and Item of [`Audiobookshelf::fractional_book`].
+#[derive(Debug, Clone)]
+pub struct Fractional {
     pub library: String,
     pub book: String,
 }
@@ -397,6 +421,34 @@ impl Audiobookshelf {
         Resumable { library, book }
     }
 
+    /// Creates the audiobook Library "Mixed", holding "Mixed" by L-Space, two audio files of
+    /// a minute each, the second named as Ogg Opus (`.opus`), and waits until a scan has
+    /// found both: an audiobook one of whose files is in a format Sonos doesn't play. No test
+    /// user sees it unless created to ([`Audiobookshelf::new_user_seeing`]). At most one test
+    /// per test run may call this: the folder takes one Library, so a second call panics.
+    pub async fn mixed_format_book(&self) -> Mixed {
+        let library = self.new_library("Mixed", MIXED_FOLDER, "book").await;
+        let book = self
+            .scanned_alone(&library, "the mixed-format book", |book| {
+                book["media"]["numAudioFiles"] == MIXED_FILES.len()
+            })
+            .await;
+        Mixed { library, book }
+    }
+
+    /// A three-file WAV book with fractional durations (40.05, 30.07 and 20 seconds),
+    /// one chapter per file. Only explicitly allowed test users see its Library.
+    /// At most one test per run may create it.
+    pub async fn fractional_book(&self) -> Fractional {
+        let library = self.new_library("Fractional", "/fractional", "book").await;
+        let book = self
+            .scanned_alone(&library, "the fractional book", |book| {
+                book["media"]["numAudioFiles"] == 3
+            })
+            .await;
+        Fractional { library, book }
+    }
+
     /// The id of the one library item in Library `library` once a scan found it `ready`;
     /// panics, naming it `what`, if that takes longer than [`SCAN_TIMEOUT`].
     async fn scanned_alone(
@@ -640,6 +692,15 @@ impl Audiobookshelf {
         }
         let (path, seconds) = RESUMABLE_FILE;
         image = image.with_copy_to(path, silence(seconds));
+        for (path, seconds) in MIXED_FILES {
+            image = image.with_copy_to(path, silence(seconds));
+        }
+        for (n, samples) in [4005, 3007, 2000].into_iter().enumerate() {
+            image = image.with_copy_to(
+                format!("/fractional/L-Space/Fractions/0{} - Part.wav", n + 1),
+                silence_samples(samples),
+            );
+        }
         let container = image
             .with_startup_timeout(STARTUP_TIMEOUT)
             .start()
@@ -852,10 +913,14 @@ async fn root_token(http: &reqwest::Client, base_url: &str) -> String {
 /// noise rather than silence, so every byte depends on its offset and a byte range served
 /// from the wrong place shows.
 fn silence(seconds: u32) -> Vec<u8> {
+    silence_samples(100 * seconds)
+}
+
+/// Near-silence at 100 samples per second, allowing fractional-second fixture files.
+fn silence_samples(data_len: u32) -> Vec<u8> {
     const RATE: u32 = 100;
     // Unsigned 8-bit samples: 0x80 is silence.
     const SILENT: u8 = 0x80;
-    let data_len = RATE * seconds;
     let mut wav = Vec::with_capacity(44 + data_len as usize);
     wav.extend_from_slice(b"RIFF");
     wav.extend_from_slice(&(36 + data_len).to_le_bytes());
@@ -870,7 +935,7 @@ fn silence(seconds: u32) -> Vec<u8> {
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_len.to_le_bytes());
     // A xorshift generator's low four bits, around silence: -8 to +7 of 255.
-    let mut state = 0x2545_F491_u32 ^ seconds;
+    let mut state = 0x2545_F491_u32 ^ data_len;
     wav.extend((0..data_len).map(|_| {
         state ^= state << 13;
         state ^= state >> 17;

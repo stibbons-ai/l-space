@@ -9,6 +9,8 @@
 //! store::store_contract_tests!(MyBackend::new());
 //! ```
 
+use std::time::Duration;
+
 use abs::ApiKey;
 
 use crate::{
@@ -59,6 +61,8 @@ macro_rules! store_contract_tests {
             a_groups_handoff_is_the_one_that_replaced_its_old_one,
             a_groups_handoff_ends_with_its_stream_or_its_key,
             a_groups_handoff_outlives_the_session_that_started_it,
+            a_handoff_keeps_all_its_files_in_order,
+            an_empty_handoff_is_refused_without_replacing_the_active_one,
         );
     };
     (@tests $backend:expr; $($test:ident),* $(,)?) => {
@@ -369,10 +373,11 @@ fn handoff(group: &str, episode: &str, user: &LibraryUser, started_at: i64) -> H
         group: group.into(),
         library_item: "podcast-id".into(),
         episode: Some(episode.into()),
-        file: HandoffFile {
+        files: vec![HandoffFile {
             ino: format!("{episode}-ino"),
             name: format!("{episode}.mp3"),
-        },
+            duration: Some(Duration::from_secs(600)),
+        }],
         started_by: user.clone(),
         username: format!("{}-name", user.user_id),
         started_at,
@@ -657,4 +662,78 @@ pub async fn a_groups_handoff_outlives_the_session_that_started_it(backend: &imp
         on_group(&store, "RINCON_K").await,
         on_stream(stream(1), &kitchen, "alice-key")
     );
+}
+
+/// An audiobook's Handoff on Group `group`, started by `user`: three files, the second of
+/// unknown length, the first with a fraction of a second.
+fn book_handoff(group: &str, user: &LibraryUser) -> Handoff {
+    let file = |ino: &str, name: &str, duration| HandoffFile {
+        ino: ino.into(),
+        name: name.into(),
+        duration,
+    };
+    Handoff {
+        group: group.into(),
+        library_item: "book-id".into(),
+        episode: None,
+        files: vec![
+            file(
+                "3",
+                "01 - Part One.mp3",
+                Some(Duration::new(2400, 123_456_789)),
+            ),
+            file("1", "02 - Part One.mp3", None),
+            file("2", "03.m4b", Some(Duration::from_secs(120))),
+        ],
+        started_by: user.clone(),
+        username: format!("{}-name", user.user_id),
+        started_at: 3_000,
+    }
+}
+
+pub async fn a_handoff_keeps_all_its_files_in_order(backend: &impl Backend) {
+    let book = book_handoff("RINCON_K", &alice());
+    {
+        let store = backend.open().await;
+        start(&store, stream(1), &book, "alice-key").await;
+    }
+
+    let store = backend.open().await;
+    assert_eq!(
+        active(&store, stream(1)).await,
+        acting_with(&book, "alice-key")
+    );
+    assert_eq!(
+        on_group(&store, "RINCON_K").await,
+        on_stream(stream(1), &book, "alice-key")
+    );
+    assert_eq!(listed(&store).await, [book]);
+
+    // Replaced by a Handoff of one file, the Group's Handoff has that one file only.
+    let episode = handoff("RINCON_K", "ep-1", &bob(), 4_000);
+    start(&store, stream(2), &episode, "bob-key").await;
+    assert_eq!(listed(&store).await, [episode]);
+    // The replaced Handoff's files went with it: stored again, the book has its three.
+    let book = book_handoff("RINCON_O", &alice());
+    start(&store, stream(1), &book, "alice-key").await;
+    assert_eq!(
+        active(&store, stream(1)).await,
+        acting_with(&book, "alice-key")
+    );
+}
+
+pub async fn an_empty_handoff_is_refused_without_replacing_the_active_one(backend: &impl Backend) {
+    let store = backend.open().await;
+    let first = handoff("RINCON_K", "ep-1", &alice(), 1000);
+    start(&store, stream(1), &first, "alice-key").await;
+    let mut empty = book_handoff("RINCON_K", &bob());
+    empty.files.clear();
+    assert!(
+        store
+            .start_handoff(&stream(2), &empty, &key("bob-key"))
+            .await
+            .is_err()
+    );
+    assert_eq!(listed(&store).await, [first]);
+    assert_eq!(active(&store, stream(2)).await, None);
 }

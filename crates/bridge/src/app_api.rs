@@ -3,6 +3,7 @@
 //! (supervised while active: `supervise`), and controlling a Group (its Handoff and its
 //! volume).
 
+mod item_files;
 mod supervise;
 
 use std::collections::HashMap;
@@ -22,9 +23,10 @@ use clock::Clock;
 use sonos::Sonos;
 use store::{ActiveHandoff, GroupHandoff, HandoffFile, LibraryUser, SessionId, Store};
 
-use crate::browse::{self, NoSingleFile};
+use crate::browse;
 use crate::config::{LibraryServerConfig, LibraryServerUrl};
-use crate::stream::{self, StreamToken};
+use crate::stream::StreamToken;
+use item_files::{ItemFiles, ItemPlayback, playable_files};
 use supervise::Supervisors;
 
 /// How many more Items in progress than the user has Progress records the Bridge asks the
@@ -103,19 +105,20 @@ impl<S: Store> AppApi<S> {
         configured_in(&self.library_servers, base_url)
     }
 
-    /// The active Handoff whose stream is `stream`, if `file` is its file's name, with its
-    /// configured Library Server; none otherwise, alike for every reason.
+    /// The active Handoff whose stream is `stream`, and its file named by the URL `segment`,
+    /// with its configured Library Server; none otherwise, alike for every reason.
     pub(crate) async fn active_handoff(
         &self,
         stream: &StreamToken,
-        file: &str,
-    ) -> Result<Option<(&str, ActiveHandoff)>, store::Error> {
+        segment: &str,
+    ) -> Result<Option<(&str, ActiveHandoff, HandoffFile)>, store::Error> {
         let Some(active) = self.store.handoff(&stream.hash()).await? else {
             return Ok(None);
         };
-        if file != active.handoff.file.name {
+        let Some(index) = crate::stream::file_in_segment(segment, &active.handoff.files) else {
             return Ok(None);
-        }
+        };
+        let served = active.handoff.files[index].clone();
         let started_by = &active.handoff.started_by;
         // The operator may have removed the Library Server since the start.
         let Some(library_server) = self.configured_base_url(&started_by.library_server) else {
@@ -126,7 +129,7 @@ impl<S: Store> AppApi<S> {
             );
             return Ok(None);
         };
-        Ok(Some((library_server, active)))
+        Ok(Some((library_server, active, served)))
     }
 
     async fn login(
@@ -543,46 +546,49 @@ impl<S: Store> AppApi<S> {
         Ok(item)
     }
 
-    /// Every Sonos Group, for any valid session, each with its active Handoff, if any. If the
-    /// Handoffs can't be read, the Groups are listed without them (the failure is logged).
+    /// Every Sonos Group, for any valid session, each with its active Handoff read separately.
+    /// A failed Handoff read omits only that Group's Handoff, logging the failure.
     async fn groups(&self, token: SessionToken) -> Result<Vec<Group>, ApiError> {
         self.session(&token).await?;
-        let (groups, handoffs) = tokio::join!(self.sonos.groups(), self.store.handoffs());
-        // Logged first, so a store failure is logged when Sonos failed too.
-        let handoffs = handoffs.unwrap_or_else(|error| {
-            log_storage_error("list the Handoffs", &error);
-            Vec::new()
-        });
+        let groups = self.sonos.groups().await;
         let groups = groups.map_err(|error| {
             tracing::warn!(%error, "cannot list the Sonos Groups");
             sonos_error(error)
         })?;
-        let mut handoffs: HashMap<String, store::Handoff> = handoffs
-            .into_iter()
-            .map(|handoff| (handoff.group.clone(), handoff))
-            .collect();
-        Ok(groups
-            .into_iter()
-            .map(|listed| {
-                let handoff = handoffs.remove(&listed.id).map(api_handoff);
-                group(listed, handoff)
-            })
-            .collect())
+        let mut listed = Vec::with_capacity(groups.len());
+        for found in groups {
+            let handoff = self
+                .store
+                .group_handoff(&found.id)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::error!(
+                        group = found.id,
+                        operation = "list a Group's Handoff",
+                        error = crate::error_chain(&error),
+                        "storage failed"
+                    );
+                    None
+                });
+            listed.push(group(found, handoff));
+        }
+        Ok(listed)
     }
 
     /// Starts Item `id` on Group `group` for the session's user: resolves the Item's audio
-    /// file with the session's key and the start position ([`start_position`]: the user's
-    /// Progress, or 0 when `from_start`, Finished, without Progress, or when its whole seconds
-    /// lie at or past the Item's end), then writes the Progress of the Handoff it replaces, if
-    /// any ([`Controls::write_replaced`]), stores the Handoff (replacing the Group's), has the
-    /// Group play its stream and go to the start position, and supervises it (`supervise`)
-    /// until it ends. The start position is read before the replaced Handoff's write: a user
-    /// who starts the Item their own Handoff on the Group plays starts it from their Progress
-    /// as it was before that write. If the Group doesn't play or seek, the new Handoff ends
-    /// again, and the one it replaced stays ended: the Group is left with none. After a failed
-    /// seek the Group, already playing, is also paused, on a task of its own that keeps the
-    /// Group's turn until the pause is done (at most [`sonos::CONTROL_TIMEOUT`]) without
-    /// holding up the answer.
+    /// files ([`playable_files`]) with the session's key and the start position
+    /// ([`start_position`]: the user's Progress, or 0 when `from_start`, Finished, without
+    /// Progress, or when its whole seconds lie at or past the Item's end), then writes the
+    /// Progress of the Handoff it replaces, if any ([`Controls::write_replaced`]), stores the
+    /// Handoff (replacing the Group's), has the Group play its files as its queue from the one
+    /// holding the start position and go to the start position in it, and supervises it
+    /// (`supervise`) until it ends. The start position is read before the replaced Handoff's
+    /// write: a user who starts the Item their own Handoff on the Group plays starts it from
+    /// their Progress as it was before that write. If the Group doesn't play or seek, the new
+    /// Handoff ends again, and the one it replaced stays ended: the Group is left with none.
+    /// After a failed seek the Group, already playing, is also paused, on a task of its own
+    /// that keeps the Group's turn until the pause is done (at most
+    /// [`sonos::CONTROL_TIMEOUT`]) without holding up the answer.
     ///
     /// Starts take turns with starts, controls and supervisors on the Group. A start that had
     /// to wait for its turn, or whose Group had a turn end while it resolved (a start, control
@@ -591,13 +597,16 @@ impl<S: Store> AppApi<S> {
     /// or the cadence writes it), within [`START_PROGRESS_TIME`], checking again that the
     /// session's key acts for its user. It waits for its turn only as long as [`START_TIME`]
     /// leaves after resolving, less [`START_PROGRESS_TIME`] for that read,
-    /// [`sonos::PLAY_TIMEOUT`] and [`sonos::CONTROL_TIMEOUT`] for a seek (just
-    /// [`sonos::PLAY_TIMEOUT`] when `from_start`); past that, or when resolving left less than
+    /// [`sonos::play_timeout`] and [`sonos::CONTROL_TIMEOUT`] for a seek (just
+    /// [`sonos::play_timeout`] when `from_start`); past that, or when resolving left less than
     /// those, or the read fails, nothing is stored or played ([`ApiError::GroupFailed`], or the
     /// read's error).
+    /// A file count that cannot fit even without a Progress reread is
+    /// [`ApiError::ItemNotPlayable`]; when a start waited or saw a turn end, a reread-only
+    /// admission failure is retryable [`ApiError::GroupFailed`].
     ///
     /// A start that found its Group's turn free, with none ended since before resolving, uses
-    /// the Progress read while resolving, and needs only [`sonos::PLAY_TIMEOUT`] (and
+    /// the Progress read while resolving, and needs only [`sonos::play_timeout`] (and
     /// [`sonos::CONTROL_TIMEOUT`] when it seeks) left after it. The replaced Handoff's
     /// Progress write gets what [`START_TIME`] leaves beyond those, at most
     /// [`REPLACED_PROGRESS_TIME`]; one that fails or runs out of time is logged, and the start
@@ -632,60 +641,55 @@ impl<S: Store> AppApi<S> {
         let progress = browse::item_progress(&user, &id);
         let length = browse::item_duration(&library_item, &id);
         let position = start_position(progress.as_ref(), from_start, length);
-        let file = match browse::single_audio_file(library_item, &id) {
-            Ok(file) => file,
-            Err(NoSingleFile::Missing(reason)) => {
-                return Err(missing(
-                    library_server,
-                    request,
-                    id.episode.as_deref(),
-                    reason,
-                ));
-            }
-            Err(NoSingleFile::Files(files)) => {
-                tracing::info!(
-                    library_server,
-                    library_item = id.library_item,
-                    episode = id.episode,
-                    files,
-                    "an Item without exactly one audio file can't be played on a Group yet"
-                );
-                return Err(ApiError::ItemNotPlayable);
-            }
+        let tracks = browse::item_audio_files(library_item, &id)
+            .map_err(|reason| missing(library_server, request, id.episode.as_deref(), reason))?;
+        let files = playable_files(library_server, &id, tracks)?;
+        let admit = |calls: StartCalls| {
+            let admission = start_admission(files.len(), calls);
+            let error = match admission {
+                Admission::Fits => return Ok(()),
+                Admission::Retry => ApiError::GroupFailed,
+                Admission::Never => ApiError::ItemNotPlayable,
+            };
+            tracing::info!(
+                group,
+                library_item = id.library_item,
+                files = files.len(),
+                seek = calls.seek,
+                reread = calls.reread,
+                ?admission,
+                "a start's mandatory playback reservation was refused"
+            );
+            Err(error)
         };
-        let name = file
-            .metadata
-            .map(|metadata| metadata.filename)
-            .filter(|name| sonos::media_type(name).is_some())
-            .ok_or_else(|| {
-                tracing::info!(
-                    library_server,
-                    library_item = id.library_item,
-                    episode = id.episode,
-                    "an Item's audio file is in a format Sonos doesn't play, or unnamed"
-                );
-                ApiError::ItemNotPlayable
-            })?;
+        admit(StartCalls::default())?;
         if !is_group_id(&group) {
             return Err(ApiError::GroupNotFound);
         }
 
         let stream_token = StreamToken::new(random_hex("a stream id")?);
         let stream = stream_token.hash();
-        let target = sonos::Stream {
-            listen: self.listen,
-            path: stream_token.path(&name),
+        let targets: Vec<sonos::Stream> = files
+            .iter()
+            .enumerate()
+            .map(|(n, file)| sonos::Stream {
+                listen: self.listen,
+                path: stream_token.path(n, &file.name),
+            })
+            .collect();
+        let item_files = ItemFiles::of(stream, &files);
+        let play_time = sonos::play_timeout(files.len());
+        let after_turn_calls = StartCalls {
+            seek: !item_files.locate(position).within.is_zero(),
+            reread: !from_start,
         };
-        let after_turn = if from_start {
-            sonos::PLAY_TIMEOUT
-        } else {
-            START_PROGRESS_TIME + sonos::PLAY_TIMEOUT + sonos::CONTROL_TIMEOUT
-        };
+        let after_turn = start_reservation(play_time, after_turn_calls);
         let (turn, position) = match group_turn.try_take() {
             // Free, and no turn on the Group ended since before resolving, so the Progress read
             // then is current (a start `from_start` uses none).
             Some(turn) if from_start || group_turn.ended() == ended => (turn, position),
             free => {
+                admit(after_turn_calls)?;
                 // Whatever held the turn may have changed Progress (a pause writes it), so a
                 // start that may seek reads it again once it has its turn, and keeps time for
                 // that read and a seek even when Progress was none.
@@ -724,13 +728,16 @@ impl<S: Store> AppApi<S> {
                 }
             }
         };
-        let seek_time = if position.is_zero() {
-            Duration::ZERO
-        } else {
-            sonos::CONTROL_TIMEOUT
+        // The start position in its file: a start at a file's beginning needs no seek.
+        let to = item_files.locate(position);
+        let calls = StartCalls {
+            seek: !to.within.is_zero(),
+            reread: false,
         };
+        let play_and_seek = start_reservation(play_time, calls);
+        admit(calls)?;
         // A turn free at once after a slow resolve may leave too little for the Group's calls.
-        if START_TIME.saturating_sub(called.elapsed()) < sonos::PLAY_TIMEOUT + seek_time {
+        if START_TIME.saturating_sub(called.elapsed()) < play_and_seek {
             return Err(too_little_time(
                 called,
                 &group,
@@ -756,7 +763,7 @@ impl<S: Store> AppApi<S> {
                 Ok(Some(replaced)) => {
                     let time = START_TIME
                         .saturating_sub(called.elapsed())
-                        .saturating_sub(sonos::PLAY_TIMEOUT + seek_time)
+                        .saturating_sub(play_and_seek)
                         .min(REPLACED_PROGRESS_TIME);
                     let known = supervisors.replaced(&task_group, &replaced.stream);
                     controls
@@ -770,10 +777,7 @@ impl<S: Store> AppApi<S> {
                 group: task_group,
                 library_item: library_item_id,
                 episode: id.episode,
-                file: HandoffFile {
-                    ino: file.ino,
-                    name,
-                },
+                files,
                 started_by: session.user,
                 username: user.username,
                 started_at: now_millis(),
@@ -785,15 +789,17 @@ impl<S: Store> AppApi<S> {
             // The replaced Handoff, if any, is gone: so is its supervision.
             supervisors.stop(&handoff.group);
             // The stream answers from here on: the Group may fetch it as soon as it is told.
-            if let Err(error) = sonos.play(&handoff.group, &target).await {
+            if let Err(error) = sonos.play(&handoff.group, &targets, to.file).await {
                 tracing::warn!(group = handoff.group, %error, "a Group did not start a Handoff");
                 end_unstarted(store.as_ref(), &stream, &handoff.group).await;
                 return Err(sonos_error(error));
             }
             // Seek after Play: the smoke test (docs/research/sonos-smoke-2026-11-04.md) sought
             // Groups already playing; a Seek right after Play is unverified on hardware.
-            if !position.is_zero()
-                && let Err(error) = sonos.seek(&handoff.group, position).await
+            if !to.within.is_zero()
+                && let Err(error) = sonos
+                    .seek(&handoff.group, None, to.within, sonos::CONTROL_TIMEOUT)
+                    .await
             {
                 tracing::warn!(
                     group = handoff.group,
@@ -803,24 +809,10 @@ impl<S: Store> AppApi<S> {
                     %error,
                     "a Group did not go to a Handoff's start position"
                 );
-                if end_unstarted(store.as_ref(), &stream, &handoff.group)
-                    .await
-                    .is_none()
-                    && end_unstarted(store.as_ref(), &stream, &handoff.group)
-                        .await
-                        .is_none()
-                {
-                    tracing::error!(
-                        group = handoff.group,
-                        library_item = handoff.library_item,
-                        episode = handoff.episode,
-                        "a Handoff left active at about 0 after a failed seek; a pause or skip \
-                         would overwrite Progress"
-                    );
-                }
-                // The Group already plays, from 0: paused, so the listener doesn't hear the
-                // Item from its beginning without a Handoff. Its turn is kept until then, but
-                // the answer doesn't wait for it.
+                end_failed_seek(store.as_ref(), &stream, &handoff).await;
+                // The Group already plays, from the start of the file: paused, so the listener
+                // doesn't hear it without a Handoff. Its turn is kept until then, but the
+                // answer doesn't wait for it.
                 let group = handoff.group;
                 tokio::spawn(async move {
                     if let Err(error) = sonos.pause(&group).await {
@@ -888,8 +880,10 @@ impl<S: Store> AppApi<S> {
         // Group's action and the Progress write; a panic in it is handled below.
         let controlled = tokio::spawn(async move {
             let not_done = "a control not sent";
-            let _turn = turn.take(&task_group, CONTROL_TURN_TIME, not_done).await?;
-            let controlled = controls.control(&task_group, control).await;
+            let mut held = Some(turn.take(&task_group, CONTROL_TURN_TIME, not_done).await?);
+            let controlled = controls
+                .control(&task_group, control, &mut held, &supervisors)
+                .await;
             // Still holding the turn, so the supervisor told is this Handoff's.
             if let Ok(playback) = &controlled {
                 supervisors.seen(&task_group, playback);
@@ -1085,26 +1079,81 @@ const CONTROL_LIBRARY_SERVER_TIME: Duration = Duration::from_secs(7);
 /// for its turn on the Group, then, when it may seek and had to wait or saw a turn end while
 /// resolving, [`START_PROGRESS_TIME`] to read the user's Progress again, then, when it
 /// replaces a Handoff, that Handoff's Progress write, with only what is left beyond the
-/// Group's calls (at most [`REPLACED_PROGRESS_TIME`]), then [`sonos::PLAY_TIMEOUT`] for the
-/// Group to play and, starting past 0, [`sonos::CONTROL_TIMEOUT`] for it to seek. Its turn
-/// waits only for what the others leave: at most 14 − 4 = 10 seconds less resolving for a
-/// start `from_start`, 14 − 2 − 4 − 4 = 4 for any other (which keeps the seek's time even
-/// without Progress, as the read may find some); a start left after its turn with less than
-/// it needs for that read (when it reads again) and the Group's calls sends nothing. One
-/// second under the App's 15.
+/// Group's calls (at most [`REPLACED_PROGRESS_TIME`]), then [`sonos::play_timeout`] for the
+/// Group to play and, starting past the start of its file, [`sonos::CONTROL_TIMEOUT`] to seek.
+/// The play reservation is 4 seconds for up to 16 files plus 1 per extra batch of 16.
+/// With nonzero resolving time, at most 10 batches (160 files) fit without a seek, 6 (96 files)
+/// with a seek, or 4 (64 files) when Progress is reread and a seek reserved.
+/// Resolving and waiting consume the remaining time, so actual admission may be lower.
+/// One second under the App's 15.
 const START_TIME: Duration = Duration::from_secs(14);
 
 /// The most a start gives the Progress write of the Handoff it replaces: reading where the
 /// Group is, checking whom the replaced Handoff's key acts for (and the Item's length, if the
 /// Group doesn't tell it), writing. It gets less when [`START_TIME`] leaves less beyond the
 /// Group's calls; with nothing left, the write isn't tried (logged).
+/// Larger queue reservations can shrink this write below four seconds; a timeout leaves
+/// the replaced listener at their last cadence write.
 const REPLACED_PROGRESS_TIME: Duration = Duration::from_secs(4);
 
-/// How long a start may take to read the user's Progress again after its turn: one `/api/me`
-/// the Library Server already answered while resolving, so 2 seconds are ample, and still
-/// leave such a start at most 4 seconds of [`START_TIME`], less resolving, to wait for its
-/// turn.
+/// How long a start may take to reread the user's Progress after its turn: one `/api/me`
+/// the Library Server already answered while resolving. Waiting gets only what remains
+/// after this, the queue reservation and a seek (at most 4 seconds for up to 16 files).
 const START_PROGRESS_TIME: Duration = Duration::from_secs(2);
+
+/// Mandatory calls after resolving and waiting.
+#[derive(Clone, Copy, Default)]
+struct StartCalls {
+    /// The initially known position needs an in-file seek.
+    seek: bool,
+    /// Progress must be read again; also reserves a seek in case that read requires one.
+    reread: bool,
+}
+
+/// Whether the mandatory calls fit, require a retry without rereading, or can never fit
+/// for the initially known seek need. A reread-only failure is never permanent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Fits,
+    Retry,
+    Never,
+}
+
+/// Classifies the start's full reservation, distinguishing reread-only retries from
+/// counts that cannot fit even with the initially known position.
+fn start_admission(files: usize, calls: StartCalls) -> Admission {
+    let play = sonos::play_timeout(files);
+    if start_reservation(play, calls) < START_TIME {
+        Admission::Fits
+    } else if calls.reread
+        && start_reservation(
+            play,
+            StartCalls {
+                reread: false,
+                ..calls
+            },
+        ) < START_TIME
+    {
+        Admission::Retry
+    } else {
+        Admission::Never
+    }
+}
+
+/// Play plus a seek when needed or rereading, and the Progress read when rereading.
+fn start_reservation(play_time: Duration, calls: StartCalls) -> Duration {
+    play_time
+        + if calls.seek || calls.reread {
+            sonos::CONTROL_TIMEOUT
+        } else {
+            Duration::ZERO
+        }
+        + if calls.reread {
+            START_PROGRESS_TIME
+        } else {
+            Duration::ZERO
+        }
+}
 
 /// What a start that fails before the Group is told anything leaves undone, as logged.
 const START_NOT_DONE: &str = "a Handoff not started";
@@ -1264,22 +1313,32 @@ impl<S> Clone for Controls<S> {
 }
 
 impl<S: Store> Controls<S> {
-    /// Has Group `group` do `control` on its Handoff; only while the Group plays the
-    /// Handoff's stream, else no control is sent to it ([`ApiError::NoHandoff`]). A Group
+    /// Has Group `group` do `control` on its Handoff; only while the Group plays one of the
+    /// Handoff's files, else no control is sent to it ([`ApiError::NoHandoff`]). Where it is
+    /// and how long the Item is are those in the whole Item ([`ItemFiles::whole_if_plays`]). A Group
     /// already paused (or playing) is sent nothing for a pause (or resume). After a pause or
     /// a skip, the Group's position is written as Progress for the starter, with the
     /// Handoff's key, once the Library Server confirmed that key still acts for the starter:
     /// for a pause, where the Group tells it paused (read right after the pause; if that read
     /// fails, is late, or tells no position of the Handoff's stream, where it was just before
-    /// the pause), for a skip, the seek's target. The control's calls to the Group take [`sonos::CONTROL_TIMEOUT`] in all, its
-    /// requests to the Library Server [`CONTROL_LIBRARY_SERVER_TIME`]; a write that fails or
-    /// runs out of time is logged and otherwise left alone, as the Group already did what was
-    /// asked, except that a key the Library Server rejects is revoked, which ends the Handoff.
-    async fn control(&self, group: &str, control: Control) -> Result<Playback, ApiError> {
+    /// the pause), for a skip, the seek's target. The control's calls to the Group take
+    /// [`sonos::CONTROL_TIMEOUT`] in all, its requests to the Library Server
+    /// [`CONTROL_LIBRARY_SERVER_TIME`]; a write that fails or runs out of time is logged and
+    /// otherwise left alone, as the Group already did what was asked, except that a key the
+    /// Library Server rejects is revoked, which ends the Handoff.
+    /// If a failed skip may have selected a file, its Handoff ends without a Progress write.
+    /// Its turn is transferred to the background pause, held until that pause completes.
+    async fn control(
+        &self,
+        group: &str,
+        control: Control,
+        turn: &mut Option<Turn>,
+        supervisors: &Supervisors<S>,
+    ) -> Result<Playback, ApiError> {
         let mut group_time = Budget(sonos::CONTROL_TIMEOUT);
         let mut library_time = Budget(CONTROL_LIBRARY_SERVER_TIME);
         let playback = self.playback(group, &mut group_time).await?;
-        let found = self.playing_handoff(group, &playback).await?;
+        let (playing, playback) = self.playing_handoff(group, playback).await?;
         let duration = told_length(&playback);
         let position = playback.position.map(|position| position.as_secs_f64());
         let asked = match control {
@@ -1309,7 +1368,7 @@ impl<S: Store> Controls<S> {
                 self.act(group, control, &mut group_time, self.sonos.pause(group))
                     .await?;
                 let position = self
-                    .paused_at(group, &found.stream, &mut group_time)
+                    .paused_at(group, &playing.files, &mut group_time)
                     .await
                     .or(position);
                 let Some(position) = position else {
@@ -1326,7 +1385,7 @@ impl<S: Store> Controls<S> {
                 };
                 let duration = self
                     .check_and_write(
-                        &found.active,
+                        &playing.found.active,
                         position,
                         duration,
                         "pause",
@@ -1340,29 +1399,43 @@ impl<S: Store> Controls<S> {
                 })
             }
             Control::Skip(skip) => {
-                self.skip(group, skip, &found, playback, group_time, library_time)
-                    .await
+                self.skip(
+                    group,
+                    skip,
+                    &playing,
+                    playback,
+                    (group_time, library_time),
+                    (turn, supervisors),
+                )
+                .await
             }
         }
     }
 
-    /// Has Group `group` skip as `skip` says, kept within the Item; the Group plays `found`'s
-    /// stream, and `playback` is what it told just before. See [`Controls::control`]. If the
-    /// Group tells no length, a forward skip first looks the Item's length up on the Library
-    /// Server. When the Library Server doesn't answer with it (unreachable, too slow, or the
-    /// Item is gone there), the skip is refused with [`ApiError::LibraryServerUnreachable`].
-    /// When it answers but knows no length either, the skip is refused with
-    /// [`ApiError::LengthUnknown`]. Either way nothing is sent to the Group and nothing written.
+    /// Has Group `group` skip as `skip` says, kept within the Item; the Group plays one of
+    /// `found`'s `files`, and `playback` is what it told just before, in the whole Item. See
+    /// [`Controls::control`]. A forward skip uses stored file lengths, else the Group's
+    /// length, else looks it up on the Library Server; a chapter skip always looks chapters
+    /// up there (and length, if not known). When the Library Server doesn't answer with
+    /// them (unreachable, too slow, or the Item is gone there), the skip is refused with
+    /// [`ApiError::LibraryServerUnreachable`]; when it answers a forward skip without a length
+    /// either, with [`ApiError::LengthUnknown`]. Either way nothing is sent to the Group and
+    /// nothing written. Chapters move as `domain::Chapters` says; a next chapter in the last
+    /// chapter sends the Group nothing and writes nothing, answering with where it is.
+    /// A failed seek ends the Handoff and pauses only if file selection was acknowledged
+    /// or may have acted; a refusal before selection leaves the Handoff and Progress alone.
     async fn skip(
         &self,
         group: &str,
         skip: Skip,
-        found: &GroupHandoff,
-        mut playback: sonos::Playback,
-        mut group_time: Budget,
-        mut library_time: Budget,
+        playing: &PlayingHandoff,
+        mut playback: ItemPlayback,
+        budgets: (Budget, Budget),
+        supervision: (&mut Option<Turn>, &Supervisors<S>),
     ) -> Result<Playback, ApiError> {
-        let active = &found.active;
+        let (turn, supervisors) = supervision;
+        let (mut group_time, mut library_time) = budgets;
+        let (active, files) = (&playing.found.active, &playing.files);
         let no_position = || {
             tracing::warn!(group, "a Group did not tell where it is, so it can't skip");
             ApiError::GroupFailed
@@ -1371,50 +1444,100 @@ impl<S: Store> Controls<S> {
             return Err(no_position());
         }
         let mut duration = told_length(&playback);
+        let forward = skip == Skip::Forward30;
+        let by_chapter = matches!(skip, Skip::PreviousChapter | Skip::NextChapter);
         let mut acting = None;
-        if duration.is_none() && skip.seconds() > 0 {
+        let mut chapters = Vec::new();
+        if by_chapter || (duration.is_none() && forward) {
             let checked = self.check(active, Wanted::Needed, &mut library_time).await;
             match checked.acting {
                 Acting::Revoked => return Err(ApiError::NoHandoff),
                 Acting::RevokeFailed => return Err(ApiError::Internal),
                 Acting::Starter { .. } | Acting::Unknown => {}
             }
-            duration = match checked.length {
-                Length::Told(told) => {
-                    let Some(told) = known_length(told) else {
-                        tracing::info!(
-                            group,
-                            "a forward skip refused: neither the Group nor the Library Server \
-                             knows the Item's length"
-                        );
-                        return Err(ApiError::LengthUnknown);
-                    };
-                    Some(told)
-                }
-                Length::Unasked | Length::Failed => {
-                    tracing::info!(
-                        group,
-                        "a forward skip refused: the Item's length is not known to the Group, \
-                         and the Library Server didn't tell it"
-                    );
-                    return Err(ApiError::LibraryServerUnreachable);
-                }
+            let Length::Told(told) = checked.length else {
+                tracing::info!(
+                    group,
+                    ?skip,
+                    "a skip refused: it needs the Item's length or chapters, which the Library \
+                     Server didn't tell"
+                );
+                return Err(ApiError::LibraryServerUnreachable);
             };
+            if by_chapter && checked.chapters.is_none() {
+                tracing::info!(
+                    group,
+                    library_item = active.handoff.library_item,
+                    "a chapter skip refused: the Item is missing from the Library Server's answer"
+                );
+                return Err(ApiError::LibraryServerUnreachable);
+            }
+            duration = duration.or(known_length(told));
+            if forward && duration.is_none() {
+                tracing::info!(
+                    group,
+                    "a forward skip refused: neither the Group nor the Library Server knows the \
+                     Item's length"
+                );
+                return Err(ApiError::LengthUnknown);
+            }
+            chapters = checked.chapters.unwrap_or_default();
             acting = Some(checked.acting);
             // The Group moved on while the Library Server answered: skip from where it is now.
-            playback = self.playback(group, &mut group_time).await?;
-            ensure_plays(group, &playback, &found.stream)?;
+            let read = self.playback(group, &mut group_time).await?;
+            playback = ensure_plays(group, read, files)?;
         }
         let position = playback.position.ok_or_else(no_position)?;
-        let target = skipped(position, skip, duration);
+        let target = match skip {
+            Skip::Back15 => skipped(position, -15, duration),
+            Skip::Forward30 => skipped(position, 30, duration),
+            Skip::PreviousChapter => chapters_of(chapters, duration).previous(position),
+            Skip::NextChapter => match chapters_of(chapters, duration).next(position) {
+                Some(target) => target,
+                None => {
+                    tracing::info!(
+                        group,
+                        "a next chapter in the last chapter: nothing sent to the Group"
+                    );
+                    return Ok(Playback {
+                        state: api_state(playback.state),
+                        position: Some(position.as_secs_f64()),
+                        duration,
+                    });
+                }
+            },
+        };
+        let to = files.seek(target);
         let control = Control::Skip(skip);
-        self.act(
-            group,
-            control,
-            &mut group_time,
-            self.sonos.seek(group, target),
-        )
-        .await?;
+        // The seek owns this remaining deadline so it can report whether TRACK_NR acted,
+        // even on a timeout. An outer timeout would erase that information.
+        if let Err(error) = self
+            .sonos
+            .seek(group, to.track, to.within, group_time.0)
+            .await
+        {
+            tracing::warn!(group, ?control, %error, "a Group did not take a control");
+            if error == sonos::Error::SeekMayHaveMoved {
+                supervisors.stop(group);
+                let sonos = Arc::clone(&self.sonos);
+                let group = group.to_owned();
+                let pause = tokio::spawn(async move {
+                    if let Err(error) = sonos.pause(&group).await {
+                        tracing::warn!(group, %error, "a Group was not paused after a failed file seek");
+                    }
+                });
+                end_failed_seek(self.store.as_ref(), files.stream(), &active.handoff).await;
+                let held = turn.take();
+                tokio::spawn(async move {
+                    if let Err(error) = pause.await {
+                        tracing::error!(%error, "a failed file seek's cleanup pause task failed");
+                    }
+                    drop(held);
+                });
+            }
+            return Err(sonos_error(error));
+        }
+        tracing::info!(group, ?control, "Group controlled");
         let acting = match acting {
             Some(acting) => acting,
             None => {
@@ -1425,7 +1548,7 @@ impl<S: Store> Controls<S> {
                 checked.acting
             }
         };
-        let target = target.as_secs_f64();
+        let target = files.sought_position(to).as_secs_f64();
         let update = abs::ProgressUpdate::at(target, duration);
         self.write_progress(active, acting, update, "skip", &mut library_time)
             .await;
@@ -1448,14 +1571,10 @@ impl<S: Store> Controls<S> {
         })
     }
 
-    /// Where Group `group` tells it is, read right after a pause within `time`, if it still
-    /// plays `stream` and tells a position; none otherwise.
-    async fn paused_at(
-        &self,
-        group: &str,
-        stream: &store::StreamId,
-        time: &mut Budget,
-    ) -> Option<f64> {
+    /// Where Group `group` tells it is in the whole Item, read right after a pause within
+    /// `time`, if it still plays one of the Handoff's `files` and tells a position; none
+    /// otherwise.
+    async fn paused_at(&self, group: &str, files: &ItemFiles, time: &mut Budget) -> Option<f64> {
         let read = match time.spend(self.sonos.playback(group)).await {
             Some(Ok(read)) => read,
             Some(Err(error)) => {
@@ -1470,20 +1589,12 @@ impl<S: Store> Controls<S> {
                 return None;
             }
         };
-        let plays_handoff = plays_stream(&read, stream);
-        let position = read.position.filter(|_| plays_handoff);
+        let position = ensure_plays(group, read, files).ok()?.position;
         if position.is_none() {
-            if plays_handoff {
-                tracing::info!(
-                    group,
-                    "a Group told no position after pausing; using where it was just before"
-                );
-            } else {
-                tracing::info!(
-                    group,
-                    "a Group plays something other than its Handoff after pausing; using where it was just before"
-                );
-            }
+            tracing::info!(
+                group,
+                "a Group told no position after pausing; using where it was just before"
+            );
         }
         position.map(|position| position.as_secs_f64())
     }
@@ -1513,13 +1624,14 @@ impl<S: Store> Controls<S> {
         Ok(())
     }
 
-    /// The active Handoff on Group `group`, if the Group plays its stream (`playback`, as read
-    /// just before); [`ApiError::NoHandoff`] otherwise.
+    /// The active Handoff on Group `group`, with its files, if the Group plays one of them
+    /// (`playback`, as read just before), and that reading in the whole Item
+    /// ([`ensure_plays`]); [`ApiError::NoHandoff`] otherwise.
     async fn playing_handoff(
         &self,
         group: &str,
-        playback: &sonos::Playback,
-    ) -> Result<GroupHandoff, ApiError> {
+        playback: sonos::Playback,
+    ) -> Result<(PlayingHandoff, ItemPlayback), ApiError> {
         let Some(found) = self
             .store
             .group_handoff(group)
@@ -1529,8 +1641,9 @@ impl<S: Store> Controls<S> {
             tracing::info!(group, "a control for a Group without a Handoff");
             return Err(ApiError::NoHandoff);
         };
-        ensure_plays(group, playback, &found.stream)?;
-        Ok(found)
+        let files = ItemFiles::stored(&found);
+        let playback = ensure_plays(group, playback, &files)?;
+        Ok((PlayingHandoff { found, files }, playback))
     }
 
     /// Writes where Group `group` is on `replaced`'s stream as Progress for the replaced
@@ -1586,8 +1699,16 @@ impl<S: Store> Controls<S> {
             lost(known.finished, "the Group did not tell what it plays");
             return;
         };
-        let on_stream = plays_stream(&playback, &replaced.stream);
-        if on_stream && playback.state == sonos::TransportState::Stopped {
+        let files = ItemFiles::stored(replaced);
+        let Some(playback) = files.whole_if_plays(&playback) else {
+            tracing::info!(group, "{not_written}");
+            lost(
+                known.finished,
+                "the Group plays something other than the Handoff",
+            );
+            return;
+        };
+        if playback.state == sonos::TransportState::Stopped {
             let Some(update) = known.finished_at_stop(at, told_length(&playback)) else {
                 tracing::info!(
                     group,
@@ -1612,11 +1733,10 @@ impl<S: Store> Controls<S> {
             return;
         }
         let position = playback.position.filter(|_| {
-            on_stream
-                && matches!(
-                    playback.state,
-                    sonos::TransportState::Playing | sonos::TransportState::Paused
-                )
+            matches!(
+                playback.state,
+                sonos::TransportState::Playing | sonos::TransportState::Paused
+            )
         });
         let Some(position) = position else {
             tracing::info!(
@@ -1680,6 +1800,7 @@ impl<S: Store> Controls<S> {
         let unknown = Checked {
             acting: Acting::Unknown,
             length: not_told,
+            chapters: None,
         };
         // The operator may have removed the Library Server since the start.
         let Some(library_server) = configured_in(&self.library_servers, &starter.library_server)
@@ -1754,9 +1875,13 @@ impl<S: Store> Controls<S> {
                 Acting::Unknown
             }
         };
+        let mut chapters = None;
         let length = match item {
             None => Length::Unasked,
-            Some(Some(Ok(item))) => Length::Told(browse::item_duration(&item, &id)),
+            Some(Some(Ok(item))) => {
+                chapters = browse::chapter_starts(&item, &id);
+                Length::Told(browse::item_duration(&item, &id))
+            }
             Some(Some(Err(error))) => {
                 tracing::warn!(
                     group,
@@ -1772,7 +1897,11 @@ impl<S: Store> Controls<S> {
                 Length::Failed
             }
         };
-        Checked { acting, length }
+        Checked {
+            acting,
+            length,
+            chapters,
+        }
     }
 
     /// Revokes `key`, `starter`'s, because of `reason`, ending their Handoffs using it; whether
@@ -1942,6 +2071,15 @@ impl<S: Store> Controls<S> {
 struct Checked<'a> {
     acting: Acting<'a>,
     length: Length,
+    /// Where chapters start when the Library Server answered with the Item; empty for an
+    /// Item without chapters, none for an unsuccessful lookup or a missing Item.
+    chapters: Option<Vec<Duration>>,
+}
+
+/// The active Handoff on a Group playing one of its files, and where they lie in its Item.
+struct PlayingHandoff {
+    found: GroupHandoff,
+    files: ItemFiles,
 }
 
 /// Whom a Handoff's key acts for, as the starter's Library Server told a control.
@@ -2046,27 +2184,21 @@ impl Budget {
 /// sent. It bounds the whole write, not each of its requests.
 const MIN_WRITE_TIME: Duration = Duration::from_millis(250);
 
-/// Whether `playback`, Group `group`'s, plays `stream`, a Handoff's; [`ApiError::NoHandoff`]
-/// if not.
+/// `playback`, Group `group`'s, read in the whole Item ([`ItemFiles::whole_if_plays`]), if it plays
+/// one of a Handoff's `files`; [`ApiError::NoHandoff`] if not.
 fn ensure_plays(
     group: &str,
-    playback: &sonos::Playback,
-    stream: &store::StreamId,
-) -> Result<(), ApiError> {
-    if plays_stream(playback, stream) {
-        return Ok(());
+    playback: sonos::Playback,
+    files: &ItemFiles,
+) -> Result<ItemPlayback, ApiError> {
+    if let Some(read) = files.whole_if_plays(&playback) {
+        return Ok(read);
     }
     tracing::info!(
         group,
-        "a control for a Group that plays something other than its Handoff"
+        "a control reading (before acting or after pausing) is not playing its Handoff"
     );
     Err(ApiError::NoHandoff)
-}
-
-/// Whether `playback` plays `stream`, a Handoff's.
-fn plays_stream(playback: &sonos::Playback, stream: &store::StreamId) -> bool {
-    let played = playback.uri.as_deref().and_then(stream::stream_in_url);
-    played.is_some_and(|played| played == *stream)
 }
 
 /// `base_url` (already normalized), if it is one of `library_servers`'.
@@ -2227,7 +2359,7 @@ fn sonos_error(error: sonos::Error) -> ApiError {
         sonos::Error::Unreachable => ApiError::SonosUnreachable,
         sonos::Error::SearchFailed => ApiError::SonosSearchFailed,
         sonos::Error::UnknownGroup => ApiError::GroupNotFound,
-        sonos::Error::GroupFailed => ApiError::GroupFailed,
+        sonos::Error::GroupFailed | sonos::Error::SeekMayHaveMoved => ApiError::GroupFailed,
     }
 }
 
@@ -2267,7 +2399,28 @@ fn now_millis() -> i64 {
 }
 
 /// A Group as the App API describes it, with its active Handoff, if any.
-fn group(group: sonos::Group, handoff: Option<Handoff>) -> Group {
+fn group(mut group: sonos::Group, handoff: Option<GroupHandoff>) -> Group {
+    let now_playing = group.track.take().map(|track| {
+        let read = sonos::Playback {
+            state: group.state.unwrap_or(sonos::TransportState::Unknown),
+            uri: track.uri,
+            position: track.position,
+            duration: track.duration,
+        };
+        let whole = handoff
+            .as_ref()
+            .and_then(|found| ItemFiles::stored(found).whole_if_plays(&read));
+        let (position, duration) = whole.map_or((read.position, read.duration), |read| {
+            (read.position, read.duration)
+        });
+        NowPlaying {
+            title: track.title,
+            creator: track.creator,
+            position: position.map(|position| position.as_secs_f64()),
+            duration: duration.map(|duration| duration.as_secs_f64()),
+        }
+    });
+    let handoff = handoff.map(|found| api_handoff(found.active.handoff));
     Group {
         id: group.id,
         name: group.name,
@@ -2280,12 +2433,7 @@ fn group(group: sonos::Group, handoff: Option<Handoff>) -> Group {
             })
             .collect(),
         state: group.state.map(api_state),
-        now_playing: group.track.map(|track| NowPlaying {
-            title: track.title,
-            creator: track.creator,
-            position: track.position.map(|position| position.as_secs_f64()),
-            duration: track.duration.map(|duration| duration.as_secs_f64()),
-        }),
+        now_playing,
         volume: group.volume,
         handoff,
     }
@@ -2310,10 +2458,10 @@ enum Control {
     Skip(Skip),
 }
 
-/// Where `skip` from `position` lands, in whole seconds: never before the start, nor past
-/// the end of an Item `duration` seconds long (if known).
-fn skipped(position: Duration, skip: Skip, duration: Option<f64>) -> Duration {
-    let mut target = (position.as_secs_f64() + f64::from(skip.seconds())).max(0.0);
+/// Where moving `seconds` (negative back) from `position` lands, in whole seconds: never
+/// before the start, nor past the end of an Item `duration` seconds long (if known).
+fn skipped(position: Duration, seconds: i32, duration: Option<f64>) -> Duration {
+    let mut target = (position.as_secs_f64() + f64::from(seconds)).max(0.0);
     if let Some(duration) = duration {
         target = target.min(duration);
     }
@@ -2321,13 +2469,19 @@ fn skipped(position: Duration, skip: Skip, duration: Option<f64>) -> Duration {
     Duration::from_secs(target as u64)
 }
 
+/// An Item's chapters, starting at `starts`, in an Item `duration` seconds long (if known).
+fn chapters_of(starts: Vec<Duration>, duration: Option<f64>) -> domain::Chapters {
+    let length = duration.and_then(|length| Duration::try_from_secs_f64(length).ok());
+    domain::Chapters::new(starts, length.unwrap_or(Duration::MAX))
+}
+
 /// `length`, in seconds, if it is one an Item can have: finite and more than zero.
 fn known_length(length: Option<f64>) -> Option<f64> {
     length.filter(|length| length.is_finite() && *length > 0.0)
 }
 
-/// The length `playback` tells, in seconds, if it is one an Item can have.
-fn told_length(playback: &sonos::Playback) -> Option<f64> {
+/// The whole-Item length from stored file lengths, else the Group, if finite and positive.
+fn told_length(playback: &ItemPlayback) -> Option<f64> {
     known_length(playback.duration.map(|duration| duration.as_secs_f64()))
 }
 
@@ -2449,7 +2603,7 @@ pub(crate) fn log_storage_error(operation: &'static str, error: &store::Error) {
     );
 }
 
-/// Ends the Handoff whose stream is `stream`, which did not start, if it was stored. Returns
+/// Ends the Handoff whose stream is `stream` after failed playback, if it was stored. Returns
 /// whether it was; none if storage failed, which is logged with `group` (the Group it was
 /// for, only for the log).
 async fn end_unstarted<S: Store>(store: &S, stream: &store::StreamId, group: &str) -> Option<bool> {
@@ -2458,7 +2612,7 @@ async fn end_unstarted<S: Store>(store: &S, stream: &store::StreamId, group: &st
         .await
         .inspect_err(|error| {
             tracing::error!(
-                operation = "end a Handoff that did not start",
+                operation = "end a Handoff after failed playback",
                 group,
                 error = crate::error_chain(error),
                 "storage failed"
@@ -2467,9 +2621,72 @@ async fn end_unstarted<S: Store>(store: &S, stream: &store::StreamId, group: &st
         .ok()
 }
 
+/// End a Handoff after a seek may have changed its file, retrying a local storage failure.
+async fn end_failed_seek<S: Store>(store: &S, stream: &store::StreamId, handoff: &store::Handoff) {
+    let group = &handoff.group;
+    let ended = match end_unstarted(store, stream, group).await {
+        Some(ended) => Some(ended),
+        None => end_unstarted(store, stream, group).await,
+    };
+    match ended {
+        Some(true) => tracing::info!(
+            group,
+            library_item = handoff.library_item,
+            episode = handoff.episode,
+            "Handoff ended after a failed file seek"
+        ),
+        Some(false) => tracing::debug!(group, "a failed file seek's Handoff was already ended"),
+        None => tracing::error!(
+            group,
+            library_item = handoff.library_item,
+            episode = handoff.episode,
+            "a Handoff stays listed but unsupervised until the Bridge restarts after a failed file seek; a pause or skip would overwrite Progress"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn starts_refuse_file_counts_that_cannot_fit_their_mandatory_calls() {
+        for (files, seek, reread, expected) in [
+            (160, false, false, Admission::Fits),
+            (161, false, false, Admission::Never),
+            (96, true, false, Admission::Fits),
+            (97, true, false, Admission::Never),
+            (64, true, true, Admission::Fits),
+            (65, true, true, Admission::Retry),
+            (96, true, true, Admission::Retry),
+            (97, true, true, Admission::Never),
+            (97, false, true, Admission::Retry),
+            (160, false, true, Admission::Retry),
+            (161, false, true, Admission::Never),
+        ] {
+            assert_eq!(
+                start_admission(files, StartCalls { seek, reread }),
+                expected
+            );
+        }
+        for files in 1..=160 {
+            assert_eq!(
+                start_admission(files, StartCalls::default()),
+                Admission::Fits
+            );
+        }
+        for files in 97..=160 {
+            assert_eq!(
+                start_admission(
+                    files,
+                    StartCalls {
+                        seek: false,
+                        reread: true
+                    }
+                ),
+                Admission::Retry
+            );
+        }
+    }
 
     fn progress(current_time: f64, finished: bool) -> Option<Progress> {
         Some(Progress {

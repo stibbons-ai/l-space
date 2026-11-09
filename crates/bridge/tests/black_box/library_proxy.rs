@@ -4,7 +4,7 @@
 //! - [`LibraryProxy::hide_lengths`]: every Item lookup (`GET /api/items/<id>`, exactly one path
 //!   segment after `/api/items/`, any query) with each `duration` in it set to `null`: an Item
 //!   whose length Audiobookshelf doesn't know (as for an audio file it could not probe),
-//!   without seeding one.
+//!   without seeding one; until [`LibraryProxy::show_lengths`].
 //! - [`LibraryProxy::reject_item_lookups`]: every Item lookup at once with 401, as for a
 //!   rejected key.
 //! - [`LibraryProxy::hang_identity`]: every `GET /api/me` never.
@@ -52,6 +52,7 @@ pub struct LibraryProxy {
 struct Faults {
     hide_lengths: AtomicBool,
     reject_item_lookups: AtomicBool,
+    hide_episodes: AtomicBool,
     hang_identity: AtomicBool,
     reject_progress_writes: AtomicBool,
     /// How many Progress writes arrived so far.
@@ -105,7 +106,12 @@ impl LibraryProxy {
 
     /// The proxy's URL, as an operator would configure it.
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        format!("http://{}", self.address())
+    }
+
+    /// The proxy's `host:port`, for a forwarder in front of it.
+    pub fn address(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
     }
 
     /// From now on, Item lookups tell no length.
@@ -113,11 +119,21 @@ impl LibraryProxy {
         self.faults.hide_lengths.store(true, Ordering::SeqCst);
     }
 
+    /// From now on, Item lookups pass as they are again.
+    pub fn show_lengths(&self) {
+        self.faults.hide_lengths.store(false, Ordering::SeqCst);
+    }
+
     /// From now on, Item lookups are rejected with 401 at once.
     pub fn reject_item_lookups(&self) {
         self.faults
             .reject_item_lookups
             .store(true, Ordering::SeqCst);
+    }
+
+    /// Item lookups still answer, but no longer contain any podcast episodes.
+    pub fn hide_episodes(&self) {
+        self.faults.hide_episodes.store(true, Ordering::SeqCst);
     }
 
     /// From now on, `GET /api/me` is never answered.
@@ -306,9 +322,15 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         // Dropped by now if the test no longer waits for it.
         let _ = answered.send(());
     }
-    if hidden && status.is_success() {
+    let episodes_hidden = item_lookup && faults.hide_episodes.load(Ordering::SeqCst);
+    if (hidden || episodes_hidden) && status.is_success() {
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("Item JSON");
-        hide_durations(&mut json);
+        if hidden {
+            hide_durations(&mut json);
+        }
+        if episodes_hidden {
+            json["media"]["episodes"] = serde_json::json!([]);
+        }
         bytes = serde_json::to_vec(&json).expect("Item JSON");
     }
     let mut response = Response::builder().status(status);

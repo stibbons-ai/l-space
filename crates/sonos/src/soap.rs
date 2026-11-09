@@ -54,6 +54,9 @@ impl Service {
 /// Why a call got no usable answer.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CallError {
+    /// Request construction or connection failed before a request could reach the player.
+    #[error("{0}")]
+    NotSent(String),
     #[error("{0}")]
     Http(String),
     /// The HTTP status, and the UPnP `errorCode` of a SOAP fault if it has a numeric one.
@@ -70,6 +73,7 @@ pub(crate) enum CallError {
 
 impl From<reqwest::Error> for CallError {
     fn from(error: reqwest::Error) -> Self {
+        let not_sent = error.is_connect() || error.is_builder();
         let mut chain = error.to_string();
         let mut source = std::error::Error::source(&error);
         while let Some(cause) = source {
@@ -77,7 +81,11 @@ impl From<reqwest::Error> for CallError {
             chain.push_str(&cause.to_string());
             source = cause.source();
         }
-        Self::Http(chain)
+        if not_sent {
+            Self::NotSent(chain)
+        } else {
+            Self::Http(chain)
+        }
     }
 }
 
@@ -159,4 +167,52 @@ pub(crate) fn argument<'a>(arguments: &'a [(String, String)], name: &str) -> Opt
         .iter()
         .find(|(argument, _)| argument == name)
         .map(|(_, value)| value.as_str())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_connection_dropped_after_reading_the_request_may_have_sent_it() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let player = listener.local_addr().unwrap();
+        let received = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            assert!(socket.read(&mut bytes).await.unwrap() > 0);
+        });
+        let client = Client::builder().no_proxy().build().unwrap();
+        let error = call_with(
+            &client,
+            player,
+            Service::AvTransport,
+            "Seek",
+            &[("Unit", "TRACK_NR"), ("Target", "1")],
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        received.await.unwrap();
+        assert!(matches!(error, CallError::Http(_)), "{error:?}");
+    }
+    #[tokio::test]
+    async fn a_refused_connection_cannot_have_sent_a_control() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let player = listener.local_addr().unwrap();
+        drop(listener);
+        let client = Client::builder().no_proxy().build().unwrap();
+        let error = call_with(
+            &client,
+            player,
+            Service::AvTransport,
+            "Seek",
+            &[("Unit", "TRACK_NR"), ("Target", "1")],
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, CallError::NotSent(_)), "{error:?}");
+    }
 }

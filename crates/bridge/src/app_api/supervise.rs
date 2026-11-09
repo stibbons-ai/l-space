@@ -10,10 +10,14 @@
 //! doesn't resume it. A supervisor that panics is logged and forgotten; its Handoff stays,
 //! unsupervised.
 //!
-//! End-of-Item detection assumes a Group stops (`STOPPED`) on the Handoff's stream at the end
-//! of a single URL, as `sonos-fake` models it. It never relies on the position a stopped Group
-//! tells (real hardware may tell 0 then; unverified): from about [`END_SLACK`] before the
-//! expected end the Group is read every [`END_RECHECK`], without asking whom the key acts for
+//! Positions are in the whole Item: a Group playing a later one of the Handoff's files is read
+//! at that file's start plus its position in it (`ItemFiles::whole_if_plays`), so reaching the end of a
+//! file that isn't the last is not the end of the Item. End-of-Item detection assumes a Group
+//! stops (`STOPPED`) on one of the Handoff's files at the end of the last, as `sonos-fake`
+//! models it. It never relies on the position, or the file, a stopped Group tells (real
+//! hardware may tell 0 then, and its queue may be back at its first file; unverified): from
+//! about [`END_SLACK`] before the expected end the Group is read every [`END_RECHECK`],
+//! without asking whom the key acts for
 //! first unless a Finished write is pending (a cadence tick among those reads, judged at the
 //! tick or at the last sighting if that came after it, is one of them, writing nothing; a
 //! visit for a tick judged before them that runs late into them still asks, and writes), and a
@@ -57,7 +61,7 @@ use store::{GroupHandoff, Handoff, Store, StreamId};
 use tokio::sync::watch;
 
 use super::{
-    Acting, Budget, CONTROL_TURN_TIME, Controls, Turns, Wanted, Wrote, plays_stream, told_length,
+    Acting, Budget, CONTROL_TURN_TIME, Controls, ItemFiles, Turns, Wanted, Wrote, told_length,
 };
 
 /// How often a playing Handoff's Progress is written, on the Bridge's clock. A tick that finds
@@ -262,7 +266,7 @@ impl<S: Store> Supervisors<S> {
             turns: Arc::clone(&self.turns),
             clock: Arc::clone(&self.clock),
             handoff: handoff.clone(),
-            stream,
+            files: ItemFiles::of(stream, &handoff.files),
             known: Arc::clone(&known),
         };
         let forget = Forget {
@@ -402,7 +406,8 @@ struct Supervisor<S> {
     clock: Arc<dyn Clock>,
     /// The supervised Handoff, as it started.
     handoff: Handoff,
-    stream: StreamId,
+    /// Its stream and files, where they lie in the whole Item.
+    files: ItemFiles,
     known: Arc<Mutex<Known>>,
 }
 
@@ -603,7 +608,7 @@ impl<S: Store> Supervisor<S> {
             self.skipped(due, "the Group did not tell what it plays");
             return Continue(Then::Wait);
         };
-        if !plays_stream(&playback, &self.stream) {
+        let Some(playback) = self.files.whole_if_plays(&playback) else {
             tracing::debug!(
                 group,
                 "a supervised Group plays something other than its Handoff"
@@ -611,7 +616,7 @@ impl<S: Store> Supervisor<S> {
             self.drop_ending("the Group plays something other than the Handoff");
             self.saw(at, None);
             return Continue(Then::Wait);
-        }
+        };
         let length = {
             let mut known = self.known();
             known.length = known.length.or_else(|| told_length(&playback));
@@ -823,7 +828,7 @@ impl<S: Store> Supervisor<S> {
     /// failed (logged). Breaks once the Handoff is gone: ended, or another on the Group.
     async fn active(&self) -> ControlFlow<(), Option<GroupHandoff>> {
         match self.controls.store.group_handoff(&self.handoff.group).await {
-            Ok(Some(found)) if found.stream == self.stream => Continue(Some(found)),
+            Ok(Some(found)) if found.stream == *self.files.stream() => Continue(Some(found)),
             Ok(_) => Break(()),
             Err(error) => {
                 self.storage_failed("look up a supervised Group's Handoff", &error);

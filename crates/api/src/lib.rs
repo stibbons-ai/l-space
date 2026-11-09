@@ -330,8 +330,8 @@ pub struct Group {
     /// What the Group's playback is doing; none if its coordinator was not found by the
     /// Bridge's searches, didn't answer, or answered too late.
     pub state: Option<TransportState>,
-    /// The track it has loaded, if any and if its coordinator said; none whenever `state` is
-    /// none.
+    /// What the Group has loaded, if its coordinator said; none whenever `state` is none.
+    /// Position and duration describe the whole Item only while playing the Handoff's stream.
     pub now_playing: Option<NowPlaying>,
     /// The Group's volume, 0 to [`MAX_VOLUME`]; none if its coordinator didn't tell it in
     /// time, refused to, or told something that isn't such a number (and from a Bridge that
@@ -371,15 +371,16 @@ pub enum TransportState {
     Unknown,
 }
 
-/// The track a Group has loaded. Times are seconds.
+/// What a Group has loaded. Times are whole-Item seconds while it plays its Handoff;
+/// otherwise they describe the loaded track.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NowPlaying {
     /// From the track's metadata, if it has one.
     pub title: Option<String>,
     pub creator: Option<String>,
-    /// How far into the track playback is.
+    /// How far into the Item (or external track) playback is.
     pub position: Option<f64>,
-    /// The track's length; none when unknown, as for a stream.
+    /// The Item's (or external track's) length; none when unknown.
     pub duration: Option<f64>,
 }
 
@@ -401,14 +402,16 @@ pub struct Handoff {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Playback {
     pub state: TransportState,
-    /// How far into the Item the Group is; none if its coordinator didn't say.
+    /// How far into the Item the Group is, in the whole Item also when it plays a later one of
+    /// the Item's audio files; none if its coordinator didn't say.
     pub position: Option<f64>,
-    /// The Item's length: as the Group tells it, else (pausing or skipping) as the Library
-    /// Server tells it; none if unknown.
+    /// The Item's length: from its audio files' lengths as the Library Server told them at the
+    /// start, else as the Group tells it, else (pausing or skipping) as the Library Server
+    /// tells it; none if unknown.
     pub duration: Option<f64>,
 }
 
-/// How far [`skip_group`] moves a Group's position.
+/// Where [`skip_group`] moves a Group in its Handoff's Item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Skip {
@@ -416,16 +419,11 @@ pub enum Skip {
     Back15,
     /// 30 seconds forward, but not past the end.
     Forward30,
-}
-
-impl Skip {
-    /// The seconds it moves by: negative back, positive forward.
-    pub fn seconds(self) -> i32 {
-        match self {
-            Self::Back15 => -15,
-            Self::Forward30 => 30,
-        }
-    }
+    /// To the start of the current chapter when more than 3 seconds into it, else to the start
+    /// of the chapter before; in the first chapter, to its start.
+    PreviousChapter,
+    /// To the start of the next chapter; in the last chapter, nowhere.
+    NextChapter,
 }
 
 /// An error code the App translates for the user.
@@ -487,19 +485,24 @@ pub enum ApiError {
     GroupNotFound,
     /// The Bridge could not complete or confirm what was asked of the Group: its coordinator
     /// refused, or didn't answer in time (the Group may then have acted all the same), or it
-    /// was busy with another start or control on it, and nothing was sent.
+    /// was busy with another start or control on it, or a start left too little time, and
+    /// nothing was sent.
+    /// A failed skip that may have selected a file ends its Handoff without writing Progress
+    /// and attempts to pause the Group. A refusal before file selection leaves it active.
     #[error("group_failed")]
     GroupFailed,
-    /// The Item can't be played on a Group by this Bridge yet: it has more than one audio
-    /// file, none, or one in a format Sonos doesn't play.
+    /// The Item can't be played on a Group by this Bridge yet: it has no audio file, one in a
+    /// format Sonos doesn't play, several of which one has no known length, or too many files
+    /// for this start's mandatory playback reservation. The limit depends on whether the
+    /// start seeks: the same Item may play from the start but be refused mid-file.
     #[error("item_not_playable")]
     ItemNotPlayable,
     /// The Group has no active Handoff to control, or plays something other than its
     /// Handoff's stream (switched in the Sonos app, for example: what is a Takeover once
     /// detected, #20, so the Handoff isn't ended yet). No control was sent to the Group and no
-    /// Progress written; a Handoff it still has goes on, except after a forward skip that
-    /// needed the Item's length: if the Library Server rejected the starter's key there, or it
-    /// now acts for another user, the key was revoked, which ended the Handoff (see [`skip_group`]).
+    /// Progress written; a Handoff it still has goes on, except after a forward skip needing
+    /// the Item's length or a chapter skip: if the Library Server rejected the starter's key
+    /// there, or it now acts for another user, revocation ends the Handoff (see [`skip_group`]).
     #[error("no_handoff")]
     NoHandoff,
     /// A forward skip was refused because neither the Group nor the Library Server knows the
@@ -690,10 +693,11 @@ pub async fn groups() -> Result<Vec<Group>, ApiError> {
 /// that is Finished or absent, when its whole seconds lie at or past the Item's end, or when
 /// `from_start` ("Play from start"; an App that sends none gets the Progress). The Bridge
 /// streams the Item to the Group, which keeps playing without the App.
-/// Only an Item with exactly one audio file plays so far. Once the Item is found playable, the
-/// Group's Handoff is replaced before the Group is told to play and then, only when it starts
-/// past the beginning, to go to the start position: if it doesn't do what it is told (a Sonos
-/// error), the Group is left with no Handoff.
+/// An Item in several audio files plays them in order, from the one holding the start
+/// position. Once the Item is found playable, the Group's Handoff is replaced before the Group
+/// is told to play and then, only when it starts past the beginning of that file, to go to
+/// the start position: if it doesn't do what it is told (a Sonos error), the Group is left
+/// with no Handoff.
 #[post(
     "/api/handoffs/start",
     headers: dioxus_fullstack::HeaderMap,
@@ -760,17 +764,24 @@ pub async fn resume_group(group: String) -> Result<Playback, ApiError> {
         .await
 }
 
-/// Moves Group `group`'s Handoff, whoever started it, 15 seconds back or 30 forward from
-/// where it is now, kept between the Item's start and its end (as the Group tells its length,
-/// else the Library Server); playing or paused as it was. Writes the new position as Progress
-/// as [`pause_group`] does, and answers likewise. A forward skip on a Group that tells no
-/// length first asks the Library Server for it: if the Library Server doesn't tell it
-/// (unreachable, too slow, or the Item is gone there), the skip is refused with
-/// [`ApiError::LibraryServerUnreachable`]; if it knows no length either, with
-/// [`ApiError::LengthUnknown`]. If the Library Server rejects the starter's key there, or it
-/// now acts for another user, the key is revoked and the skip answers
-/// [`ApiError::NoHandoff`], or [`ApiError::Internal`] if storing the revoke failed. In each
-/// of these cases nothing is sent to the Group and nothing written.
+/// Moves Group `group`'s Handoff, whoever started it, as `skip` says: 15 seconds back or 30
+/// forward from where it is now, kept between the Item's start and its end (its length as
+/// [`Playback::duration`] tells it, else the Library Server's), or to the previous or next
+/// chapter (an Item without chapters, such as an episode, counts as one chapter), across the
+/// Item's audio files; playing or paused as it was. Writes the new position as Progress as
+/// [`pause_group`] does, and answers likewise. A next chapter in the last chapter sends the
+/// Group nothing and writes nothing, and answers with where the Group is. A chapter skip
+/// asks the Library Server for the Item's chapters, and a forward skip whose length is not
+/// known asks it for that: if the Library Server doesn't tell it (unreachable, too slow, or
+/// the Item is gone there), the skip is refused with [`ApiError::LibraryServerUnreachable`];
+/// if a forward skip finds no length there either, with [`ApiError::LengthUnknown`]. If the
+/// Library Server rejects the starter's key there, or it now acts for another user, the key
+/// is revoked and the skip answers [`ApiError::NoHandoff`], or [`ApiError::Internal`] if
+/// storing the revoke failed. In each of these cases nothing is sent to the Group and nothing
+/// written.
+/// A refused or unconfirmed seek answers [`ApiError::GroupFailed`]. If file selection was
+/// acknowledged or may have acted, the Handoff ends without writing Progress and the Group
+/// is paused best-effort; a refusal before file selection leaves the Handoff active.
 #[post(
     "/api/groups/skip",
     headers: dioxus_fullstack::HeaderMap,

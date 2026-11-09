@@ -2,10 +2,10 @@
 //! Control API can replace the local UPnP implementation, [`Upnp`], later.
 //!
 //! It reads every Group as set up in the Sonos app, with its members, what its coordinator
-//! plays and the Group's volume; starts a stream the Bridge serves on a Group
-//! ([`Sonos::play`]); and controls what a Group plays: pause, resume, seek, and the Group's
-//! volume. [`media_type`] tells which audio formats a Group plays; `play` doesn't check, the
-//! caller does. It never changes grouping.
+//! plays and the Group's volume; starts streams the Bridge serves on a Group, as the Group's
+//! queue ([`Sonos::play`]); and controls what a Group plays: pause, resume, seek (to another
+//! track of its queue too), and the Group's volume. [`media_type`] tells which audio formats a
+//! Group plays; `play` doesn't check, the caller does. It never changes grouping.
 //!
 //! Every SSDP datagram and SOAP body sent or received is logged at DEBUG under the target
 //! [`RAW`], and only there; INFO and above summarise without raw bodies.
@@ -24,7 +24,9 @@ use futures::future::BoxFuture;
 pub use media::media_type;
 pub use soap::MAX_BODY;
 pub use ssdp::MULTICAST;
-pub use upnp::{CONTROL_TIMEOUT, EXPIRY, LISTING_TIMEOUT, PLAY_TIMEOUT, REFRESH, Upnp};
+pub use upnp::{
+    CONTROL_TIMEOUT, EXPIRY, LISTING_TIMEOUT, PLAY_TIMEOUT, REFRESH, Upnp, play_timeout,
+};
 
 /// The `tracing` target of the raw UPnP traffic: each SSDP datagram and SOAP request and
 /// response body, at DEBUG. Enable it with `RUST_LOG=sonos::raw=debug`.
@@ -37,14 +39,22 @@ pub const MAX_VOLUME: u8 = 100;
 ///
 /// Every call on one Group acts on its coordinator as the topology read for that call names
 /// it: a Group the topology doesn't have is [`Error::UnknownGroup`]; a coordinator the
-/// searches didn't find, or that doesn't answer in time or refuses, is [`Error::GroupFailed`].
+/// searches didn't find, or that doesn't answer in time or refuses, is [`Error::GroupFailed`],
+/// except as [`Sonos::seek`] says when file selection may have acted.
 pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// Every Group as the Sonos app shows it, by name. A household where a working search found
     /// no player has none.
     fn groups(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>>;
 
-    /// Group `group` (its id) plays `stream` from its start, replacing what it played.
-    fn play<'a>(&'a self, group: &'a str, stream: &'a Stream) -> BoxFuture<'a, Result<(), Error>>;
+    /// Group `group` (its id) plays `streams` as its queue, in order, from the start of
+    /// `streams[first]`, replacing what it played and what its queue held. Played to the end
+    /// of one, it goes on with the next; at the end of the last, it stops.
+    fn play<'a>(
+        &'a self,
+        group: &'a str,
+        streams: &'a [Stream],
+        first: usize,
+    ) -> BoxFuture<'a, Result<(), Error>>;
 
     /// What Group `group` plays now, as its coordinator tells it.
     fn playback<'a>(&'a self, group: &'a str) -> BoxFuture<'a, Result<Playback, Error>>;
@@ -55,9 +65,19 @@ pub trait Sonos: std::fmt::Debug + Send + Sync + 'static {
     /// Group `group` plays on from where it is, at normal speed.
     fn resume<'a>(&'a self, group: &'a str) -> BoxFuture<'a, Result<(), Error>>;
 
-    /// Group `group` goes to `position` into its current track, in whole seconds (any
-    /// fraction is dropped), playing or paused as it was.
-    fn seek<'a>(&'a self, group: &'a str, position: Duration) -> BoxFuture<'a, Result<(), Error>>;
+    /// Group `group` goes to `position` into a track of its queue, in whole seconds (any
+    /// fraction is dropped), playing or paused as it was: into track `track` (0-based, in
+    /// queue order) when given, else into its current track.
+    /// Takes at most `time` (capped at [`CONTROL_TIMEOUT`]). A seek that selected its queue
+    /// track before failing at REL_TIME, or whose track selection was sent but not confirmed
+    /// or refused, is [`Error::SeekMayHaveMoved`].
+    fn seek<'a>(
+        &'a self,
+        group: &'a str,
+        track: Option<usize>,
+        position: Duration,
+        time: Duration,
+    ) -> BoxFuture<'a, Result<(), Error>>;
 
     /// Group `group`'s volume becomes `volume`, at most [`MAX_VOLUME`]: every member's
     /// changes as the Sonos app's Group volume changes them.
@@ -117,9 +137,14 @@ pub enum Error {
     #[error("no such Sonos Group")]
     UnknownGroup,
     /// The Group's coordinator was not found by the last searches, didn't answer in time, or
-    /// refused (a SOAP fault), or answered without what was asked for.
+    /// refused (a SOAP fault), or answered without what was asked for, except as
+    /// [`Sonos::seek`] says when file selection may have acted.
     #[error("the Group's coordinator did not do what was asked")]
     GroupFailed,
+    /// A seek selected its queue track before failing at REL_TIME, or the track selection
+    /// was sent but not confirmed or refused. Playback may now be at that file's start.
+    #[error("a file seek failed after the queue track may have changed")]
+    SeekMayHaveMoved,
 }
 
 /// One or more players playing in sync, as grouped in the Sonos app.
@@ -167,8 +192,10 @@ pub enum TransportState {
 }
 
 /// The track a Group has loaded.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Track {
+    /// The loaded URL. Debug omits it because stream URLs carry capabilities.
+    pub uri: Option<String>,
     /// From the track's metadata, if it has one.
     pub title: Option<String>,
     pub creator: Option<String>,
@@ -176,6 +203,18 @@ pub struct Track {
     pub position: Option<Duration>,
     /// The track's length; none when unknown, as for a stream.
     pub duration: Option<Duration>,
+}
+
+impl std::fmt::Debug for Track {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Track")
+            .field("uri", &self.uri.as_ref().map(|_| "REDACTED"))
+            .field("title", &self.title)
+            .field("creator", &self.creator)
+            .field("position", &self.position)
+            .field("duration", &self.duration)
+            .finish()
+    }
 }
 
 /// What a Group plays, as [`Sonos::playback`] reads it from its coordinator.
@@ -200,5 +239,26 @@ impl std::fmt::Debug for Playback {
             .field("position", &self.position)
             .field("duration", &self.duration)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_debug_never_reveals_its_stream_capability() {
+        let track = Track {
+            uri: Some("http://bridge/stream/secret-capability/1-file.mp3".into()),
+            title: Some("Book".into()),
+            creator: None,
+            position: Some(Duration::from_secs(5)),
+            duration: None,
+        };
+        let debug = format!("{track:?}");
+        assert!(!debug.contains("secret-capability"));
+        assert!(!debug.contains("http://bridge"));
+        assert!(debug.contains("REDACTED"));
+        assert!(debug.contains("Book"));
     }
 }

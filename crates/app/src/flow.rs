@@ -540,10 +540,9 @@ impl App {
         .await;
     }
 
-    /// Whether the Item screen offers to play its Item on a Group: only an Item in one audio
-    /// file plays there so far.
+    /// Whether the Item screen offers to play its Item on a Group: one with audio files.
     pub fn can_play_on(&self) -> bool {
-        matches!(&self.screen, Screen::Item { item, .. } if item.audio_files.len() == 1)
+        matches!(&self.screen, Screen::Item { item, .. } if !item.audio_files.is_empty())
     }
 
     /// On the Item screen, marks its Item Finished (`finished`) or unfinished on the Library
@@ -1108,6 +1107,13 @@ pub fn volume_step(volume: u8, louder: bool) -> u8 {
     } else {
         volume.saturating_sub(VOLUME_STEP)
     }
+}
+
+/// Whether the Groups screen offers previous and next chapter on `group`: for a Handoff of an
+/// audiobook (an Item without an episode).
+pub fn offers_chapters(group: &Group) -> bool {
+    let handoff = group.handoff.as_ref();
+    handoff.is_some_and(|handoff| handoff.item.episode.is_none())
 }
 
 /// Shows `playback`, a control's answer, on `group`'s row: its state and position, and the

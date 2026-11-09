@@ -1,11 +1,14 @@
-//! The Bridge's media streams (ADR 0010): `/stream/<stream id>/<file>`, on the App API's
+//! The Bridge's media streams (ADR 0010): `/stream/<stream id>/<n>-<file>`, on the App API's
 //! listener, which Groups fetch over the LAN. A stream id names one active Handoff and serves
-//! only its Item's audio file, forwarding byte ranges to the Library Server with the starter's
-//! API key. Speakers can't authenticate, so the id is the only capability: 256 random bits,
-//! stored only as its hash, never logged at INFO or above (the SOAP bodies at DEBUG under
-//! `sonos::raw` carry the URL). Anything that doesn't name an active Handoff's file
-//! is a bare `404`, alike for an unknown id, a known one with another file name, and a path
-//! that isn't UTF-8.
+//! only its Item's audio files, the `n`th (from 1, in playing order) under its own name,
+//! forwarding byte ranges to the Library Server with the starter's API key. Speakers can't
+//! authenticate, so the id is the only capability: 256 random bits, stored only as its hash,
+//! never logged at INFO or above (the SOAP bodies at DEBUG under `sonos::raw` carry the URL).
+//! Anything that doesn't name an active Handoff's file is a bare `404`, alike for an unknown
+//! id, a known one with another file number or name, and a path that isn't UTF-8.
+//! Single-file Handoffs also accept `/stream/<id>/<file>`: migration 0004 preserves Handoffs
+//! whose Group still holds this pre-upgrade URL. Remove this form only when those persisted
+//! Handoffs no longer need to survive an upgrade.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -30,7 +33,7 @@ pub fn router<S: Store>(app: Arc<AppApi<S>>) -> Router {
         .with_state(app)
 }
 
-/// A stream's id as it appears in its URL: the capability that lets a Group fetch the stream.
+/// A stream's id as it appears in its URLs: the capability that lets a Group fetch the stream.
 /// It never shows in `Debug` output; only its hash, [`store::StreamId`], is stored.
 pub struct StreamToken(String);
 
@@ -44,9 +47,15 @@ impl StreamToken {
         store::StreamId::of(&self.0)
     }
 
-    /// The path of this stream serving the file named `file_name`, percent-encoded.
-    pub fn path(&self, file_name: &str) -> String {
-        format!("/stream/{}/{}", self.0, path_segment(file_name))
+    /// The path of this stream serving its Handoff's file `file` (0-based, in playing order),
+    /// named `file_name`, percent-encoded: unambiguous also when two files share a name.
+    pub fn path(&self, file: usize, file_name: &str) -> String {
+        format!(
+            "/stream/{}/{}-{}",
+            self.0,
+            file + 1,
+            path_segment(file_name)
+        )
     }
 }
 
@@ -56,20 +65,58 @@ impl std::fmt::Debug for StreamToken {
     }
 }
 
-/// The stream named in `url`, if it is a stream's URL as a Group holds it:
-/// `http://<host>/stream/<id>/<file>`, on whatever address and port. Only the shape is
-/// checked; whether it names a Handoff is the store's to say.
-pub fn stream_in_url(url: &str) -> Option<store::StreamId> {
+/// A file of a stream, as a URL names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamFile {
+    pub stream: store::StreamId,
+    /// Which of the Handoff's files, 0-based, in playing order.
+    pub file: usize,
+}
+
+/// The stream file named in a Group's URL. The caller must supply `legacy_name` (already
+/// percent-encoded) only for a single-file Handoff. Numbered URLs are checked for shape only.
+pub fn stream_in_url(url: &str, legacy_name: Option<&str>) -> Option<StreamFile> {
     let (_, path) = url.strip_prefix("http://")?.split_once('/')?;
     let mut segments = path.split('/');
     let (stream, id, file) = (segments.next()?, segments.next()?, segments.next()?);
-    let shaped = stream == "stream" && !id.is_empty() && !file.is_empty();
-    (shaped && segments.next().is_none()).then(|| store::StreamId::of(id))
+    let shaped = stream == "stream" && !id.is_empty() && segments.next().is_none();
+    if !shaped {
+        return None;
+    }
+    let file = if legacy_name == Some(file) {
+        0
+    } else {
+        numbered(file)?.0
+    };
+    Some(StreamFile {
+        stream: store::StreamId::of(id),
+        file,
+    })
+}
+
+/// The file (0-based) and its name in a stream path's last segment, `<n>-<name>`: `n` counts
+/// from 1, in decimal digits without a leading zero; the name is not empty.
+fn numbered(segment: &str) -> Option<(usize, &str)> {
+    let (number, name) = segment.split_once('-')?;
+    let digits = number.bytes().all(|byte| byte.is_ascii_digit()) && !number.starts_with('0');
+    let number: usize = digits.then(|| number.parse().ok()).flatten()?;
+    (!name.is_empty()).then_some((number.checked_sub(1)?, name))
+}
+
+/// The file named by a decoded path segment. Try the numbered form first, then the
+/// pre-upgrade unnumbered name, only for a Handoff with exactly one file.
+pub(crate) fn file_in_segment(segment: &str, files: &[store::HandoffFile]) -> Option<usize> {
+    if let Some((index, name)) = numbered(segment)
+        && files.get(index).is_some_and(|file| file.name == name)
+    {
+        return Some(index);
+    }
+    (files.len() == 1 && files[0].name == segment).then_some(0)
 }
 
 /// `text` as one URL path segment: ASCII letters, digits and `-._~` as they are, every other
 /// byte percent-encoded.
-fn path_segment(text: &str) -> String {
+pub(crate) fn path_segment(text: &str) -> String {
     let mut segment = String::with_capacity(text.len());
     for byte in text.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
@@ -111,15 +158,15 @@ async fn serve<S: Store>(
     headers: HeaderMap,
 ) -> Response {
     // A path that isn't UTF-8 names nothing either.
-    let (id, file) = match path {
+    let (id, segment) = match path {
         Ok(Path(path)) => path,
         Err(rejection) => {
             tracing::debug!(%rejection, "a stream path that names nothing");
             return not_found();
         }
     };
-    let (library_server, store::ActiveHandoff { handoff, api_key }) =
-        match app.active_handoff(&StreamToken::new(id), &file).await {
+    let (library_server, store::ActiveHandoff { handoff, api_key }, served) =
+        match app.active_handoff(&StreamToken::new(id), &segment).await {
             Ok(Some(active)) => active,
             Ok(None) => return not_found(),
             Err(error) => {
@@ -127,7 +174,7 @@ async fn serve<S: Store>(
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
         };
-    let Some(content_type) = sonos::media_type(&handoff.file.name) else {
+    let Some(content_type) = sonos::media_type(&served.name) else {
         tracing::warn!(
             group = handoff.group,
             library_item = handoff.library_item,
@@ -147,7 +194,7 @@ async fn serve<S: Store>(
             library_server,
             &api_key,
             &handoff.library_item,
-            &handoff.file.ino,
+            &served.ino,
             request,
             range,
         )
@@ -228,40 +275,83 @@ fn not_found() -> Response {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::{StreamToken, range, stream_in_url};
+    use super::{StreamFile, StreamToken, range, stream_in_url};
 
     #[test]
-    fn a_streams_id_is_read_back_from_its_url_on_any_address() {
+    fn a_streams_id_and_file_are_read_back_from_its_url_on_any_address() {
         let token = StreamToken::new("ab12".into());
-        let path = token.path("Episode 1.mp3");
-        for url in [
-            format!("http://127.0.0.1:9{path}"),
-            format!("http://[::1]:8080{path}"),
-        ] {
-            assert_eq!(stream_in_url(&url), Some(token.hash()), "{url}");
+        for file in [0, 2, 11] {
+            let path = token.path(file, "Episode 1.mp3");
+            for url in [
+                format!("http://127.0.0.1:9{path}"),
+                format!("http://[::1]:8080{path}"),
+            ] {
+                let named = StreamFile {
+                    stream: token.hash(),
+                    file,
+                };
+                assert_eq!(stream_in_url(&url, None), Some(named), "{url}");
+            }
         }
         for other in [
             "http://127.0.0.1:9/stream/ab12",
-            "http://127.0.0.1:9/stream//x.mp3",
-            "http://127.0.0.1:9/stream/ab12/x.mp3/more",
-            "http://127.0.0.1:9/track/ab12/x.mp3",
-            "https://127.0.0.1:9/stream/ab12/x.mp3",
+            "http://127.0.0.1:9/stream//1-x.mp3",
+            "http://127.0.0.1:9/stream/ab12/1-x.mp3/more",
+            "http://127.0.0.1:9/track/ab12/1-x.mp3",
+            "https://127.0.0.1:9/stream/ab12/1-x.mp3",
+            // Not numbered as the Bridge numbers files.
+            "http://127.0.0.1:9/stream/ab12/x.mp3",
+            "http://127.0.0.1:9/stream/ab12/0-x.mp3",
+            "http://127.0.0.1:9/stream/ab12/01-x.mp3",
+            "http://127.0.0.1:9/stream/ab12/-x.mp3",
+            "http://127.0.0.1:9/stream/ab12/1-",
+            "http://127.0.0.1:9/stream/ab12/+1-x.mp3",
             "x-sonos-spotify:spotify%3atrack%3a1",
             "http://127.0.0.1:9",
             "",
         ] {
-            assert_eq!(stream_in_url(other), None, "{other}");
+            assert_eq!(stream_in_url(other, None), None, "{other}");
         }
     }
 
     #[test]
-    fn a_file_name_is_one_percent_encoded_segment() {
+    fn a_single_files_legacy_name_is_accepted_even_when_it_looks_numbered() {
+        for name in ["Episode 1.mp3", "1-Intro.mp3", "2-Intro.mp3"] {
+            let file = store::HandoffFile {
+                ino: "a".into(),
+                name: name.into(),
+                duration: None,
+            };
+            assert_eq!(
+                super::file_in_segment(name, std::slice::from_ref(&file)),
+                Some(0)
+            );
+            let url = format!("http://localhost/stream/ab12/{}", super::path_segment(name));
+            let expected = Some(StreamFile {
+                stream: StreamToken::new("ab12".into()).hash(),
+                file: 0,
+            });
+            assert_eq!(
+                stream_in_url(&url, Some(&super::path_segment(name))),
+                expected
+            );
+            let numbered = format!("1-{name}");
+            assert_eq!(
+                super::file_in_segment(&numbered, std::slice::from_ref(&file)),
+                Some(0)
+            );
+            assert_eq!(super::file_in_segment(name, &[file.clone(), file]), None);
+        }
+    }
+
+    #[test]
+    fn a_file_name_is_one_percent_encoded_segment_after_its_number() {
         let token = StreamToken::new("ab12".into());
         assert_eq!(
-            token.path("Episode 1/../ä?#%.mp3"),
-            "/stream/ab12/Episode%201%2F..%2F%C3%A4%3F%23%25.mp3"
+            token.path(0, "Episode 1/../ä?#%.mp3"),
+            "/stream/ab12/1-Episode%201%2F..%2F%C3%A4%3F%23%25.mp3"
         );
-        assert_eq!(token.path("a-b_c~d.mp3"), "/stream/ab12/a-b_c~d.mp3");
+        assert_eq!(token.path(9, "a-b_c~d.mp3"), "/stream/ab12/10-a-b_c~d.mp3");
         assert_eq!(format!("{token:?}"), "StreamToken(REDACTED)");
     }
 

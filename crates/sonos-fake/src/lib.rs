@@ -1,22 +1,31 @@
 //! A fake Sonos household for tests (PRD "Testing Decisions"): players on loopback that answer
 //! SSDP M-SEARCH and serve their device description and the UPnP subset the Bridge uses
 //! (ZoneGroupTopology `GetZoneGroupState`; AVTransport `GetTransportInfo`, `GetPositionInfo`,
-//! `SetAVTransportURI`, `Play`, `Pause` and `Seek`; GroupRenderingControl `GetGroupVolume`,
-//! `SnapshotGroupVolume` and `SetGroupVolume`), with Groups, playback, volume and faults the
-//! test controls.
+//! `RemoveAllTracksFromQueue`, `AddURIToQueue`, `AddMultipleURIsToQueue`,
+//! `SetAVTransportURI`, `Play`, `Pause` and `Seek`; GroupRenderingControl
+//! `GetGroupVolume`, `SnapshotGroupVolume` and
+//! `SetGroupVolume`), with Groups, playback, volume and faults the test controls.
 //!
-//! A Group told to play a URL (`SetAVTransportURI`, then `Play`) plays it like a speaker: its
-//! transport is Playing, its position moves on the clock, `GetPositionInfo` reports the URL,
-//! and it fetches the URL over HTTP with a `Range` request, recording what it got
-//! ([`Household::fetched`]). Paused (`Pause`), its position stops on the clock; `Play` moves it
-//! on from there; `Seek` (`REL_TIME`) sets it, playing or paused as it was. Each Group has a
-//! volume, [`DEFAULT_VOLUME`] until set (`SetGroupVolume`, or [`Household::set_volume`]);
+//! Each coordinator has a queue: `RemoveAllTracksFromQueue` empties it; `AddURIToQueue` and
+//! `AddMultipleURIsToQueue` append URLs. A Group told to play a URL, or its queue
+//! (`SetAVTransportURI` with `x-rincon-queue:<its UUID>#0`, the queue as it is then), is at
+//! the first track of it; `Seek` with `TRACK_NR` (1-based) goes to the start of another track
+//! of it. Told to `Play`, it plays like a speaker: its transport is Playing, its position in
+//! the current track moves on the clock, `GetPositionInfo` reports the track's number
+//! (`Track`), URL, length and position, and it fetches the URL of the track it starts from
+//! Stopped over HTTP with a `Range` request, recording what it got ([`Household::fetched`]).
+//! Paused (`Pause`), its position stops on the clock; `Play` moves it on from there; `Seek`
+//! (`REL_TIME`) sets it within the current track, playing or paused as it was. Each Group has
+//! a volume, [`DEFAULT_VOLUME`] until set (`SetGroupVolume`, or [`Household::set_volume`]);
 //! `SnapshotGroupVolume` is accepted and only recorded, as the fake has no member volumes.
 //!
-//! A track of known length plays to its end and stops there, as a Sonos Group stops at the end
-//! of a single URL: Stopped, its track still loaded, its position back at 0. A URL the Group
-//! is given has no known length (it plays on without end) unless the test sets one with
-//! [`Household::set_url_length`].
+//! A track of known length plays to its end; the Group then goes on with the next track
+//! (playing it from its start, without fetching it), and after the last one it stops, as a
+//! Sonos Group does at the end of a single URL or of its queue: Stopped, at its first track,
+//! its position back at 0. (Where real Sonos leaves a queue played to its end is unverified;
+//! back at its first track is the case a caller must not be misled by.) A URL the Group is
+//! given has no known length (it plays on without end) unless the test sets one with
+//! [`Household::set_url_length`] or [`Household::set_queue_lengths`].
 //!
 //! The household runs on its own Tokio runtime, so it answers whatever the test's runtime is
 //! doing (also while a test blocks on starting a Bridge). Each player listens on its own
@@ -60,6 +69,9 @@ use tokio::runtime::Runtime;
 /// The `Range` a player asks for when it starts a URL: everything, from the start.
 const FETCH_RANGE: &str = "bytes=0-";
 
+/// How a URL that names a queue (`x-rincon-queue:<coordinator UUID>#0`) starts.
+const QUEUE: &str = "x-rincon-queue:";
+
 /// How long `GET /clock?after=…` waits at most, in real time, for the clock to move.
 pub const CLOCK_POLL: Duration = Duration::from_secs(10);
 
@@ -101,8 +113,8 @@ pub struct FakeTrack {
     pub creator: Option<String>,
     pub uri: String,
     /// None for a URL the Group was given, unless the test set a length for it
-    /// ([`Household::set_url_length`]): it reports `0:00:00`, as for a stream, and the
-    /// position moves on without end.
+    /// ([`Household::set_url_length`], [`Household::set_queue_lengths`]): it reports
+    /// `0:00:00`, as for a stream, and the position moves on without end.
     pub duration: Option<Duration>,
 }
 
@@ -120,6 +132,16 @@ impl FakeTrack {
     pub fn by(mut self, creator: &str) -> Self {
         self.creator = Some(creator.to_owned());
         self
+    }
+
+    /// A URL a Group was given, without metadata, `duration` long if the test set a length.
+    fn given(uri: String, duration: Option<Duration>) -> Self {
+        Self {
+            title: None,
+            creator: None,
+            uri,
+            duration,
+        }
     }
 }
 
@@ -144,6 +166,25 @@ impl Fetch {
             .iter()
             .find(|(header, _)| header == name)
             .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A `Seek` a player was called with, its arguments as sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seek {
+    /// Such as `REL_TIME` or `TRACK_NR`.
+    pub unit: String,
+    /// Such as `0:12:34`, or a track's number.
+    pub target: String,
+}
+
+impl Seek {
+    /// A seek to `target` by `unit`.
+    pub fn new(unit: &str, target: &str) -> Self {
+        Self {
+            unit: unit.to_owned(),
+            target: target.to_owned(),
+        }
     }
 }
 
@@ -183,11 +224,15 @@ pub enum Fault {
     /// It accepts `Pause`, `Play`, `Seek`, `SnapshotGroupVolume` and `SetGroupVolume` and
     /// never answers them, changing nothing, and answers everything else correctly.
     HangControl,
-    /// It answers `Seek` with a SOAP fault (UPnP error 701, transition not available),
-    /// changing nothing, and everything else correctly.
+    /// It answers `Seek` by time (`REL_TIME`) with a SOAP fault (UPnP error 701, transition
+    /// not available), changing nothing, and everything else correctly (a `Seek` by track
+    /// too).
     RefuseSeek,
-    /// It accepts `Seek` and never answers it, changing nothing, and answers everything else
-    /// correctly.
+    /// It answers a queue-track `Seek` with a bare HTTP 500, without confirming a refusal,
+    /// changing nothing, and everything else correctly.
+    BareTrackSeekFailure,
+    /// It accepts `Seek` by time (`REL_TIME`) and never answers it, changing nothing, and
+    /// answers everything else correctly (a `Seek` by track too).
     HangSeek,
     /// It answers `Seek` as [`Fault::RefuseSeek`] does, and each `Pause` correctly, but only
     /// after this long (in real time), pausing only then; everything else correctly.
@@ -229,9 +274,13 @@ struct HouseholdState {
     /// Every fetch of a URL a Group played, done, as the UUID of the coordinator and what it
     /// got.
     fetches: Vec<(String, Fetch)>,
-    /// Every `CurrentURI` a player was given with `SetAVTransportURI`, as the UUID of the
-    /// player and the URL, recorded on arrival, also when it then misbehaves.
+    /// Every URL a player was given to play, as the UUID of the player and the URL, recorded on
+    /// arrival, also when it then misbehaves: with either queue-add action, or with
+    /// `SetAVTransportURI` unless it names a queue.
     offered: Vec<(String, String)>,
+    /// Every `Seek` a player was called with, as the UUID of the player and its `Unit` and
+    /// `Target`, recorded on arrival, also when it then misbehaves.
+    sought: Vec<(String, Seek)>,
     /// How many M-SEARCHes for ZonePlayers were received.
     searches: usize,
     added: u32,
@@ -253,43 +302,86 @@ struct Player {
     /// Its Group's volume, while it coordinates the Group.
     volume: u8,
     fault: Fault,
-    /// The length of each URL it is given from now on, if the test set one.
+    /// The length of each URL it is given from now on, if the test set one, unless
+    /// `queue_lengths` sets another.
     url_length: Option<Duration>,
+    /// The length of the URL at each place of its queue (0-based), if the test set them.
+    queue_lengths: Vec<Duration>,
+    /// Its queue, while it coordinates a Group.
+    queue: Vec<FakeTrack>,
 }
 
 #[derive(Debug)]
 struct Transport {
     /// As AVTransport names it, e.g. `PAUSED_PLAYBACK`.
     state: &'static str,
-    track: Option<FakeTrack>,
-    /// The position when playback last started or stopped moving.
+    /// What it plays: one URL, or its queue as it was when given it; none with nothing
+    /// loaded.
+    tracks: Vec<FakeTrack>,
+    /// The one of `tracks` it is at, 0-based.
+    current: usize,
+    /// The position in the current track when playback last started or stopped moving.
     offset: Duration,
-    /// When playback last started, while it is playing.
+    /// When playback last started (in the current track), while it is playing.
     since: Option<Instant>,
 }
 
 impl Transport {
+    /// Nothing loaded, stopped.
+    fn empty() -> Self {
+        Self::loaded(Vec::new())
+    }
+
+    /// `tracks` loaded, stopped at the start of the first.
+    fn loaded(tracks: Vec<FakeTrack>) -> Self {
+        Self {
+            state: "STOPPED",
+            tracks,
+            current: 0,
+            offset: Duration::ZERO,
+            since: None,
+        }
+    }
+
+    /// The track it is at, if any is loaded.
+    fn track(&self) -> Option<&FakeTrack> {
+        self.tracks.get(self.current)
+    }
+
     fn position(&self, now: Instant) -> Duration {
         let moved = self
             .since
             .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
         let position = self.offset + moved;
-        match &self.track {
+        match self.track() {
             Some(track) => track.duration.map_or(position, |end| position.min(end)),
             None => Duration::ZERO,
         }
     }
 
-    /// Stops a track that has played to its end by `now`, as a Group does at the end of a
-    /// single URL: Stopped, its track still loaded, back at its start.
+    /// Moves on past each track played to its end by `now`: to the next track, from its
+    /// start, still playing; after the last one, Stopped, back at the start of the first.
     fn settle(&mut self, now: Instant) {
-        let end = self.track.as_ref().and_then(|track| track.duration);
-        if let (Some(since), Some(end)) = (self.since, end)
-            && self.offset + now.saturating_duration_since(since) >= end
-        {
-            self.state = "STOPPED";
+        let Some(since) = self.since else {
+            return;
+        };
+        let mut moved = now.saturating_duration_since(since);
+        while let Some(end) = self.track().and_then(|track| track.duration) {
+            let left = end.saturating_sub(self.offset);
+            if moved < left {
+                return;
+            }
+            moved -= left;
             self.offset = Duration::ZERO;
-            self.since = None;
+            if self.current + 1 < self.tracks.len() {
+                self.current += 1;
+                self.since = Some(now.checked_sub(moved).unwrap_or(now));
+            } else {
+                self.state = "STOPPED";
+                self.current = 0;
+                self.since = None;
+                return;
+            }
         }
     }
 }
@@ -413,15 +505,12 @@ impl Household {
                 addr,
                 bonded_to: bonded_to.map(|main| main.0.clone()),
                 group,
-                transport: Transport {
-                    state: "STOPPED",
-                    track: None,
-                    offset: Duration::ZERO,
-                    since: None,
-                },
+                transport: Transport::empty(),
                 volume: DEFAULT_VOLUME,
                 fault: Fault::None,
                 url_length: None,
+                queue_lengths: Vec::new(),
+                queue: Vec::new(),
             });
             uuid
         };
@@ -473,9 +562,8 @@ impl Household {
         let mut state = self.shared.lock();
         state.coordinator_mut(coordinator).transport = Transport {
             state: "PLAYING",
-            track: Some(track),
-            offset: Duration::ZERO,
             since: Some(now),
+            ..Transport::loaded(vec![track])
         };
     }
 
@@ -497,10 +585,19 @@ impl Household {
         transport.state = "STOPPED";
     }
 
-    /// Each URL `coordinator` is given from now on (`SetAVTransportURI`) is `length` long, as
-    /// `GetPositionInfo` then tells: played to its end, the Group stops.
+    /// Each URL `coordinator` is given from now on (directly or queued) is
+    /// `length` long, as `GetPositionInfo` then tells, unless [`Household::set_queue_lengths`]
+    /// sets another: played to its end, the Group goes on with the next track, if any, or
+    /// stops.
     pub fn set_url_length(&self, coordinator: &PlayerId, length: Duration) {
         self.shared.lock().player_mut(coordinator).url_length = Some(length);
+    }
+
+    /// Each URL `coordinator` adds to its queue from now on is as long as
+    /// `lengths` says for its place in the queue (0-based); one placed past them is as
+    /// [`Household::set_url_length`] says.
+    pub fn set_queue_lengths(&self, coordinator: &PlayerId, lengths: &[Duration]) {
+        self.shared.lock().player_mut(coordinator).queue_lengths = lengths.to_vec();
     }
 
     /// `coordinator`'s Group reports `state` as its `CurrentTransportState`, as is, such as
@@ -564,12 +661,21 @@ impl Household {
             .count()
     }
 
-    /// Every URL `player` was given with `SetAVTransportURI`, in order, also those it then
-    /// refused or never answered.
+    /// Every URL `player` was given to play, in order, also those it then refused or never
+    /// answered: those it added to its queue, and those given with
+    /// `SetAVTransportURI` other than a queue's.
     pub fn offered(&self, player: &PlayerId) -> Vec<String> {
         let state = self.shared.lock();
         let offered = state.offered.iter().filter(|(uuid, _)| *uuid == player.0);
         offered.map(|(_, uri)| uri.clone()).collect()
+    }
+
+    /// Every `Seek` `player` was called with, in order, also those it then refused or never
+    /// answered.
+    pub fn sought(&self, player: &PlayerId) -> Vec<Seek> {
+        let state = self.shared.lock();
+        let sought = state.sought.iter().filter(|(uuid, _)| *uuid == player.0);
+        sought.map(|(_, seek)| seek.clone()).collect()
     }
 
     /// How many M-SEARCHes for ZonePlayers the household has received, counted as each
@@ -578,12 +684,27 @@ impl Household {
         self.shared.lock().searches
     }
 
-    /// The URL `coordinator`'s Group has loaded, as `GetPositionInfo` reports it; none if
-    /// nothing is loaded.
+    /// The URL of the track `coordinator`'s Group is at, as `GetPositionInfo` reports it; none
+    /// if nothing is loaded.
     pub fn uri(&self, coordinator: &PlayerId) -> Option<String> {
+        self.settled(coordinator, |transport, _| {
+            transport.track().map(|track| track.uri.clone())
+        })
+    }
+
+    /// The number of the track `coordinator`'s Group is at (1-based), as `GetPositionInfo`
+    /// reports it as `Track`; none if nothing is loaded.
+    pub fn track_number(&self, coordinator: &PlayerId) -> Option<usize> {
+        self.settled(coordinator, |transport, _| {
+            transport.track().map(|_| transport.current + 1)
+        })
+    }
+
+    /// The URLs in `coordinator`'s queue, in order.
+    pub fn queue(&self, coordinator: &PlayerId) -> Vec<String> {
         let state = self.shared.lock();
-        let track = state.coordinator(coordinator).transport.track.as_ref();
-        track.map(|track| track.uri.clone())
+        let queue = state.coordinator(coordinator).queue.iter();
+        queue.map(|track| track.uri.clone()).collect()
     }
 
     /// `coordinator`'s Group's `CurrentTransportState`, such as `PLAYING`.
@@ -766,40 +887,75 @@ impl HouseholdState {
         Ok(player)
     }
 
-    /// `SetAVTransportURI`, `Play`, `Pause` or `Seek` (with the SOAP `request`) on `served`'s
-    /// player, which must coordinate its Group, at `now`. `Play` on a stopped Group starts
-    /// fetching the URL; on a paused one it moves on from where it is. `Pause` on a paused
-    /// Group changes nothing. The UPnP error code on failure: 701 (transition not available)
-    /// on a player that doesn't coordinate, with nothing loaded, or pausing a stopped Group;
-    /// 402 (invalid arguments) without a `CurrentURI`, or a seek that isn't `REL_TIME` to
-    /// `H:MM:SS`; 711 (illegal seek target) past the track's end.
+    /// `RemoveAllTracksFromQueue`, either queue-add action, `SetAVTransportURI`, `Play`, `Pause` or
+    /// `Seek` (with the SOAP `request`) on `served`'s player, which must coordinate its Group,
+    /// at `now`; the output arguments. `SetAVTransportURI` with `x-rincon-queue:<its UUID>#0`
+    /// loads the queue as it is then, any other URL alone. `Play` on a stopped Group starts
+    /// fetching the current track's URL; on a paused one it moves on from where it is. `Pause`
+    /// on a paused Group changes nothing. `Seek` by `TRACK_NR` goes to the start of that track
+    /// (1-based), by `REL_TIME` to that far into the current one, playing or paused as it was.
+    /// The UPnP error code on failure: 701 (transition not available) on a player that doesn't
+    /// coordinate, with nothing loaded, or pausing a stopped Group; 402 (invalid arguments)
+    /// without a `CurrentURI` or `EnqueuedURI`, or a seek that isn't `REL_TIME` to `H:MM:SS`
+    /// or `TRACK_NR` to a number; 711 (illegal seek target) past the track's end or to a track
+    /// it doesn't have; 714 (illegal MIME type) for another player's queue.
     fn transport(
         &mut self,
         served: &Served,
         action: &str,
         request: &str,
         now: Instant,
-    ) -> Result<(), u16> {
+    ) -> Result<Vec<(&'static str, String)>, u16> {
         let player = self.coordinating_mut(served)?;
-        let url_length = player.url_length;
         let transport = &mut player.transport;
         match action {
+            "RemoveAllTracksFromQueue" => player.queue.clear(),
+            "AddURIToQueue" | "AddMultipleURIsToQueue" => {
+                let uris = if action == "AddURIToQueue" {
+                    vec![input(request, "EnqueuedURI").ok_or(402u16)?]
+                } else {
+                    let uris = input(request, "EnqueuedURIs").ok_or(402u16)?;
+                    let count: usize = input(request, "NumberOfURIs")
+                        .and_then(|n| n.parse().ok())
+                        .ok_or(402u16)?;
+                    let metadata = input(request, "EnqueuedURIsMetaData").ok_or(402u16)?;
+                    if count == 0 || count > 16 || metadata.split(' ').count() != count {
+                        return Err(402);
+                    }
+                    let uris: Vec<_> = uris.split_whitespace().map(str::to_owned).collect();
+                    if uris.len() != count {
+                        return Err(402);
+                    }
+                    uris
+                };
+                let first = player.queue.len() + 1;
+                let count = uris.len();
+                for uri in uris {
+                    let place = player.queue.len();
+                    let duration = player.queue_lengths.get(place).copied();
+                    player
+                        .queue
+                        .push(FakeTrack::given(uri, duration.or(player.url_length)));
+                }
+                return Ok(vec![
+                    ("FirstTrackNumberEnqueued", first.to_string()),
+                    ("NumTracksAdded", count.to_string()),
+                    ("NewQueueLength", player.queue.len().to_string()),
+                    ("NewUpdateID", "0".to_owned()),
+                ]);
+            }
             "SetAVTransportURI" => {
                 let uri = input(request, "CurrentURI").ok_or(402u16)?;
-                *transport = Transport {
-                    state: "STOPPED",
-                    track: Some(FakeTrack {
-                        title: None,
-                        creator: None,
-                        uri,
-                        duration: url_length,
-                    }),
-                    offset: Duration::ZERO,
-                    since: None,
+                *transport = match uri.strip_prefix(QUEUE) {
+                    Some(queue) if queue == format!("{}#0", served.uuid) => {
+                        Transport::loaded(player.queue.clone())
+                    }
+                    Some(_) => return Err(714),
+                    None => Transport::loaded(vec![FakeTrack::given(uri, player.url_length)]),
                 };
             }
             "Play" => {
-                let uri = transport.track.as_ref().ok_or(701u16)?.uri.clone();
+                let uri = transport.track().ok_or(701u16)?.uri.clone();
                 let stopped = transport.state == "STOPPED";
                 if transport.since.is_none() {
                     transport.since = Some(now);
@@ -820,25 +976,33 @@ impl HouseholdState {
                 _ => return Err(701),
             },
             "Seek" => {
-                let track = transport.track.as_ref().ok_or(701u16)?;
-                if input(request, "Unit").as_deref() != Some("REL_TIME") {
-                    return Err(402);
+                let track = transport.track().ok_or(701u16)?;
+                let target = input(request, "Target").ok_or(402u16)?;
+                match input(request, "Unit").as_deref() {
+                    Some("REL_TIME") => {
+                        let target = parse_upnp_time(&target).ok_or(402u16)?;
+                        if track.duration.is_some_and(|end| target > end) {
+                            return Err(711);
+                        }
+                        transport.offset = target;
+                    }
+                    Some("TRACK_NR") => {
+                        let number: usize = target.parse().map_err(|_| 402u16)?;
+                        if !(1..=transport.tracks.len()).contains(&number) {
+                            return Err(711);
+                        }
+                        transport.current = number - 1;
+                        transport.offset = Duration::ZERO;
+                    }
+                    _ => return Err(402),
                 }
-                let target = input(request, "Target")
-                    .as_deref()
-                    .and_then(parse_upnp_time)
-                    .ok_or(402u16)?;
-                if track.duration.is_some_and(|end| target > end) {
-                    return Err(711);
-                }
-                transport.offset = target;
                 if transport.since.is_some() {
                     transport.since = Some(now);
                 }
             }
             _ => return Err(401),
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
     /// The household's `ZoneGroupState` document: every Group, its members in the order they
@@ -1001,6 +1165,13 @@ async fn description(State(served): State<Served>) -> Response {
     xml(StatusCode::OK, body)
 }
 
+fn is_control(action: &str) -> bool {
+    matches!(
+        action,
+        "Pause" | "Play" | "Seek" | "SnapshotGroupVolume" | "SetGroupVolume"
+    )
+}
+
 /// Answers a SOAP call on any service by its `SOAPACTION` header.
 async fn control(State(served): State<Served>, headers: HeaderMap, request: String) -> Response {
     let soap_action = headers
@@ -1010,6 +1181,8 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         .trim_matches('"');
     let (urn, action) = soap_action.split_once('#').unwrap_or(("", soap_action));
     let service = urn.rsplit(':').nth(1).unwrap_or_default();
+    // A `Seek` by time, not by track.
+    let seek_by_time = action == "Seek" && input(&request, "Unit").as_deref() == Some("REL_TIME");
     // When the call came: what it answers and does then, unless a fault delays it.
     let (fault, received) = {
         let mut state = served.shared.lock();
@@ -1017,10 +1190,31 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         state
             .actions
             .push((served.uuid.clone(), format!("{service}#{action}")));
-        if action == "SetAVTransportURI"
-            && let Some(uri) = input(&request, "CurrentURI")
-        {
+        let given = match action {
+            "SetAVTransportURI" => {
+                input(&request, "CurrentURI").filter(|uri| !uri.starts_with(QUEUE))
+            }
+            "AddURIToQueue" => input(&request, "EnqueuedURI"),
+            _ => None,
+        };
+        if let Some(uri) = given {
             state.offered.push((served.uuid.clone(), uri));
+        }
+        if action == "AddMultipleURIsToQueue"
+            && let Some(uris) = input(&request, "EnqueuedURIs")
+        {
+            state.offered.extend(
+                uris.split_whitespace()
+                    .map(|uri| (served.uuid.clone(), uri.to_owned())),
+            );
+        }
+        if action == "Seek" {
+            let argument = |name| input(&request, name).unwrap_or_default();
+            let seek = Seek {
+                unit: argument("Unit"),
+                target: argument("Target"),
+            };
+            state.sought.push((served.uuid.clone(), seek));
         }
         (
             state.find(&served.uuid).map(|player| player.fault),
@@ -1043,30 +1237,21 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             tokio::time::sleep(delay).await;
             true
         }
-        Some(Fault::RefuseControl)
-            if matches!(
-                action,
-                "Pause" | "Play" | "Seek" | "SnapshotGroupVolume" | "SetGroupVolume"
-            ) =>
-        {
+        Some(Fault::RefuseControl) if is_control(action) => {
             return upnp_fault(701);
         }
-        Some(Fault::HangControl)
-            if matches!(
-                action,
-                "Pause" | "Play" | "Seek" | "SnapshotGroupVolume" | "SetGroupVolume"
-            ) =>
-        {
-            std::future::pending().await
+        Some(Fault::HangControl) if is_control(action) => std::future::pending().await,
+        Some(Fault::BareTrackSeekFailure) if action == "Seek" && !seek_by_time => {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        Some(Fault::RefuseSeek | Fault::RefuseSeekSlowPause(_)) if action == "Seek" => {
+        Some(Fault::RefuseSeek | Fault::RefuseSeekSlowPause(_)) if seek_by_time => {
             return upnp_fault(701);
         }
         Some(Fault::RefuseSeekSlowPause(delay)) if action == "Pause" => {
             tokio::time::sleep(delay).await;
             true
         }
-        Some(Fault::HangSeek) if action == "Seek" => std::future::pending().await,
+        Some(Fault::HangSeek) if seek_by_time => std::future::pending().await,
         Some(Fault::FailGroupVolume) if action == "GetGroupVolume" => return invalid_action(),
         Some(Fault::SlowTransport(delay)) if urn == AV_TRANSPORT => {
             tokio::time::sleep(delay).await;
@@ -1084,6 +1269,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             | Fault::RefuseControl
             | Fault::HangControl
             | Fault::RefuseSeek
+            | Fault::BareTrackSeekFailure
             | Fault::HangSeek
             | Fault::RefuseSeekSlowPause(_)
             | Fault::FailGroupVolume
@@ -1134,12 +1320,19 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
                 arguments
             }
         }
-        (AV_TRANSPORT, "SetAVTransportURI" | "Play" | "Pause" | "Seek") => {
-            match state.transport(&served, action, &request, now) {
-                Ok(()) => Vec::new(),
-                Err(code) => return upnp_fault(code),
-            }
-        }
+        (
+            AV_TRANSPORT,
+            "RemoveAllTracksFromQueue"
+            | "AddURIToQueue"
+            | "AddMultipleURIsToQueue"
+            | "SetAVTransportURI"
+            | "Play"
+            | "Pause"
+            | "Seek",
+        ) => match state.transport(&served, action, &request, now) {
+            Ok(arguments) => arguments,
+            Err(code) => return upnp_fault(code),
+        },
         (GROUP_RENDERING, "GetGroupVolume") => match state.coordinating_mut(&served) {
             Ok(coordinator) => vec![("CurrentVolume", coordinator.volume.to_string())],
             Err(code) => return upnp_fault(code),
@@ -1180,7 +1373,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
 }
 
 fn position_info(transport: &Transport, now: Instant) -> Vec<(&'static str, String)> {
-    let (track, duration, metadata, uri) = match &transport.track {
+    let (track, duration, metadata, uri) = match transport.track() {
         Some(track) => {
             let mut didl = String::from(
                 r#"<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/"><item id="-1" parentID="-1" restricted="true">"#,
@@ -1195,12 +1388,18 @@ fn position_info(transport: &Transport, now: Instant) -> Vec<(&'static str, Stri
                 "<upnp:class>object.item.audioItem.musicTrack</upnp:class></item></DIDL-Lite>",
             );
             let duration = upnp_time(track.duration.unwrap_or_default());
-            ("1", duration, didl, track.uri.clone())
+            let number = (transport.current + 1).to_string();
+            (number, duration, didl, track.uri.clone())
         }
-        None => ("0", upnp_time(Duration::ZERO), String::new(), String::new()),
+        None => (
+            "0".to_owned(),
+            upnp_time(Duration::ZERO),
+            String::new(),
+            String::new(),
+        ),
     };
     vec![
-        ("Track", track.to_owned()),
+        ("Track", track),
         ("TrackDuration", duration),
         ("TrackMetaData", metadata),
         ("TrackURI", uri),
@@ -1284,14 +1483,52 @@ fn escape(text: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn queue_batches_require_one_metadata_entry_per_uri_and_at_most_sixteen() {
+        let household = Household::with_manual_clock().0;
+        let kitchen = household.add_player("Kitchen");
+        for (count, metadata, status) in [
+            (2, "", StatusCode::INTERNAL_SERVER_ERROR),
+            (2, " ", StatusCode::OK),
+            (16, "               ", StatusCode::OK),
+            (17, "                ", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let uris = (0..count)
+                .map(|n| format!("http://bridge/{n}.mp3"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let arguments = format!(
+                "<NumberOfURIs>{count}</NumberOfURIs><EnqueuedURIs>{uris}</EnqueuedURIs><EnqueuedURIsMetaData>{metadata}</EnqueuedURIsMetaData>"
+            );
+            let before = household.queue(&kitchen);
+            let response =
+                post_action(&household, &kitchen, "AddMultipleURIsToQueue", &arguments).await;
+            assert_eq!(response.status(), status);
+            if status == StatusCode::OK {
+                let expected: Vec<_> = before
+                    .into_iter()
+                    .chain(uris.split_whitespace().map(str::to_owned))
+                    .collect();
+                assert_eq!(household.queue(&kitchen), expected);
+            } else {
+                assert_eq!(household.queue(&kitchen), before);
+            }
+        }
+    }
+
     fn seconds(seconds: u64) -> Duration {
         Duration::from_secs(seconds)
     }
 
-    /// Calls AVTransport `action` on `player` with `arguments`, as the Bridge does.
-    async fn call(household: &Household, player: &PlayerId, action: &str, arguments: &str) {
+    /// Posts an AVTransport action, including actions the player should refuse.
+    async fn post_action(
+        household: &Household,
+        player: &PlayerId,
+        action: &str,
+        arguments: &str,
+    ) -> reqwest::Response {
         let addr = household.shared.lock().player(player).addr;
-        let response = reqwest::Client::new()
+        reqwest::Client::new()
             .post(format!("http://{addr}/MediaRenderer/AVTransport/Control"))
             .header("soapaction", format!("\"{AV_TRANSPORT}#{action}\""))
             .body(format!(
@@ -1299,7 +1536,12 @@ mod tests {
             ))
             .send()
             .await
-            .expect("the player answers");
+            .expect("the player answers")
+    }
+
+    /// Calls AVTransport `action` on `player` with `arguments`, as the Bridge does.
+    async fn call(household: &Household, player: &PlayerId, action: &str, arguments: &str) {
+        let response = post_action(household, player, action, arguments).await;
         assert!(
             response.status().is_success(),
             "{action}: {}",
@@ -1364,6 +1606,97 @@ mod tests {
         assert_eq!(household.position(&kitchen), seconds(100));
         assert_eq!(household.transport_state(&office), "STOPPED");
         assert_eq!(household.position(&office), Duration::ZERO);
+    }
+
+    /// `player`'s queue becomes the URLs `a`, `b` and `c` (lengths set by the test), loaded
+    /// as what it plays.
+    async fn queue_three(household: &Household, player: &PlayerId) {
+        call(household, player, "RemoveAllTracksFromQueue", "").await;
+        for name in ["a", "b", "c"] {
+            let uri = format!(
+                "<EnqueuedURI>http://127.0.0.1:9/{name}.mp3</EnqueuedURI><EnqueuedURIMetaData/>\
+                 <DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued>\
+                 <EnqueueAsNext>0</EnqueueAsNext>"
+            );
+            call(household, player, "AddURIToQueue", &uri).await;
+        }
+        let queue = format!(
+            "<CurrentURI>x-rincon-queue:{}#0</CurrentURI><CurrentURIMetaData/>",
+            player.uuid()
+        );
+        call(household, player, "SetAVTransportURI", &queue).await;
+    }
+
+    fn url(name: &str) -> Option<String> {
+        Some(format!("http://127.0.0.1:9/{name}.mp3"))
+    }
+
+    #[tokio::test]
+    async fn a_queue_plays_track_after_track_and_stops_at_its_first_after_the_last() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        household.set_queue_lengths(&kitchen, &[seconds(60), seconds(30), seconds(10)]);
+        queue_three(&household, &kitchen).await;
+        assert_eq!(household.queue(&kitchen).len(), 3);
+        assert_eq!(household.track_number(&kitchen), Some(1));
+        call(&household, &kitchen, "Play", "<Speed>1</Speed>").await;
+
+        clock.advance(seconds(65));
+        assert_eq!(household.track_number(&kitchen), Some(2));
+        assert_eq!(household.uri(&kitchen), url("b"));
+        assert_eq!(household.position(&kitchen), seconds(5));
+        assert_eq!(household.transport_state(&kitchen), "PLAYING");
+
+        // Past the end of the second and into the third in one step.
+        clock.advance(seconds(33));
+        assert_eq!(household.track_number(&kitchen), Some(3));
+        assert_eq!(household.position(&kitchen), seconds(8));
+
+        clock.advance(seconds(2));
+        assert_eq!(household.transport_state(&kitchen), "STOPPED");
+        assert_eq!(household.track_number(&kitchen), Some(1));
+        assert_eq!(household.position(&kitchen), Duration::ZERO);
+        // Only the URL it started from Stopped was fetched.
+        let fetched = household.fetched(&kitchen).await;
+        assert_eq!(Some(fetched.uri), url("a"));
+    }
+
+    #[tokio::test]
+    async fn a_seek_by_track_goes_to_its_start_and_one_by_time_within_it() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        household.set_queue_lengths(&kitchen, &[seconds(60), seconds(30), seconds(10)]);
+        queue_three(&household, &kitchen).await;
+        call(&household, &kitchen, "Play", "<Speed>1</Speed>").await;
+        clock.advance(seconds(20));
+
+        let track = |number: &str| format!("<Unit>TRACK_NR</Unit><Target>{number}</Target>");
+        call(&household, &kitchen, "Seek", &track("3")).await;
+        assert_eq!(household.track_number(&kitchen), Some(3));
+        assert_eq!(household.position(&kitchen), Duration::ZERO);
+        call(&household, &kitchen, "Pause", "").await;
+        call(&household, &kitchen, "Seek", &track("2")).await;
+        let time = "<Unit>REL_TIME</Unit><Target>0:00:25</Target>";
+        call(&household, &kitchen, "Seek", time).await;
+        clock.advance(seconds(60));
+        assert_eq!(household.transport_state(&kitchen), "PAUSED_PLAYBACK");
+        assert_eq!(household.uri(&kitchen), url("b"));
+        assert_eq!(household.position(&kitchen), seconds(25));
+
+        // A track it doesn't have, or a time past the current one's end, is refused.
+        for arguments in [
+            track("4"),
+            track("0"),
+            "<Unit>REL_TIME</Unit><Target>0:00:31</Target>".into(),
+        ] {
+            let response = post_action(&household, &kitchen, "Seek", &arguments).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{arguments}"
+            );
+        }
+        assert_eq!(household.track_number(&kitchen), Some(2));
     }
 
     #[tokio::test]

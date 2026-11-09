@@ -2,6 +2,7 @@
 //! into the App API's types for the session's user.
 
 use std::cmp::Reverse;
+use std::time::Duration;
 
 use api::{
     AudioFile, Chapter, Episode, EpisodeFilter, HomeEntry, Item, ItemId, Library, LibraryEntry,
@@ -244,19 +245,16 @@ fn progress_in(user: &abs::User, library_item: &str, episode: Option<&str>) -> O
         .map(progress)
 }
 
-/// The audio file of Item `id` in `library_item`, if it has exactly one; or why not.
-pub fn single_audio_file(
+/// The audio files of Item `id` in `library_item`, in playing order (none for an episode
+/// without one); or why `library_item` holds no such Item.
+pub fn item_audio_files(
     library_item: abs::LibraryItem,
     id: &ItemId,
-) -> Result<abs::Track, NoSingleFile> {
-    let mut tracks = match select(library_item.media, id).map_err(NoSingleFile::Missing)? {
+) -> Result<Vec<abs::Track>, Missing> {
+    Ok(match select(library_item.media, id)? {
         Selected::Audiobook(book) => book.tracks,
         Selected::Episode { episode, .. } => episode.audio_track.into_iter().collect(),
-    };
-    match tracks.len() {
-        1 => Ok(tracks.remove(0)),
-        files => Err(NoSingleFile::Files(files)),
-    }
+    })
 }
 
 /// The length in seconds of Item `id` in `library_item`, as its screen shows it; none if
@@ -276,13 +274,25 @@ pub fn item_duration(library_item: &abs::LibraryItem, id: &ItemId) -> Option<f64
     }
 }
 
-/// Why an Item has no single audio file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NoSingleFile {
-    /// The library item holds no such Item.
-    Missing(Missing),
-    /// It has this many audio files.
-    Files(usize),
+/// Where chapters start in the whole Item; empty for an episode or audiobook without
+/// chapters, none when the library item no longer holds the Item. Invalid starts are omitted.
+pub fn chapter_starts(library_item: &abs::LibraryItem, id: &ItemId) -> Option<Vec<Duration>> {
+    match (&library_item.media, &id.episode) {
+        (abs::Media::Book(book), None) if is_audiobook(book) => {
+            let chapters = book.chapters.entries.iter();
+            Some(
+                chapters
+                    .filter_map(|chapter| Duration::try_from_secs_f64(chapter.start).ok())
+                    .collect(),
+            )
+        }
+        (abs::Media::Podcast(podcast), Some(episode))
+            if podcast.episodes.iter().any(|held| held.id == *episode) =>
+        {
+            Some(Vec::new())
+        }
+        _ => None,
+    }
 }
 
 /// What an Item is in its library item.
