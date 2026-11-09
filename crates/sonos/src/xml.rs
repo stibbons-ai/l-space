@@ -10,7 +10,7 @@ use roxmltree::{Document, Node, ParsingOptions};
 use crate::{RAW, TransportState, ssdp};
 
 /// More than a household of dozens of players needs.
-const MAX_NODES: u32 = 100_000;
+pub(crate) const MAX_NODES: u32 = 100_000;
 
 /// Dublin Core, which DIDL-Lite uses for an item's title and creator.
 const DC: &str = "http://purl.org/dc/elements/1.1/";

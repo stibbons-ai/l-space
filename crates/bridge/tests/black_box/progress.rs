@@ -58,6 +58,7 @@ async fn setup() -> Setup {
 /// As [`setup`], with the Library Server at `url` (a proxy in front of `abs`).
 async fn setup_on(abs: Arc<Audiobookshelf>, url: &str) -> Setup {
     let (household, clock) = Household::with_manual_clock();
+    household.set_event_clock(Arc::new(clock.clone()));
     let kitchen = household.add_player("Kitchen");
     let office = household.add_player("Office");
     let config = format!(
@@ -1423,7 +1424,7 @@ async fn a_start_replacing_a_handoff_stopped_short_of_the_end_writes_no_finished
 }
 
 #[tokio::test]
-async fn a_group_playing_something_else_gets_no_progress_written() {
+async fn takeover_source_writes_only_old_stream_progress_and_revokes_its_url() {
     let setup = setup().await;
     let episode = setup.episode(0);
     setup
@@ -1433,18 +1434,341 @@ async fn a_group_playing_something_else_gets_no_progress_written() {
     setup
         .wait_for_progress(&setup.alice, &episode, (30.0, false))
         .await;
-
-    // Kitchen is made to play other audio from outside the App: neither the next tick nor
-    // the time the episode would have ended writes anything to Alice's Progress.
-    let other = FakeTrack::new("Another show", Duration::from_secs(3600));
-    setup.household.play(&setup.kitchen, other);
-    setup.advance_and_settle(30).await;
-    setup.advance_and_settle(600).await;
+    setup.pause().await;
+    let stream = setup.household.offered(&setup.kitchen).pop().unwrap();
+    let other_item = setup.episode(1);
+    setup
+        .bridge
+        .api()
+        .start_handoff(&setup.bobs, &other_item, setup.office.uuid())
+        .await;
+    setup.household.fetched(&setup.office).await;
+    setup.advance(7).await;
+    let other = FakeTrack::new("External radio", Duration::from_secs(3600));
+    setup.household.play(&setup.kitchen, other.clone());
+    eventually("Kitchen Handoff did not end", WITHIN, async || {
+        setup
+            .bridge
+            .api()
+            .handoffs(&setup.bobs)
+            .await
+            .iter()
+            .all(|handoff| handoff.group != setup.kitchen.uuid())
+    })
+    .await;
     assert_eq!(
         setup.progress(&setup.alice, &episode).await,
         Some((30.0, false))
     );
+    assert_eq!(setup.progress(&setup.bob, &episode).await, None);
+    assert_eq!(setup.progress(&setup.alice, &other_item).await, None);
     assert_eq!(setup.handoffs().await, 1);
+    assert_eq!(
+        reqwest::get(&stream).await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let upnp = sonos::Upnp::start(setup.household.ssdp(), Arc::new(clock::SystemClock));
+    assert_eq!(
+        upnp.playback(setup.kitchen.uuid())
+            .await
+            .unwrap()
+            .uri
+            .as_deref(),
+        Some(other.uri.as_str())
+    );
+    let group = setup
+        .bridge
+        .api()
+        .groups(&setup.bobs)
+        .await
+        .into_iter()
+        .find(|group| group.id == setup.kitchen.uuid())
+        .unwrap();
+    assert!(group.handoff.is_none());
+}
+
+#[tokio::test]
+async fn takeover_regrouping_ends_both_affected_groups_but_not_an_unrelated_group() {
+    let setup = setup().await;
+    let third = setup.household.add_player("Bedroom");
+    setup.start(&setup.alices, &setup.episode(0), None).await;
+    setup
+        .bridge
+        .api()
+        .start_handoff(&setup.bobs, &setup.episode(1), setup.office.uuid())
+        .await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &setup.episode(0), (30.0, false))
+        .await;
+    setup
+        .wait_for_progress(&setup.bob, &setup.episode(1), (30.0, false))
+        .await;
+    setup.household.join(&third, &setup.kitchen);
+    eventually(
+        "affected Handoffs stayed active after regrouping",
+        WITHIN,
+        async || {
+            let handoffs = setup.bridge.api().handoffs(&setup.bobs).await;
+            handoffs.len() == 1 && handoffs[0].group == setup.office.uuid()
+        },
+    )
+    .await;
+    assert_eq!(
+        setup.progress(&setup.alice, &setup.episode(0)).await,
+        Some((30.0, false))
+    );
+    assert_eq!(
+        setup.progress(&setup.bob, &setup.episode(1)).await,
+        Some((30.0, false))
+    );
+}
+
+#[tokio::test]
+async fn takeover_coordinator_disappearance_ends_both_affected_handoffs() {
+    let setup = setup().await;
+    setup.start(&setup.alices, &setup.episode(0), None).await;
+    setup
+        .bridge
+        .api()
+        .start_handoff(&setup.bobs, &setup.episode(1), setup.office.uuid())
+        .await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &setup.episode(0), (30.0, false))
+        .await;
+    setup
+        .wait_for_progress(&setup.bob, &setup.episode(1), (30.0, false))
+        .await;
+    setup.household.join(&setup.kitchen, &setup.office);
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &setup.episode(0)).await,
+        Some((30.0, false))
+    );
+    assert_eq!(
+        setup.progress(&setup.bob, &setup.episode(1)).await,
+        Some((30.0, false))
+    );
+}
+
+#[tokio::test]
+async fn takeover_after_renewal_ignores_bridge_controls_replacement_and_snapshots() {
+    let setup = setup().await;
+    setup.start(&setup.alices, &setup.episode(0), None).await;
+    setup.pause().await;
+    setup.resume().await;
+    setup
+        .bridge
+        .api()
+        .skip_group(&setup.bobs, setup.kitchen.uuid(), Skip::Forward30)
+        .await;
+    setup.settle().await;
+    setup.start(&setup.bobs, &setup.episode(1), None).await;
+    setup.household.notify();
+    setup.advance(31).await;
+    eventually("GENA subscriptions did not renew", WITHIN, async || {
+        setup.household.renewals() >= 4
+    })
+    .await;
+    setup
+        .wait_for_progress(&setup.bob, &setup.episode(1), (31.0, false))
+        .await;
+    assert_eq!(setup.handoffs().await, 1);
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("External", Duration::from_secs(3600)),
+    );
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.bob, &setup.episode(1)).await,
+        Some((31.0, false))
+    );
+}
+
+#[tokio::test]
+async fn takeover_subscription_failure_recovers_and_never_counts_as_a_source_change() {
+    let setup = setup().await;
+    setup.start(&setup.alices, &setup.episode(0), None).await;
+    setup.household.reject_subscriptions(true);
+    setup.advance(31).await;
+    setup
+        .wait_for_progress(&setup.alice, &setup.episode(0), (31.0, false))
+        .await;
+    assert_eq!(setup.handoffs().await, 1);
+    setup.household.reject_subscriptions(false);
+    setup.advance(6).await;
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("External", Duration::from_secs(3600)),
+    );
+    setup.advance(6).await;
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &setup.episode(0)).await,
+        Some((31.0, false))
+    );
+}
+
+#[tokio::test]
+async fn takeover_during_a_bridge_pause_is_not_suppressed() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    let before = proxy.progress_writes();
+    let held = proxy.hold_next_progress_write();
+    let pause = setup.pause();
+    let external = async {
+        eventually("pause write never arrived", WITHIN, async || {
+            proxy.progress_writes() > before
+        })
+        .await;
+        setup.household.play(
+            &setup.kitchen,
+            FakeTrack::new("External", Duration::from_secs(3600)),
+        );
+        held.release().await;
+    };
+    tokio::join!(pause, external);
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
+}
+
+#[tokio::test]
+async fn takeover_writes_progress_before_ending_and_ends_even_if_the_write_fails() {
+    for fail in [false, true] {
+        let (proxy, setup) = setup_with_proxy().await;
+        let episode = setup.episode(0);
+        setup.start(&setup.alices, &episode, None).await;
+        setup.advance(30).await;
+        setup
+            .wait_for_progress(&setup.alice, &episode, (30.0, false))
+            .await;
+        if fail {
+            proxy.fail_progress_writes(1);
+        }
+        let before = proxy.progress_writes();
+        let held = (!fail).then(|| proxy.hold_next_progress_write());
+        setup.household.play(
+            &setup.kitchen,
+            FakeTrack::new("External", Duration::from_secs(3600)),
+        );
+        eventually("final Progress write never arrived", WITHIN, async || {
+            proxy.progress_writes() > before
+        })
+        .await;
+        if let Some(held) = held {
+            assert_eq!(
+                setup.handoffs().await,
+                1,
+                "Handoff ended before its final write completed"
+            );
+            held.release().await;
+        }
+        setup.wait_until_no_handoff().await;
+        assert_eq!(
+            setup.progress(&setup.alice, &episode).await,
+            Some((30.0, false))
+        );
+        assert_eq!(proxy.progress_writes_failed(), usize::from(fail));
+    }
+}
+
+#[tokio::test]
+async fn takeover_failed_state_read_retries_without_ending_on_the_failure() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    setup
+        .household
+        .set_fault(&setup.kitchen, Fault::FailTransportInfo);
+    let reads = setup.asked(READ);
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("External", Duration::from_secs(3600)),
+    );
+    eventually("event was never reconciled", WITHIN, async || {
+        setup.asked(READ) > reads
+    })
+    .await;
+    setup.settle().await;
+    assert_eq!(setup.handoffs().await, 1);
+    setup.household.set_fault(&setup.kitchen, Fault::None);
+    setup.advance(1).await;
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
+}
+
+#[tokio::test]
+async fn takeover_final_progress_never_follows_a_key_moved_to_another_user() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    let alice_reader = AbsUser {
+        id: setup.alice.id.clone(),
+        username: setup.alice.username.clone(),
+        api_key: setup.abs.new_api_key(&setup.alice.id).await,
+    };
+    setup.set_progress(&setup.bob, &episode, 77.0, false).await;
+    setup.start(&setup.alices, &episode, None).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    setup
+        .abs
+        .move_api_key(&setup.alice.api_key, &setup.bob.id)
+        .await;
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("External", Duration::from_secs(3600)),
+    );
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&alice_reader, &episode).await,
+        Some((30.0, false))
+    );
+    assert_eq!(
+        setup.progress(&setup.bob, &episode).await,
+        Some((77.0, false))
+    );
+    assert_eq!(
+        setup.bridge.api().home_error(&setup.alices).await,
+        SESSION_INVALID
+    );
+}
+
+#[tokio::test]
+async fn takeover_of_a_stopped_stream_retains_its_last_reliable_position() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    setup.household.stop(&setup.kitchen);
+    setup.advance_and_settle(30).await;
+    assert_eq!(setup.handoffs().await, 1);
+    setup.household.join(&setup.office, &setup.kitchen);
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
 }
 
 /// Asserts that Bob's start, which replaced Alice's Handoff at 110 seconds after taking

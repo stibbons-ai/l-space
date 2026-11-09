@@ -10,6 +10,11 @@
 //! doesn't resume it. A supervisor that panics is logged and forgotten; its Handoff stays,
 //! unsupervised.
 //!
+//! GENA source/topology hints are reconciled with current state, never applied as snapshots.
+//! A Takeover writes final unfinished Progress before ending, without controlling the new
+//! source. If the old stream is gone, its last reliably observed playing/paused position is
+//! used without extrapolation; failed reads widen the normal cadence-sized accuracy gap.
+//!
 //! End-of-Item detection assumes a Group stops (`STOPPED`) on the Handoff's stream at the end
 //! of a single URL, as `sonos-fake` models it. It never relies on the position a stopped Group
 //! tells (real hardware may tell 0 then; unverified): from about [`END_SLACK`] before the
@@ -136,6 +141,9 @@ struct Known {
     /// What was last seen of the Group: by the start, a visit, or a control
     /// ([`Supervisors::seen`]).
     last: Seen,
+    /// Last reliable old-stream position, including a paused position. Never extrapolated
+    /// across a source change, whose exact time is not known.
+    position: Duration,
 }
 
 /// What a start replacing a Handoff learns from its supervisor ([`Supervisors::replaced`]).
@@ -186,6 +194,7 @@ pub(super) struct Supervisors<S> {
     controls: Controls<S>,
     turns: Arc<Turns>,
     clock: Arc<dyn Clock>,
+    events: watch::Receiver<u64>,
 }
 
 impl<S> std::fmt::Debug for Supervisors<S> {
@@ -209,12 +218,18 @@ struct Running {
 
 impl<S: Store> Supervisors<S> {
     /// None running yet; they act with `controls`, take `turns` and are timed on `clock`.
-    pub(super) fn new(controls: Controls<S>, turns: Arc<Turns>, clock: Arc<dyn Clock>) -> Self {
+    pub(super) fn new(
+        controls: Controls<S>,
+        turns: Arc<Turns>,
+        clock: Arc<dyn Clock>,
+        events: watch::Receiver<u64>,
+    ) -> Self {
         Self {
             running: Mutex::default(),
             controls,
             turns,
             clock,
+            events,
         }
     }
 
@@ -237,6 +252,7 @@ impl<S: Store> Supervisors<S> {
         stream: StreamId,
         length: Option<f64>,
         position: Duration,
+        members: Vec<String>,
     ) {
         if length.is_none() {
             tracing::info!(
@@ -256,6 +272,7 @@ impl<S: Store> Supervisors<S> {
             length,
             ending: None,
             last: seen,
+            position,
         }));
         let supervisor = Supervisor {
             controls: self.controls.clone(),
@@ -264,6 +281,8 @@ impl<S: Store> Supervisors<S> {
             handoff: handoff.clone(),
             stream,
             known: Arc::clone(&known),
+            members,
+            events: self.events.clone(),
         };
         let forget = Forget {
             supervisors: Arc::clone(self),
@@ -339,6 +358,12 @@ impl<S: Store> Supervisors<S> {
             };
             let mut known = lock(&running.known);
             known.last = seen;
+            if let Some(position) = playback
+                .position
+                .and_then(|position| Duration::try_from_secs_f64(position).ok())
+            {
+                known.position = position;
+            }
             if playback.state == TransportState::Playing {
                 drop_ending(
                     &mut known,
@@ -365,6 +390,17 @@ impl<S: Store> Supervisors<S> {
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Running>> {
         lock(&self.running)
     }
+}
+
+/// Stopped Sonos transports can report zero after reaching the end, not where the listener
+/// left the stream. Retain the earlier playing/paused observation instead.
+fn reliable_position(playback: &sonos::Playback) -> Option<Duration> {
+    playback.position.filter(|_| {
+        matches!(
+            playback.state,
+            sonos::TransportState::Playing | sonos::TransportState::Paused
+        )
+    })
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -404,6 +440,8 @@ struct Supervisor<S> {
     handoff: Handoff,
     stream: StreamId,
     known: Arc<Mutex<Known>>,
+    members: Vec<String>,
+    events: watch::Receiver<u64>,
 }
 
 /// What is left to do for a Handoff played to the end of its Item.
@@ -456,10 +494,12 @@ fn drop_ending(known: &mut Known, handoff: &Handoff, why: &'static str) {
 impl<S: Store> Supervisor<S> {
     /// Supervises until the Handoff ends, or `seen` is dropped.
     async fn run(&self, mut seen: watch::Receiver<()>) {
+        let mut events = self.events.clone();
         let started = self.known().last.at;
         let mut tick = started + CADENCE;
         let mut not_before = started;
         let mut then = Then::Wait;
+        let mut event_due: Option<Instant> = None;
         loop {
             let Known { ending, last, .. } = *self.known();
             // The next read for the end of the Item, when that is all there is to do: also for
@@ -473,6 +513,7 @@ impl<S: Store> Supervisor<S> {
                 (Then::Wait, Some(_)) => tick,
                 (Then::Wait, None) => end.map_or(tick, |end| end.min(tick)),
             };
+            let wake = event_due.map_or(wake.max(not_before), |due| due.min(wake.max(not_before)));
             tokio::select! {
                 // A control's sighting first, so a visit on a passed wake acts on it.
                 biased;
@@ -484,9 +525,21 @@ impl<S: Store> Supervisor<S> {
                     seen.mark_unchanged();
                     continue;
                 }
-                () = self.clock.sleep_until(wake.max(not_before)) => {}
+                changed = events.changed() => {
+                    if changed.is_err() { return; }
+                    event_due = Some(self.clock.now());
+                    continue;
+                }
+                () = self.clock.sleep_until(wake) => {}
             }
             let now = self.clock.now();
+            if event_due.is_some_and(|due| due <= now) {
+                match self.event().await {
+                    Break(()) => return,
+                    Continue(retry) => event_due = retry.then_some(self.clock.now() + END_RECHECK),
+                }
+                continue;
+            }
             // Whether the reads near the end began by `at`, for the Group as last seen.
             let reading_end_by = |at: Instant| self.end_due(&last, at) == Some(at);
             // A tick among the reads near the end is one of them, as is a revisit for a write
@@ -525,6 +578,92 @@ impl<S: Store> Supervisor<S> {
             then = next;
             if then != Then::Wait {
                 not_before = now;
+            }
+        }
+    }
+
+    /// Reconciles a notification with current state under the same turn as starts/controls.
+    /// Notification payloads never identify which Handoff ends; stale snapshots are harmless.
+    async fn event(&self) -> ControlFlow<(), bool> {
+        let group = &self.handoff.group;
+        // Topology sends no control. Keep the turn for only one playback read and the final
+        // key check/write, below a control's wait budget.
+        let topology = tokio::time::timeout(GROUP_TIME, self.controls.sonos.topology()).await;
+        let Ok(Ok(groups)) = topology else {
+            tracing::warn!(group, "cannot reconcile Sonos event topology");
+            return Continue(true);
+        };
+        let turn = self.turns.of(group);
+        let Ok(_turn) = turn
+            .take(group, CONTROL_TURN_TIME, "a Takeover check not made")
+            .await
+        else {
+            return Continue(true);
+        };
+        let Some(found) = self.active().await? else {
+            return Continue(true);
+        };
+        let current = groups.iter().find(|current| current.id == *group);
+        let regrouped = current.is_none_or(|current| {
+            current.members.len() != self.members.len()
+                || current
+                    .members
+                    .iter()
+                    .any(|member| !self.members.contains(&member.id))
+        });
+        let playback = self
+            .controls
+            .playback(group, &mut Budget(GROUP_TIME))
+            .await
+            .ok();
+        let changed_source = playback.as_ref().is_some_and(|playback| {
+            !matches!(
+                playback.state,
+                sonos::TransportState::Transitioning | sonos::TransportState::Unknown
+            ) && !plays_stream(playback, &self.stream)
+        });
+        if !regrouped && !changed_source {
+            if let Some(playback) = playback.as_ref() {
+                let mut known = self.known();
+                if let Some(position) = reliable_position(playback) {
+                    known.position = position;
+                }
+            }
+            return Continue(playback.as_ref().is_none_or(|playback| {
+                matches!(
+                    playback.state,
+                    sonos::TransportState::Transitioning | sonos::TransportState::Unknown
+                )
+            }));
+        }
+        let (position, length) = {
+            let known = self.known();
+            (known.position, known.length)
+        };
+        // Regrouping can leave the old coordinator reading the old stream reliably.
+        let position = playback
+            .as_ref()
+            .filter(|playback| plays_stream(playback, &self.stream))
+            .and_then(reliable_position)
+            .unwrap_or(position);
+        let mut time = Budget(WRITE_TIME);
+        self.controls
+            .check_and_write(
+                &found.active,
+                position.as_secs_f64(),
+                length,
+                "Takeover",
+                &mut time,
+            )
+            .await;
+        match self.controls.store.end_handoff(&found.stream).await {
+            Ok(_) => {
+                tracing::info!(group, "Handoff ended by Takeover");
+                Break(())
+            }
+            Err(error) => {
+                self.storage_failed("end a Handoff on Takeover", &error);
+                Continue(true)
             }
         }
     }
@@ -617,6 +756,9 @@ impl<S: Store> Supervisor<S> {
             known.length = known.length.or_else(|| told_length(&playback));
             known.length
         };
+        if let Some(position) = reliable_position(&playback) {
+            self.known().position = position;
+        }
         match playback.state {
             sonos::TransportState::Playing => {
                 self.drop_ending("the Group plays the Handoff again");

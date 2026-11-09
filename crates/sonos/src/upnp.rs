@@ -6,6 +6,7 @@
 //! `Pause`, `Play` and `Seek`; GroupRenderingControl `SnapshotGroupVolume`, then
 //! `SetGroupVolume`).
 
+mod events;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -60,6 +61,7 @@ const STAGGER: Duration = Duration::from_millis(500);
 pub struct Upnp {
     shared: Arc<Shared>,
     discovery: AbortHandle,
+    event_task: Mutex<Option<AbortHandle>>,
 }
 
 #[derive(Debug)]
@@ -69,6 +71,8 @@ struct Shared {
     known: Mutex<Known>,
     /// Whether the first search is over (or searching stopped for good).
     searched: watch::Sender<bool>,
+    events: events::Events,
+    event_clock: Mutex<Arc<dyn Clock>>,
 }
 
 /// What the searches and listings found out.
@@ -129,6 +133,7 @@ impl Upnp {
         Self {
             shared,
             discovery: handle,
+            event_task: Mutex::new(None),
         }
     }
 
@@ -156,10 +161,54 @@ impl Upnp {
 impl Drop for Upnp {
     fn drop(&mut self) {
         self.discovery.abort();
+        if let Some(task) = self
+            .event_task
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+        {
+            task.abort();
+        }
     }
 }
 
 impl Sonos for Upnp {
+    fn topology(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>> {
+        Box::pin(async {
+            let (_, topology) = self
+                .shared
+                .topology_by(tokio::time::Instant::now() + CONTROL_TIMEOUT)
+                .await?;
+            Ok(topology.iter().filter_map(visible).collect())
+        })
+    }
+    fn events(&self, listen: SocketAddr, clock: Arc<dyn Clock>) -> watch::Receiver<u64> {
+        let mut task = self
+            .event_task
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if task.is_none() {
+            *self
+                .shared
+                .event_clock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Arc::clone(&clock);
+            *task = Some(
+                tokio::spawn(events::run(Arc::clone(&self.shared), listen, clock)).abort_handle(),
+            );
+        }
+        self.shared.events.changed.subscribe()
+    }
+
+    fn notify(&self, sid: &str, seq: u32, body: &str) -> bool {
+        let now = self
+            .shared
+            .event_clock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .now();
+        self.shared.events.notify(sid, seq, body, now)
+    }
+
     fn groups(&self) -> BoxFuture<'_, Result<Vec<Group>, Error>> {
         Box::pin(self.groups())
     }
@@ -247,10 +296,12 @@ impl Shared {
             .build()
             .expect("an HTTP client without TLS builds");
         Self {
+            event_clock: Mutex::new(Arc::clone(&clock)),
             http,
             clock,
             known: Mutex::default(),
             searched: watch::Sender::new(false),
+            events: events::Events::default(),
         }
     }
 
@@ -1364,6 +1415,7 @@ mod tests {
         let upnp = Upnp {
             shared: Arc::new(knowing(&household, &clock).await),
             discovery: tokio::spawn(async {}).abort_handle(),
+            event_task: Mutex::new(None),
         };
 
         Sonos::set_volume(&upnp, kitchen.uuid(), 255).await.unwrap();
