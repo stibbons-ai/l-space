@@ -77,6 +77,7 @@ Use an audiobook in at least three files (MP3 or M4A/M4B, as Audiobookshelf list
 5. Start the book about a minute before its end and let it play to the end of the last file. Record the queue's position after stopping in `docs/research/`.
 
 - [ ] Step 1: the Group starts in the right file at the right offset (the Sonos app shows that file and its elapsed time), within the Bridge's 14-second start budget; its play call has 4 seconds for up to 16 files plus 1 second per additional batch of at most 16. The queue holds the book's files in order, and what it held before is gone.
+- [ ] Resume inside a very short first file: startup briefly pauses multi-file playback, selects the saved file and offset, then resumes, all within the existing 4-second seek allowance. Verify it never resumes in the next file, including with a slow coordinator; this pause/seek/resume sequence still needs hardware confirmation.
 - [ ] Step 2: the Group moves on to the next file by itself without a gap the listener notices, and the Item's Progress on the Library Server keeps advancing in the whole book (past the first file's length), not back at the start of the file.
 - [ ] Step 3: playback lands near the end of the file before, and Progress is that position in the whole book.
 - [ ] Step 4: each chapter skip lands at the chapter's start, in the right file; "Next chapter" in the last chapter does nothing; Progress follows each skip.

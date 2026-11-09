@@ -794,12 +794,29 @@ impl<S: Store> AppApi<S> {
                 end_unstarted(store.as_ref(), &stream, &handoff.group).await;
                 return Err(sonos_error(error));
             }
-            // Seek after Play: the smoke test (docs/research/sonos-smoke-2026-11-04.md) sought
-            // Groups already playing; a Seek right after Play is unverified on hardware.
-            if !to.within.is_zero()
-                && let Err(error) = sonos
-                    .seek(&handoff.group, None, to.within, sonos::CONTROL_TIMEOUT)
+            // Freeze multi-file playback while selecting its saved file and offset: a short
+            // file can finish even between TRACK_NR and REL_TIME. Keep all these calls in
+            // the existing initial-seek reservation.
+            let sought = if !to.within.is_zero() { async {
+                let mut time = Budget(sonos::CONTROL_TIMEOUT);
+                let track = (handoff.files.len() > 1).then_some(to.file);
+                if track.is_some() {
+                    time.spend(sonos.pause(&handoff.group))
+                        .await
+                        .ok_or(sonos::Error::GroupFailed)??;
+                }
+                let left = time.0;
+                time.spend(sonos.seek(&handoff.group, track, to.within, left))
                     .await
+                    .ok_or(sonos::Error::GroupFailed)??;
+                if track.is_some() {
+                    time.spend(sonos.resume(&handoff.group))
+                        .await
+                        .ok_or(sonos::Error::GroupFailed)??;
+                }
+                Ok::<(), sonos::Error>(())
+            }.await } else { Ok(()) };
+            if let Err(error) = sought
             {
                 tracing::warn!(
                     group = handoff.group,

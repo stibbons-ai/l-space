@@ -69,6 +69,8 @@ struct Faults {
     next_identity_delay_ms: AtomicU64,
     /// What the next Progress write waits for before it is passed on, if anything.
     next_write_held: Mutex<Option<Held>>,
+    /// Replacement audio-file lengths for Item lookups, when set.
+    file_lengths: Mutex<Option<Vec<f64>>>,
 }
 
 #[derive(Clone)]
@@ -122,6 +124,11 @@ impl LibraryProxy {
     /// From now on, Item lookups pass as they are again.
     pub fn show_lengths(&self) {
         self.faults.hide_lengths.store(false, Ordering::SeqCst);
+    }
+
+    /// Item lookups report these file lengths and their cumulative offsets.
+    pub fn set_file_lengths(&self, lengths: &[f64]) {
+        *self.faults.file_lengths.lock().expect("file lengths") = Some(lengths.to_vec());
     }
 
     /// From now on, Item lookups are rejected with 401 at once.
@@ -323,13 +330,25 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         let _ = answered.send(());
     }
     let episodes_hidden = item_lookup && faults.hide_episodes.load(Ordering::SeqCst);
-    if (hidden || episodes_hidden) && status.is_success() {
+    let lengths = faults.file_lengths.lock().expect("file lengths").clone();
+    if (hidden || episodes_hidden || (item_lookup && lengths.is_some())) && status.is_success() {
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("Item JSON");
         if hidden {
             hide_durations(&mut json);
         }
         if episodes_hidden {
             json["media"]["episodes"] = serde_json::json!([]);
+        }
+        if item_lookup && let Some(lengths) = lengths {
+            let tracks = json["media"]["tracks"].as_array_mut().expect("audio files");
+            assert_eq!(tracks.len(), lengths.len());
+            let mut offset = 0.0;
+            for (track, duration) in tracks.iter_mut().zip(lengths) {
+                track["duration"] = serde_json::json!(duration);
+                track["startOffset"] = serde_json::json!(offset);
+                offset += duration;
+            }
+            json["media"]["duration"] = serde_json::json!(offset);
         }
         bytes = serde_json::to_vec(&json).expect("Item JSON");
     }

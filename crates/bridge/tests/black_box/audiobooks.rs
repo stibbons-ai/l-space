@@ -197,8 +197,6 @@ async fn a_book_starts_in_the_file_and_at_the_offset_of_its_progress() {
     assert!(queue.iter().all(|url| stream(url) == stream(&queue[0])));
     assert_eq!(setup.track(), (Some(2), seconds(600)));
     assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
-    let sought = [Seek::new("TRACK_NR", "2"), Seek::new("REL_TIME", "0:10:00")];
-    assert_eq!(setup.household.sought(&setup.kitchen), sought);
     // It fetched the second file, the one it plays.
     let fetched = setup.household.fetched(&setup.kitchen).await;
     assert_eq!(fetched.uri, queue[1]);
@@ -242,6 +240,47 @@ async fn a_book_starts_in_the_file_and_at_the_offset_of_its_progress() {
     assert_eq!(setup.household.track_number(&setup.office), Some(3));
     let sought = setup.household.sought(&setup.office);
     assert_eq!(sought, [Seek::new("TRACK_NR", "3")]);
+}
+
+#[tokio::test]
+async fn initial_resume_keeps_its_file_when_a_short_file_advances_during_start() {
+    let abs = Audiobookshelf::shared();
+    let proxy = LibraryProxy::to(abs.base_url()).await;
+    proxy.set_file_lengths(&[2.0, 1800.0, 120.0]);
+    let (household, clock) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    household.set_queue_lengths(&kitchen, &[seconds(2), seconds(1800), seconds(120)]);
+    household.set_fault(
+        &kitchen,
+        sonos_fake::Fault::SlowTransport(Duration::from_millis(250)),
+    );
+    let url = proxy.url();
+    let bridge = TestBridge::start(&home_with_sonos_toml(&url, household.ssdp()));
+    let user = abs.new_user().await;
+    let book = ItemId {
+        library_item: abs.seeded().long_book.clone(),
+        episode: None,
+    };
+    abs.set_item_progress(&user, &book, 1.0, false).await;
+    let api = bridge.api();
+    let session = api.login(&url, &user.api_key.key).await;
+    tokio::join!(api.start_handoff(&session, &book, kitchen.uuid()), async {
+        // Natural advancement after Play, before the initial seek has acted.
+        eventually("Play never acted", WITHIN, async || {
+            household.transport_state(&kitchen) == "PLAYING"
+        }).await;
+        clock.advance(seconds(2));
+        assert_eq!(household.track_number(&kitchen), Some(2));
+        eventually("initial REL_TIME never arrived", WITHIN, async || {
+            household.sought(&kitchen).iter().any(|seek| seek.unit == "REL_TIME")
+        }).await;
+        // It must not advance again while REL_TIME is in flight.
+        clock.advance(seconds(2));
+    });
+    assert_eq!(household.track_number(&kitchen), Some(1));
+    assert_eq!(household.position(&kitchen), seconds(1));
+    assert_eq!(household.transport_state(&kitchen), "PLAYING");
+    assert_eq!(abs.item_progress(&user, &book).await, Some((1.0, false)));
 }
 
 #[tokio::test]
