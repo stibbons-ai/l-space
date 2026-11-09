@@ -10,6 +10,9 @@
 //!
 //! [sonos]                     # optional
 //! discovery_address = "239.255.255.250:1900"   # the default: SSDP multicast
+//!
+//! [testing]                   # tests only; never set in production
+//! clock_address = "127.0.0.1:41901"   # follow a sonos-fake household's clock (`GET /clock`)
 //! ```
 
 use std::fmt;
@@ -31,6 +34,7 @@ pub struct Config {
     /// In file order; no two share a [`LibraryServerUrl`].
     pub library_servers: Vec<LibraryServerConfig>,
     pub sonos: SonosConfig,
+    pub testing: TestingConfig,
 }
 
 /// One configured Library Server.
@@ -48,6 +52,15 @@ pub struct SonosConfig {
     pub discovery_address: SocketAddr,
 }
 
+/// Test-only hooks (`[testing]`); none set unless configured, never in production.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestingConfig {
+    /// Where a `sonos-fake` household serves the test clock the Bridge times Handoff
+    /// supervision on instead of the system clock (see `crate::test_clock`).
+    pub clock_address: Option<SocketAddr>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -57,6 +70,8 @@ struct RawConfig {
     library_servers: Vec<RawLibraryServer>,
     #[serde(default)]
     sonos: RawSonos,
+    #[serde(default)]
+    testing: TestingConfig,
 }
 
 #[derive(Deserialize)]
@@ -155,6 +170,7 @@ impl std::str::FromStr for Config {
             sonos: SonosConfig {
                 discovery_address: raw.sonos.discovery_address.unwrap_or(sonos::MULTICAST),
             },
+            testing: raw.testing,
         })
     }
 }
@@ -485,6 +501,28 @@ mod tests {
             config.sonos.discovery_address,
             "127.0.0.1:41900".parse().unwrap()
         );
+    }
+
+    #[test]
+    fn the_test_clock_hook_is_off_unless_set_and_takes_only_an_address() {
+        let base = "listen = \"127.0.0.1:0\"\ndatabase = \"bridge.db\"\n";
+        let config = base.parse::<Config>().unwrap();
+        assert_eq!(config.testing.clock_address, None);
+
+        let config = format!("{base}[testing]\nclock_address = \"127.0.0.1:41901\"\n")
+            .parse::<Config>()
+            .unwrap();
+        let expected = Some("127.0.0.1:41901".parse().unwrap());
+        assert_eq!(config.testing.clock_address, expected);
+
+        for invalid in ["\"http://127.0.0.1:41901/clock\"", "\"127.0.0.1\"", "41901"] {
+            let config = format!("{base}[testing]\nclock_address = {invalid}\n");
+            let error = config.parse::<Config>().unwrap_err();
+            assert!(
+                matches!(error, ConfigError::Parse { .. }),
+                "{invalid}: {error}"
+            );
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ use test_support::bridge::{
     KeyEnv, OTHER_KEY, SESSION_INVALID, TestBridge, acting_as, home_with_sonos_toml,
     output_contains,
 };
+use test_support::{WITHIN, eventually};
 
 use crate::forwarder::Forwarder;
 
@@ -93,11 +94,7 @@ async fn setup_with(abs: Arc<Audiobookshelf>, url: &str, extra: &[&str]) -> Setu
 impl Setup {
     /// Episode `n` (0-based) of the seeded podcast.
     fn episode(&self, n: usize) -> ItemId {
-        let seeded = self.abs.seeded();
-        ItemId {
-            library_item: seeded.podcast.clone(),
-            episode: Some(seeded.episodes[n].clone()),
-        }
+        self.abs.seeded().episode(n)
     }
 
     /// The Audiobookshelf id of `item`'s one audio file.
@@ -138,22 +135,14 @@ impl Setup {
 
     /// Records `user`'s Progress in `item` in Audiobookshelf, as their own player would.
     async fn set_progress(&self, user: &AbsUser, item: &ItemId, current_time: f64, finished: bool) {
-        self.abs
-            .set_progress(
-                user,
-                &item.library_item,
-                item.episode.as_deref(),
-                current_time,
-                finished,
-            )
+        let abs = &self.abs;
+        abs.set_item_progress(user, item, current_time, finished)
             .await;
     }
 
     /// `user`'s Progress in `item`, straight from Audiobookshelf: `(currentTime, isFinished)`.
     async fn progress(&self, user: &AbsUser, item: &ItemId) -> Option<(f64, bool)> {
-        self.abs
-            .progress(user, &item.library_item, item.episode.as_deref())
-            .await
+        self.abs.item_progress(user, item).await
     }
 
     /// Where `group`'s Group is in its track, and whether it was sent a `Seek`.
@@ -227,21 +216,9 @@ fn assert_quiet(output: &[serde_json::Value], key: &str, stream_ids: &[&str]) {
     }
 }
 
-/// Waits up to ten seconds for `done`, checking every 20 ms; panics with `what` if it never is.
-async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !done() {
-        assert!(Instant::now() < deadline, "{what}");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-}
-
 /// Whether `player` has been called with `action`.
 fn called(household: &Household, player: &PlayerId, action: &str) -> bool {
-    household
-        .actions_of(player)
-        .iter()
-        .any(|called| called == action)
+    household.asked(player, action) > 0
 }
 
 /// The WARN events with `message` in the Bridge's `output`.
@@ -795,7 +772,7 @@ async fn a_start_on_a_hanging_group_doesnt_hold_up_another_group() {
     };
     let other = async {
         // Once Kitchen has been told its URL and hangs on it, Office starts.
-        wait_until("Kitchen was never given a URL", || {
+        eventually("Kitchen was never given a URL", WITHIN, async || {
             called(&setup.household, &setup.kitchen, SET_URI)
         })
         .await;
@@ -834,7 +811,7 @@ async fn a_start_whose_client_hangs_up_still_finishes() {
     );
     let mut client = tokio::net::TcpStream::connect(&addr).await.unwrap();
     client.write_all(request.as_bytes()).await.unwrap();
-    wait_until("Office was never given a URL", || {
+    eventually("Office was never given a URL", WITHIN, async || {
         called(&setup.household, &setup.office, SET_URI)
     })
     .await;
@@ -842,7 +819,7 @@ async fn a_start_whose_client_hangs_up_still_finishes() {
     // The client hangs up before the answer.
     drop(client);
 
-    wait_until("Office never played", || {
+    eventually("Office never played", WITHIN, async || {
         setup.household.transport_state(&setup.office) == "PLAYING"
     })
     .await;

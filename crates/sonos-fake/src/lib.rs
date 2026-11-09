@@ -13,6 +13,11 @@
 //! volume, [`DEFAULT_VOLUME`] until set (`SetGroupVolume`, or [`Household::set_volume`]);
 //! `SnapshotGroupVolume` is accepted and only recorded, as the fake has no member volumes.
 //!
+//! A track of known length plays to its end and stops there, as a Sonos Group stops at the end
+//! of a single URL: Stopped, its track still loaded, its position back at 0. A URL the Group
+//! is given has no known length (it plays on without end) unless the test sets one with
+//! [`Household::set_url_length`].
+//!
 //! The household runs on its own Tokio runtime, so it answers whatever the test's runtime is
 //! doing (also while a test blocks on starting a Bridge). Each player listens on its own
 //! loopback port; one SSDP socket answers searches for all of them, as the players on a LAN
@@ -21,6 +26,13 @@
 //!
 //! Playback positions advance on the [`Clock`] the household is started with, so a test with a
 //! `clock::ManualClock` moves a Playing Group's position by advancing that clock.
+//!
+//! The household also serves that clock over HTTP ([`Household::clock_address`]), for a Bridge
+//! in another process to follow (the Bridge's test-only clock hook): `GET /clock` answers how
+//! far the clock has moved since the household started, in whole nanoseconds, as plain text;
+//! `GET /clock?after=<nanoseconds>` answers the same once the clock has moved past `after` (or
+//! after [`CLOCK_POLL`] in real time, unchanged). A follower that asks again with what it got
+//! is waiting, caught up: [`Household::clock_followed`] waits for that after an advance.
 //!
 //! ```ignore
 //! let clock = ManualClock::new();
@@ -37,7 +49,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{RawQuery, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -47,6 +59,12 @@ use tokio::runtime::Runtime;
 
 /// The `Range` a player asks for when it starts a URL: everything, from the start.
 const FETCH_RANGE: &str = "bytes=0-";
+
+/// How long `GET /clock?after=…` waits at most, in real time, for the clock to move.
+pub const CLOCK_POLL: Duration = Duration::from_secs(10);
+
+/// How long [`Household::clock_followed`] waits at most, in real time.
+const FOLLOW_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The most bytes of a URL's body a player keeps, per fetch; it reads no further.
 pub const MAX_FETCHED: usize = 16 * 1024 * 1024;
@@ -82,8 +100,9 @@ pub struct FakeTrack {
     pub title: Option<String>,
     pub creator: Option<String>,
     pub uri: String,
-    /// None for a URL the Group was given, whose length the fake doesn't learn: it reports
-    /// `0:00:00`, as for a stream, and the position moves on without end.
+    /// None for a URL the Group was given, unless the test set a length for it
+    /// ([`Household::set_url_length`]): it reports `0:00:00`, as for a stream, and the
+    /// position moves on without end.
     pub duration: Option<Duration>,
 }
 
@@ -185,12 +204,17 @@ pub enum Fault {
 pub struct Household {
     shared: Arc<Shared>,
     ssdp: SocketAddr,
+    clock: SocketAddr,
     runtime: Option<Runtime>,
 }
 
 #[derive(Debug)]
 struct Shared {
     clock: Arc<dyn Clock>,
+    /// When the household started, on `clock`: what `GET /clock` counts from.
+    origin: Instant,
+    /// Woken each time a `GET /clock?after=…` starts waiting.
+    clock_waiting: tokio::sync::Notify,
     state: Mutex<HouseholdState>,
     /// How players fetch the URLs they play.
     http: reqwest::Client,
@@ -211,6 +235,8 @@ struct HouseholdState {
     /// How many M-SEARCHes for ZonePlayers were received.
     searches: usize,
     added: u32,
+    /// The `after` of each `GET /clock?after=…` waiting for an answer.
+    clock_waits: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -227,6 +253,8 @@ struct Player {
     /// Its Group's volume, while it coordinates the Group.
     volume: u8,
     fault: Fault,
+    /// The length of each URL it is given from now on, if the test set one.
+    url_length: Option<Duration>,
 }
 
 #[derive(Debug)]
@@ -251,6 +279,19 @@ impl Transport {
             None => Duration::ZERO,
         }
     }
+
+    /// Stops a track that has played to its end by `now`, as a Group does at the end of a
+    /// single URL: Stopped, its track still loaded, back at its start.
+    fn settle(&mut self, now: Instant) {
+        let end = self.track.as_ref().and_then(|track| track.duration);
+        if let (Some(since), Some(end)) = (self.since, end)
+            && self.offset + now.saturating_duration_since(since) >= end
+        {
+            self.state = "STOPPED";
+            self.offset = Duration::ZERO;
+            self.since = None;
+        }
+    }
 }
 
 impl Household {
@@ -270,18 +311,34 @@ impl Household {
             .build()
             .expect("an HTTP client without TLS builds");
         let shared = Arc::new(Shared {
+            origin: clock.now(),
+            clock_waiting: tokio::sync::Notify::new(),
             clock,
             state: Mutex::default(),
             http,
         });
+        let clock_listener =
+            std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the clock");
+        clock_listener
+            .set_nonblocking(true)
+            .expect("non-blocking clock");
+        let clock = clock_listener.local_addr().expect("clock address");
         {
             let _runtime = runtime.enter();
             let socket = tokio::net::UdpSocket::from_std(socket).expect("SSDP socket");
             runtime.spawn(answer_searches(Arc::clone(&shared), socket));
+            let listener = tokio::net::TcpListener::from_std(clock_listener).expect("clock socket");
+            let router = Router::new()
+                .route("/clock", get(serve_clock))
+                .with_state(Arc::clone(&shared));
+            runtime.spawn(async move {
+                let _ = axum::serve(listener, router).await;
+            });
         }
         Self {
             shared,
             ssdp,
+            clock,
             runtime: Some(runtime),
         }
     }
@@ -296,6 +353,31 @@ impl Household {
     /// Where the household answers SSDP searches, for the Bridge's discovery.
     pub fn ssdp(&self) -> SocketAddr {
         self.ssdp
+    }
+
+    /// Where the household serves its clock (`GET /clock`), for a Bridge's test clock hook.
+    pub fn clock_address(&self) -> SocketAddr {
+        self.clock
+    }
+
+    /// Waits until a follower of the clock has seen its current time and asks for the next
+    /// one (`GET /clock?after=<now>`), at most [`FOLLOW_TIMEOUT`] in real time. Panics if none
+    /// does by then. After advancing the clock, a test waits for this before it expects a
+    /// Bridge following the clock to act on the new time.
+    pub async fn clock_followed(&self) {
+        let deadline = tokio::time::Instant::now() + FOLLOW_TIMEOUT;
+        loop {
+            // Enabled before checking, so a follower arriving in between still wakes it.
+            let waiting = self.shared.clock_waiting.notified();
+            let mut waiting = std::pin::pin!(waiting);
+            waiting.as_mut().enable();
+            let now = self.shared.elapsed();
+            if self.shared.lock().clock_waits.contains(&now) {
+                return;
+            }
+            let woken = tokio::time::timeout_at(deadline, waiting).await;
+            assert!(woken.is_ok(), "nobody followed the clock to {now} ns");
+        }
     }
 
     /// Adds a player named `name` in a Group of its own, stopped with nothing loaded.
@@ -339,6 +421,7 @@ impl Household {
                 },
                 volume: DEFAULT_VOLUME,
                 fault: Fault::None,
+                url_length: None,
             });
             uuid
         };
@@ -398,12 +481,11 @@ impl Household {
 
     /// `coordinator`'s Group pauses where it is.
     pub fn pause(&self, coordinator: &PlayerId) {
-        let now = self.shared.clock.now();
-        let mut state = self.shared.lock();
-        let transport = &mut state.coordinator_mut(coordinator).transport;
-        transport.offset = transport.position(now);
-        transport.since = None;
-        transport.state = "PAUSED_PLAYBACK";
+        self.settled(coordinator, |transport, now| {
+            transport.offset = transport.position(now);
+            transport.since = None;
+            transport.state = "PAUSED_PLAYBACK";
+        });
     }
 
     /// `coordinator`'s Group stops; its track stays loaded, back at its start.
@@ -413,6 +495,12 @@ impl Household {
         transport.offset = Duration::ZERO;
         transport.since = None;
         transport.state = "STOPPED";
+    }
+
+    /// Each URL `coordinator` is given from now on (`SetAVTransportURI`) is `length` long, as
+    /// `GetPositionInfo` then tells: played to its end, the Group stops.
+    pub fn set_url_length(&self, coordinator: &PlayerId, length: Duration) {
+        self.shared.lock().player_mut(coordinator).url_length = Some(length);
     }
 
     /// `coordinator`'s Group reports `state` as its `CurrentTransportState`, as is, such as
@@ -466,6 +554,16 @@ impl Household {
         actions.map(|(_, action)| action.clone()).collect()
     }
 
+    /// How often `player` was called with SOAP action `action`, as [`Household::actions`]
+    /// names it.
+    pub fn asked(&self, player: &PlayerId, action: &str) -> usize {
+        let state = self.shared.lock();
+        let actions = state.actions.iter();
+        actions
+            .filter(|(uuid, called)| *uuid == player.0 && called == action)
+            .count()
+    }
+
     /// Every URL `player` was given with `SetAVTransportURI`, in order, also those it then
     /// refused or never answered.
     pub fn offered(&self, player: &PlayerId) -> Vec<String> {
@@ -490,14 +588,26 @@ impl Household {
 
     /// `coordinator`'s Group's `CurrentTransportState`, such as `PLAYING`.
     pub fn transport_state(&self, coordinator: &PlayerId) -> &'static str {
-        self.shared.lock().coordinator(coordinator).transport.state
+        self.settled(coordinator, |transport, _| transport.state)
     }
 
     /// How far into its track `coordinator`'s Group is, on the household's clock.
     pub fn position(&self, coordinator: &PlayerId) -> Duration {
+        self.settled(coordinator, |transport, now| transport.position(now))
+    }
+
+    /// What `act` does with `coordinator`'s Group's transport at the household's now, the
+    /// transport first stopped if it played to its end by then.
+    fn settled<T>(
+        &self,
+        coordinator: &PlayerId,
+        act: impl FnOnce(&mut Transport, Instant) -> T,
+    ) -> T {
         let now = self.shared.clock.now();
-        let state = self.shared.lock();
-        state.coordinator(coordinator).transport.position(now)
+        let mut state = self.shared.lock();
+        let transport = &mut state.coordinator_mut(coordinator).transport;
+        transport.settle(now);
+        act(transport, now)
     }
 
     /// `coordinator`'s Group's volume, as `GetGroupVolume` reports it.
@@ -551,6 +661,57 @@ impl Drop for Household {
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, HouseholdState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How far the clock has moved since the household started, in whole nanoseconds.
+    fn elapsed(&self) -> u64 {
+        let elapsed = self.clock.now().saturating_duration_since(self.origin);
+        u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+/// Answers `GET /clock`: see the module documentation.
+async fn serve_clock(State(shared): State<Arc<Shared>>, RawQuery(query): RawQuery) -> Response {
+    let after = query.as_deref().and_then(|query| {
+        let after = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("after="));
+        after.and_then(|after| after.parse::<u64>().ok())
+    });
+    if let Some(after) = after {
+        let waiting = ClockWait::new(Arc::clone(&shared), after);
+        let moved = shared.origin + Duration::from_nanos(after.saturating_add(1));
+        let _ = tokio::time::timeout(CLOCK_POLL, shared.clock.sleep_until(moved)).await;
+        drop(waiting);
+    }
+    shared.elapsed().to_string().into_response()
+}
+
+/// A `GET /clock?after=…` waiting, recorded in [`HouseholdState::clock_waits`] while it lives
+/// (also when its client hangs up, which drops it).
+struct ClockWait {
+    shared: Arc<Shared>,
+    after: u64,
+}
+
+impl ClockWait {
+    fn new(shared: Arc<Shared>, after: u64) -> Self {
+        shared.lock().clock_waits.push(after);
+        shared.clock_waiting.notify_waiters();
+        Self { shared, after }
+    }
+}
+
+impl Drop for ClockWait {
+    fn drop(&mut self) {
+        let mut state = self.shared.lock();
+        if let Some(found) = state
+            .clock_waits
+            .iter()
+            .position(|&after| after == self.after)
+        {
+            state.clock_waits.swap_remove(found);
+        }
     }
 }
 
@@ -619,7 +780,9 @@ impl HouseholdState {
         request: &str,
         now: Instant,
     ) -> Result<(), u16> {
-        let transport = &mut self.coordinating_mut(served)?.transport;
+        let player = self.coordinating_mut(served)?;
+        let url_length = player.url_length;
+        let transport = &mut player.transport;
         match action {
             "SetAVTransportURI" => {
                 let uri = input(request, "CurrentURI").ok_or(402u16)?;
@@ -629,7 +792,7 @@ impl HouseholdState {
                         title: None,
                         creator: None,
                         uri,
-                        duration: None,
+                        duration: url_length,
                     }),
                     offset: Duration::ZERO,
                     since: None,
@@ -847,8 +1010,10 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         .trim_matches('"');
     let (urn, action) = soap_action.split_once('#').unwrap_or(("", soap_action));
     let service = urn.rsplit(':').nth(1).unwrap_or_default();
-    let fault = {
+    // When the call came: what it answers and does then, unless a fault delays it.
+    let (fault, received) = {
         let mut state = served.shared.lock();
+        let received = served.shared.clock.now();
         state
             .actions
             .push((served.uuid.clone(), format!("{service}#{action}")));
@@ -857,13 +1022,18 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         {
             state.offered.push((served.uuid.clone(), uri));
         }
-        state.find(&served.uuid).map(|player| player.fault)
+        (
+            state.find(&served.uuid).map(|player| player.fault),
+            received,
+        )
     };
-    match fault {
+    // Whether a fault held the call up: it then answers and acts as of when it is let go.
+    let delayed = match fault {
         Some(Fault::Hang) => std::future::pending().await,
         Some(Fault::Garbage) => return xml(StatusCode::OK, "<s:Envelope><unclosed".to_owned()),
         Some(Fault::SlowPosition(delay)) if action == "GetPositionInfo" => {
             tokio::time::sleep(delay).await;
+            true
         }
         Some(Fault::FailTransportInfo) if action == "GetTransportInfo" => return invalid_action(),
         Some(Fault::RefusePlayback) if matches!(action, "SetAVTransportURI" | "Play") => {
@@ -871,6 +1041,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         }
         Some(Fault::SlowPlayback(delay)) if action == "SetAVTransportURI" => {
             tokio::time::sleep(delay).await;
+            true
         }
         Some(Fault::RefuseControl)
             if matches!(
@@ -893,11 +1064,13 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         }
         Some(Fault::RefuseSeekSlowPause(delay)) if action == "Pause" => {
             tokio::time::sleep(delay).await;
+            true
         }
         Some(Fault::HangSeek) if action == "Seek" => std::future::pending().await,
         Some(Fault::FailGroupVolume) if action == "GetGroupVolume" => return invalid_action(),
         Some(Fault::SlowTransport(delay)) if urn == AV_TRANSPORT => {
             tokio::time::sleep(delay).await;
+            true
         }
         Some(
             Fault::None
@@ -915,12 +1088,19 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             | Fault::RefuseSeekSlowPause(_)
             | Fault::FailGroupVolume
             | Fault::SlowTransport(_),
-        ) => {}
+        ) => false,
         // Removed from the household: as good as unplugged.
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
-    let now = served.shared.clock.now();
+    };
+    let now = if delayed {
+        served.shared.clock.now()
+    } else {
+        received
+    };
     let mut state = served.shared.lock();
+    for player in &mut state.players {
+        player.transport.settle(now);
+    }
     let arguments: Vec<(&str, String)> = match (urn, action) {
         (TOPOLOGY, "GetZoneGroupState") => {
             vec![("ZoneGroupState", state.zone_group_state())]
@@ -1098,4 +1278,108 @@ fn escape(text: &str) -> String {
         }
     }
     escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seconds(seconds: u64) -> Duration {
+        Duration::from_secs(seconds)
+    }
+
+    /// Calls AVTransport `action` on `player` with `arguments`, as the Bridge does.
+    async fn call(household: &Household, player: &PlayerId, action: &str, arguments: &str) {
+        let addr = household.shared.lock().player(player).addr;
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/MediaRenderer/AVTransport/Control"))
+            .header("soapaction", format!("\"{AV_TRANSPORT}#{action}\""))
+            .body(format!(
+                r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"><s:Body><u:{action} xmlns:u="{AV_TRANSPORT}"><InstanceID>0</InstanceID>{arguments}</u:{action}></s:Body></s:Envelope>"#
+            ))
+            .send()
+            .await
+            .expect("the player answers");
+        assert!(
+            response.status().is_success(),
+            "{action}: {}",
+            response.status()
+        );
+    }
+
+    async fn clock_text(household: &Household, query: &str) -> String {
+        let url = format!("http://{}/clock{query}", household.clock_address());
+        let response = reqwest::get(url).await.expect("the clock answers");
+        response.text().await.expect("a body")
+    }
+
+    #[tokio::test]
+    async fn a_track_played_to_its_end_stops_back_at_its_start_still_loaded() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        let track = FakeTrack::new("Moby Dick", seconds(600));
+        household.play(&kitchen, track.clone());
+
+        clock.advance(seconds(599));
+        assert_eq!(household.transport_state(&kitchen), "PLAYING");
+        assert_eq!(household.position(&kitchen), seconds(599));
+
+        clock.advance(seconds(5));
+        assert_eq!(household.transport_state(&kitchen), "STOPPED");
+        assert_eq!(household.position(&kitchen), Duration::ZERO);
+        assert_eq!(household.uri(&kitchen), Some(track.uri));
+        clock.advance(seconds(60));
+        assert_eq!(household.position(&kitchen), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_paused_track_does_not_stop_at_its_end() {
+        let (household, clock) = Household::with_manual_clock();
+        let kitchen = household.add_player("Kitchen");
+        household.play(&kitchen, FakeTrack::new("Moby Dick", seconds(600)));
+        clock.advance(seconds(598));
+        household.pause(&kitchen);
+
+        clock.advance(seconds(60));
+        assert_eq!(household.transport_state(&kitchen), "PAUSED_PLAYBACK");
+        assert_eq!(household.position(&kitchen), seconds(598));
+    }
+
+    #[tokio::test]
+    async fn a_url_plays_without_end_unless_given_a_length() {
+        let (household, clock) = Household::with_manual_clock();
+        let (kitchen, office) = (
+            household.add_player("Kitchen"),
+            household.add_player("Office"),
+        );
+        household.set_url_length(&office, seconds(90));
+        for player in [&kitchen, &office] {
+            let uri = "<CurrentURI>http://127.0.0.1:9/a.mp3</CurrentURI><CurrentURIMetaData/>";
+            call(&household, player, "SetAVTransportURI", uri).await;
+            call(&household, player, "Play", "<Speed>1</Speed>").await;
+        }
+
+        clock.advance(seconds(100));
+        assert_eq!(household.transport_state(&kitchen), "PLAYING");
+        assert_eq!(household.position(&kitchen), seconds(100));
+        assert_eq!(household.transport_state(&office), "STOPPED");
+        assert_eq!(household.position(&office), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn the_clock_is_served_and_a_follower_waits_for_it_to_move() {
+        let (household, clock) = Household::with_manual_clock();
+        assert_eq!(clock_text(&household, "").await, "0");
+        clock.advance(Duration::from_nanos(1500));
+        assert_eq!(clock_text(&household, "").await, "1500");
+        // Already past `after`: at once.
+        assert_eq!(clock_text(&household, "?after=1000").await, "1500");
+
+        // Caught up: it waits until the clock moves, and is seen waiting meanwhile.
+        let (moved, ()) = tokio::join!(clock_text(&household, "?after=1500"), async {
+            household.clock_followed().await;
+            clock.advance(seconds(30));
+        });
+        assert_eq!(moved, "30000001500");
+    }
 }

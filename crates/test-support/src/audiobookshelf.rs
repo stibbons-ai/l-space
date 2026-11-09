@@ -127,6 +127,16 @@ pub struct Seeded {
     pub episodes: [String; 3],
 }
 
+impl Seeded {
+    /// Episode `n` (0-based, oldest first) of [`Seeded::podcast`], as the App API names it.
+    pub fn episode(&self, n: usize) -> api::ItemId {
+        api::ItemId {
+            library_item: self.podcast.clone(),
+            episode: Some(self.episodes[n].clone()),
+        }
+    }
+}
+
 const ROOT_PASSWORD: &str = "root-password";
 
 static SHARED: Mutex<Weak<Audiobookshelf>> = Mutex::new(Weak::new());
@@ -239,6 +249,25 @@ impl Audiobookshelf {
             record["currentTime"].as_f64().expect("currentTime"),
             record["isFinished"].as_bool().expect("isFinished"),
         ))
+    }
+
+    /// [`Self::set_progress`] in `item`, as the App API names it.
+    pub async fn set_item_progress(
+        &self,
+        user: &AbsUser,
+        item: &api::ItemId,
+        current_time: f64,
+        finished: bool,
+    ) {
+        let episode = item.episode.as_deref();
+        self.set_progress(user, &item.library_item, episode, current_time, finished)
+            .await;
+    }
+
+    /// [`Self::progress`] in `item`, as the App API names it.
+    pub async fn item_progress(&self, user: &AbsUser, item: &api::ItemId) -> Option<(f64, bool)> {
+        self.progress(user, &item.library_item, item.episode.as_deref())
+            .await
     }
 
     /// `user`'s Progress record in audiobook `library_item`, or in its episode `episode`, as

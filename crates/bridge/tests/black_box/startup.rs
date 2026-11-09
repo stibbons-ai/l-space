@@ -5,8 +5,8 @@
 use std::net::TcpListener;
 
 use test_support::bridge::{
-    DATABASE, Exited, KEY, KeyEnv, KeyFile, LISTEN, RUST_LOG, config_file, is_listening,
-    library_server_toml, run_until_exit, run_until_exit_with_key,
+    DATABASE, Exited, KEY, KeyEnv, KeyFile, LISTEN, RUST_LOG, clock_toml, config_file,
+    is_listening, library_server_toml, run_until_exit, run_until_exit_with_key,
 };
 
 /// Asserts the Bridge refused to start with one error event `message`, and returns that
@@ -183,6 +183,15 @@ fn listen_address_in_use() {
     let addr = taken.local_addr().expect("local addr");
     let exited = run_with(&format!("listen = \"{addr}\"\n{DATABASE}"));
     refused(&exited, "cannot listen");
+}
+
+#[test]
+fn unreachable_test_clock() {
+    let exited = run_with(&format!(
+        "{LISTEN}{DATABASE}{}",
+        clock_toml(test_support::closed_port())
+    ));
+    refused(&exited, "cannot follow the test clock");
 }
 
 #[test]

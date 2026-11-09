@@ -16,6 +16,8 @@ clap.workspace = true
 clock.workspace = true
 futures.workspace = true
 getrandom.workspace = true
+# The test-only clock hook follows a `sonos-fake` household's clock over HTTP.
+reqwest.workspace = true
 serde.workspace = true
 sonos.workspace = true
 store.workspace = true
@@ -29,7 +31,6 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
-reqwest.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

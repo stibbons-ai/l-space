@@ -293,6 +293,83 @@ pub struct EpisodePodcast {
     pub metadata: PodcastMetadata,
 }
 
+/// A Progress write ([`Client::set_progress`]): unfinished at a position ([`Self::at`]), also
+/// over Progress Audiobookshelf holds Finished ([`Self::over_finished`]), or Finished at the
+/// end of an Item of known length ([`Self::finished`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProgressUpdate {
+    /// The position, in seconds.
+    current_time: f64,
+    /// The Item's length in seconds, when known.
+    duration: Option<f64>,
+    /// Whether the write marks the Item Finished; otherwise it doesn't (see
+    /// [`Client::set_progress`] for when Audiobookshelf leaves or marks it Finished then).
+    finished: bool,
+    /// Whether an unfinished write clears Finished first.
+    over_finished: bool,
+}
+
+impl ProgressUpdate {
+    /// Not marked Finished, `current_time` seconds into an Item `duration` seconds long, if
+    /// known.
+    pub fn at(current_time: f64, duration: Option<f64>) -> Self {
+        Self {
+            current_time,
+            duration,
+            finished: false,
+            over_finished: false,
+        }
+    }
+
+    /// Finished, at the end of an Item `length` seconds long; none unless `length` is one an
+    /// Item can have (finite and more than zero).
+    pub fn finished(length: f64) -> Option<Self> {
+        (length.is_finite() && length > 0.0).then_some(Self {
+            current_time: length,
+            duration: Some(length),
+            finished: true,
+            over_finished: false,
+        })
+    }
+
+    /// This write over Progress Audiobookshelf holds Finished: unfinished, it clears Finished
+    /// first ([`Client::set_progress`]); Finished, it is left as it is.
+    pub fn over_finished(self) -> Self {
+        Self {
+            over_finished: !self.finished,
+            ..self
+        }
+    }
+
+    /// The position written, in seconds.
+    pub fn current_time(&self) -> f64 {
+        self.current_time
+    }
+
+    /// Whether the write marks the Item Finished.
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// Whether the write clears Finished first, in a request of its own
+    /// ([`Client::set_progress`]).
+    pub fn clears_finished(&self) -> bool {
+        self.over_finished
+    }
+}
+
+/// Why a Progress write ([`Client::set_progress`]) failed, and whether it changed Progress all
+/// the same.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct ProgressError {
+    /// Why the request that failed did.
+    pub error: Error,
+    /// Whether Finished was cleared before the position write failed: Audiobookshelf then
+    /// holds the Progress unfinished at 0, the position not written.
+    pub finished_cleared: bool,
+}
+
 /// A duration in seconds, unless Audiobookshelf doesn't know it: it then sends 0 (or null).
 fn known_seconds<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<f64>, D::Error> {
     Ok(Option::<f64>::deserialize(deserializer)?
@@ -541,27 +618,44 @@ impl Client {
     }
 
     /// Sets the Progress of the user `api_key` acts for in the book `library_item_id`, or the
-    /// episode `episode_id` of the podcast `library_item_id`, to `current_time` seconds in:
+    /// episode `episode_id` of the podcast `library_item_id`, as `update` says:
     /// `PATCH /api/me/progress/<library item>[/<episode>]` with `{"currentTime": …}`, plus
-    /// `duration` (seconds) and the `progress` fraction it makes when the length is known.
-    /// Finished is not sent.
+    /// `duration` (seconds) and the `progress` fraction it makes when the length is known, and
+    /// `"isFinished": true` when Finished. Not Finished, `isFinished` is not sent, and
+    /// `"markAsFinishedTimeRemaining": 0` keeps Audiobookshelf from marking it Finished itself
+    /// short of the end. Not Finished over Progress held Finished
+    /// ([`ProgressUpdate::over_finished`]), that write comes after a first PATCH with
+    /// `{"isFinished": false, "markAsFinishedTimeRemaining": 0}`, which clears Finished; a
+    /// failed first PATCH fails the whole, without the second, and a failed second one fails
+    /// with [`ProgressError::finished_cleared`] set, as the first already changed Progress.
     ///
     /// As Audiobookshelf 2.37.2 does it (`User.createUpdateMediaProgressFromPayload`,
     /// `MediaProgress.applyProgressUpdate`): the user gets Progress if they had none, and that
-    /// first write leaves it unfinished. A write that updates Progress they already have, with
-    /// a length, has Audiobookshelf itself mark it Finished when under 10 seconds remain, and
-    /// unfinished when an earlier Finished one moves away from there. Fails as
-    /// [`Client::set_finished`] does. Audiobookshelf doesn't check that the user may see the
-    /// Item: a caller that needs it checks that itself.
+    /// first write leaves it unfinished unless Finished is sent. A write that moves Progress
+    /// they already have leaves it unfinished, also a Finished one, unless Finished is sent or
+    /// `currentTime` lies past the Item's length as Audiobookshelf then holds it (it marks it
+    /// Finished itself then); without the `markAsFinishedTimeRemaining` above it would also
+    /// mark it Finished when under 10 seconds of a known length remain. A write that leaves
+    /// `currentTime` as it was leaves Finished as it was: hence the first PATCH over Progress
+    /// held Finished. `"isFinished": false` sets a Finished one back to 0 and drops a
+    /// `currentTime` sent with it, so it goes in a PATCH of its own; over unfinished Progress
+    /// it changes nothing. Fails as [`Client::set_finished`] does, in a [`ProgressError`].
+    /// Audiobookshelf doesn't check that the user may see the Item: a caller that needs it
+    /// checks that itself.
     pub async fn set_progress(
         &self,
         base_url: &str,
         api_key: &ApiKey,
         library_item_id: &str,
         episode_id: Option<&str>,
-        current_time: f64,
-        duration: Option<f64>,
-    ) -> Result<(), Error> {
+        update: ProgressUpdate,
+    ) -> Result<(), ProgressError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ClearFinished {
+            is_finished: bool,
+            mark_as_finished_time_remaining: u8,
+        }
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Update {
@@ -570,15 +664,45 @@ impl Client {
             duration: Option<f64>,
             #[serde(skip_serializing_if = "Option::is_none")]
             progress: Option<f64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_finished: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            mark_as_finished_time_remaining: Option<u8>,
         }
-        let url = progress_url(base_url, library_item_id, episode_id)?;
+        let not_written = |error| ProgressError {
+            error,
+            finished_cleared: false,
+        };
+        let url = progress_url(base_url, library_item_id, episode_id).map_err(not_written)?;
+        let ProgressUpdate {
+            current_time,
+            duration,
+            finished,
+            over_finished,
+        } = update;
+        if over_finished {
+            let request = self.http.patch(url.clone()).json(&ClearFinished {
+                is_finished: false,
+                mark_as_finished_time_remaining: 0,
+            });
+            self.send(request, api_key, Names::One)
+                .await
+                .map_err(not_written)?;
+        }
         let duration = duration.filter(|duration| duration.is_finite() && *duration > 0.0);
         let request = self.http.patch(url).json(&Update {
             current_time,
             duration,
             progress: duration.map(|duration| (current_time / duration).clamp(0.0, 1.0)),
+            is_finished: finished.then_some(true),
+            mark_as_finished_time_remaining: (!finished).then_some(0),
         });
-        self.send(request, api_key, Names::One).await?;
+        self.send(request, api_key, Names::One)
+            .await
+            .map_err(|error| ProgressError {
+                error,
+                finished_cleared: over_finished,
+            })?;
         Ok(())
     }
 
@@ -763,7 +887,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        ApiKey, Client, Error, Known, LibraryItem, Media, MediaProgress, MediaType, NotFound, User,
+        ApiKey, Client, Error, Known, LibraryItem, Media, MediaProgress, MediaType, NotFound,
+        ProgressUpdate, User,
     };
 
     async fn serve(router: Router) -> String {
@@ -1330,17 +1455,23 @@ mod tests {
         let (base_url, requests) = recording(StatusCode::OK).await;
         let client = Client::new();
         let key = ApiKey::new("s3cret");
+        let at = ProgressUpdate::at;
         client
-            .set_progress(&base_url, &key, "li-1", None, 150.0, Some(600.0))
+            .set_progress(&base_url, &key, "li-1", None, at(150.0, Some(600.0)))
             .await
             .unwrap();
         client
-            .set_progress(&base_url, &key, "li-2", Some("ep-1"), 42.0, None)
+            .set_progress(&base_url, &key, "li-2", Some("ep-1"), at(42.0, None))
             .await
             .unwrap();
         // A length Audiobookshelf would take as unknown is left out.
         client
-            .set_progress(&base_url, &key, "li-2", Some("ep-1"), 0.0, Some(0.0))
+            .set_progress(&base_url, &key, "li-2", Some("ep-1"), at(0.0, Some(0.0)))
+            .await
+            .unwrap();
+        let finished = ProgressUpdate::finished(600.0).unwrap();
+        client
+            .set_progress(&base_url, &key, "li-1", None, finished)
             .await
             .unwrap();
 
@@ -1351,21 +1482,108 @@ mod tests {
                     "PATCH".to_owned(),
                     "/api/me/progress/li-1".to_owned(),
                     "Bearer s3cret".to_owned(),
-                    json!({"currentTime": 150.0, "duration": 600.0, "progress": 0.25}),
+                    json!({"currentTime": 150.0, "duration": 600.0, "progress": 0.25, "markAsFinishedTimeRemaining": 0}),
                 ),
                 (
                     "PATCH".to_owned(),
                     "/api/me/progress/li-2/ep-1".to_owned(),
                     "Bearer s3cret".to_owned(),
-                    json!({"currentTime": 42.0}),
+                    json!({"currentTime": 42.0, "markAsFinishedTimeRemaining": 0}),
                 ),
                 (
                     "PATCH".to_owned(),
                     "/api/me/progress/li-2/ep-1".to_owned(),
                     "Bearer s3cret".to_owned(),
-                    json!({"currentTime": 0.0}),
+                    json!({"currentTime": 0.0, "markAsFinishedTimeRemaining": 0}),
+                ),
+                (
+                    "PATCH".to_owned(),
+                    "/api/me/progress/li-1".to_owned(),
+                    "Bearer s3cret".to_owned(),
+                    json!({"currentTime": 600.0, "duration": 600.0, "progress": 1.0, "isFinished": true}),
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_progress_over_finished_progress_clears_finished_first() {
+        let (base_url, requests) = recording(StatusCode::OK).await;
+        let client = Client::new();
+        let key = ApiKey::new("s3cret");
+        let unfinished = ProgressUpdate::at(30.0, None).over_finished();
+        client
+            .set_progress(&base_url, &key, "li-1", None, unfinished)
+            .await
+            .unwrap();
+        // A Finished write needs no clearing.
+        let finished = ProgressUpdate::finished(600.0).unwrap().over_finished();
+        client
+            .set_progress(&base_url, &key, "li-1", None, finished)
+            .await
+            .unwrap();
+
+        let bodies: Vec<_> = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, _, body)| body.clone())
+            .collect();
+        assert_eq!(
+            bodies,
+            [
+                json!({"isFinished": false, "markAsFinishedTimeRemaining": 0}),
+                json!({"currentTime": 30.0, "markAsFinishedTimeRemaining": 0}),
+                json!({"currentTime": 600.0, "duration": 600.0, "progress": 1.0, "isFinished": true}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_progress_over_finished_progress_stops_when_clearing_fails() {
+        let (base_url, requests) = recording(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let update = ProgressUpdate::at(30.0, None).over_finished();
+        let error = Client::new()
+            .set_progress(&base_url, &ApiKey::new("key"), "li-1", None, update)
+            .await
+            .unwrap_err();
+        assert!(matches!(error.error, Error::Unavailable(_)), "{error:?}");
+        assert!(!error.finished_cleared);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn setting_progress_over_finished_progress_tells_when_only_the_clearing_landed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Clearing Finished lands; the position write that follows fails.
+        let answered = std::sync::Arc::new(AtomicUsize::new(0));
+        let counted = answered.clone();
+        let base_url = serve(Router::new().fallback(move || async move {
+            match counted.fetch_add(1, Ordering::SeqCst) {
+                0 => StatusCode::OK,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            }
+        }))
+        .await;
+        let update = ProgressUpdate::at(30.0, None).over_finished();
+        let error = Client::new()
+            .set_progress(&base_url, &ApiKey::new("key"), "li-1", None, update)
+            .await
+            .unwrap_err();
+        assert!(matches!(error.error, Error::Unavailable(_)), "{error:?}");
+        assert!(error.finished_cleared);
+        assert_eq!(answered.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn only_a_length_an_item_can_have_is_written_finished() {
+        for length in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(ProgressUpdate::finished(length), None, "{length}");
+        }
+        let finished = ProgressUpdate::finished(0.5).unwrap();
+        assert_eq!(
+            (finished.current_time(), finished.is_finished()),
+            (0.5, true)
         );
     }
 
@@ -1383,10 +1601,17 @@ mod tests {
         for (status, expected) in cases {
             let (base_url, _) = recording(status).await;
             let error = Client::new()
-                .set_progress(&base_url, &ApiKey::new("key"), "li-1", None, 1.0, None)
+                .set_progress(
+                    &base_url,
+                    &ApiKey::new("key"),
+                    "li-1",
+                    None,
+                    ProgressUpdate::at(1.0, None),
+                )
                 .await
                 .unwrap_err();
-            assert_eq!(format!("{error:?}"), expected, "{status}");
+            assert_eq!(format!("{:?}", error.error), expected, "{status}");
+            assert!(!error.finished_cleared);
         }
 
         let (base_url, requests) = recording(StatusCode::OK).await;
@@ -1394,9 +1619,18 @@ mod tests {
             assert!(
                 matches!(
                     Client::new()
-                        .set_progress(&base_url, &ApiKey::new("key"), item, episode, 1.0, None)
+                        .set_progress(
+                            &base_url,
+                            &ApiKey::new("key"),
+                            item,
+                            episode,
+                            ProgressUpdate::at(1.0, None)
+                        )
                         .await,
-                    Err(Error::NotFound(NotFound::InvalidId))
+                    Err(super::ProgressError {
+                        error: Error::NotFound(NotFound::InvalidId),
+                        finished_cleared: false
+                    })
                 ),
                 "{item:?} {episode:?}"
             );
