@@ -1,7 +1,7 @@
 //! The App API's view of this Bridge: configured Library Servers, logins and sessions,
 //! browsing a session's Library Server as its user, the household's Sonos Groups, Handoffs
-//! (supervised while active: `supervise`), and controlling a Group (its Handoff and its
-//! volume).
+//! (supervised while active: `supervise`), controlling a Group (its Handoff and its volume),
+//! and Local playback.
 
 mod supervise;
 
@@ -15,12 +15,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use api::server::{BoxFuture, Bridge};
 use api::{
     ApiError, CurrentUser, EpisodeFilter, Group, GroupMember, HOME_ENTRIES, Handoff, Home,
-    HomeEntry, Item, ItemId, Library, LibraryEntry, LibraryServer, NowPlaying, Playback, Podcast,
-    Progress, Session, SessionToken, Skip, TransportState,
+    HomeEntry, Item, ItemId, Library, LibraryEntry, LibraryServer, LocalStart, NowPlaying,
+    Playback, Podcast, Progress, Session, SessionToken, Skip, TransportState,
 };
 use clock::Clock;
 use sonos::Sonos;
-use store::{ActiveHandoff, GroupHandoff, HandoffFile, LibraryUser, SessionId, Store};
+use store::{ActiveHandoff, ActiveLocal, GroupHandoff, HandoffFile, LibraryUser, SessionId, Store};
 
 use crate::browse::{self, NoSingleFile};
 use crate::config::{LibraryServerConfig, LibraryServerUrl};
@@ -107,10 +107,10 @@ impl<S: Store> AppApi<S> {
     /// configured Library Server; none otherwise, alike for every reason.
     pub(crate) async fn active_handoff(
         &self,
-        stream: &StreamToken,
+        stream: &store::StreamId,
         file: &str,
     ) -> Result<Option<(&str, ActiveHandoff)>, store::Error> {
-        let Some(active) = self.store.handoff(&stream.hash()).await? else {
+        let Some(active) = self.store.handoff(stream).await? else {
             return Ok(None);
         };
         if file != active.handoff.file.name {
@@ -123,6 +123,26 @@ impl<S: Store> AppApi<S> {
                 group = active.handoff.group,
                 library_server = started_by.library_server,
                 "stream for a Library Server that is not configured"
+            );
+            return Ok(None);
+        };
+        Ok(Some((library_server, active)))
+    }
+
+    /// The active Local session whose stream is `stream`, with its configured Library Server;
+    /// none otherwise, alike for every reason. Its file's name is the caller's to check.
+    pub(crate) async fn active_local(
+        &self,
+        stream: &store::StreamId,
+    ) -> Result<Option<(&str, ActiveLocal)>, store::Error> {
+        let Some(active) = self.store.local_stream(stream).await? else {
+            return Ok(None);
+        };
+        // The operator may have removed the Library Server since the start.
+        let Some(library_server) = self.configured_base_url(&active.user.library_server) else {
+            tracing::info!(
+                library_server = active.user.library_server,
+                "Local playback stream for a Library Server that is not configured"
             );
             return Ok(None);
         };
@@ -632,40 +652,7 @@ impl<S: Store> AppApi<S> {
         let progress = browse::item_progress(&user, &id);
         let length = browse::item_duration(&library_item, &id);
         let position = start_position(progress.as_ref(), from_start, length);
-        let file = match browse::single_audio_file(library_item, &id) {
-            Ok(file) => file,
-            Err(NoSingleFile::Missing(reason)) => {
-                return Err(missing(
-                    library_server,
-                    request,
-                    id.episode.as_deref(),
-                    reason,
-                ));
-            }
-            Err(NoSingleFile::Files(files)) => {
-                tracing::info!(
-                    library_server,
-                    library_item = id.library_item,
-                    episode = id.episode,
-                    files,
-                    "an Item without exactly one audio file can't be played on a Group yet"
-                );
-                return Err(ApiError::ItemNotPlayable);
-            }
-        };
-        let name = file
-            .metadata
-            .map(|metadata| metadata.filename)
-            .filter(|name| sonos::media_type(name).is_some())
-            .ok_or_else(|| {
-                tracing::info!(
-                    library_server,
-                    library_item = id.library_item,
-                    episode = id.episode,
-                    "an Item's audio file is in a format Sonos doesn't play, or unnamed"
-                );
-                ApiError::ItemNotPlayable
-            })?;
+        let file = playable_file(library_server, request, library_item, &id)?;
         if !is_group_id(&group) {
             return Err(ApiError::GroupNotFound);
         }
@@ -674,7 +661,7 @@ impl<S: Store> AppApi<S> {
         let stream = stream_token.hash();
         let target = sonos::Stream {
             listen: self.listen,
-            path: stream_token.path(&name),
+            path: stream_token.path(&file.name),
         };
         let after_turn = if from_start {
             sonos::PLAY_TIMEOUT
@@ -770,10 +757,7 @@ impl<S: Store> AppApi<S> {
                 group: task_group,
                 library_item: library_item_id,
                 episode: id.episode,
-                file: HandoffFile {
-                    ino: file.ino,
-                    name,
-                },
+                file,
                 started_by: session.user,
                 username: user.username,
                 started_at: now_millis(),
@@ -864,6 +848,251 @@ impl<S: Store> AppApi<S> {
             }
         };
         Ok(api_handoff(handoff))
+    }
+
+    /// Starts Local playback of Item `id` for the session: resolves the Item and its audio
+    /// file with the session's key, as a start on a Group does, and stores its Local session,
+    /// replacing the session's. Answers where the App plays it from, starting at the user's
+    /// Progress (0 without one, or for a Finished Item).
+    async fn start_local(&self, token: SessionToken, id: ItemId) -> Result<LocalStart, ApiError> {
+        let session_id = SessionId::of_token(token.expose());
+        let request = Request {
+            operation: "start Local playback",
+            id: Some(&id.library_item),
+        };
+        let Browsed {
+            library_server,
+            session,
+            user,
+            fetched: library_item,
+        } = self
+            .browse(token, request, async |server, key| {
+                self.abs.library_item(server, key, &id.library_item).await
+            })
+            .await?;
+        let has_cover = browse::has_cover(&library_item);
+        let item = browse::item(&user, library_item.clone(), id.clone())
+            .map_err(|reason| missing(library_server, request, id.episode.as_deref(), reason))?;
+        let file = playable_file(library_server, request, library_item, &id)?;
+        if !plays_on_iphone(&file.name) {
+            tracing::info!(
+                library_server,
+                library_item = id.library_item,
+                episode = id.episode,
+                "an Item's audio file is in a format the iPhone doesn't play"
+            );
+            return Err(ApiError::ItemNotPlayable);
+        }
+        let stream = StreamToken::new(random_hex("a stream id")?);
+        let local = store::LocalSession {
+            library_item: id.library_item.clone(),
+            episode: id.episode.clone(),
+            file,
+            started_at: now_millis(),
+        };
+        let started = self
+            .store
+            .start_local(&session_id, &stream.hash(), &local)
+            .await
+            .map_err(storage_error("start a Local session"))?;
+        if !started {
+            // Logged out (or the key revoked) since the session was looked up.
+            return Err(ApiError::SessionInvalid);
+        }
+        tracing::info!(
+            library_server,
+            user_id = session.user.user_id,
+            library_item = local.library_item,
+            episode = local.episode,
+            "Local playback started"
+        );
+        let start_at = match &item.progress {
+            Some(progress) if !progress.finished => progress.current_time.max(0.0),
+            _ => 0.0,
+        };
+        Ok(LocalStart {
+            stream: stream.path(&local.file.name),
+            artwork: has_cover.then(|| stream.cover_path()),
+            start_at,
+            duration: item.duration,
+            item: item.id,
+            title: item.title,
+            author: item.author,
+            podcast: item.podcast,
+        })
+    }
+
+    /// Writes `position` as Progress in the Item of the session's Local session named by
+    /// `stream`, its stream's path ([`AppApi::local_session`], [`AppApi::write_local`]).
+    async fn report_local(
+        &self,
+        token: SessionToken,
+        stream: String,
+        position: f64,
+        duration: Option<f64>,
+    ) -> Result<(), ApiError> {
+        let found = self.local_session(&token, &stream).await?;
+        self.write_local(&found, position, duration).await
+    }
+
+    /// Writes `position` as [`AppApi::report_local`] does, then ends that Local session, also
+    /// when the write failed: the answer tells how the write went.
+    async fn end_local(
+        &self,
+        token: SessionToken,
+        stream: String,
+        position: f64,
+        duration: Option<f64>,
+    ) -> Result<(), ApiError> {
+        let found = self.local_session(&token, &stream).await?;
+        let written = self.write_local(&found, position, duration).await;
+        let FoundLocal {
+            library_server,
+            session,
+            session_id,
+            stream,
+            local,
+        } = &found;
+        // A rejected key was revoked, which already ended it.
+        let ended = match self.store.end_local(session_id, stream).await {
+            Ok(ended) => ended,
+            Err(error) => {
+                tracing::warn!(
+                    library_server,
+                    user_id = session.user.user_id,
+                    written = ?written,
+                    "a Local session's last Progress write, before storage failed to end it"
+                );
+                return Err(storage_error("end a Local session")(error));
+            }
+        };
+        if ended {
+            tracing::info!(
+                library_server,
+                user_id = session.user.user_id,
+                library_item = local.library_item,
+                episode = local.episode,
+                "Local playback ended"
+            );
+        }
+        written
+    }
+
+    /// The session `token` names, with its Local session named by `stream`, the path of that
+    /// Local session's stream as [`AppApi::start_local`] answered it.
+    /// [`ApiError::NoLocalSession`] if the session has no Local session with that stream: none
+    /// was started, it ended, or the session started another since (so a late call can't act
+    /// on the one that replaced it).
+    async fn local_session(
+        &self,
+        token: &SessionToken,
+        stream: &str,
+    ) -> Result<FoundLocal<'_>, ApiError> {
+        let (library_server, session) = self.session(token).await?;
+        let session_id = SessionId::of_token(token.expose());
+        let stream = stream::stream_in_path(stream).ok_or(ApiError::NoLocalSession)?;
+        let local = self
+            .store
+            .session_local(&session_id, &stream)
+            .await
+            .map_err(storage_error("look up a Local session"))?
+            .ok_or(ApiError::NoLocalSession)?;
+        Ok(FoundLocal {
+            library_server,
+            session,
+            session_id,
+            stream,
+            local,
+        })
+    }
+
+    /// Writes `position` (seconds, not before 0, in an Item `duration` seconds long, if known)
+    /// as Progress in `found`'s Item for the session's user, with the session's key, once the
+    /// Library Server confirmed the key still acts for them: a key it rejects, or that now
+    /// acts for another user, is revoked ([`AppApi::verified`]), which ends the session and
+    /// its Local session. A position at or past a known length writes Finished at that length;
+    /// any other is written unfinished, also within Audiobookshelf's own 10 seconds of the end
+    /// ([`abs::Client::set_progress`]). Both requests to the Library Server take
+    /// [`LOCAL_LIBRARY_SERVER_TIME`] in all; past that, [`ApiError::LibraryServerUnreachable`].
+    async fn write_local(
+        &self,
+        found: &FoundLocal<'_>,
+        position: f64,
+        duration: Option<f64>,
+    ) -> Result<(), ApiError> {
+        let FoundLocal {
+            library_server,
+            session,
+            local,
+            ..
+        } = found;
+        let request = Request {
+            operation: "write Local playback's Progress",
+            id: Some(&local.library_item),
+        };
+        let late = || {
+            tracing::warn!(
+                library_server,
+                user_id = session.user.user_id,
+                "the Library Server did not answer a Local playback report in time"
+            );
+            ApiError::LibraryServerUnreachable
+        };
+        let mut time = Budget(LOCAL_LIBRARY_SERVER_TIME);
+        let me = time
+            .spend(self.abs.me(library_server, &session.api_key))
+            .await
+            .ok_or_else(late)?;
+        self.verified(library_server, session, me).await?;
+        if time.0 < MIN_WRITE_TIME {
+            return Err(late());
+        }
+        let position = position.max(0.0);
+        let length = known_length(duration);
+        let update = length
+            .filter(|&length| position >= length)
+            .and_then(abs::ProgressUpdate::finished)
+            .unwrap_or_else(|| abs::ProgressUpdate::at(position, length));
+        let written = time
+            .spend(self.abs.set_progress(
+                library_server,
+                &session.api_key,
+                &local.library_item,
+                local.episode.as_deref(),
+                update,
+            ))
+            .await;
+        match written {
+            Some(Ok(())) => {
+                tracing::info!(
+                    library_server,
+                    user_id = session.user.user_id,
+                    library_item = local.library_item,
+                    episode = local.episode,
+                    position = update.current_time(),
+                    finished = update.is_finished(),
+                    "Progress written"
+                );
+                Ok(())
+            }
+            // Never clears Finished first, so nothing changed before a failure.
+            Some(Err(error)) => Err(self
+                .failure(library_server, session, request, error.error)
+                .await),
+            // The request may have landed all the same.
+            None => {
+                tracing::warn!(
+                    library_server,
+                    user_id = session.user.user_id,
+                    library_item = local.library_item,
+                    episode = local.episode,
+                    position,
+                    reason = "the Library Server did not answer in time",
+                    "Progress write not confirmed"
+                );
+                Err(ApiError::LibraryServerUnreachable)
+            }
+        }
     }
 
     /// Has Group `group` do `control` on its Handoff, for any valid session, whoever started
@@ -2046,6 +2275,21 @@ impl Budget {
 /// sent. It bounds the whole write, not each of its requests.
 const MIN_WRITE_TIME: Duration = Duration::from_millis(250);
 
+/// How long a Local playback report or end waits in all for the session's Library Server
+/// (whom the key acts for, then the write): with the Bridge's own storage, within the App's 15
+/// seconds, so a late answer never lands after the App gave up on it.
+const LOCAL_LIBRARY_SERVER_TIME: Duration = Duration::from_secs(10);
+
+/// A session's Local session, as a report or end on it finds it ([`AppApi::local_session`]).
+struct FoundLocal<'a> {
+    /// The session's configured Library Server.
+    library_server: &'a str,
+    session: store::Session,
+    session_id: SessionId,
+    stream: store::StreamId,
+    local: store::LocalSession,
+}
+
 /// Whether `playback`, Group `group`'s, plays `stream`, a Handoff's; [`ApiError::NoHandoff`]
 /// if not.
 fn ensure_plays(
@@ -2218,6 +2462,34 @@ impl<S: Store> Bridge for AppApi<S> {
         volume: u8,
     ) -> BoxFuture<'_, Result<u8, ApiError>> {
         Box::pin(self.set_group_volume(token, group, volume))
+    }
+
+    fn start_local(
+        &self,
+        token: SessionToken,
+        item: ItemId,
+    ) -> BoxFuture<'_, Result<LocalStart, ApiError>> {
+        Box::pin(self.start_local(token, item))
+    }
+
+    fn report_local(
+        &self,
+        token: SessionToken,
+        stream: String,
+        position: f64,
+        duration: Option<f64>,
+    ) -> BoxFuture<'_, Result<(), ApiError>> {
+        Box::pin(self.report_local(token, stream, position, duration))
+    }
+
+    fn end_local(
+        &self,
+        token: SessionToken,
+        stream: String,
+        position: f64,
+        duration: Option<f64>,
+    ) -> BoxFuture<'_, Result<(), ApiError>> {
+        Box::pin(self.end_local(token, stream, position, duration))
     }
 }
 
@@ -2406,6 +2678,67 @@ fn missing(
     ApiError::NotFound
 }
 
+/// Whether the iPhone's player (AVPlayer) plays `file_name`, an audio file in a format Sonos
+/// plays ([`sonos::media_type`]): all but Ogg (`ogg`, `oga`) and Windows Media (`wma`, `asf`).
+/// Apple lists neither container nor their codecs among the formats iOS plays: "Audio
+/// playback formats and codecs" in the Multimedia Programming Guide's "Using Audio"
+/// (<https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/MultimediaPG/UsingAudio/UsingAudio.html>).
+fn plays_on_iphone(file_name: &str) -> bool {
+    let extension = file_name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase());
+    !matches!(extension.as_deref(), Some("ogg" | "oga" | "wma" | "asf"))
+}
+
+/// The audio file of Item `id` in `library_item` (fetched by `request`) that a stream serves,
+/// on a Group or on the phone: its only one, named, in a format Sonos plays. Otherwise
+/// [`ApiError::ItemNotPlayable`], or not found if `library_item` holds no such Item.
+fn playable_file(
+    library_server: &str,
+    request: Request,
+    library_item: abs::LibraryItem,
+    id: &ItemId,
+) -> Result<HandoffFile, ApiError> {
+    let file = match browse::single_audio_file(library_item, id) {
+        Ok(file) => file,
+        Err(NoSingleFile::Missing(reason)) => {
+            return Err(missing(
+                library_server,
+                request,
+                id.episode.as_deref(),
+                reason,
+            ));
+        }
+        Err(NoSingleFile::Files(files)) => {
+            tracing::info!(
+                library_server,
+                library_item = id.library_item,
+                episode = id.episode,
+                files,
+                "an Item without exactly one audio file can't be played yet"
+            );
+            return Err(ApiError::ItemNotPlayable);
+        }
+    };
+    let name = file
+        .metadata
+        .map(|metadata| metadata.filename)
+        .filter(|name| sonos::media_type(name).is_some())
+        .ok_or_else(|| {
+            tracing::info!(
+                library_server,
+                library_item = id.library_item,
+                episode = id.episode,
+                "an Item's audio file is in a format Sonos doesn't play, or unnamed"
+            );
+            ApiError::ItemNotPlayable
+        })?;
+    Ok(HandoffFile {
+        ino: file.ino,
+        name,
+    })
+}
+
 fn abs_error(library_server: &str, request: Request, error: abs::Error) -> ApiError {
     match error {
         abs::Error::Rejected => ApiError::ApiKeyRejected,
@@ -2502,6 +2835,18 @@ mod tests {
                 expected,
                 "{progress:?} {from_start} {duration:?}"
             );
+        }
+    }
+
+    #[test]
+    fn ogg_and_windows_media_dont_play_on_the_iphone() {
+        for name in [
+            "a.mp3", "b.M4B", "c.m4a", "d.aac", "e.flac", "f.wav", "g.aiff",
+        ] {
+            assert!(plays_on_iphone(name), "{name}");
+        }
+        for name in ["a.ogg", "b.OGA", "c.wma", "d.asf"] {
+            assert!(!plays_on_iphone(name), "{name}");
         }
     }
 }

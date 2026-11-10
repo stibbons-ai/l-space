@@ -19,16 +19,36 @@ const STYLE: &str = include_str!("../assets/app.css");
 pub fn root() -> Element {
     let app = use_signal(|| {
         let store = FileStore::in_data_dir().expect("the platform has an application data dir");
-        App::open(Arc::new(store), sys_locale::get_locale().as_deref())
+        let app = App::open(Arc::new(store), sys_locale::get_locale().as_deref());
+        // Local playback only where the App has a player of its own.
+        #[cfg(target_os = "ios")]
+        let app = crate::ios::with_player(app);
+        app
     });
     let busy = use_signal(|| false);
     use_hook(move || act(app, busy, async |app: &mut App| app.start().await));
+    // Says why Local playback stopped on its own, once no other action runs.
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            if !*busy.peek() && app.peek().local_halted() {
+                act(app, busy, async |app: &mut App| {
+                    app.show_local_halted().await
+                });
+            }
+        }
+    });
 
     let screen = app.read().screen().clone();
+    let logged_in = app.read().session().is_some();
+    let on_now_playing = matches!(screen, Screen::NowPlaying { .. });
     rsx! {
         document::Title { {app.read().text(Text::AppName)} }
         style { {STYLE} }
         main {
+            if logged_in && !on_now_playing && app.read().local_status().is_some() {
+                NowPlayingBar { app, busy }
+            }
             match screen {
                 Screen::Starting => rsx! {
                     p { class: "status", {app.read().text(Text::Starting)} }
@@ -62,6 +82,9 @@ pub fn root() -> Element {
                 },
                 Screen::Settings { notice } => rsx! {
                     SettingsScreen { app, busy, notice }
+                },
+                Screen::NowPlaying { .. } => rsx! {
+                    NowPlayingScreen { app, busy }
                 },
             }
         }
@@ -566,6 +589,14 @@ fn ItemScreen(app: Signal<App>, busy: Signal<bool>, item: Item, notice: Option<N
         }
         NoticeView { app, notice }
         div { class: "actions",
+            if app.read().can_play_on_phone() {
+                button {
+                    r#type: "button",
+                    disabled: busy(),
+                    onclick: move |_| act(app, busy, async |app: &mut App| app.play_on_phone().await),
+                    {text(Text::PlayOnPhone)}
+                }
+            }
             if app.read().can_play_on() {
                 button {
                     r#type: "button",
@@ -876,4 +907,114 @@ fn choice_value(choice: LanguageChoice) -> &'static str {
         LanguageChoice::English => "en",
         LanguageChoice::German => "de",
     }
+}
+
+/// A signal that changes every second while its component lives, for components showing
+/// Local playback, which moves on without the App's actions.
+fn use_second_ticks() -> Signal<u64> {
+    let mut ticks = use_signal(|| 0);
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            ticks += 1;
+        }
+    });
+    ticks
+}
+
+/// Above every logged-in screen but Now playing, while something plays on this phone: what
+/// plays, opening Now playing.
+#[component]
+fn NowPlayingBar(app: Signal<App>, busy: Signal<bool>) -> Element {
+    let ticks = use_second_ticks();
+    ticks.read();
+    let Some(status) = app.read().local_status() else {
+        return rsx! {};
+    };
+    let label = app.read().text(Text::NowPlayingTitle);
+    rsx! {
+        nav { class: "now-playing-bar",
+            button {
+                r#type: "button",
+                class: "secondary",
+                disabled: busy(),
+                onclick: move |_| app.write().open_now_playing(),
+                "{label}: {status.title}"
+            }
+        }
+    }
+}
+
+/// What plays on this phone, with its controls: play or pause, 15 s back, 30 s forward and
+/// stop. All are off while any action runs.
+#[component]
+fn NowPlayingScreen(app: Signal<App>, busy: Signal<bool>) -> Element {
+    let ticks = use_second_ticks();
+    ticks.read();
+    let text = |text| app.read().text(text);
+    let status = app.read().local_status();
+    let control = move |action: LocalControl| {
+        move |_: MouseEvent| {
+            act(app, busy, async move |app: &mut App| match action {
+                LocalControl::Toggle => app.toggle_local().await,
+                LocalControl::Skip(skip) => app.skip_local(skip).await,
+                LocalControl::Stop => app.stop_local().await,
+            });
+        }
+    };
+    let notice = app.read().now_playing_notice();
+    rsx! {
+        BackButton { app, busy }
+        h1 { {text(Text::NowPlayingTitle)} }
+        NoticeView { app, notice }
+        if let Some(status) = status {
+            if let Some(artwork) = &status.artwork_url {
+                img { class: "artwork", src: "{artwork}", alt: "" }
+            }
+            p { class: "title", "{status.title}" }
+            if let Some(artist) = &status.artist {
+                p { class: "byline", "{artist}" }
+            }
+            p { class: "detail", {i18n::position(status.position, status.duration)} }
+            div { class: "actions", role: "group",
+                button {
+                    r#type: "button",
+                    disabled: busy(),
+                    onclick: control(LocalControl::Toggle),
+                    {text(if status.playing { Text::GroupPause } else { Text::LocalPlay })}
+                }
+                button {
+                    r#type: "button",
+                    class: "secondary",
+                    disabled: busy(),
+                    onclick: control(LocalControl::Skip(Skip::Back15)),
+                    {text(Text::GroupBack15)}
+                }
+                button {
+                    r#type: "button",
+                    class: "secondary",
+                    disabled: busy(),
+                    onclick: control(LocalControl::Skip(Skip::Forward30)),
+                    {text(Text::GroupForward30)}
+                }
+                button {
+                    r#type: "button",
+                    class: "secondary",
+                    disabled: busy(),
+                    onclick: control(LocalControl::Stop),
+                    {text(Text::LocalStop)}
+                }
+            }
+        } else {
+            p { {text(Text::NowPlayingNone)} }
+        }
+    }
+}
+
+/// What a button on Now playing does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LocalControl {
+    Toggle,
+    Skip(Skip),
+    Stop,
 }

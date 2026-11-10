@@ -11,8 +11,9 @@
 //! ([`episode_summary`]), a row on Home ([`home_entry_summary`]), an Item's facts
 //! ([`item_facts`]) and its chapters with their start times ([`chapter_rows`], [`clock`]). So
 //! is what the Groups screen says about a Group's playback ([`group_playback`]), where its
-//! track is ([`group_position`]) and its volume ([`group_volume`]), and the notice that an
-//! Item now plays on a Group ([`playing_on`]).
+//! track is ([`group_position`]) and its volume ([`group_volume`]), the notice that an
+//! Item now plays on a Group ([`playing_on`]), and the one that where the Item played on this
+//! phone before stopped wasn't saved ([`local_end_not_saved`]).
 
 use std::sync::LazyLock;
 
@@ -178,6 +179,11 @@ texts! {
     GroupVolumeDown => "group-volume-down",
     GroupVolumeUp => "group-volume-up",
     PlayOn => "play-on",
+    PlayOnPhone => "play-on-phone",
+    NowPlayingTitle => "now-playing-title",
+    NowPlayingNone => "now-playing-none",
+    LocalPlay => "local-play",
+    LocalStop => "local-stop",
     PlayFromStart => "play-from-start",
     SettingsTitle => "settings-title",
     SettingsLibraryServer => "settings-library-server",
@@ -196,6 +202,7 @@ texts! {
     ErrorStorageStuck => "error-storage-stuck",
     ErrorStorageSave => "error-storage-save",
     ErrorLogoutNotSaved => "error-logout-not-saved",
+    ErrorLocalPlayerFailed => "error-local-player-failed",
     ErrorNotABridge => "error-not-a-bridge",
     ErrorBridgeUnreachable => "error-bridge-unreachable",
     ErrorInternal => "error-internal",
@@ -211,6 +218,7 @@ texts! {
     ErrorItemNotPlayable => "error-item-not-playable",
     ErrorNoHandoff => "error-no-handoff",
     ErrorLengthUnknown => "error-length-unknown",
+    ErrorNoLocalSession => "error-no-local-session",
     ErrorUnknown => "error-unknown",
 }
 
@@ -250,6 +258,7 @@ macro_rules! phrases {
 phrases! {
     ProgressLeft => "progress-left" ("duration"),
     PlayingOn => "playing-on" ("group"),
+    LocalEndNotSaved => "error-local-end-not-saved" ("reason"),
     GroupVolume => "group-volume" ("volume"),
     DurationHoursMinutes => "duration-hours-minutes" ("hours", "minutes"),
     DurationHours => "duration-hours" ("hours"),
@@ -276,6 +285,7 @@ impl From<&api::ApiError> for Text {
             ApiError::ItemNotPlayable => Self::ErrorItemNotPlayable,
             ApiError::NoHandoff => Self::ErrorNoHandoff,
             ApiError::LengthUnknown => Self::ErrorLengthUnknown,
+            ApiError::NoLocalSession => Self::ErrorNoLocalSession,
             ApiError::Unknown => Self::ErrorUnknown,
         }
     }
@@ -440,6 +450,14 @@ pub fn playing_on(language: Language, group: &str) -> String {
     phrase(language, Phrase::PlayingOn, &args)
 }
 
+/// That where the Item played on this phone before stopped wasn't written as Progress, and
+/// why: `error`'s own text.
+pub fn local_end_not_saved(language: Language, error: &api::ApiError) -> String {
+    let mut args = FluentArgs::new();
+    args.set("reason", text(language, error.into()));
+    phrase(language, Phrase::LocalEndNotSaved, &args)
+}
+
 /// What a Group's row says about its playback: its state, then its track's title and creator
 /// where known, such as "Playing · Moby Dick · Herman Melville".
 pub fn group_playback(language: Language, group: &Group) -> String {
@@ -458,11 +476,16 @@ pub fn group_playback(language: Language, group: &Group) -> String {
 /// none without a track or a position.
 pub fn group_position(group: &Group) -> Option<String> {
     let track = group.now_playing.as_ref()?;
-    let position = clock(track.position?);
-    Some(match track.duration {
-        Some(duration) => format!("{position} / {}", clock(duration)),
-        None => position,
-    })
+    Some(position(track.position?, track.duration))
+}
+
+/// Where playback is in something `duration` seconds long (if known): "2:15 / 10:00", or
+/// "2:15" without a length.
+pub fn position(position: f64, duration: Option<f64>) -> String {
+    match duration {
+        Some(duration) => format!("{} / {}", clock(position), clock(duration)),
+        None => clock(position),
+    }
 }
 
 /// A Group's volume as its row says it: "Volume 20".
@@ -828,8 +851,8 @@ mod tests {
         for (text, error) in &messages {
             assert_eq!(Text::from(error), *text, "{error:?}");
         }
-        // One message per code (ApiError has 16), each different in every language.
-        assert_eq!(messages.len(), 16, "{messages:?}");
+        // One message per code (ApiError has 17), each different in every language.
+        assert_eq!(messages.len(), 17, "{messages:?}");
         for language in Language::ALL {
             let distinct: BTreeSet<_> = messages
                 .iter()

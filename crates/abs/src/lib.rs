@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::stream::{self, BoxStream};
-use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, HeaderValue, RANGE};
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, HeaderValue, RANGE,
+};
 use reqwest::{Method, RequestBuilder, Response, StatusCode, redirect};
 use serde::de::{DeserializeOwned, IgnoredAny};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -179,6 +181,9 @@ pub struct Book {
     /// The audio files in playing order.
     #[serde(default)]
     pub tracks: Vec<Track>,
+    /// Where Audiobookshelf keeps its cover; none without one.
+    #[serde(default)]
+    pub cover_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -191,10 +196,14 @@ pub struct BookMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Podcast {
     pub metadata: PodcastMetadata,
     #[serde(default)]
     pub episodes: Vec<Episode>,
+    /// Where Audiobookshelf keeps its cover; none without one.
+    #[serde(default)]
+    pub cover_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -581,6 +590,47 @@ impl Client {
         })
     }
 
+    /// The cover of the audiobook or podcast `library_item_id` (`/api/items/<id>/cover`), as
+    /// the Library Server serves it: its bytes and their `Content-Type`. One without a cover
+    /// is [`Error::NotFound`]; an answer that isn't an image, or is larger than
+    /// [`MAX_COVER_BYTES`], is [`Error::Unavailable`].
+    pub async fn cover(
+        &self,
+        base_url: &str,
+        api_key: &ApiKey,
+        library_item_id: &str,
+    ) -> Result<Cover, Error> {
+        let library_item_id = id_segment(library_item_id)?;
+        let request = self
+            .http
+            .get(format!("{base_url}/api/items/{library_item_id}/cover"));
+        let mut response = self.send(request, api_key, Names::One).await?;
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .filter(|value| value.as_bytes().starts_with(b"image/"))
+            .cloned()
+            .ok_or_else(|| Error::Unavailable("a cover that is no image".to_owned()))?;
+        let too_large = || Error::Unavailable("a cover larger than the Bridge takes".to_owned());
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_COVER_BYTES as u64)
+        {
+            return Err(too_large());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(Error::unavailable)? {
+            if bytes.len() + chunk.len() > MAX_COVER_BYTES {
+                return Err(too_large());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Cover {
+            content_type,
+            bytes: Bytes::from(bytes),
+        })
+    }
+
     /// Marks the book `library_item_id`, or the episode `episode_id` of the podcast
     /// `library_item_id`, Finished (`finished`) or unfinished for the user `api_key` acts for:
     /// `PATCH /api/me/progress/<library item>[/<episode>]` with `{"isFinished": finished}`.
@@ -805,6 +855,28 @@ pub enum FileRequest {
     Head,
 }
 
+/// The largest cover [`Client::cover`] takes: 8 MiB, far above a cover image's usual size, so
+/// a misbehaving Library Server can't make the Bridge hold an unbounded body.
+pub const MAX_COVER_BYTES: usize = 8 << 20;
+
+/// An audiobook's or podcast's cover image, as the Library Server answered. Its `Debug`
+/// output leaves the bytes out.
+#[derive(Clone)]
+pub struct Cover {
+    /// Its `Content-Type`, an `image/` one.
+    pub content_type: HeaderValue,
+    pub bytes: Bytes,
+}
+
+impl std::fmt::Debug for Cover {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cover")
+            .field("content_type", &self.content_type)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
 /// An audio file, or the part of it asked for, as the Library Server answered.
 pub struct File {
     /// 200 (the whole file), 206 (the range asked for) or 416 (a range the file doesn't
@@ -887,9 +959,61 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        ApiKey, Client, Error, Known, LibraryItem, Media, MediaProgress, MediaType, NotFound,
-        ProgressUpdate, User,
+        ApiKey, Client, Error, Known, LibraryItem, MAX_COVER_BYTES, Media, MediaProgress,
+        MediaType, NotFound, ProgressUpdate, User,
     };
+
+    /// A cover over the cap fails, told by its length or found while reading a body without
+    /// one; one at the cap comes whole, and its `Debug` output leaves the bytes out.
+    #[tokio::test]
+    async fn a_cover_larger_than_the_cap_is_unavailable() {
+        let image = |len: usize| {
+            (
+                [(axum::http::header::CONTENT_TYPE, "image/png")],
+                vec![7_u8; len],
+            )
+        };
+        let streamed = |len: usize| {
+            let chunks = (0..2).map(move |_| Ok::<_, std::io::Error>(vec![7_u8; len / 2]));
+            (
+                [(axum::http::header::CONTENT_TYPE, "image/png")],
+                axum::body::Body::from_stream(futures::stream::iter(chunks)),
+            )
+        };
+        let base_url = serve(
+            Router::new()
+                .route(
+                    "/api/items/fits/cover",
+                    get(move || async move { image(MAX_COVER_BYTES) }),
+                )
+                .route(
+                    "/api/items/big/cover",
+                    get(move || async move { image(MAX_COVER_BYTES + 1) }),
+                )
+                .route(
+                    "/api/items/big-stream/cover",
+                    get(move || async move { streamed(MAX_COVER_BYTES + 2) }),
+                ),
+        )
+        .await;
+        let (client, key) = (Client::new(), ApiKey::new("key"));
+
+        let cover = client.cover(&base_url, &key, "fits").await.unwrap();
+        assert_eq!(cover.bytes.len(), MAX_COVER_BYTES);
+        assert_eq!(
+            format!("{cover:?}"),
+            format!("Cover {{ content_type: \"image/png\", len: {MAX_COVER_BYTES} }}")
+        );
+        for item in ["big", "big-stream"] {
+            assert!(
+                matches!(
+                    client.cover(&base_url, &key, item).await,
+                    Err(Error::Unavailable(_))
+                ),
+                "{item}"
+            );
+        }
+    }
 
     async fn serve(router: Router) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

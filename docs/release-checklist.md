@@ -68,12 +68,18 @@ Kind one pauses at the end of the current chapter (audiobook) or episode (podcas
 
 ## Local playback while locked, with a phone call and with AirPlay
 
-1. Start Local playback of an Item; lock the phone.
-2. While it plays locked, use the lock screen's play/pause, 15 seconds back and 30 seconds forward.
+1. Start Local playback of an Item ("Play on this phone"); switch to another app for a minute, then lock the phone.
+2. While it plays locked, use the lock screen's play/pause, 15 seconds back and 30 seconds forward; then the same in Control Center.
 3. Receive a phone call; end it.
-4. Route the phone's audio to an AirPlay speaker through iOS, then back to the phone.
+4. Route the phone's audio to an AirPlay speaker through iOS, then back to the phone; then to Bluetooth headphones, and take them off.
+5. Away from home, on mobile data with Tailscale, start Local playback again.
 
 - [ ] Playback continues with the phone locked, and the lock screen shows the Item's title and artwork.
 - [ ] The lock-screen controls work, and Progress follows them on the Library Server.
+- [ ] Right after the start and after each skip, the lock screen's elapsed time shows the new position (not the old one, nor 0:00), and keeps counting from there.
+- [ ] Pause or Stop within a second of "Play on this phone" keeps the Progress: the Library Server holds where it started, not 0.
+- [ ] 30 seconds after "Play on this phone" of an Item with Progress, the Library Server holds the start plus about 30 seconds (not about 30).
 - [ ] The call pauses playback, and it resumes when the call ends.
 - [ ] Playback moves to the AirPlay speaker and back without restarting the Item or losing its position.
+- [ ] Bluetooth headphones play it; taking them off pauses it, and Progress shows where.
+- [ ] Over Tailscale it plays as at home.

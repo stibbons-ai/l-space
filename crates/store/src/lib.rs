@@ -5,14 +5,19 @@
 //! the shared contract suite in `contract` (feature `contract`).
 //!
 //! What is stored so far: the Audiobookshelf API keys users logged in with, per Library Server
-//! and user, App sessions, and active Handoffs. A session is bound to the API key it was
-//! opened with and ends when that key is revoked; a user's other keys and their sessions are
-//! unaffected. Logout ends only the session: the key stays stored (later work acts for the
-//! user with it), as do keys and sessions of Library Servers the operator has since removed.
+//! and user, App sessions, active Handoffs and Local sessions. A session is bound to the API
+//! key it was opened with and ends when that key is revoked; a user's other keys and their
+//! sessions are unaffected. Logout ends only the session: the key stays stored (later work
+//! acts for the user with it), as do keys and sessions of Library Servers the operator has
+//! since removed.
 //!
 //! A Handoff acts with the API key of the user who started it, stored like a session's, and
 //! ends when that key is revoked or can no longer be read; logging out doesn't end it. A Group
 //! has at most one: starting another on it replaces the one it had.
+//!
+//! A Local session (Local playback) belongs to the App session that started it and acts with
+//! that session's key: it ends with the session (logout, the key revoked or unreadable), and an
+//! App session has at most one: starting another replaces the one it had.
 
 #[cfg(feature = "contract")]
 pub mod contract;
@@ -94,7 +99,7 @@ pub struct Handoff {
     pub started_at: i64,
 }
 
-/// The audio file a Handoff's stream serves.
+/// The audio file a Handoff's or a Local session's stream serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandoffFile {
     /// Audiobookshelf's id for the file within its library item.
@@ -116,6 +121,29 @@ pub struct GroupHandoff {
     /// Its stream.
     pub stream: StreamId,
     pub active: ActiveHandoff,
+}
+
+/// A Local session (Local playback): an Item an App session plays on the phone from the
+/// Bridge's stream (ADR 0010), acting with that session's key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalSession {
+    /// The audiobook, or the podcast of the episode, on the session's Library Server.
+    pub library_item: String,
+    /// The episode, for a podcast's.
+    pub episode: Option<String>,
+    /// The audio file the stream serves.
+    pub file: HandoffFile,
+    /// When it started, in milliseconds since the Unix epoch.
+    pub started_at: i64,
+}
+
+/// A Local session as its stream needs it: with its App session's user and the key it acts
+/// with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveLocal {
+    pub local: LocalSession,
+    pub user: LibraryUser,
+    pub api_key: ApiKey,
 }
 
 /// A storage failure. The store's state is unchanged by the failed operation.
@@ -154,13 +182,14 @@ pub trait Store: Send + Sync + 'static {
         id: &SessionId,
     ) -> impl Future<Output = Result<Option<Session>, Error>> + Send;
 
-    /// Ends session `id`. Returns whether it was open.
+    /// Ends session `id`, and its Local session if it has one. Returns whether it was open.
     fn close_session(&self, id: &SessionId) -> impl Future<Output = Result<bool, Error>> + Send;
 
     /// Forgets `api_key` for `user` on `user`'s Library Server, ending every session opened
-    /// with it and every Handoff acting with it. The user's other keys, and the same key
-    /// stored for another Library Server or user, stay. Returns whether it was still stored;
-    /// false if there was nothing to revoke (a concurrent revoke came first, for example).
+    /// with it (and their Local sessions) and every Handoff acting with it. The user's other
+    /// keys, and the same key stored for another Library Server or user, stay. Returns whether
+    /// it was still stored; false if there was nothing to revoke (a concurrent revoke came
+    /// first, for example).
     fn revoke_api_key(
         &self,
         user: &LibraryUser,
@@ -200,4 +229,41 @@ pub trait Store: Send + Sync + 'static {
 
     /// Ends the Handoff whose stream is `stream`. Returns whether it was active.
     fn end_handoff(&self, stream: &StreamId) -> impl Future<Output = Result<bool, Error>> + Send;
+
+    /// Starts `local` for open session `session`, its stream identified by `stream`; it acts
+    /// with the session's key. It replaces the session's Local session, if any, whose stream
+    /// is then gone. Returns whether it started: false if `session` is not open (nothing is
+    /// stored then).
+    fn start_local(
+        &self,
+        session: &SessionId,
+        stream: &StreamId,
+        local: &LocalSession,
+    ) -> impl Future<Output = Result<bool, Error>> + Send;
+
+    /// The active Local session whose stream is `stream`, if any, with its session's user and
+    /// key. As for [`Store::session`], one whose key can no longer be read is not active, and
+    /// the implementation forgets that key, ending its sessions (with their Local sessions)
+    /// and Handoffs.
+    fn local_stream(
+        &self,
+        stream: &StreamId,
+    ) -> impl Future<Output = Result<Option<ActiveLocal>, Error>> + Send;
+
+    /// The Local session of session `session`, if it has one and its stream is `stream`: a
+    /// caller names the Local session it acts on, so a late call for one the session replaced
+    /// finds nothing. The session's own key is [`Store::session`]'s to read.
+    fn session_local(
+        &self,
+        session: &SessionId,
+        stream: &StreamId,
+    ) -> impl Future<Output = Result<Option<LocalSession>, Error>> + Send;
+
+    /// Ends the Local session of session `session` if its stream is `stream`. Returns whether
+    /// it ended one: false without one, or if the session's Local session is another.
+    fn end_local(
+        &self,
+        session: &SessionId,
+        stream: &StreamId,
+    ) -> impl Future<Output = Result<bool, Error>> + Send;
 }

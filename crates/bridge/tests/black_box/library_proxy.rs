@@ -18,6 +18,8 @@
 //! - [`LibraryProxy::delay_progress_writes`]: every one of them only after a while, as a slow
 //!   Library Server would.
 //! - [`LibraryProxy::hold_next_progress_write`]: the next one until the test releases it.
+//! - [`LibraryProxy::name_files_ogg`]: every Item lookup with each file name in it ending in
+//!   `.ogg`: an Item in a format Sonos plays and the iPhone doesn't, without seeding one.
 //!
 //! Everything else, also every deeper path under an Item (its files, its cover), passes as it
 //! is. [`LibraryProxy::progress_writes`] counts the Progress writes that arrived, whatever
@@ -54,6 +56,7 @@ struct Faults {
     reject_item_lookups: AtomicBool,
     hang_identity: AtomicBool,
     reject_progress_writes: AtomicBool,
+    name_files_ogg: AtomicBool,
     /// How many Progress writes arrived so far.
     progress_writes: AtomicUsize,
     /// How many Progress writes are still to fail.
@@ -140,6 +143,10 @@ impl LibraryProxy {
             .store(true, Ordering::SeqCst);
     }
 
+    /// From now on, Item lookups name every file as an Ogg file.
+    pub fn name_files_ogg(&self) {
+        self.faults.name_files_ogg.store(true, Ordering::SeqCst);
+    }
     /// From now on, Progress writes pass again.
     pub fn pass_progress_writes(&self) {
         self.faults
@@ -281,6 +288,7 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
     let hidden = item_lookup && faults.hide_lengths.load(Ordering::SeqCst);
+    let ogg = item_lookup && faults.name_files_ogg.load(Ordering::SeqCst);
     let body = to_bytes(body, MAX_BODY).await.expect("request body");
     let mut sent = proxy
         .http
@@ -306,9 +314,14 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         // Dropped by now if the test no longer waits for it.
         let _ = answered.send(());
     }
-    if hidden && status.is_success() {
+    if (hidden || ogg) && status.is_success() {
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("Item JSON");
-        hide_durations(&mut json);
+        if hidden {
+            hide_durations(&mut json);
+        }
+        if ogg {
+            name_ogg(&mut json);
+        }
         bytes = serde_json::to_vec(&json).expect("Item JSON");
     }
     let mut response = Response::builder().status(status);
@@ -336,6 +349,23 @@ fn hide_durations(json: &mut serde_json::Value) {
             object.values_mut().for_each(hide_durations);
         }
         serde_json::Value::Array(array) => array.iter_mut().for_each(hide_durations),
+        _ => {}
+    }
+}
+
+/// Has every `filename` in `json` end in `.ogg` instead of its own extension.
+fn name_ogg(json: &mut serde_json::Value) {
+    match json {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::String(name)) = object.get_mut("filename") {
+                let stem = name
+                    .rsplit_once('.')
+                    .map_or(name.as_str(), |(stem, _)| stem);
+                *name = format!("{stem}.ogg");
+            }
+            object.values_mut().for_each(name_ogg);
+        }
+        serde_json::Value::Array(array) => array.iter_mut().for_each(name_ogg),
         _ => {}
     }
 }

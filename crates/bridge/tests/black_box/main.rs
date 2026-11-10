@@ -13,6 +13,7 @@ mod handoff;
 mod home;
 mod library_proxy;
 mod library_servers;
+mod local;
 mod logging;
 mod login;
 mod progress;
