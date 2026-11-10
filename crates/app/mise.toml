@@ -5,3 +5,7 @@
 [env]
 # Xcode, not the Command Line Tools, for iOS builds, without a global `xcode-select -s`.
 DEVELOPER_DIR = "/Applications/Xcode.app/Contents/Developer"
+
+[tasks.ios-device]
+description = "Build, install and launch the App on a phone: OOK_DEVICE (its name), OOK_SIGNING_IDENTITY (`security find-identity -v -p codesigning`, whole)"
+run = 'dx serve --ios --release --device "${OOK_DEVICE:?set OOK_DEVICE to the phone name}" --codesign --apple-team-id "${OOK_SIGNING_IDENTITY:?set OOK_SIGNING_IDENTITY to the signing identity}"'

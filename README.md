@@ -16,6 +16,8 @@ Toolchain and tasks come from [mise](https://mise.jdx.dev). In a fresh clone run
 
 CI runs `mise run check` on every pull request and every push to `main` ([check.yml](.github/workflows/check.yml)).
 
+Build through these tasks, not a bare `cargo build --workspace`: that builds the App together with the Bridge, so `api` gets its `server` feature in the App and the App fails to compile (for example "implementation of `Send` is not general enough" in `crates/app/src/local.rs`).
+
 The black-box Bridge tests start a real Audiobookshelf in a container ([testcontainers](https://crates.io/crates/testcontainers)), so `mise run test` needs a running Docker; the first run pulls the Audiobookshelf image. The App's flow tests (`crates/app/tests`) drive the App's state and actions, without rendering, against a real Bridge and Audiobookshelf; they start the `bridge` binary from the same target directory, so run them through `mise run test` (or `cargo build -p bridge` before `cargo test -p app`). They run apart from the rest of the workspace: built together with the Bridge, `api` gets its `server` feature, and the App's server function calls would run in-process instead of over HTTP.
 
 Crates live in `crates/`: `api` (the App API contract), `bridge` (the Bridge binary), `app` (the App), `abs` (the Audiobookshelf client), `sonos` (Sonos control behind one trait, over local UPnP), `clock` (the time the Bridge and `sonos-fake` share, which tests advance by hand), `store` (the storage traits and their contract test suite), `store-sqlite` (their SQLite implementation), `test-support` (the test harness the Bridge's and the App's tests share) and `sonos-fake` (a fake Sonos household on loopback for those tests).
@@ -28,8 +30,8 @@ The App (shipped as Ook; its screens call the Bridge Clacks) is a [Dioxus](https
 cd crates/app
 mise trust && mise install                  # once: Rust's iOS targets and dx
 mise exec -- dx serve --ios                 # iOS Simulator: builds, installs and launches on the booted simulator
-mise exec -- dx serve --ios --release --device "<iPhone name>" \
-  --codesign --apple-team-id "Apple Development: <Name> (<TEAMID>)"   # a phone
+OOK_DEVICE="<iPhone name>" OOK_SIGNING_IDENTITY="Apple Development: <Name> (<TEAMID>)" \
+  mise run ios-device                       # a phone: dx serve --ios --release --device … --codesign
 ```
 
 For a phone, once:
@@ -37,7 +39,7 @@ For a phone, once:
 1. Xcode → Settings → Accounts: sign in with the Apple ID of the developer team.
 2. Plug in the iPhone, trust the Mac, enable Settings → Privacy & Security → Developer Mode, reboot.
 3. Create a provisioning profile for `ai.stibbons.ook`: in Xcode, a new iOS App project with that bundle identifier, your team and automatic signing, run once on the phone. This creates the Apple Development certificate and the profile in `~/Library/Developer/Xcode/UserData/Provisioning Profiles`, where `dx` looks for it.
-4. `security find-identity -v -p codesigning` shows the identity to pass as `--apple-team-id`, such as `Apple Development: Name (TEAMID)`; `mise exec -- xcrun devicectl list devices` the phone's name.
+4. `security find-identity -v -p codesigning` shows the identity for `OOK_SIGNING_IDENTITY` (`dx`'s `--apple-team-id`); copy it whole, such as `Apple Development: Name (TEAMID)` with the space before the parenthesis, or signing fails. `mise exec -- xcrun devicectl list devices` shows the phone's name for `OOK_DEVICE`.
 
 The bundle identifier is `ai.stibbons.ook`. On first launch the App asks for the Bridge's address, for example `http://192.168.1.10:8080` (the Simulator reaches a Bridge on the same Mac at `http://127.0.0.1:8080`); the Bridge answers with its Library Servers, and the App remembers the address. An address that redirects to a Bridge while keeping the path it was asked for (say a reverse proxy redirecting `http://` to `https://`) is remembered as the address it redirects to; one that redirects anywhere else (a login page, or a bare `https://host/`) is rejected as not a Bridge, one whose redirect leads nowhere reachable as unreachable, and a redirect from `https://` to `http://` is never followed. The App's calls to the Bridge never follow a redirect, so the session token goes only to the remembered address; a remembered address that starts redirecting counts as the Bridge being unreachable, and the session stays. Then a person picks a Library Server and enters their Audiobookshelf API key (see [Log in](#log-in)). The App keeps the address, its sessions and the language choice in `Application Support/ai.stibbons.ook/app.json` inside its sandbox, readable by its owner only; the API key is not kept. A file the App can't read is moved aside (to the first free `app.json.bad`, `app.json.bad.2`, …), and the App starts afresh and says so; if it can't even move the file, it leaves it untouched, saves nothing during that launch, and says that instead. A session lasts across launches until logout, or until the Bridge answers `api_key_rejected` at launch, or `session_invalid` while it still lists the session's Library Server; then the App forgets it and shows Login with the reason. A session whose Library Server the operator removed from the configuration stays, and the App says so: it may work again once the operator re-adds the Library Server (a session that also ended in the meantime is forgotten at the next launch after that). Any other failure at launch (the Bridge or the Library Server unreachable, also for the listing after `session_invalid`, a call taking longer than 15 seconds, a proxy or captive portal answering instead of the Bridge) keeps the session. Logout also forgets the session when the Bridge can't be reached; if the App can't save that, it says so.
 
@@ -197,7 +199,7 @@ Before each release, run the [release hardware checklist](docs/release-checklist
 
 ## Log in
 
-An App user logs in by picking a configured Library Server and entering an Audiobookshelf API key, which an Audiobookshelf admin creates for them (Settings → API Keys). The Bridge checks the key with Audiobookshelf and opens a session, which survives Bridge restarts and lasts until one of these:
+An App user logs in by picking a configured Library Server and entering an Audiobookshelf API key. Only an Audiobookshelf admin can create one: in Audiobookshelf's settings, under API Keys, for the user who will listen with it (a user without admin rights can't create their own). The Bridge checks the key with Audiobookshelf and opens a session, which survives Bridge restarts and lasts until one of these:
 
 - the user logs out;
 - on a session call, Audiobookshelf rejects the key (HTTP 401: deleted, deactivated or expired key, or deactivated user), or the key now acts for another user; this ends this user's sessions opened with that key (a rejected login ends nothing);

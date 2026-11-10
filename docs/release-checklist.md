@@ -68,7 +68,7 @@ Kind one pauses at the end of the current chapter (audiobook) or episode (podcas
 
 ## Local playback while locked, with a phone call and with AirPlay
 
-1. Start Local playback of an Item ("Play on this phone"); switch to another app for a minute, then lock the phone.
+1. Start Local playback of an Item ("Play on this phone", in German "Auf diesem Telefon abspielen"; "Play on…" / "Abspielen auf…" is a Handoff to a Group instead); switch to another app for a minute, then lock the phone.
 2. While it plays locked, use the lock screen's play/pause, 15 seconds back and 30 seconds forward; then the same in Control Center.
 3. Receive a phone call; end it.
 4. Route the phone's audio to an AirPlay speaker through iOS, then back to the phone; then to Bluetooth headphones, and take them off.
