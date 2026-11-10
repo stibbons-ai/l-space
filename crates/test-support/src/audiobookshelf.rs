@@ -65,6 +65,16 @@ const EBOOK_FILE: &str = "/audiobooks/Rincewind/Only Words/only.pdf";
 /// Enough of a PDF for Audiobookshelf to scan it as an ebook: it reads only the extension.
 const MINIMAL_PDF: &[u8] = b"%PDF-1.4\n%%EOF\n";
 
+/// The seeded podcast's cover, which a scan finds in its folder: a [`cover_png`] of
+/// [`COVER_SIZE`] in [`COVER_RGB`].
+const PODCAST_COVER: &str = "/podcasts/The Clacks Hour/cover.png";
+
+/// The seeded podcast's cover's width and height in pixels.
+const COVER_SIZE: u32 = 64;
+
+/// The seeded podcast's cover's colour: Ankh-Morpork brown.
+const COVER_RGB: [u8; 3] = [0x8B, 0x5A, 0x2B];
+
 /// The folder of [`Audiobookshelf::crowded_podcast`]: a podcast with
 /// [`CROWDED_EPISODES`] one-second episodes, in no Library until a test asks for it.
 const CROWDED_FOLDER: &str = "/crowded";
@@ -119,7 +129,8 @@ pub struct Seeded {
     pub silence: String,
     /// "Only Words" by Rincewind: an ebook (a PDF) without audio, so not an audiobook.
     pub ebook_only: String,
-    /// "The Clacks Hour" by Ankh-Morpork Radio.
+    /// "The Clacks Hour" by Ankh-Morpork Radio, with a cover (an image in its folder); the
+    /// audiobooks have none.
     pub podcast: String,
     /// Its episodes "Episode 1" (10 min), "Episode 2" (15 min) and "Episode 3" (66 min),
     /// oldest first, published at [`EPISODE_PUBLISHED_AT`]; "Episode 1" is described as
@@ -264,7 +275,7 @@ impl Audiobookshelf {
             .await;
     }
 
-    /// [`Self::progress`] in `item`, as the App API names it.
+    /// `user`'s Progress in `item`, as [`Audiobookshelf::progress`] reads it.
     pub async fn item_progress(&self, user: &AbsUser, item: &api::ItemId) -> Option<(f64, bool)> {
         self.progress(user, &item.library_item, item.episode.as_deref())
             .await
@@ -632,6 +643,7 @@ impl Audiobookshelf {
             image = image.with_copy_to(path, silence(seconds));
         }
         image = image.with_copy_to(EBOOK_FILE, MINIMAL_PDF.to_vec());
+        image = image.with_copy_to(PODCAST_COVER, cover_png(COVER_SIZE, COVER_RGB));
         for n in 1..=CROWDED_EPISODES {
             image = image.with_copy_to(
                 format!("{CROWDED_FOLDER}/The Long Wait/Episode {n}.wav"),
@@ -689,7 +701,8 @@ impl Audiobookshelf {
                     .count()
                     == 2
                 && podcasts.len() == 1
-                && podcasts[0]["media"]["numEpisodes"] == 3;
+                && podcasts[0]["media"]["numEpisodes"] == 3
+                && podcasts[0]["media"]["coverPath"].is_string();
             if scanned {
                 break (books, podcasts);
             }
@@ -878,4 +891,63 @@ fn silence(seconds: u32) -> Vec<u8> {
         SILENT - 8 + (state & 0x0F) as u8
     }));
     wav
+}
+
+/// A `size`×`size` PNG in one colour (8-bit RGB, unfiltered rows, stored without
+/// compression): enough for Audiobookshelf to take it as a cover and for a phone to show it.
+fn cover_png(size: u32, rgb: [u8; 3]) -> Vec<u8> {
+    fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        png.extend_from_slice(&u32::try_from(data.len()).expect("chunk size").to_be_bytes());
+        let start = png.len();
+        png.extend_from_slice(kind);
+        png.extend_from_slice(data);
+        let crc = crc32(&png[start..]);
+        png.extend_from_slice(&crc.to_be_bytes());
+    }
+    let mut header = Vec::with_capacity(13);
+    header.extend_from_slice(&size.to_be_bytes());
+    header.extend_from_slice(&size.to_be_bytes());
+    header.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB, no interlace
+    // Each row: filter type 0, then the pixels.
+    let size = size as usize;
+    let mut row = vec![0];
+    row.extend(rgb.repeat(size));
+    let raw = row.repeat(size);
+    // zlib: a header, stored deflate blocks of at most 65535 bytes, the Adler-32.
+    let mut zlib = vec![0x78, 0x01];
+    let mut blocks = raw.chunks(0xFFFF).peekable();
+    while let Some(block) = blocks.next() {
+        zlib.push(u8::from(blocks.peek().is_none()));
+        let len = u16::try_from(block.len()).expect("block size");
+        zlib.extend_from_slice(&len.to_le_bytes());
+        zlib.extend_from_slice(&(!len).to_le_bytes());
+        zlib.extend_from_slice(block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for byte in &raw {
+        a = (a + u32::from(*byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut png, b"IHDR", &header);
+    chunk(&mut png, b"IDAT", &zlib);
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+/// The CRC-32 (ISO-HDLC, as PNG uses it) of `bytes`.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }

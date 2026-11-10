@@ -17,11 +17,14 @@ use api::{
     ApiError, ApiKey, Episode, EpisodeFilter, Group, Home, Item, ItemId, Library, LibraryEntry,
     LibraryKind, LibraryServer, Playback, Podcast, Session, SessionToken, Skip,
 };
+use clock::Clock;
 use dioxus::fullstack::http::header::{AUTHORIZATION, HeaderValue};
 use dioxus::fullstack::{HeaderMap, get_server_url, set_request_headers, set_server_url};
+use tokio::sync::mpsc;
 
 use crate::client;
 use crate::i18n::{self, Language, LanguageChoice, Text};
+use crate::local::{Halted, LocalPlayback, LocalPlayer, LocalStatus, PlayerEvent};
 use crate::storage::{DeviceStore, LoadError, Stored, StoredSession};
 
 /// What the App shows.
@@ -82,6 +85,10 @@ pub enum Screen {
     /// Logged in: the Library Server, the account, the language, logout, the other Library
     /// Servers with a session to switch to, and logging in to another Library Server.
     Settings { notice: Option<Notice> },
+    /// Local playback: what plays on the phone, with its controls
+    /// ([`App::local_status`]); opened by starting it, and from any logged-in screen while
+    /// it runs. Leaving it keeps playback going.
+    NowPlaying { notice: Option<Notice> },
 }
 
 impl Screen {
@@ -106,7 +113,8 @@ impl Screen {
             | Self::Item { notice, .. }
             | Self::PlayOn { notice, .. }
             | Self::Groups { notice, .. }
-            | Self::Settings { notice } => notice.as_ref(),
+            | Self::Settings { notice }
+            | Self::NowPlaying { notice } => notice.as_ref(),
         }
     }
 
@@ -122,7 +130,8 @@ impl Screen {
             | Self::Item { notice, .. }
             | Self::PlayOn { notice, .. }
             | Self::Groups { notice, .. }
-            | Self::Settings { notice } => Some(notice),
+            | Self::Settings { notice }
+            | Self::NowPlaying { notice } => Some(notice),
         }
     }
 }
@@ -152,6 +161,11 @@ pub enum Notice {
     LogoutNotSaved,
     /// The Item now plays on the Group with this name.
     PlayingOn(String),
+    /// This phone's player couldn't play the Item, so Local playback ended.
+    LocalPlayerFailed,
+    /// Where the Item played on this phone before stopped wasn't written as Progress, for
+    /// this reason; shown on the next Item's Now playing.
+    LocalEndNotSaved(ApiError),
 }
 
 impl Notice {
@@ -171,7 +185,9 @@ impl Notice {
             Self::StorageStuck => Text::ErrorStorageStuck,
             Self::StorageSave => Text::ErrorStorageSave,
             Self::LogoutNotSaved => Text::ErrorLogoutNotSaved,
+            Self::LocalPlayerFailed => Text::ErrorLocalPlayerFailed,
             Self::PlayingOn(group) => return i18n::playing_on(language, group),
+            Self::LocalEndNotSaved(error) => return i18n::local_end_not_saved(language, error),
         };
         i18n::text(language, text)
     }
@@ -199,11 +215,19 @@ pub struct App {
     /// Set when what was saved could neither be read nor moved aside: saving would destroy it.
     read_only: bool,
     /// Sessions `log_in` replaced, each with the Bridge address that issued it, kept while the
-    /// file may still hold them: a failed save leaves them there, usable. Ended on that Bridge
-    /// after the next successful save (read-only: after the next save attempt); dropped unsent
-    /// if the stored Bridge address differs at that save. Never saved.
+    /// file may still hold them: a failed save leaves them there, usable. Each successful save
+    /// (read-only: each save attempt) moves them to `unheld`. Never saved.
     replaced: Vec<(String, SessionToken)>,
+    /// Sessions `log_in` replaced that the device no longer holds, to end on the Bridge that
+    /// issued them at once, or, while Local playback runs, once it has stopped and a Stop, a
+    /// halt shown, or a save follows ([`App::end_replaced`]); dropped unsent if the stored
+    /// Bridge address differs by then.
+    /// Never saved.
+    unheld: Vec<(String, SessionToken)>,
     call_timeout: Duration,
+    /// Local playback, where the App has a [`LocalPlayer`]; none elsewhere, which then offers
+    /// no Local playback.
+    local: Option<LocalPlayback>,
 }
 
 impl App {
@@ -239,13 +263,28 @@ impl App {
             load_notice,
             read_only,
             replaced: Vec::new(),
+            unheld: Vec::new(),
             call_timeout: CALL_TIMEOUT,
+            local: None,
         }
     }
 
     /// This App with calls to the Bridge bounded by `timeout` instead of [`CALL_TIMEOUT`].
     pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
         self.call_timeout = timeout;
+        self
+    }
+
+    /// This App offering Local playback through `player`, whose events come through `events`,
+    /// reporting on `clock`'s time. Its calls to the Bridge are bounded by the call timeout set
+    /// so far. Must run within a Tokio runtime.
+    pub fn with_local_player(
+        mut self,
+        player: Arc<dyn LocalPlayer>,
+        events: mpsc::UnboundedReceiver<PlayerEvent>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        self.local = Some(LocalPlayback::new(player, events, clock, self.call_timeout));
         self
     }
 
@@ -370,9 +409,11 @@ impl App {
     /// Logs in to the Library Server with base URL `library_server`, adding its session and
     /// selecting it; the other sessions stay. A session already on that Library Server is
     /// replaced, and ended on the Bridge as far as it can once the device no longer holds it:
-    /// after this save or, if that fails, the next one that succeeds (read-only: at once). It
-    /// only ever reaches the Bridge that issued it: dropped unsent if the stored address
-    /// differs when that save comes. The key is sent to the Bridge and not kept.
+    /// after this save or, if that fails, the next one that succeeds (read-only: at once); and,
+    /// should Local playback run by then, once it has stopped and a Stop, a halt shown, or a
+    /// save follows ([`App::end_replaced`]). It only ever reaches the Bridge that issued it:
+    /// dropped unsent if the stored address differs by then. The key is sent to the Bridge and
+    /// not kept.
     pub async fn log_in(&mut self, library_server: &str, api_key: ApiKey) {
         if !matches!(self.screen, Screen::Login { .. }) {
             return;
@@ -384,6 +425,8 @@ impl App {
             .await
         {
             Ok(Session { token, user }) => {
+                // Local playback belongs to the session that started it.
+                self.end_local_playback().await;
                 let listed = match &self.screen {
                     Screen::Login {
                         library_servers, ..
@@ -422,6 +465,7 @@ impl App {
         let Some(session) = self.stored.session() else {
             return;
         };
+        self.end_local_playback().await;
         self.end_session(&session.token).await;
         let not_saved = self.forget_session().await;
         self.show_login(None).await;
@@ -457,6 +501,8 @@ impl App {
         if !self.stored.select(library_server) {
             return;
         }
+        // Calls still carry the session switched away from: its Local playback ends with it.
+        self.end_local_playback().await;
         authorize_selected(&self.stored);
         let notice = self.save().await;
         self.show_home(notice).await;
@@ -710,6 +756,186 @@ impl App {
         }
     }
 
+    /// Whether the Item screen offers to play its Item on this phone: only where the App has a
+    /// player (iOS), and for an Item that plays on a Group too.
+    pub fn can_play_on_phone(&self) -> bool {
+        self.local.is_some() && self.can_play_on()
+    }
+
+    /// On the Item screen, plays its Item on this phone from the person's Progress, and opens
+    /// Now playing, to come back from to the Item; or shows why it could not start. Whatever
+    /// played on the phone ends first, its position written as Progress (as does an end still
+    /// on its way); if that write failed, the new Now playing says so
+    /// ([`Notice::LocalEndNotSaved`]). A player failure not yet shown is only logged, as is
+    /// the end after it should that have failed too, unless it ended the session: the Item it
+    /// was about no longer plays.
+    pub async fn play_on_phone(&mut self) {
+        let (Some(local), Some(bridge_url), Screen::Item { item, .. }) =
+            (&self.local, &self.stored.bridge_url, &self.screen)
+        else {
+            return;
+        };
+        let (local, bridge_url, id) = (local.clone(), bridge_url.clone(), item.id.clone());
+        let ended = match (local.stop().await, local.take_halted()) {
+            (Err(error), _) | (Ok(()), Some(Halted::Api(error))) => {
+                match self.session_call_failed(error).await {
+                    Some(error) => Some(Notice::LocalEndNotSaved(error)),
+                    None => return,
+                }
+            }
+            (Ok(()), Some(Halted::PlayerFailed)) => {
+                tracing::info!("the player failed on the Item before; not said on the next one");
+                None
+            }
+            (Ok(()), None) => None,
+        };
+        match self.call(api::start_local(id)).await {
+            Ok(started) => match local.start(started, &bridge_url).await {
+                Ok(()) => self.push_screen(Screen::NowPlaying { notice: ended }),
+                Err(error) => self.set_notice(Notice::Api(error)),
+            },
+            // Why nothing plays matters more.
+            Err(error) => self.failed(error).await,
+        }
+    }
+
+    /// What plays on this phone, if anything.
+    pub fn local_status(&self) -> Option<LocalStatus> {
+        self.local.as_ref()?.status()
+    }
+
+    /// The notice Now playing shows, while it shows: the action's own first, but a failed
+    /// report of the Item playing says why over a carried [`Notice::LocalEndNotSaved`], until
+    /// a report succeeds.
+    pub fn now_playing_notice(&self) -> Option<Notice> {
+        let Screen::NowPlaying { notice } = &self.screen else {
+            return None;
+        };
+        let report_failed = self.local_status().and_then(|status| status.report_failed);
+        match (notice, report_failed) {
+            (None | Some(Notice::LocalEndNotSaved(_)), Some(error)) => Some(Notice::Api(error)),
+            (notice, _) => notice.clone(),
+        }
+    }
+
+    /// Opens Now playing from any logged-in screen while something plays on this phone, to
+    /// come back from to that screen.
+    pub fn open_now_playing(&mut self) {
+        let playing = self.local.as_ref().is_some_and(LocalPlayback::is_active);
+        if playing
+            && self.stored.session().is_some()
+            && !matches!(self.screen, Screen::NowPlaying { .. })
+        {
+            self.push_screen(Screen::NowPlaying { notice: None });
+        }
+    }
+
+    /// On Now playing, pauses (writing where as Progress) or plays on. The player acts at
+    /// once; how the report went shows on Now playing, or through
+    /// [`App::show_local_halted`] if it ended Local playback.
+    pub async fn toggle_local(&mut self) {
+        if let Some(local) = self.local_on_screen()
+            && let Err(error) = local.toggle().await
+        {
+            self.set_notice(Notice::Api(error));
+        }
+    }
+
+    /// On Now playing, moves by `skip` (writing where to as Progress), as
+    /// [`App::toggle_local`] does.
+    pub async fn skip_local(&mut self, skip: Skip) {
+        if let Some(local) = self.local_on_screen()
+            && let Err(error) = local.skip(skip).await
+        {
+            self.set_notice(Notice::Api(error));
+        }
+    }
+
+    /// On Now playing, ends Local playback, writing where it stopped as Progress, and goes
+    /// back to the screen Now playing was opened from, saying if that write failed. A write
+    /// that tells the session ended leads to Login instead, as for any call. Sessions `log_in`
+    /// replaced that waited for Local playback to end are ended then ([`App::end_replaced`]).
+    pub async fn stop_local(&mut self) {
+        let Some(local) = self.local_on_screen() else {
+            return;
+        };
+        let answer = local.stop().await;
+        if self.local_answered(answer.clone()).await {
+            self.go_back();
+            if let Err(error) = answer {
+                self.set_notice(Notice::Api(error));
+            }
+            self.end_replaced().await;
+        }
+    }
+
+    /// Whether Local playback stopped on its own (the Bridge ended its Local session, or the
+    /// player failed) and the App hasn't said why yet ([`App::show_local_halted`]).
+    pub fn local_halted(&self) -> bool {
+        self.local.as_ref().is_some_and(LocalPlayback::has_halted)
+    }
+
+    /// Whether why Local playback stopped on its own, not yet said, ends the session; a probe
+    /// for tests that leaves it for [`App::show_local_halted`].
+    #[doc(hidden)]
+    pub fn local_halt_ends_session(&self) -> bool {
+        self.local
+            .as_ref()
+            .is_some_and(LocalPlayback::halt_ends_session)
+    }
+
+    /// Says why Local playback stopped on its own, if it did since last asked: an ended
+    /// session leads to Login, as for any call; any other reason shows as a notice on the
+    /// screen shown, and sessions `log_in` replaced that waited for Local playback to end are
+    /// ended then ([`App::end_replaced`]). The UI asks every second while no other action
+    /// runs. Leaving a session drops what it hadn't said yet, logged, never shown to the next
+    /// ([`App::end_local_playback`]).
+    pub async fn show_local_halted(&mut self) {
+        match self.local.as_ref().and_then(LocalPlayback::take_halted) {
+            Some(Halted::Api(error)) => self.failed(error).await,
+            Some(Halted::PlayerFailed) => self.set_notice(Notice::LocalPlayerFailed),
+            None => return,
+        }
+        self.end_replaced().await;
+    }
+
+    /// Local playback, while Now playing shows.
+    fn local_on_screen(&self) -> Option<LocalPlayback> {
+        match self.screen {
+            Screen::NowPlaying { .. } => self.local.clone(),
+            _ => None,
+        }
+    }
+
+    /// Handles `answer`, how ending Local playback went: an ended session leads to Login (as
+    /// for any call). Returns whether the session goes on; any other failure is the caller's
+    /// to show.
+    async fn local_answered(&mut self, answer: Result<(), ApiError>) -> bool {
+        match answer {
+            Ok(()) => true,
+            Err(error) => self.session_call_failed(error).await.is_some(),
+        }
+    }
+
+    /// Ends Local playback, as far as the Bridge can be told, before the session it belongs to
+    /// is left: what plays, and any end still on its way, all sent with that session's token.
+    /// Why it stopped on its own, not yet said, is dropped: logged, never shown to the next
+    /// session.
+    async fn end_local_playback(&self) {
+        let Some(local) = &self.local else {
+            return;
+        };
+        if let Err(error) = local.stop().await {
+            tracing::warn!(%error, "Local playback ended here; its last position isn't written");
+        }
+        if let Some(halted) = local.take_halted() {
+            tracing::warn!(
+                ?halted,
+                "Local playback stopped on its own in the session left"
+            );
+        }
+    }
+
     /// Opens Settings, from any logged-in screen; the screens to go back to are dropped (the
     /// UI offers it on Home).
     pub fn open_settings(&mut self) {
@@ -892,15 +1118,18 @@ impl App {
             return;
         }
         match self.call(call).await {
-            Ok(answer) => {
-                let mut left = std::mem::replace(&mut self.screen, opened(answer));
-                if let Some(notice) = left.notice_mut() {
-                    *notice = None;
-                }
-                self.back.push(left);
-            }
+            Ok(answer) => self.push_screen(opened(answer)),
             Err(error) => self.failed(error).await,
         }
+    }
+
+    /// Shows `screen`, to come back from to the one shown now, whose notice goes.
+    fn push_screen(&mut self, screen: Screen) {
+        let mut left = std::mem::replace(&mut self.screen, screen);
+        if let Some(notice) = left.notice_mut() {
+            *notice = None;
+        }
+        self.back.push(left);
     }
 
     /// Shows why a call failed on the screen shown, unless it ended the session.
@@ -1011,6 +1240,8 @@ impl App {
     /// Forgets the selected session on the device; the others stay. Returns a notice if that
     /// could not be saved.
     async fn forget_session(&mut self) -> Option<Notice> {
+        // As far as the session still works, which it may not.
+        self.end_local_playback().await;
         self.stored.forget_selected();
         self.back.clear();
         authorize_selected(&self.stored);
@@ -1020,9 +1251,12 @@ impl App {
     /// Ends the session with `token` on the Bridge, as far as it can; callers forget it either
     /// way. Later calls send the selected session's token again.
     async fn end_session(&self, token: &SessionToken) {
-        // The process-wide header carries `token` until the restore below. No guard restores
-        // it if this future is dropped midway: safe while `act` runs every action to its end,
-        // as the screen that started it stays until `act` sets the result.
+        // The process-wide header carries `token` until the restore below, for every call: no
+        // guard restores it if this future is dropped midway, which is safe while `act` runs
+        // every action to its end, as the screen that started it stays until `act` sets the
+        // result. Local playback's sender task calls on its own, so callers end Local playback
+        // first (`log_out`), or put it off until Local playback has stopped, then wait for an
+        // end on its way (`end_replaced`).
         authorize(Some(token));
         match self.call(api::logout()).await {
             Ok(()) => {}
@@ -1037,9 +1271,8 @@ impl App {
     }
 
     /// Saves what the App remembers, then ends the sessions `log_in` replaced, which the device
-    /// no longer holds, on the Bridge that issued them; those of another Bridge are dropped
-    /// unsent. Returns a notice if saving failed; the replaced sessions stay then, unless the
-    /// App is read-only.
+    /// no longer holds ([`App::end_replaced`]). Returns a notice if saving failed; the
+    /// replaced sessions stay then, unless the App is read-only.
     async fn save(&mut self) -> Option<Notice> {
         let notice = if self.read_only {
             // Not kept after a restart: the person needs to know with every change.
@@ -1052,7 +1285,32 @@ impl App {
         } else {
             None
         };
-        for (bridge_url, token) in std::mem::take(&mut self.replaced) {
+        self.unheld.append(&mut self.replaced);
+        self.end_replaced().await;
+        notice
+    }
+
+    /// Ends the sessions `log_in` replaced that the device no longer holds, on the Bridge that
+    /// issued them; those of another Bridge are dropped unsent. While Local playback runs,
+    /// they wait until it has stopped and a Stop, a halt shown, or a save follows: its reports
+    /// would go out with their token meanwhile.
+    async fn end_replaced(&mut self) {
+        if self.unheld.is_empty() {
+            return;
+        }
+        if let Some(local) = &self.local {
+            if local.is_active() {
+                tracing::info!(
+                    "Local playback runs: replaced sessions end once it has stopped and a Stop, \
+                     a halt shown, or a save follows"
+                );
+                return;
+            }
+            // Nothing plays: this only waits for an end still on its way, which goes out with
+            // the selected session's token; the task logged it if it's gone.
+            let _ = local.stop().await;
+        }
+        for (bridge_url, token) in std::mem::take(&mut self.unheld) {
             // A session belongs to the Bridge that issued it: never send it to another.
             // `stored.bridge_url` is where calls go (`point_at`).
             if self.stored.bridge_url.as_ref() == Some(&bridge_url) {
@@ -1061,33 +1319,22 @@ impl App {
                 tracing::debug!("another Bridge: dropping a replaced session unsent");
             }
         }
-        notice
     }
 
-    /// `call` to the Bridge, or `bridge_unreachable` if it takes longer than the call timeout.
-    /// An address that answers but not as a Bridge counts as unreachable too: once the
-    /// address is stored, that's a captive portal or a proxy in the way, not a typo.
+    /// `call` to the Bridge, as [`client::bridge_call`] makes it.
     async fn call<T>(
         &self,
         call: impl Future<Output = Result<T, ApiError>>,
     ) -> Result<T, ApiError> {
-        match self.probe(call).await {
-            Err(ApiError::NotABridge) => Err(ApiError::BridgeUnreachable),
-            result => result,
-        }
+        client::bridge_call(self.call_timeout, call).await
     }
 
-    /// `call` to the Bridge, or `bridge_unreachable` if it takes longer than the call timeout.
+    /// `call` to the Bridge, as [`client::probe`] makes it.
     async fn probe<T>(
         &self,
         call: impl Future<Output = Result<T, ApiError>>,
     ) -> Result<T, ApiError> {
-        tokio::time::timeout(self.call_timeout, call)
-            .await
-            .unwrap_or_else(|_| {
-                tracing::debug!(timeout = ?self.call_timeout, "the Bridge did not answer in time");
-                Err(ApiError::BridgeUnreachable)
-            })
+        client::probe(self.call_timeout, call).await
     }
 
     fn set_notice(&mut self, new: Notice) {

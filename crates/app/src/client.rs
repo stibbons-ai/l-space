@@ -1,5 +1,7 @@
-//! The HTTP client every server function call goes through, and the one request the App sends
-//! past it, which follows redirects: discovering where an entered address redirects to.
+//! The HTTP client every server function call goes through, with the call timeout every call
+//! to the Bridge gets ([`bridge_call`]); the one request the App sends past it, which follows
+//! redirects: discovering where an entered address redirects to; and, on iOS, fetching a Local
+//! session's cover for Now Playing.
 //!
 //! Dioxus fullstack's own client follows redirects, so a call could land on another origin than
 //! the stored Bridge address: a `POST` redirected with 301 or 302 turns into a `GET`, and reqwest
@@ -8,7 +10,9 @@
 //! is an error the App shows (`not_a_bridge`, or `bridge_unreachable` once the address is stored).
 
 use std::sync::{Arc, LazyLock, Once};
+use std::time::Duration;
 
+use api::ApiError;
 use dioxus::fullstack::GLOBAL_REQUEST_CLIENT;
 use dioxus::fullstack::reqwest::Client;
 use dioxus::fullstack::reqwest::redirect::Policy;
@@ -77,6 +81,64 @@ pub(crate) async fn redirect_target(url: Url) -> Result<Option<Url>, Unreachable
 /// which would move the address (and so the session token and API key) off TLS.
 fn may_follow(previous: &Url, next: &Url) -> bool {
     !(previous.scheme() == "https" && next.scheme() == "http")
+}
+
+/// `call` to the Bridge, or `bridge_unreachable` if it takes longer than `timeout`. An address
+/// that answers but not as a Bridge counts as unreachable too: once the address is stored,
+/// that's a captive portal or a proxy in the way, not a typo.
+pub(crate) async fn bridge_call<T>(
+    timeout: Duration,
+    call: impl Future<Output = Result<T, ApiError>>,
+) -> Result<T, ApiError> {
+    match probe(timeout, call).await {
+        Err(ApiError::NotABridge) => Err(ApiError::BridgeUnreachable),
+        result => result,
+    }
+}
+
+/// `call` to the Bridge, or `bridge_unreachable` if it takes longer than `timeout`.
+pub(crate) async fn probe<T>(
+    timeout: Duration,
+    call: impl Future<Output = Result<T, ApiError>>,
+) -> Result<T, ApiError> {
+    tokio::time::timeout(timeout, call)
+        .await
+        .unwrap_or_else(|_| {
+            tracing::debug!(?timeout, "the Bridge did not answer in time");
+            Err(ApiError::BridgeUnreachable)
+        })
+}
+
+/// The body of a `GET` of `url`, if it answers 200 within `timeout`, through the client server
+/// function calls go through, without their headers (fullstack adds those per call). For a
+/// Local session's cover, which its URL alone authorizes. Why it got none is logged at DEBUG,
+/// without the URL.
+#[cfg(target_os = "ios")]
+pub(crate) async fn fetch(url: &str, timeout: Duration) -> Option<Vec<u8>> {
+    let plain = GLOBAL_REQUEST_CLIENT.get_or_init(|| client(Policy::none()));
+    let fetched = async {
+        let response = plain.get(url).send().await.map_err(|error| {
+            tracing::debug!(error = %error.without_url(), "cannot fetch the artwork");
+        });
+        let response = response.ok()?;
+        let status = response.status();
+        if status != dioxus::fullstack::reqwest::StatusCode::OK {
+            tracing::debug!(%status, "the Bridge answered no artwork");
+            return None;
+        }
+        match response.bytes().await {
+            Ok(bytes) => Some(bytes.to_vec()),
+            Err(error) => {
+                tracing::debug!(error = %error.without_url(), "the artwork broke off");
+                None
+            }
+        }
+    };
+    let fetched = tokio::time::timeout(timeout, fetched).await;
+    if fetched.is_err() {
+        tracing::debug!(?timeout, "the artwork took too long");
+    }
+    fetched.ok().flatten()
 }
 
 /// A client set up like fullstack's (`ClientRequest::new_reqwest_client`), redirects as `policy`

@@ -316,6 +316,14 @@ fn select(media: abs::Media, id: &ItemId) -> Result<Selected, Missing> {
     }
 }
 
+/// Whether `library_item` has a cover.
+pub fn has_cover(library_item: &abs::LibraryItem) -> bool {
+    match &library_item.media {
+        abs::Media::Book(book) => book.cover_path.is_some(),
+        abs::Media::Podcast(podcast) => podcast.cover_path.is_some(),
+    }
+}
+
 /// Why a library item that exists holds nothing the App asked for: the App answers
 /// `not_found` either way, the reason goes to the log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,6 +435,7 @@ mod tests {
                     author: None,
                 },
                 episodes,
+                cover_path: None,
             }),
         }
     }

@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 
 use api::{
     ApiError, CurrentUser, EpisodeFilter, Group, Handoff, Home, HomeEntry, Item, ItemId, Library,
-    LibraryEntry, Playback, Podcast, Progress, Session, Skip,
+    LibraryEntry, LocalStart, Playback, Podcast, Progress, Session, Skip,
 };
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -452,6 +452,14 @@ pub const LENGTH_UNKNOWN: (StatusCode, ApiError) = (StatusCode::CONFLICT, ApiErr
 pub const LIBRARY_SERVER_UNREACHABLE: (StatusCode, ApiError) =
     (StatusCode::BAD_GATEWAY, ApiError::LibraryServerUnreachable);
 
+/// The rejection of a Local playback report or end without a Local session.
+pub const NO_LOCAL_SESSION: (StatusCode, ApiError) =
+    (StatusCode::CONFLICT, ApiError::NoLocalSession);
+
+/// The rejection of an Item the Bridge can't stream yet.
+pub const ITEM_NOT_PLAYABLE: (StatusCode, ApiError) =
+    (StatusCode::UNPROCESSABLE_ENTITY, ApiError::ItemNotPlayable);
+
 /// Who a session of `user` on `abs` acts as.
 pub fn acting_as(abs: &Audiobookshelf, user: &AbsUser) -> CurrentUser {
     acting_on(abs.base_url(), user)
@@ -738,6 +746,55 @@ impl AppApi {
         self.post_error(path, None, body).await
     }
 
+    /// Starts Local playback of Item `item` as `session`, panicking unless that succeeds.
+    pub async fn start_local(&self, session: &Session, item: &ItemId) -> LocalStart {
+        let body = json!({"item": item});
+        decode(
+            self.post("/api/local/start", Some(&bearer(session)), body)
+                .await,
+        )
+        .await
+    }
+
+    /// Starts Local playback of Item `item` as `session`, expecting a rejection.
+    pub async fn start_local_error(
+        &self,
+        session: &Session,
+        item: &ItemId,
+    ) -> (StatusCode, ApiError) {
+        let body = json!({"item": item});
+        self.post_error("/api/local/start", Some(&bearer(session)), body)
+            .await
+    }
+
+    /// Reports `position` (and `duration`) of `session`'s Local playback whose stream's path
+    /// is `stream`, or ends it (`end`), panicking unless that succeeds.
+    pub async fn report_local(
+        &self,
+        session: &Session,
+        report: LocalReport,
+        stream: &str,
+        position: f64,
+        duration: Option<f64>,
+    ) {
+        let body = local_report_body(stream, position, duration);
+        decode::<Value>(self.post(report.path(), Some(&bearer(session)), body).await).await;
+    }
+
+    /// [`AppApi::report_local`], expecting a rejection.
+    pub async fn report_local_error(
+        &self,
+        session: &Session,
+        report: LocalReport,
+        stream: &str,
+        position: f64,
+        duration: Option<f64>,
+    ) -> (StatusCode, ApiError) {
+        let body = local_report_body(stream, position, duration);
+        self.post_error(report.path(), Some(&bearer(session)), body)
+            .await
+    }
+
     /// `GET`s (or with `method`, `HEAD`s) `path` on the Bridge without authenticating, with
     /// the `Range` header `range`, if any, as a Group fetches a stream.
     pub async fn fetch(
@@ -866,6 +923,47 @@ pub fn filter_name(filter: EpisodeFilter) -> String {
 
 fn handoff_body(item: &ItemId, group: &str, from_start: bool) -> Value {
     json!({"item": item, "group": group, "from_start": from_start})
+}
+
+/// The body of a Local playback report or end.
+pub fn local_report_body(stream: &str, position: f64, duration: Option<f64>) -> Value {
+    json!({"stream": stream, "position": position, "duration": duration})
+}
+
+/// The id and the (percent-encoded) file name in a stream's path, `/stream/<id>/<file>`: a
+/// Handoff's or a Local session's.
+fn stream_path_parts(path: &str) -> (&str, &str) {
+    path.strip_prefix("/stream/")
+        .and_then(|rest| rest.split_once('/'))
+        .unwrap_or_else(|| panic!("not a stream path: {path}"))
+}
+
+/// The id in a stream's path, `/stream/<id>/<file>`.
+pub fn stream_path_id(path: &str) -> &str {
+    stream_path_parts(path).0
+}
+
+/// The (percent-encoded) file name in a stream's path, `/stream/<id>/<file>`.
+pub fn stream_path_file(path: &str) -> &str {
+    stream_path_parts(path).1
+}
+
+/// How the App tells the Bridge where Local playback is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalReport {
+    /// [`api::report_local`]: the Local session goes on.
+    Report,
+    /// [`api::end_local`]: the Local session ends.
+    End,
+}
+
+impl LocalReport {
+    fn path(self) -> &'static str {
+        match self {
+            Self::Report => "/api/local/report",
+            Self::End => "/api/local/end",
+        }
+    }
 }
 
 /// A call that controls a Group, as the App makes it.

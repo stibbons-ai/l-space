@@ -13,7 +13,7 @@ use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
 use test_support::bridge::{
     KeyEnv, OTHER_KEY, SESSION_INVALID, TestBridge, acting_as, home_with_sonos_toml,
-    output_contains,
+    output_contains, stream_path_file, stream_path_id,
 };
 use test_support::{WITHIN, eventually};
 
@@ -160,9 +160,9 @@ fn path(url: &str) -> &str {
     &rest[rest.find('/').expect("a path")..]
 }
 
-/// A stream URL's id: its second path segment.
+/// A stream URL's id.
 fn stream_id(url: &str) -> &str {
-    path(url).split('/').nth(2).expect("a stream id")
+    stream_path_id(path(url))
 }
 
 /// The headers a stream answer may have: none of Audiobookshelf's own.
@@ -264,7 +264,7 @@ async fn choosing_a_group_plays_the_episode_there_from_the_bridges_stream() {
         url.starts_with(&format!("{}/stream/", setup.bridge.url())),
         "{url}"
     );
-    assert_eq!(path(&url).split('/').nth(3), Some("Episode%201.wav"));
+    assert_eq!(stream_path_file(path(&url)), "Episode%201.wav");
     assert!(!url.contains(setup.abs.address()), "{url}");
     assert!(!url.contains(&setup.user.api_key.key), "{url}");
     // 256 random bits, hex-encoded.
@@ -313,8 +313,8 @@ async fn a_file_name_with_reserved_and_non_ascii_characters_streams() {
     let (_, url) = setup.start(&silence, &setup.kitchen).await;
 
     assert_eq!(
-        path(&url).split('/').nth(3),
-        Some("Folge%203%20%E2%80%93%20%C3%9Cber%20%26%20Co%20%231%20%2850%25%29.wav")
+        stream_path_file(path(&url)),
+        "Folge%203%20%E2%80%93%20%C3%9Cber%20%26%20Co%20%231%20%2850%25%29.wav"
     );
     let fetch = setup.household.fetched(&setup.kitchen).await;
     assert_eq!((fetch.status, &fetch.error), (Some(206), &None));
@@ -415,6 +415,34 @@ async fn a_stream_serves_only_its_handoffs_file() {
             "{path}"
         );
     }
+}
+
+/// A Handoff's stream id and a Local session's don't cross: neither serves the other's file,
+/// and a Handoff's id (which the household's speakers see) names no cover.
+#[tokio::test]
+async fn a_handoffs_stream_and_a_local_sessions_dont_cross() {
+    let setup = setup().await;
+    let (handed_off, local_item) = (setup.episode(0), setup.episode(1));
+    let (_, kitchen) = setup.start(&handed_off, &setup.kitchen).await;
+    let api = setup.bridge.api();
+    let local = api.start_local(&setup.session, &local_item).await;
+    let local_id = stream_path_id(&local.stream);
+    let local_file = stream_path_file(&local.stream);
+    let handoff_file = stream_path_file(path(&kitchen));
+    assert_ne!(local_file, handoff_file);
+    let status = async |path: &str| api.fetch(Method::GET, path, None).await.status();
+
+    for path in [
+        format!("/stream/{local_id}/{handoff_file}"),
+        format!("/stream/{}/{local_file}", stream_id(&kitchen)),
+        format!("/cover/{}", stream_id(&kitchen)),
+    ] {
+        assert_eq!(status(&path).await, StatusCode::NOT_FOUND, "{path}");
+    }
+    assert_eq!(status(path(&kitchen)).await, StatusCode::OK);
+    assert_eq!(status(&local.stream).await, StatusCode::OK);
+    let cover = local.artwork.as_deref().expect("the podcast's cover");
+    assert_eq!(status(cover).await, StatusCode::OK);
 }
 
 #[tokio::test]

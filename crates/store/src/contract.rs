@@ -12,8 +12,8 @@
 use abs::ApiKey;
 
 use crate::{
-    ActiveHandoff, GroupHandoff, Handoff, HandoffFile, LibraryUser, Session, SessionId, Store,
-    StreamId,
+    ActiveHandoff, ActiveLocal, GroupHandoff, Handoff, HandoffFile, LibraryUser, LocalSession,
+    Session, SessionId, Store, StreamId,
 };
 
 /// Empty storage that a store can be opened on, any number of times in turn: what one opened
@@ -59,6 +59,15 @@ macro_rules! store_contract_tests {
             a_groups_handoff_is_the_one_that_replaced_its_old_one,
             a_groups_handoff_ends_with_its_stream_or_its_key,
             a_groups_handoff_outlives_the_session_that_started_it,
+            a_local_session_streams_with_its_sessions_user_and_key,
+            an_unknown_stream_or_session_has_no_local_session,
+            a_local_session_needs_an_open_session,
+            a_new_local_session_replaces_the_sessions_old_one,
+            local_sessions_of_other_sessions_stay_apart,
+            ending_a_local_session_reports_whether_there_was_one,
+            closing_a_session_ends_its_local_session,
+            revoking_a_key_ends_the_local_sessions_acting_with_it,
+            local_sessions_survive_reopening,
         );
     };
     (@tests $backend:expr; $($test:ident),* $(,)?) => {
@@ -656,5 +665,252 @@ pub async fn a_groups_handoff_outlives_the_session_that_started_it(backend: &imp
     assert_eq!(
         on_group(&store, "RINCON_K").await,
         on_stream(stream(1), &kitchen, "alice-key")
+    );
+}
+
+/// A Local session of `episode`, started at `started_at`.
+fn local(episode: &str, started_at: i64) -> LocalSession {
+    LocalSession {
+        library_item: "podcast-id".into(),
+        episode: Some(episode.into()),
+        file: HandoffFile {
+            ino: format!("{episode}-ino"),
+            name: format!("{episode}.mp3"),
+        },
+        started_at,
+    }
+}
+
+async fn start_local(
+    store: &impl Store,
+    session: SessionId,
+    stream: StreamId,
+    local: &LocalSession,
+) {
+    assert!(
+        store
+            .start_local(&session, &stream, local)
+            .await
+            .expect("start local session"),
+        "the session is open"
+    );
+}
+
+async fn local_stream(store: &impl Store, stream: StreamId) -> Option<ActiveLocal> {
+    store
+        .local_stream(&stream)
+        .await
+        .expect("look up a local stream")
+}
+
+async fn session_local(
+    store: &impl Store,
+    session: SessionId,
+    stream: StreamId,
+) -> Option<LocalSession> {
+    store
+        .session_local(&session, &stream)
+        .await
+        .expect("look up a session's local session")
+}
+
+async fn end_local(store: &impl Store, session: SessionId, stream: StreamId) -> bool {
+    store
+        .end_local(&session, &stream)
+        .await
+        .expect("end a local session")
+}
+
+fn playing_for(local: &LocalSession, user: &LibraryUser, api_key: &str) -> Option<ActiveLocal> {
+    Some(ActiveLocal {
+        local: local.clone(),
+        user: user.clone(),
+        api_key: key(api_key),
+    })
+}
+
+pub async fn a_local_session_streams_with_its_sessions_user_and_key(backend: &impl Backend) {
+    let store = backend.open().await;
+    open(&store, session_id(1), &alice(), "alice-key").await;
+    let playing = local("ep-1", 1_000);
+
+    start_local(&store, session_id(1), stream(1), &playing).await;
+
+    assert_eq!(
+        local_stream(&store, stream(1)).await,
+        playing_for(&playing, &alice(), "alice-key")
+    );
+    assert_eq!(
+        session_local(&store, session_id(1), stream(1)).await,
+        Some(playing)
+    );
+    // A Local session is no Handoff, and keeps its session open.
+    assert_eq!(active(&store, stream(1)).await, None);
+    assert_eq!(listed(&store).await, []);
+    assert_eq!(
+        session(&store, session_id(1)).await,
+        acting_as(&alice(), "alice-key")
+    );
+}
+
+pub async fn an_unknown_stream_or_session_has_no_local_session(backend: &impl Backend) {
+    let store = backend.open().await;
+    open(&store, session_id(1), &alice(), "alice-key").await;
+    assert_eq!(local_stream(&store, stream(1)).await, None);
+    assert_eq!(session_local(&store, session_id(1), stream(1)).await, None);
+
+    start_local(&store, session_id(1), stream(1), &local("ep-1", 1_000)).await;
+    assert_eq!(local_stream(&store, stream(2)).await, None);
+    assert_eq!(session_local(&store, session_id(2), stream(1)).await, None);
+    // The session's Local session, named by another stream.
+    assert_eq!(session_local(&store, session_id(1), stream(2)).await, None);
+    // A Handoff's stream is no Local session's.
+    start(
+        &store,
+        stream(3),
+        &handoff("RINCON_K", "ep-1", &alice(), 1_000),
+        "alice-key",
+    )
+    .await;
+    assert_eq!(local_stream(&store, stream(3)).await, None);
+}
+
+pub async fn a_local_session_needs_an_open_session(backend: &impl Backend) {
+    let store = backend.open().await;
+    let started = store
+        .start_local(&session_id(1), &stream(1), &local("ep-1", 1_000))
+        .await
+        .expect("start local session");
+
+    assert!(!started);
+    assert_eq!(local_stream(&store, stream(1)).await, None);
+    assert_eq!(session_local(&store, session_id(1), stream(1)).await, None);
+}
+
+pub async fn a_new_local_session_replaces_the_sessions_old_one(backend: &impl Backend) {
+    let store = backend.open().await;
+    open(&store, session_id(1), &alice(), "alice-key").await;
+    start_local(&store, session_id(1), stream(1), &local("ep-1", 1_000)).await;
+    let second = local("ep-2", 2_000);
+
+    start_local(&store, session_id(1), stream(2), &second).await;
+
+    assert_eq!(local_stream(&store, stream(1)).await, None);
+    assert_eq!(
+        local_stream(&store, stream(2)).await,
+        playing_for(&second, &alice(), "alice-key")
+    );
+    assert_eq!(
+        session_local(&store, session_id(1), stream(2)).await,
+        Some(second.clone())
+    );
+    // A late call naming the replaced one finds nothing, and can't end the new one.
+    assert_eq!(session_local(&store, session_id(1), stream(1)).await, None);
+    assert!(!end_local(&store, session_id(1), stream(1)).await);
+    assert_eq!(
+        local_stream(&store, stream(2)).await,
+        playing_for(&second, &alice(), "alice-key")
+    );
+}
+
+/// Two sessions of one user, with one key, each have their own.
+pub async fn local_sessions_of_other_sessions_stay_apart(backend: &impl Backend) {
+    let store = backend.open().await;
+    open(&store, session_id(1), &alice(), "alice-key").await;
+    open(&store, session_id(2), &alice(), "alice-key").await;
+    let (phone, tablet) = (local("ep-1", 1_000), local("ep-2", 2_000));
+    start_local(&store, session_id(1), stream(1), &phone).await;
+    start_local(&store, session_id(2), stream(2), &tablet).await;
+
+    assert!(end_local(&store, session_id(1), stream(1)).await);
+
+    assert_eq!(local_stream(&store, stream(1)).await, None);
+    assert_eq!(session_local(&store, session_id(1), stream(1)).await, None);
+    assert_eq!(
+        local_stream(&store, stream(2)).await,
+        playing_for(&tablet, &alice(), "alice-key")
+    );
+    assert_eq!(
+        session_local(&store, session_id(2), stream(2)).await,
+        Some(tablet)
+    );
+}
+
+pub async fn ending_a_local_session_reports_whether_there_was_one(backend: &impl Backend) {
+    let store = backend.open().await;
+    open(&store, session_id(1), &alice(), "alice-key").await;
+    assert!(!end_local(&store, session_id(1), stream(1)).await);
+
+    start_local(&store, session_id(1), stream(1), &local("ep-1", 1_000)).await;
+    // Another session's stream, or one that isn't this session's, ends nothing.
+    assert!(!end_local(&store, session_id(2), stream(1)).await);
+    assert!(!end_local(&store, session_id(1), stream(2)).await);
+    assert!(end_local(&store, session_id(1), stream(1)).await);
+    assert!(!end_local(&store, session_id(1), stream(1)).await);
+
+    // The session itself goes on.
+    assert_eq!(
+        session(&store, session_id(1)).await,
+        acting_as(&alice(), "alice-key")
+    );
+}
+
+pub async fn closing_a_session_ends_its_local_session(backend: &impl Backend) {
+    let store = backend.open().await;
+    open(&store, session_id(1), &alice(), "alice-key").await;
+    open(&store, session_id(2), &alice(), "alice-key").await;
+    start_local(&store, session_id(1), stream(1), &local("ep-1", 1_000)).await;
+    let other = local("ep-2", 2_000);
+    start_local(&store, session_id(2), stream(2), &other).await;
+
+    assert!(store.close_session(&session_id(1)).await.expect("close"));
+
+    assert_eq!(local_stream(&store, stream(1)).await, None);
+    assert_eq!(session_local(&store, session_id(1), stream(1)).await, None);
+    assert_eq!(
+        local_stream(&store, stream(2)).await,
+        playing_for(&other, &alice(), "alice-key")
+    );
+}
+
+pub async fn revoking_a_key_ends_the_local_sessions_acting_with_it(backend: &impl Backend) {
+    let store = backend.open().await;
+    open(&store, session_id(1), &alice(), "phone-key").await;
+    open(&store, session_id(2), &alice(), "tablet-key").await;
+    start_local(&store, session_id(1), stream(1), &local("ep-1", 1_000)).await;
+    let tablet = local("ep-2", 2_000);
+    start_local(&store, session_id(2), stream(2), &tablet).await;
+
+    assert!(
+        store
+            .revoke_api_key(&alice(), &key("phone-key"))
+            .await
+            .expect("revoke")
+    );
+
+    assert_eq!(local_stream(&store, stream(1)).await, None);
+    assert_eq!(session_local(&store, session_id(1), stream(1)).await, None);
+    assert_eq!(
+        local_stream(&store, stream(2)).await,
+        playing_for(&tablet, &alice(), "tablet-key")
+    );
+}
+
+pub async fn local_sessions_survive_reopening(backend: &impl Backend) {
+    let playing = local("ep-1", 1_000);
+    {
+        let store = backend.open().await;
+        open(&store, session_id(1), &alice(), "alice-key").await;
+        start_local(&store, session_id(1), stream(1), &playing).await;
+    }
+
+    let store = backend.open().await;
+    assert_eq!(
+        local_stream(&store, stream(1)).await,
+        playing_for(&playing, &alice(), "alice-key")
+    );
+    assert_eq!(
+        session_local(&store, session_id(1), stream(1)).await,
+        Some(playing)
     );
 }

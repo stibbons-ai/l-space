@@ -20,17 +20,27 @@ test-support = { path = "crates/test-support" }
 
 axum = "0.8.9"
 base64 = "0.23.1"
+block2 = "0.6.2"
 bytes = "1.12.1"
 chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 dioxus = { version = "=0.8.0-alpha.3", default-features = false }
 dirs = "7.0.0"
+dispatch2 = "0.3.1"
 fluent-bundle = "0.16.0"
 fluent-syntax = "0.12.0"
 futures = "0.3.34"
 getrandom = "0.4.3"
 hkdf = "0.13.0"
 hmac = { version = "0.13.0", features = ["zeroize"] }
+objc2 = "0.6.5"
+objc2-av-foundation = { version = "0.3.2", features = ["dispatch2", "objc2-core-media"] }
+objc2-avf-audio = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-core-media = "0.3.2"
+objc2-foundation = "0.3.2"
+objc2-media-player = "0.3.2"
+objc2-ui-kit = "0.3.2"
 # Only to enable its `zeroize` feature, which `chacha20poly1305`'s doesn't: the per-call MAC state
 # is wiped when dropped.
 poly1305 = { version = "0.9.1", features = ["zeroize"] }

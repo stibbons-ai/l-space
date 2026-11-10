@@ -11,7 +11,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use api::{
     ApiError, ApiKey, EpisodeFilter, Group, GroupMember, Home, HomeEntry, Item, ItemId, Library,
@@ -20,15 +20,18 @@ use api::{
 };
 use app::flow::{App, Notice, Screen};
 use app::i18n::{self, Language, LanguageChoice, Text};
+use app::local::{LocalPlayer, LocalStatus, Media, PlayerEvent, REPORT_EVERY};
 use app::storage::{DeviceStore, FileStore, LoadError, Stored, StoredSession};
+use clock::{Clock, ManualClock};
 use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
 use tempfile::TempDir;
 use test_support::audiobookshelf::{AbsUser, Audiobookshelf, EPISODE_PUBLISHED_AT};
 use test_support::bridge::{
-    TestBridge, home_episode, home_long_book, home_with_sonos_toml, library_server_toml,
+    TestBridge, acting_on, home_episode, home_long_book, home_with_sonos_toml, library_server_toml,
     named_library_server_toml,
 };
 use test_support::closed_port;
+use tokio::sync::mpsc;
 
 /// The seeded audiobook Library.
 fn audiobooks(abs: &Audiobookshelf) -> Library {
@@ -4101,5 +4104,1454 @@ fn a_session_ended_elsewhere_leads_from_a_group_control_to_login() {
             app.screen()
         );
         assert_eq!(household.transport_state(&kitchen), "PLAYING");
+    });
+}
+
+/// A [`LocalPlayer`] standing in for AVPlayer: what it was asked, and a position that moves on
+/// the test's manual clock while it plays. As AVPlayer's periodic observer does, it tells its
+/// position in whole seconds; a pause answers it exactly.
+#[derive(Debug)]
+struct FakePlayer {
+    clock: ManualClock,
+    state: Mutex<FakeState>,
+}
+
+#[derive(Debug, Default)]
+struct FakeState {
+    media: Option<Media>,
+    playing: bool,
+    /// Where it was when it last started playing, paused, or was moved.
+    at: f64,
+    /// When that was.
+    since: Option<Instant>,
+}
+
+impl FakePlayer {
+    fn new(clock: &ManualClock) -> Arc<Self> {
+        Arc::new(Self {
+            clock: clock.clone(),
+            state: Mutex::default(),
+        })
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What it plays.
+    fn media(&self) -> Option<Media> {
+        self.state().media.clone()
+    }
+
+    fn playing(&self) -> bool {
+        self.state().playing
+    }
+
+    /// Where it is, exactly.
+    fn exact(&self) -> f64 {
+        let state = self.state();
+        match (state.playing, state.since) {
+            (true, Some(since)) => state.at + (self.clock.now() - since).as_secs_f64(),
+            _ => state.at,
+        }
+    }
+
+    /// Moves it to `at` now, playing or not.
+    fn set(&self, playing: bool, at: f64) {
+        let now = self.clock.now();
+        let mut state = self.state();
+        state.playing = playing;
+        state.at = at;
+        state.since = Some(now);
+    }
+}
+
+impl LocalPlayer for FakePlayer {
+    fn load(&self, media: &Media) {
+        self.set(true, media.start_at);
+        self.state().media = Some(media.clone());
+    }
+
+    fn play(&self) {
+        self.set(true, self.exact());
+    }
+
+    fn pause(&self) -> f64 {
+        let at = self.exact();
+        self.set(false, at);
+        at
+    }
+
+    fn seek(&self, position: f64) {
+        let playing = self.playing();
+        self.set(playing, position);
+    }
+
+    fn unload(&self) {
+        *self.state() = FakeState::default();
+    }
+
+    fn position(&self) -> f64 {
+        self.exact().floor()
+    }
+}
+
+/// An App with Local playback through a fake player: the player, and where its events go.
+struct Phone {
+    app: App,
+    player: Arc<FakePlayer>,
+    events: mpsc::UnboundedSender<PlayerEvent>,
+}
+
+impl Device {
+    /// Launches the App on this device with a [`FakePlayer`] on `clock`, as [`Device::launch`]
+    /// does without one.
+    async fn launch_playing(&self, clock: &ManualClock) -> Phone {
+        dioxus::fullstack::set_server_url("");
+        dioxus::fullstack::clear_request_headers();
+        let player = FakePlayer::new(clock);
+        let (events, received) = mpsc::unbounded_channel();
+        let mut app = App::open(Arc::new(self.clone()), Some(self.locale)).with_local_player(
+            Arc::clone(&player) as Arc<dyn LocalPlayer>,
+            received,
+            Arc::new(clock.clone()),
+        );
+        app.start().await;
+        Phone {
+            app,
+            player,
+            events,
+        }
+    }
+}
+
+/// Launches the App with a fake player on `clock`, enters `bridge`'s URL, logs in as `user` on
+/// the Library Server at `library_server`, and opens episode `n` of the seeded podcast.
+async fn on_episode_with_player(
+    device: &Device,
+    bridge: &TestBridge,
+    library_server: &str,
+    user: &AbsUser,
+    clock: &ManualClock,
+    abs: &Audiobookshelf,
+    n: usize,
+) -> Phone {
+    let mut phone = device.launch_playing(clock).await;
+    phone.app.submit_bridge_url(bridge.url()).await;
+    phone
+        .app
+        .log_in(library_server, ApiKey::new(&user.api_key.key))
+        .await;
+    open_episode(&mut phone.app, abs, n).await;
+    phone
+}
+
+/// Waits up to ten seconds for `user`'s Progress in `item` to be `expected`.
+async fn progress_becomes(
+    abs: &Audiobookshelf,
+    user: &AbsUser,
+    item: &ItemId,
+    expected: (f64, bool),
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let progress = abs.item_progress(user, item).await;
+        if progress == Some(expected) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Progress {progress:?}, not {expected:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits up to ten seconds for `done`.
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// How long a step that sends nothing is given to send something all the same, before a test
+/// takes it that nothing was sent.
+const QUIET: Duration = Duration::from_millis(300);
+
+/// The Progress writes `log`, a proxy's in front of the Library Server, saw after [`QUIET`].
+async fn progress_writes(log: &ProxyLog) -> usize {
+    tokio::time::sleep(QUIET).await;
+    requests(log, "PATCH /api/me/progress/")
+}
+
+/// A Bridge whose Library Server "Home" is the shared Audiobookshelf behind a proxy that logs
+/// every request.
+fn bridge_behind_logging_proxy() -> (TestBridge, Arc<Audiobookshelf>, String, ProxyLog) {
+    let abs = Audiobookshelf::shared();
+    let (proxy, log) = proxy(abs.address(), |_, _| false);
+    let bridge = TestBridge::start(&named_library_server_toml(&proxy, "Home"));
+    (bridge, abs, proxy, log)
+}
+
+/// The HTTP status of a `GET` of `url`, a full URL on `bridge`.
+async fn status_of(bridge: &TestBridge, url: &str) -> u16 {
+    let path = url.strip_prefix(bridge.url()).expect("a URL on the Bridge");
+    bridge
+        .api()
+        .fetch(reqwest::Method::GET, path, None)
+        .await
+        .status()
+        .as_u16()
+}
+
+#[test]
+fn playing_on_the_phone_starts_at_the_progress_from_the_bridges_stream() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        abs.set_progress(
+            &user,
+            &episode.library_item,
+            episode.episode.as_deref(),
+            123.0,
+            false,
+        )
+        .await;
+        let Phone {
+            mut app, player, ..
+        } = on_episode_with_player(&device, &bridge, abs.base_url(), &user, &clock, &abs, 1).await;
+        assert!(app.can_play_on_phone());
+        assert_eq!(app.local_status(), None);
+
+        app.play_on_phone().await;
+
+        assert_eq!(app.screen(), &Screen::NowPlaying { notice: None });
+        let media = player.media().expect("the player was loaded");
+        // The stream and cover on the App's own Bridge URL, whatever address the Bridge has.
+        assert!(
+            media.url.starts_with(&format!("{}/stream/", bridge.url())),
+            "{}",
+            media.url
+        );
+        assert!(media.url.ends_with("/Episode%202.wav"), "{}", media.url);
+        let artwork = media.artwork_url.clone().expect("the podcast's cover");
+        assert!(
+            artwork.starts_with(&format!("{}/cover/", bridge.url())),
+            "{artwork}"
+        );
+        assert_eq!(
+            (
+                media.start_at,
+                media.title.as_str(),
+                media.artist.as_deref(),
+                media.duration
+            ),
+            (123.0, "Episode 2", Some("The Clacks Hour"), Some(900.0))
+        );
+        // Neither URL shows in the App's debug output.
+        let shown = format!("{media:?} {:?}", app.local_status());
+        assert!(
+            !shown.contains("/stream/") && !shown.contains("/cover/"),
+            "{shown}"
+        );
+        assert!(player.playing());
+        assert_eq!(status_of(&bridge, &media.url).await, 200);
+        assert_eq!(status_of(&bridge, &artwork).await, 200);
+        assert_eq!(
+            app.local_status(),
+            Some(LocalStatus {
+                item: episode.clone(),
+                title: "Episode 2".into(),
+                artist: Some("The Clacks Hour".into()),
+                artwork_url: Some(artwork),
+                duration: Some(900.0),
+                position: 123.0,
+                playing: true,
+                report_failed: None,
+            })
+        );
+
+        // Leaving Now playing keeps it playing, and it can be opened again.
+        app.go_back();
+        assert!(
+            matches!(app.screen(), Screen::Item { .. }),
+            "{:?}",
+            app.screen()
+        );
+        assert!(player.playing());
+        app.open_libraries().await;
+        app.open_now_playing();
+        assert_eq!(app.screen(), &Screen::NowPlaying { notice: None });
+        app.go_back();
+
+        // A Finished episode starts from the beginning; the one playing ends first, its
+        // position written.
+        let finished = abs.seeded().episode(0);
+        abs.set_progress(
+            &user,
+            &finished.library_item,
+            finished.episode.as_deref(),
+            590.0,
+            true,
+        )
+        .await;
+        clock.advance(Duration::from_secs(4));
+        open_episode(&mut app, &abs, 0).await;
+        app.play_on_phone().await;
+        let replaced = media;
+        let media = player.media().expect("the player was loaded");
+        assert_eq!((media.title.as_str(), media.start_at), ("Episode 1", 0.0));
+        assert_eq!(
+            abs.item_progress(&user, &episode).await,
+            Some((127.0, false))
+        );
+        assert_eq!(status_of(&bridge, &replaced.url).await, 404);
+
+        // An App without a player of its own offers no Local playback.
+        let mut elsewhere = logged_in(&Device::new(), &bridge, &abs, &user).await;
+        open_episode(&mut elsewhere, &abs, 1).await;
+        assert!(!elsewhere.can_play_on_phone());
+        elsewhere.play_on_phone().await;
+        assert!(matches!(
+            elsewhere.screen(),
+            Screen::Item { notice: None, .. }
+        ));
+    });
+}
+
+/// Every 30 seconds of playing (not a second before), and at once on pause, skip and stop,
+/// each at the exact position; nothing while paused; the timer starts over after a skip.
+#[test]
+fn local_playback_reports_every_30_seconds_and_at_once_on_pause_skip_and_stop() {
+    let (bridge, abs, proxy, log) = bridge_behind_logging_proxy();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(2);
+        let Phone {
+            mut app, player, ..
+        } = on_episode_with_player(&device, &bridge, &proxy, &user, &clock, &abs, 2).await;
+        app.play_on_phone().await;
+        let stream = player.media().unwrap().url;
+        let writes = progress_writes(&log).await;
+
+        clock.advance(Duration::from_secs(29));
+        assert_eq!(progress_writes(&log).await, writes);
+        clock.advance(Duration::from_secs(1));
+        progress_becomes(&abs, &user, &episode, (30.0, false)).await;
+
+        // Where the pause stopped it, to the fraction.
+        clock.advance(Duration::from_millis(10_500));
+        app.toggle_local().await;
+        assert!(!player.playing());
+        assert!(app.local_status().is_some_and(|status| !status.playing));
+        progress_becomes(&abs, &user, &episode, (40.5, false)).await;
+
+        // Paused: no reports, and playing on reports nothing either.
+        let writes = progress_writes(&log).await;
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(progress_writes(&log).await, writes);
+        app.toggle_local().await;
+        assert!(player.playing());
+        assert_eq!(progress_writes(&log).await, writes);
+
+        clock.advance(Duration::from_millis(4_500));
+        app.skip_local(Skip::Forward30).await;
+        progress_becomes(&abs, &user, &episode, (75.0, false)).await;
+        app.skip_local(Skip::Back15).await;
+        progress_becomes(&abs, &user, &episode, (60.0, false)).await;
+
+        // The timer starts over from the skip.
+        let writes = progress_writes(&log).await;
+        clock.advance(Duration::from_secs(29));
+        assert_eq!(progress_writes(&log).await, writes);
+        clock.advance(Duration::from_secs(1));
+        progress_becomes(&abs, &user, &episode, (90.0, false)).await;
+
+        clock.advance(Duration::from_millis(7_250));
+        app.stop_local().await;
+        assert_eq!(
+            abs.item_progress(&user, &episode).await,
+            Some((97.25, false))
+        );
+        assert!(
+            matches!(app.screen(), Screen::Item { notice: None, .. }),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(app.local_status(), None);
+        assert_eq!(player.media(), None);
+        assert_eq!(status_of(&bridge, &stream).await, 404);
+        app.open_now_playing();
+        assert!(matches!(app.screen(), Screen::Item { .. }));
+    });
+}
+
+/// A proxy in front of `abs` that holds every Progress write while the flag it returns is set,
+/// and its log.
+fn progress_stalling_proxy(abs: &Audiobookshelf) -> (String, ProxyLog, Arc<AtomicBool>) {
+    let stall = Arc::new(AtomicBool::new(false));
+    let stalled = Arc::clone(&stall);
+    let (proxy, log) = proxy_answering(abs.address(), move |_, request| {
+        if request.starts_with(b"PATCH /api/me/progress/") {
+            while stalled.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        None
+    });
+    (proxy, log, stall)
+}
+
+/// Lets what `stall` holds go after [`QUIET`], while the step it holds back waits.
+async fn release_after_quiet(stall: &AtomicBool) {
+    tokio::time::sleep(QUIET).await;
+    stall.store(false, Ordering::SeqCst);
+}
+
+/// Holds the next Progress write behind `stall`, and has the timer report: once it reached the
+/// Library Server, it's in flight.
+async fn report_held(stall: &AtomicBool, log: &ProxyLog, clock: &ManualClock) {
+    let before = requests(log, "PATCH /api/me/progress/");
+    stall.store(true, Ordering::SeqCst);
+    clock.advance(REPORT_EVERY);
+    eventually("the report reached the Library Server", || {
+        requests(log, "PATCH /api/me/progress/") == before + 1
+    })
+    .await;
+}
+
+/// While the Bridge takes its time over a report (its Library Server hangs), the player still
+/// does at once what the lock screen and the buttons ask.
+#[test]
+fn a_slow_report_holds_back_no_player_action() {
+    let abs = Audiobookshelf::shared();
+    let (proxy, log, stall) = progress_stalling_proxy(&abs);
+    let bridge = TestBridge::start(&named_library_server_toml(&proxy, "Home"));
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        let Phone {
+            mut app,
+            player,
+            events,
+        } = on_episode_with_player(&device, &bridge, &proxy, &user, &clock, &abs, 1).await;
+        app.play_on_phone().await;
+        report_held(&stall, &log, &clock).await;
+
+        let asked = std::time::Instant::now();
+        events.send(PlayerEvent::Pause).unwrap();
+        eventually("paused", || !player.playing()).await;
+        within(Duration::from_secs(1), app.toggle_local()).await;
+        assert!(player.playing());
+        within(Duration::from_secs(1), app.skip_local(Skip::Forward30)).await;
+        assert!(
+            asked.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            asked.elapsed()
+        );
+
+        // Once the Library Server answers again, the newest position lands; the pause's, given
+        // way to the skip's, is never sent.
+        stall.store(false, Ordering::SeqCst);
+        progress_becomes(&abs, &user, &episode, (60.0, false)).await;
+        assert_eq!(progress_writes(&log).await, 2);
+    });
+}
+
+/// Stop while a report is on its way: the end goes after it, so the Stop's position is what
+/// stays.
+#[test]
+fn a_stop_behind_a_slow_report_writes_where_it_stopped_last() {
+    let abs = Audiobookshelf::shared();
+    let (proxy, log, stall) = progress_stalling_proxy(&abs);
+    let bridge = TestBridge::start(&named_library_server_toml(&proxy, "Home"));
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        let Phone { mut app, .. } =
+            on_episode_with_player(&device, &bridge, &proxy, &user, &clock, &abs, 1).await;
+        app.play_on_phone().await;
+        report_held(&stall, &log, &clock).await;
+
+        clock.advance(Duration::from_secs(5));
+        tokio::join!(app.stop_local(), release_after_quiet(&stall));
+
+        assert_eq!(
+            abs.item_progress(&user, &episode).await,
+            Some((35.0, false))
+        );
+        assert_eq!(progress_writes(&log).await, 2);
+        assert!(
+            matches!(app.screen(), Screen::Item { notice: None, .. }),
+            "{:?}",
+            app.screen()
+        );
+    });
+}
+
+/// The Item ends while a report is on its way, and the person plays another at once: the end
+/// reaches the Bridge first, writing the end, and the new Item plays without a word about it.
+#[test]
+fn an_end_on_its_way_lands_before_the_next_item_starts() {
+    let abs = Audiobookshelf::shared();
+    let (proxy, log, stall) = progress_stalling_proxy(&abs);
+    let bridge = TestBridge::start(&named_library_server_toml(&proxy, "Home"));
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        let Phone {
+            mut app,
+            player,
+            events,
+        } = on_episode_with_player(&device, &bridge, &proxy, &user, &clock, &abs, 1).await;
+        app.play_on_phone().await;
+        report_held(&stall, &log, &clock).await;
+        events.send(PlayerEvent::Ended).unwrap();
+        eventually("Local playback ended", || app.local_status().is_none()).await;
+
+        app.go_back();
+        open_episode(&mut app, &abs, 0).await;
+        tokio::join!(app.play_on_phone(), release_after_quiet(&stall));
+
+        progress_becomes(&abs, &user, &episode, (900.0, true)).await;
+        assert_eq!(app.screen(), &Screen::NowPlaying { notice: None });
+        assert_eq!(
+            player.media().map(|media| media.title),
+            Some("Episode 1".into())
+        );
+        tokio::time::sleep(QUIET).await;
+        assert!(!app.local_halted());
+        assert!(player.playing());
+    });
+}
+
+/// The last write of the Item playing fails as the next one starts: the new Now playing says
+/// so, as being about the Item before, until a report of the new one fails, which says why
+/// instead. Should the start fail too, why nothing plays is what the Item screen says.
+#[test]
+fn a_failed_stop_of_the_item_before_shows_on_the_next_now_playing() {
+    let abs = Audiobookshelf::shared();
+    let (fail_writes, fail_items) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (proxy, _) = proxy(abs.address(), {
+        let (fail_writes, fail_items) = (Arc::clone(&fail_writes), Arc::clone(&fail_items));
+        move |_, request| {
+            (fail_writes.load(Ordering::SeqCst) && request.starts_with(b"PATCH /api/me/progress/"))
+                || (fail_items.load(Ordering::SeqCst) && request.starts_with(b"GET /api/items/"))
+        }
+    });
+    let bridge = TestBridge::start(&named_library_server_toml(&proxy, "Home"));
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let Phone {
+            mut app, player, ..
+        } = on_episode_with_player(&device, &bridge, &proxy, &user, &clock, &abs, 1).await;
+        app.play_on_phone().await;
+        clock.advance(Duration::from_secs(8));
+
+        fail_writes.store(true, Ordering::SeqCst);
+        app.go_back();
+        open_episode(&mut app, &abs, 0).await;
+        app.play_on_phone().await;
+
+        assert_eq!(
+            app.screen(),
+            &Screen::NowPlaying {
+                notice: Some(Notice::LocalEndNotSaved(ApiError::LibraryServerUnreachable))
+            }
+        );
+        assert_eq!(
+            notice_texts(&mut app).await,
+            (
+                "Ook couldn't save where the episode or audiobook before this one stopped. \
+                 Clacks can't reach this Library Server right now. Please try again later."
+                    .to_owned(),
+                "Ook konnte nicht speichern, wo die Folge oder das Hörbuch davor aufgehört hat. \
+                 Clacks erreicht diesen Library Server gerade nicht. Bitte versuche es später \
+                 noch einmal."
+                    .to_owned(),
+            )
+        );
+        assert_eq!(
+            player.media().map(|media| media.title),
+            Some("Episode 1".into())
+        );
+        assert!(player.playing());
+        assert_eq!(
+            abs.item_progress(&user, &abs.seeded().episode(1)).await,
+            None
+        );
+
+        // A report of the Item playing that fails says why over the Item before's.
+        assert_eq!(
+            app.now_playing_notice(),
+            Some(Notice::LocalEndNotSaved(ApiError::LibraryServerUnreachable))
+        );
+        clock.advance(Duration::from_secs(30));
+        eventually("the failed report shows over the Item before's", || {
+            app.now_playing_notice() == Some(Notice::Api(ApiError::LibraryServerUnreachable))
+        })
+        .await;
+
+        // The stop fails, and so does the next start.
+        app.go_back();
+        open_episode(&mut app, &abs, 1).await;
+        fail_items.store(true, Ordering::SeqCst);
+        app.play_on_phone().await;
+
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Item {
+                    notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(player.media(), None);
+        assert_eq!(app.local_status(), None);
+    });
+}
+
+/// The Item plays to its end, but its last write fails: the App says so, on the screen shown
+/// (Now playing) when the UI asks; or, when another Item is played before it asked, on that
+/// one's Now playing, as being about the Item before.
+#[test]
+fn a_failed_write_at_the_end_of_the_item_is_said() {
+    let (bridge, abs, proxy, failing) = bridge_behind_proxy();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let Phone {
+            mut app,
+            player,
+            events,
+        } = on_episode_with_player(&device, &bridge, &proxy, &user, &clock, &abs, 1).await;
+        *failing.lock().unwrap() = Some("PATCH /api/me/progress/");
+
+        app.play_on_phone().await;
+        events.send(PlayerEvent::Ended).unwrap();
+        eventually("the end failed", || app.local_halted()).await;
+        app.show_local_halted().await;
+        assert_eq!(
+            app.screen(),
+            &Screen::NowPlaying {
+                notice: Some(Notice::Api(ApiError::LibraryServerUnreachable))
+            }
+        );
+
+        // Played again to its end; the next Item plays before the UI asks.
+        app.go_back();
+        app.play_on_phone().await;
+        events.send(PlayerEvent::Ended).unwrap();
+        eventually("Local playback ended", || app.local_status().is_none()).await;
+        app.go_back();
+        open_episode(&mut app, &abs, 0).await;
+        app.play_on_phone().await;
+
+        assert_eq!(
+            app.screen(),
+            &Screen::NowPlaying {
+                notice: Some(Notice::LocalEndNotSaved(ApiError::LibraryServerUnreachable))
+            }
+        );
+        assert_eq!(
+            player.media().map(|media| media.title),
+            Some("Episode 1".into())
+        );
+        assert!(!app.local_halted());
+        assert_eq!(
+            abs.item_progress(&user, &abs.seeded().episode(1)).await,
+            None
+        );
+    });
+}
+
+/// The Item's end, or the player failing, finds the key rejected: that ends the session
+/// (Login), more than anything else does; playing another Item first starts nothing.
+#[test]
+fn a_rejected_key_at_an_end_nobody_waits_for_leads_to_login() {
+    let (bridge, abs, _) = bridge_with_abs();
+    // Between the App and the Bridge, to see what the App asks.
+    let bridge_address = bridge.url().strip_prefix("http://").unwrap();
+    let (front, log) = proxy(bridge_address, |_, _| false);
+    let clock = ManualClock::new();
+    run(async || {
+        for event in [PlayerEvent::Ended, PlayerEvent::Failed] {
+            let user = abs.new_user().await;
+            let Phone {
+                mut app,
+                player,
+                events,
+            } = Device::new().launch_playing(&clock).await;
+            app.submit_bridge_url(&front).await;
+            app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
+                .await;
+            open_episode(&mut app, &abs, 1).await;
+            app.play_on_phone().await;
+            // The stream and cover on the App's own Bridge URL, the front's, not the Bridge's.
+            let media = player.media().expect("the player was loaded");
+            assert!(
+                media.url.starts_with(&format!("{front}/stream/")),
+                "{}",
+                media.url
+            );
+            let artwork = media.artwork_url.expect("the podcast's cover");
+            assert!(artwork.starts_with(&format!("{front}/cover/")), "{artwork}");
+            let starts = requests(&log, "POST /api/local/start ");
+            abs.delete_api_key(&user.api_key).await;
+            match event {
+                // On the Item screen, playing it again right after the end.
+                PlayerEvent::Ended => {
+                    app.go_back();
+                    events.send(event).unwrap();
+                    eventually("Local playback ended", || app.local_status().is_none()).await;
+                    app.play_on_phone().await;
+                }
+                // On Now playing, the UI asking once the end's answer came back.
+                _ => {
+                    events.send(event).unwrap();
+                    eventually("the end's answer ended the session", || {
+                        app.local_halt_ends_session()
+                    })
+                    .await;
+                    app.show_local_halted().await;
+                }
+            }
+
+            assert!(
+                matches!(
+                    app.screen(),
+                    Screen::Login {
+                        notice: Some(Notice::Api(ApiError::ApiKeyRejected)),
+                        ..
+                    }
+                ),
+                "{event:?}: {:?}",
+                app.screen()
+            );
+            assert!(app.session().is_none(), "{event:?}");
+            assert_eq!(
+                requests(&log, "POST /api/local/start "),
+                starts,
+                "{event:?}"
+            );
+            assert_eq!(player.media(), None, "{event:?}");
+        }
+    });
+}
+
+/// A report the Bridge answers only after Stop, finding the Local session gone (another start
+/// in the same session replaced it meanwhile), adds nothing to what the Stop's own answer said.
+#[test]
+fn a_report_answered_after_stop_changes_nothing() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let stall = Arc::new(AtomicBool::new(false));
+    let stalled = Arc::clone(&stall);
+    // Between the App and the Bridge: holds the App's reports.
+    let bridge_address = bridge.url().strip_prefix("http://").unwrap();
+    let (front, log) = proxy_answering(bridge_address, move |_, request| {
+        if request.starts_with(b"POST /api/local/report ") {
+            while stalled.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        None
+    });
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let Phone {
+            mut app, player, ..
+        } = device.launch_playing(&clock).await;
+        app.submit_bridge_url(&front).await;
+        app.log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
+            .await;
+        open_episode(&mut app, &abs, 1).await;
+        app.play_on_phone().await;
+        stall.store(true, Ordering::SeqCst);
+        clock.advance(REPORT_EVERY);
+        eventually("the report is on its way", || {
+            requests(&log, "POST /api/local/report ") == 1
+        })
+        .await;
+        bridge
+            .api()
+            .start_local(&session(&app), &abs.seeded().episode(0))
+            .await;
+
+        clock.advance(Duration::from_secs(5));
+        tokio::join!(app.stop_local(), release_after_quiet(&stall));
+
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Item {
+                    notice: Some(Notice::Api(ApiError::NoLocalSession)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(player.media(), None);
+        tokio::time::sleep(QUIET).await;
+        assert!(!app.local_halted());
+    });
+}
+
+#[test]
+fn remote_commands_interruptions_and_the_end_act_like_the_buttons() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(0);
+        let Phone {
+            mut app,
+            player,
+            events,
+        } = on_episode_with_player(&device, &bridge, abs.base_url(), &user, &clock, &abs, 0).await;
+        app.play_on_phone().await;
+        let stream = player.media().unwrap().url;
+        let playing = || player.playing();
+
+        clock.advance(Duration::from_secs(12));
+        events.send(PlayerEvent::Pause).unwrap();
+        progress_becomes(&abs, &user, &episode, (12.0, false)).await;
+        assert!(!playing());
+        events.send(PlayerEvent::Play).unwrap();
+        eventually("playing again", playing).await;
+
+        clock.advance(Duration::from_secs(20));
+        events.send(PlayerEvent::Skip(Skip::Back15)).unwrap();
+        progress_becomes(&abs, &user, &episode, (17.0, false)).await;
+        events.send(PlayerEvent::Skip(Skip::Forward30)).unwrap();
+        progress_becomes(&abs, &user, &episode, (47.0, false)).await;
+
+        // A call pauses, writing where; its end resumes when iOS says so, and only then.
+        clock.advance(Duration::from_secs(3));
+        events.send(PlayerEvent::InterruptionBegan).unwrap();
+        progress_becomes(&abs, &user, &episode, (50.0, false)).await;
+        assert!(!playing());
+        events
+            .send(PlayerEvent::InterruptionEnded { resume: false })
+            .unwrap();
+        tokio::time::sleep(QUIET).await;
+        assert!(!playing());
+        events.send(PlayerEvent::Play).unwrap();
+        eventually("playing by hand", playing).await;
+        events.send(PlayerEvent::InterruptionBegan).unwrap();
+        eventually("paused by the call", || !playing()).await;
+        events
+            .send(PlayerEvent::InterruptionEnded { resume: true })
+            .unwrap();
+        eventually("resumed after the call", playing).await;
+
+        events.send(PlayerEvent::Toggle).unwrap();
+        eventually("paused by the toggle", || !playing()).await;
+        events.send(PlayerEvent::Toggle).unwrap();
+        eventually("playing by the toggle", playing).await;
+        // Paused by hand, an interruption's end doesn't resume.
+        events.send(PlayerEvent::Pause).unwrap();
+        events.send(PlayerEvent::InterruptionBegan).unwrap();
+        events
+            .send(PlayerEvent::InterruptionEnded { resume: true })
+            .unwrap();
+        events.send(PlayerEvent::Skip(Skip::Back15)).unwrap();
+        progress_becomes(&abs, &user, &episode, (35.0, false)).await;
+        assert!(!playing());
+        // Nor after the person played and paused during the interruption.
+        events.send(PlayerEvent::Play).unwrap();
+        events.send(PlayerEvent::InterruptionBegan).unwrap();
+        events.send(PlayerEvent::Play).unwrap();
+        events.send(PlayerEvent::Pause).unwrap();
+        events
+            .send(PlayerEvent::InterruptionEnded { resume: true })
+            .unwrap();
+        events.send(PlayerEvent::Skip(Skip::Back15)).unwrap();
+        progress_becomes(&abs, &user, &episode, (20.0, false)).await;
+        assert!(!playing());
+
+        // The end writes the end, which the Library Server takes as Finished, and the Local
+        // session ends, with nothing to tell.
+        events.send(PlayerEvent::Ended).unwrap();
+        progress_becomes(&abs, &user, &episode, (600.0, true)).await;
+        eventually("Local playback ended", || app.local_status().is_none()).await;
+        assert_eq!(player.media(), None);
+        assert_eq!(status_of(&bridge, &stream).await, 404);
+        assert!(!app.local_halted());
+        app.toggle_local().await;
+        assert_eq!(app.screen(), &Screen::NowPlaying { notice: None });
+    });
+}
+
+#[test]
+fn a_failed_report_keeps_playing_and_says_why() {
+    let (bridge, abs, proxy, failing) = bridge_behind_proxy();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        let Phone {
+            mut app, player, ..
+        } = on_episode_with_player(&device, &bridge, &proxy, &user, &clock, &abs, 1).await;
+        app.play_on_phone().await;
+
+        *failing.lock().unwrap() = Some("PATCH /api/me/progress/");
+        clock.advance(Duration::from_secs(30));
+        let failed = || {
+            app.local_status().is_some_and(|status| {
+                status.report_failed == Some(ApiError::LibraryServerUnreachable)
+            })
+        };
+        eventually("the failed report is shown", failed).await;
+        assert!(player.playing());
+        assert_eq!(abs.item_progress(&user, &episode).await, None);
+
+        *failing.lock().unwrap() = None;
+        clock.advance(Duration::from_secs(5));
+        app.toggle_local().await;
+        progress_becomes(&abs, &user, &episode, (35.0, false)).await;
+        eventually("the failure is gone once a report lands", || {
+            app.local_status()
+                .is_some_and(|status| status.report_failed.is_none())
+        })
+        .await;
+        assert!(!app.local_halted());
+    });
+}
+
+/// A report the Bridge answers with the Local session gone stops playback here, and the App
+/// says why: on Now playing for `no_local_session`; at Login, the session forgotten, for
+/// `session_invalid` and `api_key_rejected`. Whichever reported it: the timer, the lock
+/// screen, a button.
+#[test]
+fn a_report_finding_the_local_session_gone_stops_playback_and_says_why() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let clock = ManualClock::new();
+    run(async || {
+        for gone in [
+            ApiError::NoLocalSession,
+            ApiError::SessionInvalid,
+            ApiError::ApiKeyRejected,
+        ] {
+            let user = abs.new_user().await;
+            let Phone {
+                mut app,
+                player,
+                events,
+            } = on_episode_with_player(
+                &Device::new(),
+                &bridge,
+                abs.base_url(),
+                &user,
+                &clock,
+                &abs,
+                1,
+            )
+            .await;
+            app.play_on_phone().await;
+            let stream = player.media().unwrap().url;
+            let held = session(&app);
+            match gone {
+                // Another start in the same session replaces it; the timer reports.
+                ApiError::NoLocalSession => {
+                    bridge
+                        .api()
+                        .start_local(&held, &abs.seeded().episode(0))
+                        .await;
+                    clock.advance(Duration::from_secs(30));
+                }
+                // Logged out elsewhere; the lock screen pauses.
+                ApiError::SessionInvalid => {
+                    bridge.api().logout(&held).await;
+                    clock.advance(Duration::from_secs(3));
+                    events.send(PlayerEvent::Pause).unwrap();
+                }
+                // The key deleted; a button skips.
+                _ => {
+                    abs.delete_api_key(&user.api_key).await;
+                    app.skip_local(Skip::Forward30).await;
+                }
+            }
+
+            eventually("Local playback stopped", || app.local_halted()).await;
+            assert_eq!(player.media(), None, "{gone}");
+            assert_eq!(app.local_status(), None, "{gone}");
+            assert_eq!(status_of(&bridge, &stream).await, 404, "{gone}");
+            app.show_local_halted().await;
+            assert!(!app.local_halted());
+            match gone {
+                ApiError::NoLocalSession => {
+                    assert_eq!(
+                        app.screen(),
+                        &Screen::NowPlaying {
+                            notice: Some(Notice::Api(gone))
+                        }
+                    );
+                    assert!(app.session().is_some());
+                }
+                gone => {
+                    assert!(
+                        matches!(
+                            app.screen(),
+                            Screen::Login { notice: Some(Notice::Api(shown)), .. } if *shown == gone
+                        ),
+                        "{:?}",
+                        app.screen()
+                    );
+                    assert!(app.session().is_none(), "{gone}");
+                }
+            }
+        }
+    });
+}
+
+/// The player failing writes where it was, ends the Local session, and says so.
+#[test]
+fn a_failing_player_ends_local_playback_and_says_why() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        let Phone {
+            mut app,
+            player,
+            events,
+        } = on_episode_with_player(&device, &bridge, abs.base_url(), &user, &clock, &abs, 1).await;
+        app.play_on_phone().await;
+        let stream = player.media().unwrap().url;
+
+        clock.advance(Duration::from_secs(14));
+        events.send(PlayerEvent::Failed).unwrap();
+
+        progress_becomes(&abs, &user, &episode, (14.0, false)).await;
+        eventually("Local playback stopped", || app.local_halted()).await;
+        assert_eq!(player.media(), None);
+        assert_eq!(app.local_status(), None);
+        assert_eq!(status_of(&bridge, &stream).await, 404);
+        app.show_local_halted().await;
+        assert_eq!(
+            app.screen(),
+            &Screen::NowPlaying {
+                notice: Some(Notice::LocalPlayerFailed)
+            }
+        );
+    });
+}
+
+/// A player failure the App hasn't said yet isn't said on the next Item's Now playing: the
+/// Item it was about no longer plays.
+#[test]
+fn a_player_failure_not_yet_shown_isnt_said_on_the_next_item() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let Phone {
+            mut app,
+            player,
+            events,
+        } = on_episode_with_player(&device, &bridge, abs.base_url(), &user, &clock, &abs, 1).await;
+        app.play_on_phone().await;
+        events.send(PlayerEvent::Failed).unwrap();
+        eventually("Local playback stopped", || app.local_halted()).await;
+
+        app.go_back();
+        open_episode(&mut app, &abs, 0).await;
+        app.play_on_phone().await;
+
+        assert_eq!(app.screen(), &Screen::NowPlaying { notice: None });
+        assert!(!app.local_halted());
+        assert_eq!(
+            player.media().map(|media| media.title),
+            Some("Episode 1".into())
+        );
+    });
+}
+
+/// Stop with a Library Server that fails the last write still stops: back to the Item, the
+/// failure shown, the player and the stream done.
+#[test]
+fn a_stop_whose_write_fails_still_stops_and_says_why() {
+    let (bridge, abs, proxy, failing) = bridge_behind_proxy();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        let Phone {
+            mut app, player, ..
+        } = on_episode_with_player(&device, &bridge, &proxy, &user, &clock, &abs, 1).await;
+        app.play_on_phone().await;
+        let stream = player.media().unwrap().url;
+
+        *failing.lock().unwrap() = Some("PATCH /api/me/progress/");
+        clock.advance(Duration::from_secs(8));
+        app.stop_local().await;
+
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Item {
+                    notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(player.media(), None);
+        assert_eq!(app.local_status(), None);
+        assert_eq!(status_of(&bridge, &stream).await, 404);
+        assert_eq!(abs.item_progress(&user, &episode).await, None);
+    });
+}
+
+#[test]
+fn a_start_that_fails_says_why_and_plays_nothing() {
+    let (bridge, abs, proxy, failing) = bridge_behind_proxy();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let Phone {
+            mut app, player, ..
+        } = on_episode_with_player(&device, &bridge, &proxy, &user, &clock, &abs, 0).await;
+        let Screen::Item { item, .. } = app.screen().clone() else {
+            unreachable!()
+        };
+
+        *failing.lock().unwrap() = Some("GET /api/items/");
+        app.play_on_phone().await;
+
+        assert_eq!(
+            app.screen(),
+            &Screen::Item {
+                item,
+                notice: Some(Notice::Api(ApiError::LibraryServerUnreachable)),
+            }
+        );
+        assert_eq!(player.media(), None);
+        assert_eq!(app.local_status(), None);
+    });
+}
+
+#[test]
+fn logging_out_ends_local_playback_with_its_position() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(2);
+        let Phone {
+            mut app, player, ..
+        } = on_episode_with_player(&device, &bridge, abs.base_url(), &user, &clock, &abs, 2).await;
+        app.play_on_phone().await;
+        let stream = player.media().unwrap().url;
+        app.go_back();
+        clock.advance(Duration::from_secs(9));
+
+        app.open_settings();
+        app.log_out().await;
+
+        assert!(
+            matches!(app.screen(), Screen::Login { .. }),
+            "{:?}",
+            app.screen()
+        );
+        assert_eq!(abs.item_progress(&user, &episode).await, Some((9.0, false)));
+        assert_eq!(player.media(), None);
+        assert_eq!(app.local_status(), None);
+        assert_eq!(status_of(&bridge, &stream).await, 404);
+    });
+}
+
+/// Logging in to another Library Server, or switching to one, ends Local playback first, as
+/// the session that started it: its user's Progress written, its stream gone.
+#[test]
+fn logging_in_elsewhere_or_switching_ends_local_playback_as_its_own_session() {
+    let (bridge, abs, second) = bridge_with_two_library_servers();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let (user, other) = (abs.new_user().await, abs.new_user().await);
+        let episode = abs.seeded().episode(2);
+        let Phone {
+            mut app, player, ..
+        } = on_episode_with_player(&device, &bridge, abs.base_url(), &user, &clock, &abs, 2).await;
+        app.play_on_phone().await;
+        let stream = player.media().unwrap().url;
+        clock.advance(Duration::from_secs(6));
+
+        log_in_elsewhere(&mut app, &second, &other).await;
+
+        assert_eq!(abs.item_progress(&user, &episode).await, Some((6.0, false)));
+        assert_eq!(abs.item_progress(&other, &episode).await, None);
+        assert_eq!(player.media(), None);
+        assert_eq!(status_of(&bridge, &stream).await, 404);
+
+        // Back on Home, playing again; then switching to Second.
+        app.open_settings();
+        app.switch_to(abs.base_url()).await;
+        open_episode(&mut app, &abs, 2).await;
+        app.play_on_phone().await;
+        let stream = player.media().unwrap().url;
+        clock.advance(Duration::from_secs(8));
+
+        app.open_settings();
+        app.switch_to(&second).await;
+
+        assert_eq!(
+            abs.item_progress(&user, &episode).await,
+            Some((14.0, false))
+        );
+        assert_eq!(abs.item_progress(&other, &episode).await, None);
+        assert_eq!(player.media(), None);
+        assert_eq!(status_of(&bridge, &stream).await, 404);
+    });
+}
+
+/// The Item ends while a report is on its way, and the person switches to another Library
+/// Server: the end goes out first, as the session it belongs to, writing the end for its user;
+/// the session switched to stays, without a word.
+#[test]
+fn an_end_on_its_way_goes_out_as_its_own_session_before_a_switch() {
+    let abs = Audiobookshelf::shared();
+    let (home, log, stall) = progress_stalling_proxy(&abs);
+    let (second, _) = proxy(abs.address(), |_, _| false);
+    let bridge = TestBridge::start(&format!(
+        "{}{}",
+        named_library_server_toml(&home, "Home"),
+        named_library_server_toml(&second, "Second"),
+    ));
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let (user, other) = (abs.new_user().await, abs.new_user().await);
+        let episode = abs.seeded().episode(1);
+        let Phone {
+            mut app, events, ..
+        } = on_episode_with_player(&device, &bridge, &home, &user, &clock, &abs, 1).await;
+        log_in_elsewhere(&mut app, &second, &other).await;
+        app.open_settings();
+        app.switch_to(&home).await;
+        open_episode(&mut app, &abs, 1).await;
+        app.play_on_phone().await;
+        report_held(&stall, &log, &clock).await;
+        events.send(PlayerEvent::Ended).unwrap();
+        eventually("Local playback ended", || app.local_status().is_none()).await;
+
+        app.open_settings();
+        tokio::join!(app.switch_to(&second), release_after_quiet(&stall));
+
+        progress_becomes(&abs, &user, &episode, (900.0, true)).await;
+        assert_eq!(abs.item_progress(&other, &episode).await, None);
+        assert_on_home(&app);
+        assert_eq!(
+            app.session().map(StoredSession::library_server_url),
+            Some(second.as_str())
+        );
+        tokio::time::sleep(QUIET).await;
+        assert!(!app.local_halted());
+    });
+}
+
+/// A report finds the key rejected, and the person switches to another Library Server before
+/// the App said so: the session switched to stays, and nothing is said on it.
+#[test]
+fn a_halt_not_yet_shown_stays_with_its_session() {
+    let (bridge, abs, second) = bridge_with_two_library_servers();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let (user, other) = (abs.new_user().await, abs.new_user().await);
+        let Phone { mut app, .. } =
+            on_episode_with_player(&device, &bridge, abs.base_url(), &user, &clock, &abs, 1).await;
+        log_in_elsewhere(&mut app, &second, &other).await;
+        app.open_settings();
+        app.switch_to(abs.base_url()).await;
+        open_episode(&mut app, &abs, 1).await;
+        app.play_on_phone().await;
+        abs.delete_api_key(&user.api_key).await;
+        clock.advance(REPORT_EVERY);
+        eventually("Local playback stopped", || app.local_halted()).await;
+
+        app.open_settings();
+        app.switch_to(&second).await;
+        // As the UI's poll would.
+        app.show_local_halted().await;
+
+        assert_on_home(&app);
+        let selected = session(&app);
+        assert_eq!(selected.user, acting_on(&second, &other));
+        assert_eq!(bridge.api().current_user(&selected).await, selected.user);
+        assert_eq!(session(&device.launch().await), selected);
+    });
+}
+
+/// A session `log_in` replaced isn't ended while the file may still hold it, nor while Local
+/// playback runs, which would have its reports go out with that session's token for a moment;
+/// once saved over, Stop ends it, without another save.
+#[test]
+fn a_replaced_session_ends_only_once_local_playback_does() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        let Phone { mut app, .. } =
+            on_episode_with_player(&device, &bridge, abs.base_url(), &user, &clock, &abs, 1).await;
+        let replaced = session(&app);
+        device.fail_saves.store(true, Ordering::SeqCst);
+        log_in_elsewhere(&mut app, abs.base_url(), &user).await;
+        device.fail_saves.store(false, Ordering::SeqCst);
+        open_episode(&mut app, &abs, 1).await;
+
+        // Not saved over yet: Stop leaves it.
+        app.play_on_phone().await;
+        app.stop_local().await;
+        assert_eq!(bridge.api().current_user(&replaced).await, replaced.user);
+
+        app.play_on_phone().await;
+        app.set_language(LanguageChoice::German).await;
+        assert_eq!(app.screen(), &Screen::NowPlaying { notice: None });
+        assert_eq!(bridge.api().current_user(&replaced).await, replaced.user);
+        clock.advance(REPORT_EVERY);
+        progress_becomes(&abs, &user, &episode, (30.0, false)).await;
+
+        app.stop_local().await;
+        assert_eq!(
+            bridge.api().current_user_error(&replaced).await.1,
+            ApiError::SessionInvalid
+        );
+        let current = session(&app);
+        assert_eq!(bridge.api().current_user(&current).await, current.user);
+    });
+}
+
+/// A session `log_in` replaced, saved over while Local playback runs, ends once the App says
+/// why playback stopped on its own, with no save after it.
+#[test]
+fn a_replaced_session_ends_once_a_halt_is_shown() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let Phone {
+            mut app, events, ..
+        } = on_episode_with_player(&device, &bridge, abs.base_url(), &user, &clock, &abs, 1).await;
+        let replaced = session(&app);
+        device.fail_saves.store(true, Ordering::SeqCst);
+        log_in_elsewhere(&mut app, abs.base_url(), &user).await;
+        device.fail_saves.store(false, Ordering::SeqCst);
+        open_episode(&mut app, &abs, 1).await;
+        app.play_on_phone().await;
+        // Saved over while Local playback runs: its end waits.
+        app.set_language(LanguageChoice::German).await;
+        assert_eq!(app.screen(), &Screen::NowPlaying { notice: None });
+        // From here a save would end nothing: only the halt shown can.
+        device.fail_saves.store(true, Ordering::SeqCst);
+
+        events.send(PlayerEvent::Failed).unwrap();
+        eventually("Local playback stopped", || app.local_halted()).await;
+        assert_eq!(bridge.api().current_user(&replaced).await, replaced.user);
+        app.show_local_halted().await;
+
+        assert_eq!(
+            app.screen(),
+            &Screen::NowPlaying {
+                notice: Some(Notice::LocalPlayerFailed)
+            }
+        );
+        assert_eq!(
+            bridge.api().current_user_error(&replaced).await.1,
+            ApiError::SessionInvalid
+        );
+        let current = session(&app);
+        assert_eq!(bridge.api().current_user(&current).await, current.user);
+    });
+}
+
+/// A save that ends a replaced session while the end of the Item is still on its way waits for
+/// that end first: the end goes out with the selected session's token, not with the replaced
+/// one's for a moment.
+#[test]
+fn a_replaced_session_ends_only_after_an_end_on_its_way() {
+    let abs = Audiobookshelf::shared();
+    let (home, log, stall) = progress_stalling_proxy(&abs);
+    let bridge = TestBridge::start(&named_library_server_toml(&home, "Home"));
+    // Between the App and the Bridge: ending a session takes a second.
+    let bridge_address = bridge.url().strip_prefix("http://").unwrap();
+    let (front, front_log) = proxy_answering(bridge_address, |_, request| {
+        if request.starts_with(b"POST /api/logout ") {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        None
+    });
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        let Phone {
+            mut app, events, ..
+        } = device.launch_playing(&clock).await;
+        app.submit_bridge_url(&front).await;
+        app.log_in(&home, ApiKey::new(&user.api_key.key)).await;
+        let replaced = session(&app);
+        device.fail_saves.store(true, Ordering::SeqCst);
+        log_in_elsewhere(&mut app, &home, &user).await;
+        device.fail_saves.store(false, Ordering::SeqCst);
+        open_episode(&mut app, &abs, 1).await;
+        app.play_on_phone().await;
+        report_held(&stall, &log, &clock).await;
+        events.send(PlayerEvent::Ended).unwrap();
+        eventually("Local playback ended", || app.local_status().is_none()).await;
+
+        tokio::join!(app.set_language(LanguageChoice::German), async {
+            tokio::time::sleep(QUIET).await;
+            // The end is still held: no session may end before it went out.
+            assert_eq!(requests(&front_log, "POST /api/logout "), 0);
+            stall.store(false, Ordering::SeqCst);
+        });
+
+        progress_becomes(&abs, &user, &episode, (900.0, true)).await;
+        assert_eq!(
+            bridge.api().current_user_error(&replaced).await.1,
+            ApiError::SessionInvalid
+        );
+        tokio::time::sleep(QUIET).await;
+        assert!(!app.local_halted());
     });
 }

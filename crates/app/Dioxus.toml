@@ -6,6 +6,8 @@ identifier = "ai.stibbons.ook"
 publisher = "stibbons-ai"
 
 [ios.plist]
+# Local playback goes on in the background and with the phone locked (ADR 0007).
+UIBackgroundModes = ["audio"]
 # English only: dx doesn't generate InfoPlist.strings.
 NSLocalNetworkUsageDescription = "Ook connects to Clacks on your network."
 CFBundleDisplayName = "Ook"
