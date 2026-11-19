@@ -22,8 +22,8 @@ use std::time::Duration;
 use abs::ApiKey;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use store::{
-    ActiveHandoff, Error, GroupHandoff, Handoff, HandoffFile, LibraryUser, Session, SessionId,
-    Store, StreamId,
+    ActiveHandoff, ActiveLocal, Error, GroupHandoff, Handoff, HandoffFile, LibraryUser,
+    LocalSession, Session, SessionId, Store, StreamId,
 };
 
 pub use crate::sealing::EncryptionKey;
@@ -35,8 +35,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migrations/0001_sessions.sql"),
     include_str!("migrations/0002_encrypted_api_keys.sql"),
     include_str!("migrations/0003_handoffs.sql"),
-    include_str!("migrations/0004_handoff_files.sql"),
-    include_str!("migrations/0005_handoff_seeking.sql"),
+    include_str!("migrations/0004_local_sessions.sql"),
+    include_str!("migrations/0005_handoff_files.sql"),
+    include_str!("migrations/0006_handoff_seeking.sql"),
 ];
 
 /// A [`Store`] in one SQLite database file. It stays open until it, its [`Closer`]s and its
@@ -695,6 +696,119 @@ impl Store for SqliteStore {
         })
         .await
     }
+
+    async fn start_local(
+        &self,
+        session: &SessionId,
+        stream: &StreamId,
+        local: &LocalSession,
+    ) -> Result<bool, Error> {
+        let (session, stream, local) = (*session, *stream, local.clone());
+        self.transaction(move |tx| {
+            let open = tx
+                .prepare_cached("SELECT 1 FROM sessions WHERE id = ?1")?
+                .exists(params![session.as_bytes()])?;
+            if !open {
+                return Ok(false);
+            }
+            tx.prepare_cached("DELETE FROM local_sessions WHERE session_id = ?1")?
+                .execute(params![session.as_bytes()])?;
+            tx.prepare_cached(
+                "INSERT INTO local_sessions (session_id, stream_id, library_item, episode,
+                     file_ino, file_name, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?
+            .execute(params![
+                session.as_bytes(),
+                stream.as_bytes(),
+                local.library_item,
+                local.episode,
+                local.file.ino,
+                local.file.name,
+                local.started_at,
+            ])?;
+            Ok(true)
+        })
+        .await
+    }
+
+    async fn local_stream(&self, stream: &StreamId) -> Result<Option<ActiveLocal>, Error> {
+        let (stream, sealing) = (*stream, Arc::clone(&self.sealing));
+        let lookup = self
+            .transaction(move |tx| {
+                let Some((local, key)) = tx
+                    .prepare_cached(
+                        "SELECT l.library_item, l.episode, l.file_ino, l.file_name, l.started_at,
+                             k.id, k.library_server, k.user_id, k.key_fingerprint, k.sealed_key
+                         FROM local_sessions l
+                         JOIN sessions s ON s.id = l.session_id
+                         JOIN api_keys k ON k.id = s.api_key_id
+                         WHERE l.stream_id = ?1",
+                    )?
+                    .query_row(params![stream.as_bytes()], |row| {
+                        Ok((local_row(row)?, StoredKey::read(row, 5)?))
+                    })
+                    .optional()?
+                else {
+                    return Ok(Lookup::Unknown);
+                };
+                Ok(match key.open(tx, &sealing)? {
+                    Some(api_key) => Lookup::Open(ActiveLocal {
+                        local,
+                        user: key.user,
+                        api_key,
+                    }),
+                    None => Lookup::Unreadable(key.user),
+                })
+            })
+            .await?;
+        Ok(lookup.found())
+    }
+
+    async fn session_local(
+        &self,
+        session: &SessionId,
+        stream: &StreamId,
+    ) -> Result<Option<LocalSession>, Error> {
+        let (session, stream) = (*session, *stream);
+        self.transaction(move |tx| {
+            tx.prepare_cached(
+                "SELECT library_item, episode, file_ino, file_name, started_at
+                 FROM local_sessions WHERE session_id = ?1 AND stream_id = ?2",
+            )?
+            .query_row(params![session.as_bytes(), stream.as_bytes()], local_row)
+            .optional()
+        })
+        .await
+    }
+
+    async fn end_local(&self, session: &SessionId, stream: &StreamId) -> Result<bool, Error> {
+        let (session, stream) = (*session, *stream);
+        self.transaction(move |tx| {
+            let deleted = tx
+                .prepare_cached(
+                    "DELETE FROM local_sessions WHERE session_id = ?1 AND stream_id = ?2",
+                )?
+                .execute(params![session.as_bytes(), stream.as_bytes()])?;
+            Ok(deleted > 0)
+        })
+        .await
+    }
+}
+
+/// A Local session from a row whose first columns are `local_sessions`' `library_item`,
+/// `episode`, `file_ino`, `file_name` and `started_at`.
+fn local_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalSession> {
+    Ok(LocalSession {
+        library_item: row.get(0)?,
+        episode: row.get(1)?,
+        file: HandoffFile {
+            ino: row.get(2)?,
+            name: row.get(3)?,
+            duration: None,
+        },
+        started_at: row.get(4)?,
+    })
 }
 
 #[cfg(test)]
@@ -704,7 +818,7 @@ mod tests {
     use abs::ApiKey;
     use rusqlite::params;
     use store::contract::Backend;
-    use store::{Handoff, HandoffFile, LibraryUser, SessionId, Store, StreamId};
+    use store::{Handoff, HandoffFile, LibraryUser, LocalSession, SessionId, Store, StreamId};
     use tempfile::TempDir;
 
     use super::{EncryptionKey, MIGRATIONS, SqliteStore};
@@ -1047,7 +1161,8 @@ mod tests {
         database
             .raw()
             .execute_batch(
-                "DROP TABLE handoff_files; DROP TABLE handoffs; PRAGMA user_version = 2;",
+                "DROP TABLE local_sessions; DROP TABLE handoff_files; DROP TABLE handoffs;
+                 PRAGMA user_version = 2;",
             )
             .unwrap();
 
@@ -1055,16 +1170,76 @@ mod tests {
         assert_eq!(schema_version(&database), MIGRATIONS.len() as i64);
         assert_eq!(api_key(&store, 1).await, Some(ApiKey::new("alice-key")));
         assert_eq!(store.handoffs().await.unwrap(), []);
+        let stream = StreamId::of("stream-1");
+        assert_eq!(store.session_local(&token(1), &stream).await.unwrap(), None);
     }
 
-    /// A Handoff stored by a Bridge of schema version 3, with one file, keeps it, of unknown
-    /// length.
+    fn local_episode() -> LocalSession {
+        LocalSession {
+            library_item: "podcast-id".into(),
+            episode: Some("episode-id".into()),
+            file: HandoffFile {
+                ino: "42".into(),
+                name: "Episode 1.mp3".into(),
+                duration: None,
+            },
+            started_at: 1_000,
+        }
+    }
+
+    /// A Local session whose session's key no longer decrypts is gone, and its session with
+    /// it; another user's stays.
     #[tokio::test]
-    async fn a_handoff_from_before_its_files_were_listed_keeps_its_one_file() {
+    async fn a_tampered_key_ends_the_local_sessions_using_it_only() {
         let database = TempDatabase::new();
-        let v3 = database.raw();
-        for migration in &MIGRATIONS[..3] {
-            v3.execute_batch(migration).unwrap();
+        let store = database.open_with(1);
+        login(&store, 1, &alice(), "alice-key").await;
+        login(&store, 2, &bob(), "bob-key").await;
+        for (n, stream) in [(1, "stream-1"), (2, "stream-2")] {
+            let started = store
+                .start_local(&token(n), &StreamId::of(stream), &local_episode())
+                .await
+                .unwrap();
+            assert!(started);
+        }
+        let mut sealed = database.sealed_key("alice-id");
+        sealed[30] ^= 1;
+        database.set_sealed_key("alice-id", &sealed);
+
+        let found = store.local_stream(&StreamId::of("stream-1")).await.unwrap();
+        assert_eq!(found, None);
+        // Forgotten by that lookup, with the session and its Local session.
+        assert_eq!(api_key(&store, 1).await, None);
+        let alices = StreamId::of("stream-1");
+        assert_eq!(store.session_local(&token(1), &alices).await.unwrap(), None);
+        let bobs = store.local_stream(&StreamId::of("stream-2")).await.unwrap();
+        assert_eq!(bobs.map(|active| active.user), Some(bob()));
+    }
+
+    #[tokio::test]
+    async fn the_file_holds_no_local_stream_id() {
+        let database = TempDatabase::new();
+        let store = database.open_with(1);
+        login(&store, 1, &alice(), "alice-key").await;
+        let stream = StreamId::of("local-secret-id");
+        assert!(
+            store
+                .start_local(&token(1), &stream, &local_episode())
+                .await
+                .unwrap()
+        );
+        drop(store);
+
+        assert!(!contains(&file_bytes(&database.path), b"local-secret-id"));
+    }
+
+    /// Upgrading from main's schema version 4 preserves both playback modes.
+    #[tokio::test]
+    async fn local_sessions_and_single_file_handoffs_survive_the_upgrade() {
+        let database = TempDatabase::new();
+        let v4 = database.raw();
+        for migration in &MIGRATIONS[..4] {
+            v4.execute_batch(migration).unwrap();
         }
         let user = alice();
         let key = ApiKey::new("alice-key");
@@ -1073,12 +1248,12 @@ mod tests {
         let sealed = sealing
             .seal(&super::Row::of(&user, &fingerprint), &key)
             .unwrap();
-        v3.execute(
+        v4.execute(
             "INSERT INTO api_keys (id, library_server, user_id, key_fingerprint, sealed_key, key_id)
              VALUES (1, ?1, ?2, ?3, ?4, ?5)",
             params![user.library_server, user.user_id, fingerprint, sealed, sealing.key_id()],
         ).unwrap();
-        v3.execute(
+        v4.execute(
             "INSERT INTO handoffs (group_id, stream_id, library_item, episode, file_ino,
              file_name, username, api_key_id, started_at)
              VALUES ('RINCON_K', ?1, 'podcast-id', 'episode-id', '42',
@@ -1086,8 +1261,30 @@ mod tests {
             params![StreamId::of("stream-1").as_bytes()],
         )
         .unwrap();
-        v3.pragma_update(None, "user_version", 3).unwrap();
-        drop(v3);
+        v4.execute(
+            "INSERT INTO sessions (id, api_key_id) VALUES (?1, 1)",
+            params![token(1).as_bytes()],
+        )
+        .unwrap();
+        let local = local_episode();
+        let local_stream = StreamId::of("local-stream");
+        v4.execute(
+            "INSERT INTO local_sessions
+             (session_id, stream_id, library_item, episode, file_ino, file_name, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                token(1).as_bytes(),
+                local_stream.as_bytes(),
+                local.library_item,
+                local.episode,
+                local.file.ino,
+                local.file.name,
+                local.started_at,
+            ],
+        )
+        .unwrap();
+        v4.pragma_update(None, "user_version", 4).unwrap();
+        drop(v4);
 
         let store = database.open_with(1);
         assert_eq!(schema_version(&database), MIGRATIONS.len() as i64);
@@ -1099,6 +1296,10 @@ mod tests {
             duration: None,
         };
         assert_eq!(files, Some(vec![file]));
+        assert_eq!(
+            store.session_local(&token(1), &local_stream).await.unwrap(),
+            Some(local)
+        );
     }
 
     /// Writes a database as the Bridge before encryption (schema version 1) left it: plain-text

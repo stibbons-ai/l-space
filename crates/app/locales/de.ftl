@@ -82,6 +82,12 @@ play-on = Abspielen auf…
 play-from-start = Von vorn abspielen…
 playing-on = Spielt auf { $group }
 
+play-on-phone = Auf diesem Telefon abspielen
+now-playing-title = Wird abgespielt
+now-playing-none = Auf diesem Telefon wird nichts abgespielt.
+local-play = Abspielen
+local-stop = Beenden
+
 date = { $day }. { $month ->
         [1] Januar
         [2] Februar
@@ -108,6 +114,8 @@ error-storage-load = Ook konnte nicht lesen, was es auf diesem Gerät gespeicher
 error-storage-stuck = Ook konnte nicht lesen, was es auf diesem Gerät gespeichert hat, und lässt es unverändert. Was du jetzt änderst, ist nach einem Neustart nicht mehr da.
 error-storage-save = Ook konnte nicht auf diesem Gerät speichern. Nach einem Neustart musst du dich eventuell erneut anmelden.
 error-logout-not-saved = Du bist abgemeldet, aber Ook konnte das nicht auf diesem Gerät speichern: Nach einem Neustart bist du eventuell wieder angemeldet. Melde dich dann erneut ab.
+error-local-player-failed = Dieses Telefon konnte es nicht abspielen, deshalb ist die Wiedergabe auf diesem Telefon beendet.
+error-local-end-not-saved = Ook konnte nicht speichern, wo die Folge oder das Hörbuch davor aufgehört hat. { $reason }
 error-not-a-bridge = Unter dieser Adresse antwortet etwas, aber nicht Clacks. Prüfe die Adresse.
 error-bridge-unreachable = Clacks ist nicht erreichbar. Prüfe, ob dieses Telefon in deinem Heimnetz oder VPN ist und ob Clacks läuft.
 error-internal = Bei Clacks ist etwas schiefgegangen. Bitte versuche es später noch einmal.
@@ -120,7 +128,8 @@ error-sonos-unreachable = Clacks hat deine Sonos-Lautsprecher gefunden, aber ger
 error-sonos-search-failed = Clacks kann dein Netzwerk gerade nicht nach Sonos-Lautsprechern durchsuchen. Bitte die Person, die Clacks betreibt, die Netzwerkeinrichtung und die Logs von Clacks zu prüfen.
 error-group-not-found = Diese Gruppe gibt es nicht mehr: Vielleicht wurde sie in der Sonos-App neu gruppiert. Wähle eine andere.
 error-group-failed = Die Gruppe hat die Aktion nicht abgeschlossen oder bestätigt: Sie war beschäftigt, hat nicht geantwortet oder abgelehnt. Versuche es gleich noch einmal; wenn die Wiedergabe gestoppt wurde, starte sie erneut mit „Abspielen auf…“. Klappt es weiterhin nicht, prüfe, ob die Gruppe eingeschaltet und in deinem Netzwerk ist.
-error-item-not-playable = Clacks kann das noch nicht auf einer Gruppe abspielen: Alle Dateien müssen in einem Format sein, das Sonos abspielt, und es dürfen nicht zu viele sein, um rechtzeitig zu starten; bei Hörbüchern in mehreren Dateien muss dein Library Server alle Dateilängen kennen.
+error-item-not-playable = Clacks kann das hier nicht abspielen. Auf einer Gruppe müssen alle Dateien in einem Format sein, das Sonos abspielt, und es dürfen nicht zu viele sein, um rechtzeitig zu starten. Bei Hörbüchern in mehreren Dateien muss dein Library Server alle Dateilängen kennen. Auf diesem Telefon geht nur eine einzelne Datei in einem Format, das sowohl Sonos als auch das iPhone abspielen.
 error-no-handoff = Diese Gruppe spielt nicht ab, was Clacks gestartet hat: Sie spielt jetzt etwas anderes (vielleicht aus der Sonos-App), oder was Clacks dort abgespielt hat, ist beendet. Starte es erneut mit „Abspielen auf…“.
 error-length-unknown = Clacks weiß nicht, wie lang das ist, und kann deshalb nicht vorspulen. „15 s zurück“ geht weiterhin.
+error-no-local-session = Die Wiedergabe auf diesem Telefon ist bei Clacks schon beendet. Starte sie erneut bei der Folge oder dem Hörbuch.
 error-unknown = Etwas Unerwartetes ist schiefgegangen. Ein Update von Ook kann helfen.

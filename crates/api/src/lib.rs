@@ -26,6 +26,12 @@
 //! also control any Group's Handoff, whoever started it: [`pause_group`], [`resume_group`],
 //! [`skip_group`]; and any Group's volume, [`set_group_volume`]. Pausing and skipping write
 //! the new position as Progress for the user who started the Handoff, with their key.
+//!
+//! A session also plays an Item on the phone (Local playback): [`start_local`] starts its
+//! Local session (one per session) and answers where the App's player fetches it from;
+//! [`report_local`] writes the player's position as Progress for the session's user, and
+//! [`end_local`] writes it and ends the Local session. Both name the Local session by its
+//! stream's path; only the session that started it reaches it.
 
 use std::cmp::Reverse;
 use std::fmt;
@@ -426,6 +432,44 @@ pub enum Skip {
     NextChapter,
 }
 
+/// Local playback of an Item on the phone, as [`start_local`] answers it: what the App's
+/// player needs. Times are seconds. Its `Debug` output leaves out the stream's and cover's
+/// paths, which let anyone holding them fetch the Item while the Local session lasts.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct LocalStart {
+    pub item: ItemId,
+    pub title: String,
+    /// An audiobook's author.
+    pub author: Option<String>,
+    /// An episode's podcast, by title.
+    pub podcast: Option<String>,
+    /// The path of the Local session's stream on the Bridge, `/stream/<id>/<file>`: the App
+    /// appends it to its own Bridge URL. It works only while the Local session is active.
+    pub stream: String,
+    /// The path of the Item's cover on the Bridge, `/cover/<id>`, appended like `stream`; none
+    /// if the Item has none. It works only while the Local session is active.
+    pub artwork: Option<String>,
+    /// Where to start: the user's Progress, or 0 without one or for a Finished Item.
+    pub start_at: f64,
+    /// Unknown if the Library Server doesn't know it.
+    pub duration: Option<f64>,
+}
+
+impl fmt::Debug for LocalStart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalStart")
+            .field("item", &self.item)
+            .field("title", &self.title)
+            .field("author", &self.author)
+            .field("podcast", &self.podcast)
+            .field("stream", &"REDACTED")
+            .field("artwork", &self.artwork.as_ref().map(|_| "REDACTED"))
+            .field("start_at", &self.start_at)
+            .field("duration", &self.duration)
+            .finish()
+    }
+}
+
 /// An error code the App translates for the user.
 ///
 /// On the wire this is the `data` member of the error body, for example
@@ -495,6 +539,8 @@ pub enum ApiError {
     /// format Sonos doesn't play, several of which one has no known length, or too many files
     /// for this start's mandatory playback reservation. The limit depends on whether the
     /// start seeks: the same Item may play from the start but be refused mid-file.
+    /// On the phone, the Item must have exactly one audio file in a format both Sonos and
+    /// the iPhone play.
     #[error("item_not_playable")]
     ItemNotPlayable,
     /// The Group has no active Handoff to control, or plays something other than its
@@ -510,6 +556,11 @@ pub enum ApiError {
     /// Progress written.
     #[error("length_unknown")]
     LengthUnknown,
+    /// The calling session has no Local session with the stream the call names: none was
+    /// started, or it ended (stopped, or the session started another since). Nothing was
+    /// written.
+    #[error("no_local_session")]
+    NoLocalSession,
     /// A code this build of the App does not know yet, from a newer Bridge. Produced only on
     /// the App's side, when decoding; the Bridge never sends it.
     #[serde(other)]
@@ -544,7 +595,7 @@ impl AsStatusCode for ApiError {
             Self::LibraryServerNotConfigured | Self::NotFound | Self::GroupNotFound => {
                 StatusCode::NOT_FOUND
             }
-            Self::NoHandoff | Self::LengthUnknown => StatusCode::CONFLICT,
+            Self::NoHandoff | Self::LengthUnknown | Self::NoLocalSession => StatusCode::CONFLICT,
             Self::ItemNotPlayable => StatusCode::UNPROCESSABLE_ENTITY,
             Self::BridgeUnreachable
             | Self::NotABridge
@@ -806,6 +857,67 @@ pub async fn set_group_volume(group: String, volume: u8) -> Result<u8, ApiError>
         .await
 }
 
+/// Starts Local playback of the Item `item` for the caller's session: a Local session, whose
+/// stream the App plays from the Bridge. It replaces the session's Local session, if any,
+/// whose stream then stops working. Answers where to start (the user's Progress; 0 for a
+/// Finished Item), with the paths of its stream and cover. The Items that play are those that
+/// play on a Group, less the formats the iPhone doesn't play (Ogg, Windows Media):
+/// [`ApiError::ItemNotPlayable`] otherwise.
+#[post(
+    "/api/local/start",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn start_local(item: ItemId) -> Result<LocalStart, ApiError> {
+    bridge
+        .start_local(server::session_token(&headers)?, item)
+        .await
+}
+
+/// Writes `position` (seconds; and `duration`, the Item's length, if known) as Progress in the
+/// Item of the caller's Local session whose stream's path is `stream` (as [`start_local`]
+/// answered it), for the session's user with their key, once their Library Server confirms
+/// the key still acts for them: Finished at `duration` when `position` is at or past it,
+/// otherwise unfinished. Without such a Local session (another one
+/// replaced it, say), [`ApiError::NoLocalSession`]. A key the Library Server rejects, or that
+/// now acts for another user, is revoked, ending the session and its Local session
+/// ([`ApiError::ApiKeyRejected`]); a Library Server that can't be reached, or doesn't answer
+/// within 10 seconds, leaves the Local session as it is
+/// ([`ApiError::LibraryServerUnreachable`]).
+#[post(
+    "/api/local/report",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn report_local(
+    stream: String,
+    position: f64,
+    duration: Option<f64>,
+) -> Result<(), ApiError> {
+    bridge
+        .report_local(server::session_token(&headers)?, stream, position, duration)
+        .await
+}
+
+/// Writes `position` as [`report_local`] does, then ends the caller's Local session whose
+/// stream's path is `stream`, which then stops working. It ends also when the write fails,
+/// which the answer then tells; without such a Local session, [`ApiError::NoLocalSession`]
+/// and nothing is written or ended.
+#[post(
+    "/api/local/end",
+    headers: dioxus_fullstack::HeaderMap,
+    bridge: dioxus_fullstack::extract::Extension<server::BridgeHandle>
+)]
+pub async fn end_local(
+    stream: String,
+    position: f64,
+    duration: Option<f64>,
+) -> Result<(), ApiError> {
+    bridge
+        .end_local(server::session_token(&headers)?, stream, position, duration)
+        .await
+}
+
 /// The Bridge's side of the App API.
 #[cfg(feature = "server")]
 pub mod server {
@@ -820,7 +932,7 @@ pub mod server {
 
     use crate::{
         ApiError, ApiKey, CurrentUser, EpisodeFilter, Group, Handoff, Home, Item, ItemId, Library,
-        LibraryEntry, LibraryServer, Playback, Podcast, Session, SessionToken, Skip,
+        LibraryEntry, LibraryServer, LocalStart, Playback, Podcast, Session, SessionToken, Skip,
     };
 
     /// A boxed future, so [`Bridge`] stays object-safe.
@@ -921,6 +1033,31 @@ pub mod server {
             group: String,
             volume: u8,
         ) -> BoxFuture<'_, Result<u8, ApiError>>;
+
+        /// See [`crate::start_local`].
+        fn start_local(
+            &self,
+            token: SessionToken,
+            item: ItemId,
+        ) -> BoxFuture<'_, Result<LocalStart, ApiError>>;
+
+        /// See [`crate::report_local`].
+        fn report_local(
+            &self,
+            token: SessionToken,
+            stream: String,
+            position: f64,
+            duration: Option<f64>,
+        ) -> BoxFuture<'_, Result<(), ApiError>>;
+
+        /// See [`crate::end_local`].
+        fn end_local(
+            &self,
+            token: SessionToken,
+            stream: String,
+            position: f64,
+            duration: Option<f64>,
+        ) -> BoxFuture<'_, Result<(), ApiError>>;
     }
 
     /// How server functions reach the [`Bridge`].
@@ -958,7 +1095,7 @@ mod tests {
     use dioxus::fullstack::{AsStatusCode, StatusCode};
     use serde_json::json;
 
-    use super::{ApiError, ApiKey, SessionToken, TransportState};
+    use super::{ApiError, ApiKey, ItemId, LocalStart, SessionToken, TransportState};
 
     #[test]
     fn error_codes_travel_as_a_code_field() {
@@ -1039,6 +1176,20 @@ mod tests {
             "SessionToken(REDACTED)"
         );
         assert_eq!(format!("{:?}", ApiKey::new("s3cret")), "ApiKey(REDACTED)");
+        let local = LocalStart {
+            item: ItemId {
+                library_item: "li".into(),
+                episode: None,
+            },
+            title: "Title".into(),
+            author: None,
+            podcast: None,
+            stream: "/stream/s3cret/a.mp3".into(),
+            artwork: Some("/cover/s3cret".into()),
+            start_at: 0.0,
+            duration: None,
+        };
+        assert!(!format!("{local:?}").contains("s3cret"), "{local:?}");
     }
 
     #[cfg(feature = "server")]

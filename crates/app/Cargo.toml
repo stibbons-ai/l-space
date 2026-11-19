@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 api.workspace = true
+clock.workspace = true
 # No `fullstack` here: `dx` would then also build and launch a server half on the host (a
 # desktop window). `api` enables it, which gives the App the server function client.
 dioxus = { workspace = true, features = ["mobile", "launch", "lib", "logger"] }
@@ -19,17 +20,37 @@ serde.workspace = true
 serde_json.workspace = true
 sys-locale.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 unic-langid.workspace = true
 url.workspace = true
 webpki-roots.workspace = true
 
+# The iOS Local player: AVPlayer, the audio session, Now Playing and remote commands (ADR 0007).
+[target.'cfg(target_os = "ios")'.dependencies]
+block2.workspace = true
+dispatch2.workspace = true
+objc2.workspace = true
+objc2-av-foundation.workspace = true
+objc2-avf-audio.workspace = true
+objc2-core-foundation.workspace = true
+objc2-core-media.workspace = true
+objc2-foundation.workspace = true
+objc2-media-player.workspace = true
+objc2-ui-kit.workspace = true
+
 [dev-dependencies]
 fluent-syntax.workspace = true
+reqwest.workspace = true
 sonos-fake.workspace = true
 tempfile.workspace = true
 test-support.workspace = true
 
-[lints]
-workspace = true
+# The iOS Local player (`src/ios.rs`) calls Objective-C, which is `unsafe`: the workspace's lints
+# with `unsafe_code` denied rather than forbidden, so that one module can allow it.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,14 +1,10 @@
-//! The Bridge's media streams (ADR 0010): `/stream/<stream id>/<n>-<file>`, on the App API's
-//! listener, which Groups fetch over the LAN. A stream id names one active Handoff and serves
-//! only its Item's audio files, the `n`th (from 1, in playing order) under its own name,
-//! forwarding byte ranges to the Library Server with the starter's API key. Speakers can't
-//! authenticate, so the id is the only capability: 256 random bits, stored only as its hash,
-//! never logged at INFO or above (the SOAP bodies at DEBUG under `sonos::raw` carry the URL).
-//! Anything that doesn't name an active Handoff's file is a bare `404`, alike for an unknown
-//! id, a known one with another file number or name, and a path that isn't UTF-8.
-//! Single-file Handoffs also accept `/stream/<id>/<file>`: migration 0004 preserves Handoffs
-//! whose Group still holds this pre-upgrade URL. Remove this form only when those persisted
-//! Handoffs no longer need to survive an upgrade.
+//! The Bridge's unauthenticated media streams (ADR 0010): `/stream/<id>/<n>-<file>` for
+//! Sonos Handoffs (numbered from 1), `/stream/<id>/<file>` for Local playback, and
+//! `/cover/<id>` for a Local session's artwork. A stream id is a capability: 256 random bits,
+//! stored only as its hash, never logged at INFO or above (Sonos SOAP bodies at DEBUG carry it).
+//! Each gateway forwards byte ranges with the Handoff starter's or Local session's API key.
+//! An unknown id, a wrong file number or name, or a non-UTF-8 path gets a bare `404`.
+//! Single-file Handoffs also accept `/stream/<id>/<file>` so pre-upgrade URLs keep working.
 
 use std::fmt::Write;
 use std::sync::Arc;
@@ -26,10 +22,12 @@ use store::Store;
 
 use crate::app_api::AppApi;
 
-/// The router serving every stream, for `app`'s Handoffs. `GET` routes answer `HEAD` too.
+/// The router serving every stream, for `app`'s Handoffs and Local sessions, and Local
+/// sessions' covers. `GET` routes answer `HEAD` too.
 pub fn router<S: Store>(app: Arc<AppApi<S>>) -> Router {
     Router::new()
         .route("/stream/{id}/{file}", get(serve::<S>))
+        .route("/cover/{id}", get(serve_cover::<S>))
         .with_state(app)
 }
 
@@ -57,6 +55,16 @@ impl StreamToken {
             path_segment(file_name)
         )
     }
+
+    /// The path of a Local session's single file.
+    pub fn local_path(&self, file_name: &str) -> String {
+        format!("/stream/{}/{}", self.0, path_segment(file_name))
+    }
+
+    /// The path of the cover of this stream's Item: Local sessions' only.
+    pub fn cover_path(&self) -> String {
+        format!("/cover/{}", self.0)
+    }
 }
 
 impl std::fmt::Debug for StreamToken {
@@ -77,12 +85,7 @@ pub struct StreamFile {
 /// percent-encoded) only for a single-file Handoff. Numbered URLs are checked for shape only.
 pub fn stream_in_url(url: &str, legacy_name: Option<&str>) -> Option<StreamFile> {
     let (_, path) = url.strip_prefix("http://")?.split_once('/')?;
-    let mut segments = path.split('/');
-    let (stream, id, file) = (segments.next()?, segments.next()?, segments.next()?);
-    let shaped = stream == "stream" && !id.is_empty() && segments.next().is_none();
-    if !shaped {
-        return None;
-    }
+    let (id, file) = stream_segments(path)?;
     let file = if legacy_name == Some(file) {
         0
     } else {
@@ -92,6 +95,19 @@ pub fn stream_in_url(url: &str, legacy_name: Option<&str>) -> Option<StreamFile>
         stream: store::StreamId::of(id),
         file,
     })
+}
+
+/// The stream id named by a Local playback path. Only the path shape is checked here.
+pub fn stream_in_path(path: &str) -> Option<store::StreamId> {
+    let (id, _) = stream_segments(path.strip_prefix('/')?)?;
+    Some(store::StreamId::of(id))
+}
+
+fn stream_segments(path: &str) -> Option<(&str, &str)> {
+    let mut segments = path.split('/');
+    let (stream, id, file) = (segments.next()?, segments.next()?, segments.next()?);
+    let shaped = stream == "stream" && !id.is_empty() && !file.is_empty();
+    (shaped && segments.next().is_none()).then_some((id, file))
 }
 
 /// The file (0-based) and its name in a stream path's last segment, `<n>-<name>`: `n` counts
@@ -150,6 +166,60 @@ fn range(headers: &HeaderMap) -> Option<&str> {
     }
 }
 
+/// What a stream serves: an active Handoff's or Local session's file, found by its stream id
+/// and file name.
+struct Source<'a> {
+    library_server: &'a str,
+    api_key: abs::ApiKey,
+    library_item: String,
+    file: store::HandoffFile,
+    /// Who acts for it: a Handoff's starter, a Local session's user.
+    user_id: String,
+    /// For the log: the Handoff's Group; none for a Local session.
+    group: Option<String>,
+    /// For the log: "a Handoff" or "a Local session".
+    what: &'static str,
+}
+
+/// The source of the stream `id`, if it names an active Handoff or Local session and `file`
+/// is its file's name; none otherwise, alike for every reason.
+async fn source<'a, S: Store>(
+    app: &'a AppApi<S>,
+    id: &store::StreamId,
+    file: &str,
+) -> Result<Option<Source<'a>>, store::Error> {
+    if let Some((library_server, active, index)) = app.active_handoff(id, file).await? {
+        let store::ActiveHandoff {
+            mut handoff,
+            api_key,
+        } = active;
+        return Ok(Some(Source {
+            library_server,
+            api_key,
+            library_item: handoff.library_item,
+            file: handoff.files.swap_remove(index),
+            user_id: handoff.started_by.user_id,
+            group: Some(handoff.group),
+            what: "a Handoff",
+        }));
+    }
+    let Some((library_server, active)) = app.active_local(id).await? else {
+        return Ok(None);
+    };
+    if file != active.local.file.name {
+        return Ok(None);
+    }
+    Ok(Some(Source {
+        library_server,
+        api_key: active.api_key,
+        library_item: active.local.library_item,
+        file: active.local.file,
+        user_id: active.user.user_id,
+        group: None,
+        what: "a Local session",
+    }))
+}
+
 /// Serves a stream's file, or the part of it asked for.
 async fn serve<S: Store>(
     State(app): State<Arc<AppApi<S>>>,
@@ -165,20 +235,28 @@ async fn serve<S: Store>(
             return not_found();
         }
     };
-    let (library_server, store::ActiveHandoff { handoff, api_key }, served) =
-        match app.active_handoff(&StreamToken::new(id), &segment).await {
-            Ok(Some(active)) => active,
-            Ok(None) => return not_found(),
-            Err(error) => {
-                crate::app_api::log_storage_error("look up a stream", &error);
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
-    let Some(content_type) = sonos::media_type(&served.name) else {
+    let source = match source(&app, &store::StreamId::of(&id), &segment).await {
+        Ok(Some(source)) => source,
+        Ok(None) => return not_found(),
+        Err(error) => {
+            crate::app_api::log_storage_error("look up a stream", &error);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let Source {
+        library_server,
+        api_key,
+        library_item,
+        file: streamed,
+        user_id,
+        group,
+        what,
+    } = source;
+    let Some(content_type) = sonos::media_type(&streamed.name) else {
         tracing::warn!(
-            group = handoff.group,
-            library_item = handoff.library_item,
-            "a Handoff's file is in a format Sonos doesn't play"
+            group,
+            library_item,
+            "{what}'s file is in a format Sonos doesn't play"
         );
         return not_found();
     };
@@ -193,8 +271,8 @@ async fn serve<S: Store>(
         .file(
             library_server,
             &api_key,
-            &handoff.library_item,
-            &served.ino,
+            &library_item,
+            &streamed.ino,
             request,
             range,
         )
@@ -203,11 +281,11 @@ async fn serve<S: Store>(
         Ok(file) => file,
         Err(error) => {
             tracing::warn!(
-                group = handoff.group,
+                group,
                 library_server,
-                user_id = handoff.started_by.user_id,
+                user_id,
                 %error,
-                "cannot stream a Handoff's file from its Library Server"
+                "cannot stream {what}'s file from its Library Server"
             );
             return match error {
                 abs::Error::NotFound(_) => not_found(),
@@ -218,10 +296,10 @@ async fn serve<S: Store>(
         }
     };
     tracing::debug!(
-        group = handoff.group,
+        group,
         status = file.status,
         range,
-        "streaming a Handoff's file"
+        "streaming {what}'s file"
     );
     let status = StatusCode::from_u16(file.status).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = Response::builder()
@@ -242,7 +320,7 @@ async fn serve<S: Store>(
     let body = if request == abs::FileRequest::Head {
         Body::empty()
     } else {
-        let (group, library_server) = (handoff.group, library_server.to_owned());
+        let library_server = library_server.to_owned();
         let mut sent: u64 = 0;
         Body::from_stream(file.body.map(move |chunk| match chunk {
             Ok(chunk) => {
@@ -255,7 +333,7 @@ async fn serve<S: Store>(
                     library_server,
                     sent,
                     %error,
-                    "a Handoff's file broke off while streaming from its Library Server"
+                    "{what}'s file broke off while streaming from its Library Server"
                 );
                 Err(axum::Error::new(error))
             }
@@ -266,7 +344,47 @@ async fn serve<S: Store>(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
-/// The answer to whatever names no active Handoff's file: the same for every such request.
+/// Serves the cover of a Local session's Item: `/cover/<stream id>`, alive as long as the
+/// Local session's stream. Anything else is a bare `404`, as for a stream.
+async fn serve_cover<S: Store>(
+    State(app): State<Arc<AppApi<S>>>,
+    path: Result<Path<String>, PathRejection>,
+) -> Response {
+    let Ok(Path(id)) = path else {
+        return not_found();
+    };
+    let (library_server, active) = match app.active_local(&StreamToken::new(id).hash()).await {
+        Ok(Some(active)) => active,
+        Ok(None) => return not_found(),
+        Err(error) => {
+            crate::app_api::log_storage_error("look up a cover", &error);
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let cover = app
+        .abs
+        .cover(library_server, &active.api_key, &active.local.library_item)
+        .await;
+    match cover {
+        Ok(cover) => ([(CONTENT_TYPE, cover.content_type)], cover.bytes).into_response(),
+        Err(abs::Error::NotFound(_)) => not_found(),
+        Err(error) => {
+            tracing::warn!(
+                library_server,
+                user_id = active.user.user_id,
+                %error,
+                "cannot fetch a Local session's cover from its Library Server"
+            );
+            StatusCode::BAD_GATEWAY.into_response()
+        }
+    }
+}
+
+/// The answer to whatever names no active Handoff's or Local session's file, or no active
+/// Local session's cover; to an active Handoff's or Local session's file, or a Local
+/// session's cover, that the Library Server says doesn't exist (most often an Item without a
+/// cover); and to an active Handoff's or Local session's file in a format Sonos doesn't play:
+/// the same for every such request.
 fn not_found() -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
@@ -275,7 +393,7 @@ fn not_found() -> Response {
 mod tests {
     use axum::http::{HeaderMap, HeaderValue};
 
-    use super::{StreamFile, StreamToken, range, stream_in_url};
+    use super::{StreamFile, StreamToken, range, stream_in_path, stream_in_url};
 
     #[test]
     fn a_streams_id_and_file_are_read_back_from_its_url_on_any_address() {
@@ -311,6 +429,11 @@ mod tests {
             "",
         ] {
             assert_eq!(stream_in_url(other, None), None, "{other}");
+        }
+        let path = token.local_path("Episode 1.mp3");
+        assert_eq!(stream_in_path(&path), Some(token.hash()));
+        for other in ["stream/ab12/x.mp3", "/cover/ab12", "/stream/ab12", ""] {
+            assert_eq!(stream_in_path(other), None, "{other}");
         }
     }
 

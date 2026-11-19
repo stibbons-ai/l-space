@@ -1,8 +1,0 @@
-[tools]
-rust = { version = "1.99.1", profile = "minimal", targets = "aarch64-apple-ios,aarch64-apple-ios-sim" }
-# 0.7.10 (the workspace pin) uses tao 0.34, which cannot launch on the iOS 27 SDK. Shadows Deno's unrelated `dx` on PATH.
-"cargo:dioxus-cli" = "0.8.0-alpha.3"
-
-[env]
-# Xcode, not the Command Line Tools, without a global `xcode-select -s`.
-DEVELOPER_DIR = "/Applications/Xcode.app/Contents/Developer"
