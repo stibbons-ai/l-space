@@ -5045,6 +5045,55 @@ fn a_failed_report_keeps_playing_and_says_why() {
     });
 }
 
+/// A pause's report the Library Server fails is said, and not tried again: only a lost Bridge
+/// is. Once the Library Server is back, nothing is written until the person acts.
+#[test]
+fn a_paused_report_the_library_server_fails_is_not_sent_again() {
+    let (bridge, abs, proxy, failing) = bridge_behind_proxy();
+    let (front, log, _) = bridge_behind_outage(&bridge);
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        let Phone {
+            mut app, player, ..
+        } = Device::new().launch_playing(&clock).await;
+        app.submit_bridge_url(&front).await;
+        app.log_in(&proxy, ApiKey::new(&user.api_key.key)).await;
+        open_episode(&mut app, &abs, 1).await;
+        app.play_on_phone().await;
+        clock.advance(REPORT_EVERY);
+        progress_becomes(&abs, &user, &episode, (30.0, false)).await;
+        assert!(
+            app.local_status()
+                .is_some_and(|status| status.report_failed.is_none())
+        );
+
+        *failing.lock().unwrap() = Some("PATCH /api/me/progress/");
+        clock.advance(Duration::from_secs(10));
+        app.toggle_local().await;
+        eventually("the pause's failed report is shown", || {
+            app.local_status().is_some_and(|status| {
+                status.report_failed == Some(ApiError::LibraryServerUnreachable)
+            })
+        })
+        .await;
+        let tried = reports_sent(&log).await;
+        clock.advance(REPORT_EVERY * 2);
+        assert_eq!(reports_sent(&log).await, tried);
+
+        *failing.lock().unwrap() = None;
+        clock.advance(REPORT_EVERY * 2);
+        assert_eq!(reports_sent(&log).await, tried);
+        assert_eq!(
+            abs.item_progress(&user, &episode).await,
+            Some((30.0, false))
+        );
+        assert!(!player.playing());
+        assert!(!app.local_halted());
+    });
+}
+
 /// A proxy in front of `bridge`, standing for the network between the App and it: while the
 /// flag it returns is set, every connection drops without an answer. Its log has each request.
 fn bridge_behind_outage(bridge: &TestBridge) -> (String, ProxyLog, Arc<AtomicBool>) {
