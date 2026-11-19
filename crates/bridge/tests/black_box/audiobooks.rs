@@ -729,11 +729,12 @@ async fn a_forward_skip_to_the_end_of_a_multi_file_book_marks_it_finished() {
 }
 
 #[tokio::test]
-async fn next_chapter_twice_while_paused_advances_across_fractional_files() {
+async fn fractional_files_resume_at_and_skip_by_chapter_across_their_boundaries() {
     let abs = Audiobookshelf::shared();
     let fractional = abs.fractional_book().await;
     let (household, _) = Household::with_manual_clock();
     let kitchen = household.add_player("Kitchen");
+    let office = household.add_player("Office");
     let bridge = TestBridge::start(&home_with_sonos_toml(abs.base_url(), household.ssdp()));
     let user = abs.new_user_seeing(&[&fractional.library]).await;
     let api = bridge.api();
@@ -750,6 +751,7 @@ async fn next_chapter_twice_while_paused_advances_across_fractional_files() {
         .collect();
     assert_eq!(durations[0], Duration::from_millis(40050));
     household.set_queue_lengths(&kitchen, &durations);
+    household.set_queue_lengths(&office, &durations);
     api.start_handoff(&session, &book, kitchen.uuid()).await;
     api.pause_group(&session, kitchen.uuid()).await;
     api.skip_group(&session, kitchen.uuid(), Skip::NextChapter)
@@ -792,6 +794,15 @@ async fn next_chapter_twice_while_paused_advances_across_fractional_files() {
     assert_eq!(household.track_number(&kitchen), Some(2));
     assert_eq!(household.position(&kitchen), seconds(30));
     assert_eq!(abs.item_progress(&user, &book).await, Some((70.05, false)));
+
+    // A resume exactly where the second file starts: that file, from its start, not the
+    // first file's whole seconds.
+    abs.set_item_progress(&user, &book, 40.05, false).await;
+    api.start_handoff(&session, &book, office.uuid()).await;
+    assert_eq!(household.track_number(&office), Some(2));
+    assert_eq!(household.position(&office), Duration::ZERO);
+    assert_eq!(household.sought(&office), [Seek::new("TRACK_NR", "2")]);
+    assert_eq!(abs.item_progress(&user, &book).await, Some((40.05, false)));
 }
 
 #[tokio::test]

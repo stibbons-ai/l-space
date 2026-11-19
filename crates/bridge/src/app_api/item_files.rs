@@ -166,16 +166,38 @@ impl ItemFiles {
 
     /// Whole-Item position of the file selection and time actually sent to the Group.
     pub(super) fn sought_position(&self, to: FileSeek) -> Duration {
-        let within = Duration::from_secs(to.within.as_secs());
+        self.whole(FilePosition {
+            file: to.track.unwrap_or(0),
+            within: Duration::from_secs(to.within.as_secs()),
+        })
+    }
+
+    /// Whole-Item position of `at`.
+    pub(super) fn whole(&self, at: FilePosition) -> Duration {
         self.layout
             .as_ref()
-            .and_then(|layout| {
-                layout.position(FilePosition {
-                    file: to.track.unwrap_or(0),
-                    within,
-                })
-            })
-            .unwrap_or(within)
+            .and_then(|layout| layout.position(at))
+            .unwrap_or(at.within)
+    }
+
+    /// Where a start at saved `position` in the whole Item begins: the file holding the exact
+    /// position (a fraction past a boundary is the later file), at whole seconds within it,
+    /// never past the saved place.
+    pub(super) fn start_at(&self, position: Duration) -> FilePosition {
+        let mut at = self.exact(position);
+        at.within = Duration::from_secs(at.within.as_secs());
+        at
+    }
+
+    /// Where exactly `position` in the whole Item lies among the files.
+    fn exact(&self, position: Duration) -> FilePosition {
+        match &self.layout {
+            Some(layout) => layout.locate(position),
+            None => FilePosition {
+                file: 0,
+                within: position,
+            },
+        }
     }
 
     /// Where `position` in the whole Item lies among the files. Round within the file up to
@@ -184,13 +206,7 @@ impl ItemFiles {
     /// Rounding up keeps a chapter target at or past its exact `Chapters::current` boundary,
     /// except where capped at the last file's length.
     pub(super) fn locate(&self, position: Duration) -> FilePosition {
-        let mut at = match &self.layout {
-            Some(layout) => layout.locate(position),
-            None => FilePosition {
-                file: 0,
-                within: position,
-            },
-        };
+        let mut at = self.exact(position);
         let rounded = Duration::from_secs(
             at.within
                 .as_secs()
@@ -380,6 +396,25 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn a_start_selects_the_file_of_exact_progress_and_floors_within_it() {
+        let token = StreamToken::new("ab12".into());
+        let boundary = Duration::from_millis(40_050);
+        let files = ItemFiles::of(
+            token.hash(),
+            &[file("a", Some(boundary)), file("b", Some(s(30)))],
+        );
+        let at = |file, within| FilePosition { file, within };
+        // At the fractional boundary: the later file, from its start.
+        assert_eq!(files.start_at(boundary), at(1, s(0)));
+        assert_eq!(files.whole(at(1, s(0))), boundary);
+        // Just below it: the earlier file, floored, not rounded up into the next.
+        assert_eq!(files.start_at(Duration::from_millis(40_049)), at(0, s(40)));
+        // Within a file: never past the saved place.
+        assert_eq!(files.start_at(Duration::from_millis(52_999)), at(1, s(12)));
+        assert_eq!(files.whole(at(1, s(12))), Duration::from_millis(52_050));
     }
 
     #[test]

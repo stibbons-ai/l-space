@@ -699,7 +699,7 @@ impl<S: Store> AppApi<S> {
         let item_files = ItemFiles::of(stream, &files);
         let play_time = sonos::play_timeout(files.len());
         let after_turn_calls = StartCalls {
-            seek: !item_files.locate(position).within.is_zero(),
+            seek: !item_files.start_at(position).within.is_zero(),
             reread: !from_start,
         };
         let after_turn = start_reservation(play_time, after_turn_calls);
@@ -748,7 +748,9 @@ impl<S: Store> AppApi<S> {
             }
         };
         // The start position in its file: a start at a file's beginning needs no seek.
-        let to = item_files.locate(position);
+        let to = item_files.start_at(position);
+        // Where the Group then is in the whole Item.
+        let begun = item_files.whole(to);
         let calls = StartCalls {
             seek: !to.within.is_zero(),
             reread: false,
@@ -876,7 +878,7 @@ impl<S: Store> AppApi<S> {
                 });
                 return Err(sonos_error(error));
             }
-            supervisors.start(&handoff, stream, known_length(length), position);
+            supervisors.start(&handoff, stream, known_length(length), begun);
             tracing::info!(
                 group = handoff.group,
                 library_server,
@@ -1476,25 +1478,24 @@ fn too_little_time(
     ApiError::GroupFailed
 }
 
-/// Where a start has the Group begin, in whole seconds: 0 when asked to play `from_start`, or
-/// when `progress` (the starting user's own) is absent, Finished, less than a second in (or
-/// not a time at all), or when its whole seconds lie at or past the Item's end (`duration`,
-/// in seconds, when known); else its `current_time`, without the fraction.
+/// Where a start has the Group begin in the whole Item: 0 when asked to play `from_start`, or
+/// when `progress` (the starting user's own) is absent, Finished, negative (or not a time at
+/// all), or when its whole seconds lie at or past the Item's end (`duration`, in seconds,
+/// when known); else its exact `current_time`, so a fraction past a file boundary selects the
+/// later file ([`ItemFiles::start_at`] drops the fraction only within that file).
 fn start_position(
     progress: Option<&Progress>,
     from_start: bool,
     duration: Option<f64>,
 ) -> Duration {
     match progress {
-        Some(progress)
-            if !from_start && !progress.finished && progress.current_time.is_finite() =>
-        {
-            // Saturating: a negative time starts at 0.
-            let position = Duration::from_secs(progress.current_time as u64);
+        Some(progress) if !from_start && !progress.finished => {
+            // Negative, not finite or beyond `Duration`: starts at 0.
+            let position = Duration::try_from_secs_f64(progress.current_time).unwrap_or_default();
             match duration {
                 // A Group may refuse a seek past its track (sonos-fake does; unverified on
                 // hardware).
-                Some(duration) if position.as_secs_f64() >= duration => Duration::ZERO,
+                Some(duration) if position.as_secs() as f64 >= duration => Duration::ZERO,
                 _ => position,
             }
         }
@@ -3106,22 +3107,24 @@ mod tests {
     }
 
     #[test]
-    fn a_start_begins_at_the_whole_seconds_of_unfinished_progress_unless_from_start() {
+    fn a_start_begins_at_the_exact_unfinished_progress_unless_from_start() {
         let secs = Duration::from_secs;
+        let exact = Duration::from_secs_f64;
         let cases = [
             (None, false, None, secs(0)),
-            (progress(754.6, false), false, None, secs(754)),
+            (progress(754.6, false), false, None, exact(754.6)),
             (progress(754.6, false), true, None, secs(0)),
             (progress(754.6, true), false, None, secs(0)),
-            (progress(0.9, false), false, None, secs(0)),
+            (progress(0.9, false), false, None, exact(0.9)),
             (progress(-3.0, false), false, None, secs(0)),
             (progress(f64::NAN, false), false, None, secs(0)),
             (progress(f64::INFINITY, false), false, None, secs(0)),
-            // Within the Item's length; at or past its end.
-            (progress(754.6, false), false, Some(754.3), secs(754)),
+            (progress(f64::MAX, false), false, None, secs(0)),
+            // Whole seconds within the Item's length; at or past its end.
+            (progress(754.6, false), false, Some(754.3), exact(754.6)),
             (progress(754.6, false), false, Some(754.0), secs(0)),
             (progress(900.0, false), false, Some(754.3), secs(0)),
-            (progress(754.6, false), false, Some(f64::NAN), secs(754)),
+            (progress(754.6, false), false, Some(f64::NAN), exact(754.6)),
         ];
         for (progress, from_start, duration, expected) in cases {
             assert_eq!(
