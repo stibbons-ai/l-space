@@ -871,6 +871,7 @@ impl<S: Store> AppApi<S> {
             })
             .await?;
         let has_cover = browse::has_cover(&library_item);
+        let library = library_item.library_id.clone();
         let item = browse::item(&user, library_item.clone(), id.clone())
             .map_err(|reason| missing(library_server, request, id.episode.as_deref(), reason))?;
         let file = playable_file(library_server, request, library_item, &id)?;
@@ -919,6 +920,7 @@ impl<S: Store> AppApi<S> {
             title: item.title,
             author: item.author,
             podcast: item.podcast,
+            library,
         })
     }
 

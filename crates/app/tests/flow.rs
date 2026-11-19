@@ -20,7 +20,7 @@ use api::{
 };
 use app::flow::{App, Notice, Screen};
 use app::i18n::{self, Language, LanguageChoice, Text};
-use app::local::{LocalPlayer, LocalStatus, Media, PlayerEvent, REPORT_EVERY};
+use app::local::{LocalPlayer, LocalStatus, Media, PlayerEvent, REPORT_EVERY, Speed};
 use app::storage::{DeviceStore, FileStore, LoadError, Stored, StoredSession};
 use clock::{Clock, ManualClock};
 use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
@@ -4108,8 +4108,9 @@ fn a_session_ended_elsewhere_leads_from_a_group_control_to_login() {
 }
 
 /// A [`LocalPlayer`] standing in for AVPlayer: what it was asked, and a position that moves on
-/// the test's manual clock while it plays. As AVPlayer's periodic observer does, it tells its
-/// position in whole seconds; a pause answers it exactly.
+/// the test's manual clock while it plays, by its speed's rate of media seconds per second. As
+/// AVPlayer's periodic observer does, it tells its position in whole seconds; a pause answers
+/// it exactly.
 #[derive(Debug)]
 struct FakePlayer {
     clock: ManualClock,
@@ -4124,6 +4125,7 @@ struct FakeState {
     at: f64,
     /// When that was.
     since: Option<Instant>,
+    speed: Speed,
 }
 
 impl FakePlayer {
@@ -4147,11 +4149,18 @@ impl FakePlayer {
         self.state().playing
     }
 
+    /// The speed it plays at, or would play on at.
+    fn speed(&self) -> Speed {
+        self.state().speed
+    }
+
     /// Where it is, exactly.
     fn exact(&self) -> f64 {
         let state = self.state();
         match (state.playing, state.since) {
-            (true, Some(since)) => state.at + (self.clock.now() - since).as_secs_f64(),
+            (true, Some(since)) => {
+                state.at + (self.clock.now() - since).as_secs_f64() * f64::from(state.speed.rate())
+            }
             _ => state.at,
         }
     }
@@ -4169,7 +4178,9 @@ impl FakePlayer {
 impl LocalPlayer for FakePlayer {
     fn load(&self, media: &Media) {
         self.set(true, media.start_at);
-        self.state().media = Some(media.clone());
+        let mut state = self.state();
+        state.media = Some(media.clone());
+        state.speed = media.speed;
     }
 
     fn play(&self) {
@@ -4185,6 +4196,12 @@ impl LocalPlayer for FakePlayer {
     fn seek(&self, position: f64) {
         let playing = self.playing();
         self.set(playing, position);
+    }
+
+    fn set_speed(&self, speed: Speed) {
+        let playing = self.playing();
+        self.set(playing, self.exact());
+        self.state().speed = speed;
     }
 
     fn unload(&self) {
@@ -4372,6 +4389,7 @@ fn playing_on_the_phone_starts_at_the_progress_from_the_bridges_stream() {
                 duration: Some(900.0),
                 position: 123.0,
                 playing: true,
+                speed: Speed::Normal,
                 report_failed: None,
             })
         );
@@ -4490,6 +4508,176 @@ fn local_playback_reports_every_30_seconds_and_at_once_on_pause_skip_and_stop() 
         assert_eq!(status_of(&bridge, &stream).await, 404);
         app.open_now_playing();
         assert!(matches!(app.screen(), Screen::Item { .. }));
+    });
+}
+
+/// Now playing offers 1.0× to 2.0×, at 1.0× at first. A speed applies at once, playing or
+/// paused, without moving, playing on or reporting; Progress stays in seconds into the Item at
+/// any speed: on the timer, at a pause, a skip and the stop.
+#[test]
+fn a_local_speed_applies_at_once_and_progress_stays_in_seconds_into_the_item() {
+    let (bridge, abs, proxy, log) = bridge_behind_logging_proxy();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(2);
+        let Phone {
+            mut app, player, ..
+        } = on_episode_with_player(&device, &bridge, &proxy, &user, &clock, &abs, 2).await;
+        app.play_on_phone().await;
+        assert_eq!(app.local_status().map(|s| s.speed), Some(Speed::Normal));
+        assert_eq!(
+            Speed::ALL.map(|speed| i18n::speed(Language::English, speed)),
+            ["1.0×", "1.25×", "1.5×", "1.75×", "2.0×"]
+        );
+        assert_eq!(
+            Speed::ALL.map(|speed| i18n::speed(Language::German, speed)),
+            ["1,0×", "1,25×", "1,5×", "1,75×", "2,0×"]
+        );
+
+        clock.advance(Duration::from_secs(4));
+        let writes = progress_writes(&log).await;
+        app.set_local_speed(Speed::X2).await;
+        assert_eq!((player.speed(), player.exact()), (Speed::X2, 4.0));
+        assert!(player.playing());
+        assert_eq!(app.local_status().map(|s| s.speed), Some(Speed::X2));
+        assert_eq!(progress_writes(&log).await, writes);
+        // The timer still reports every 30 s on the clock, each in seconds into the episode.
+        clock.advance(Duration::from_secs(26));
+        progress_becomes(&abs, &user, &episode, (56.0, false)).await;
+
+        clock.advance(Duration::from_millis(10_250));
+        app.toggle_local().await;
+        progress_becomes(&abs, &user, &episode, (76.5, false)).await;
+
+        // Paused, a speed neither plays on nor moves; it plays at it once played on.
+        let writes = progress_writes(&log).await;
+        app.set_local_speed(Speed::X1_5).await;
+        assert!(!player.playing());
+        assert_eq!((player.speed(), player.exact()), (Speed::X1_5, 76.5));
+        assert_eq!(app.local_status().map(|s| s.speed), Some(Speed::X1_5));
+        assert_eq!(progress_writes(&log).await, writes);
+        app.toggle_local().await;
+        clock.advance(Duration::from_secs(3));
+        app.skip_local(Skip::Forward30).await;
+        progress_becomes(&abs, &user, &episode, (111.0, false)).await;
+        app.skip_local(Skip::Back15).await;
+        progress_becomes(&abs, &user, &episode, (96.0, false)).await;
+
+        clock.advance(Duration::from_secs(1));
+        app.stop_local().await;
+        assert_eq!(
+            abs.item_progress(&user, &episode).await,
+            Some((97.5, false))
+        );
+    });
+}
+
+/// Plays `item` on the phone from its Item screen, and answers the speed it plays at.
+async fn plays_at(app: &mut App, item: &ItemId) -> Speed {
+    app.open_item(item.clone()).await;
+    app.play_on_phone().await;
+    assert_eq!(app.screen(), &Screen::NowPlaying { notice: None });
+    app.local_status().expect("playing on the phone").speed
+}
+
+/// An audiobook's [`ItemId`].
+fn book(library_item: &str) -> ItemId {
+    ItemId {
+        library_item: library_item.to_owned(),
+        episode: None,
+    }
+}
+
+/// Episodes of one podcast share a speed, and books of one audiobook Library do, kept on the
+/// device across launches; another podcast or audiobook Library keeps its own. Another Library
+/// Server never takes them up, though its ids are the same; a file from before speeds reads
+/// as 1.0× everywhere.
+#[test]
+fn a_local_speed_is_kept_per_podcast_and_audiobook_library_on_its_library_server() {
+    let (bridge, abs, second) = bridge_with_two_library_servers();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let seeded = abs.seeded();
+        let twins = abs.twin_books().await;
+        let crowded = abs.crowded_podcast().await;
+        let user = abs
+            .new_user_seeing(&[
+                &seeded.audiobook_library,
+                &seeded.podcast_library,
+                &twins.library,
+                &crowded.library,
+            ])
+            .await;
+        let other_podcast = ItemId {
+            library_item: crowded.podcast.clone(),
+            episode: Some(crowded.episodes[0].clone()),
+        };
+        let mut phone = device.launch_playing(&clock).await;
+        phone.app.submit_bridge_url(bridge.url()).await;
+        phone
+            .app
+            .log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
+            .await;
+        assert_eq!(
+            plays_at(&mut phone.app, &seeded.episode(0)).await,
+            Speed::Normal
+        );
+        phone.app.set_local_speed(Speed::X1_5).await;
+        assert_eq!(
+            plays_at(&mut phone.app, &book(&twins.books[0])).await,
+            Speed::Normal
+        );
+        phone.app.set_local_speed(Speed::X2).await;
+        assert_eq!(phone.player.speed(), Speed::X2);
+        drop(phone);
+
+        let Phone {
+            mut app, player, ..
+        } = device.launch_playing(&clock).await;
+        assert_on_home(&app);
+        assert_eq!(plays_at(&mut app, &seeded.episode(2)).await, Speed::X1_5);
+        assert_eq!(player.speed(), Speed::X1_5);
+        assert_eq!(plays_at(&mut app, &other_podcast).await, Speed::Normal);
+        assert_eq!(plays_at(&mut app, &book(&twins.books[1])).await, Speed::X2);
+        assert_eq!(
+            plays_at(&mut app, &book(&seeded.silence)).await,
+            Speed::Normal
+        );
+
+        // Second is the same Audiobookshelf behind another URL: the same ids, its own speeds.
+        log_in_elsewhere(&mut app, &second, &user).await;
+        assert_on_home(&app);
+        assert_eq!(plays_at(&mut app, &seeded.episode(1)).await, Speed::Normal);
+        assert_eq!(
+            plays_at(&mut app, &book(&twins.books[0])).await,
+            Speed::Normal
+        );
+        app.set_local_speed(Speed::X1_25).await;
+        app.switch_to(abs.base_url()).await;
+        assert_eq!(plays_at(&mut app, &book(&twins.books[1])).await, Speed::X2);
+        assert_eq!(plays_at(&mut app, &seeded.episode(1)).await, Speed::X1_5);
+        app.switch_to(&second).await;
+        assert_eq!(
+            plays_at(&mut app, &book(&twins.books[1])).await,
+            Speed::X1_25
+        );
+        app.stop_local().await;
+        drop((app, player));
+
+        // As an App from before speeds left the file.
+        device.edit(|json| {
+            json.as_object_mut().unwrap().remove("speeds");
+        });
+        let Phone { mut app, .. } = device.launch_playing(&clock).await;
+        assert_on_home(&app);
+        assert_eq!(
+            plays_at(&mut app, &book(&twins.books[0])).await,
+            Speed::Normal
+        );
+        app.stop_local().await;
     });
 }
 

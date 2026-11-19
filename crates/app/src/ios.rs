@@ -55,7 +55,7 @@ use objc2_ui_kit::UIImage;
 use tokio::sync::mpsc;
 
 use crate::flow::{App, CALL_TIMEOUT};
-use crate::local::{LocalPlayer, Media, PlayerEvent, PlayerEvents};
+use crate::local::{LocalPlayer, Media, PlayerEvent, PlayerEvents, Speed};
 
 /// How often AVPlayer tells the main thread where it is, in seconds.
 const POSITION_EVERY: f64 = 1.0;
@@ -168,7 +168,8 @@ impl LocalPlayer for AvPlayer {
             activate_session();
             with_main(|main| {
                 if let Some(player) = &main.player {
-                    unsafe { player.play() };
+                    // `play` would play at 1.0×; a rate other than 0 plays at that rate.
+                    unsafe { player.setRate(main.speed()) };
                 }
                 main.playing = true;
             });
@@ -211,6 +212,23 @@ impl LocalPlayer for AvPlayer {
             });
             // AVPlayer seeks in the background: until then it still tells the old time.
             update_now_playing(Some(position));
+        });
+    }
+
+    fn set_speed(&self, speed: Speed) {
+        on_main(move |_| {
+            with_main(|main| {
+                if let Some(media) = &mut main.media {
+                    media.speed = speed;
+                }
+                // Setting a rate other than 0 plays: only while App logic has it play.
+                if main.playing
+                    && let Some(player) = &main.player
+                {
+                    unsafe { player.setRate(speed.rate()) };
+                }
+            });
+            update_now_playing(None);
         });
     }
 
@@ -271,6 +289,11 @@ struct Main {
 }
 
 impl Main {
+    /// The rate what is loaded plays at, while it plays.
+    fn speed(&self) -> f32 {
+        self.media.as_ref().map_or(1.0, |media| media.speed.rate())
+    }
+
     /// Pauses and drops the player, if any, with its observers.
     fn release_player(&mut self) {
         if let Some(player) = self.player.take() {
@@ -528,7 +551,7 @@ fn load(mtm: MainThreadMarker, media: Media, number: u64) {
             CMTime::with_seconds(media.start_at, 1000),
             &landing(position, number),
         );
-        player.play();
+        player.setRate(media.speed.rate());
     }
     let item_observers = item.map(|item| observe_item(&item)).unwrap_or_default();
     let start_at = media.start_at;
@@ -625,7 +648,11 @@ fn update_now_playing(elapsed: Option<f64>) {
                 MPNowPlayingInfoPropertyElapsedPlaybackTime,
                 NSNumber::new_f64(elapsed).into(),
             );
-            let rate = if main.playing { 1.0 } else { 0.0 };
+            let rate = if main.playing {
+                f64::from(main.speed())
+            } else {
+                0.0
+            };
             add(
                 MPNowPlayingInfoPropertyPlaybackRate,
                 NSNumber::new_f64(rate).into(),

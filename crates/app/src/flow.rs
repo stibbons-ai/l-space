@@ -24,8 +24,8 @@ use tokio::sync::mpsc;
 
 use crate::client;
 use crate::i18n::{self, Language, LanguageChoice, Text};
-use crate::local::{Halted, LocalPlayback, LocalPlayer, LocalStatus, PlayerEvent};
-use crate::storage::{DeviceStore, LoadError, Stored, StoredSession};
+use crate::local::{Halted, LocalPlayback, LocalPlayer, LocalStatus, PlayerEvent, Speed};
+use crate::storage::{DeviceStore, LoadError, SpeedKey, Stored, StoredSession};
 
 /// What the App shows.
 #[derive(Debug, Clone, PartialEq)]
@@ -228,6 +228,8 @@ pub struct App {
     /// Local playback, where the App has a [`LocalPlayer`]; none elsewhere, which then offers
     /// no Local playback.
     local: Option<LocalPlayback>,
+    /// What the Playback speed of what plays on this phone is kept for, if it is kept.
+    speed_key: Option<SpeedKey>,
 }
 
 impl App {
@@ -266,6 +268,7 @@ impl App {
             unheld: Vec::new(),
             call_timeout: CALL_TIMEOUT,
             local: None,
+            speed_key: None,
         }
     }
 
@@ -790,10 +793,21 @@ impl App {
             (Ok(()), None) => None,
         };
         match self.call(api::start_local(id)).await {
-            Ok(started) => match local.start(started, &bridge_url).await {
-                Ok(()) => self.push_screen(Screen::NowPlaying { notice: ended }),
-                Err(error) => self.set_notice(Notice::Api(error)),
-            },
+            Ok(started) => {
+                let library_server = self.stored.session().map(StoredSession::library_server_url);
+                let speed_key =
+                    library_server.and_then(|server| SpeedKey::of_start(server, &started));
+                let speed = speed_key
+                    .as_ref()
+                    .map_or(Speed::Normal, |key| self.stored.speed(key));
+                match local.start(started, &bridge_url, speed).await {
+                    Ok(()) => {
+                        self.speed_key = speed_key;
+                        self.push_screen(Screen::NowPlaying { notice: ended });
+                    }
+                    Err(error) => self.set_notice(Notice::Api(error)),
+                }
+            }
             // Why nothing plays matters more.
             Err(error) => self.failed(error).await,
         }
@@ -848,6 +862,31 @@ impl App {
             && let Err(error) = local.skip(skip).await
         {
             self.set_notice(Notice::Api(error));
+        }
+    }
+
+    /// On Now playing, plays at `speed` from now on, without moving or playing on, and keeps
+    /// it for the podcast or audiobook Library of what plays, on its Library Server; says if
+    /// that could not be saved. A Group never takes it: Groups play at normal speed.
+    pub async fn set_local_speed(&mut self, speed: Speed) {
+        let Some(local) = self.local_on_screen() else {
+            return;
+        };
+        match local.set_speed(speed).await {
+            Ok(true) => {}
+            // Nothing plays: nothing to keep a speed for.
+            Ok(false) => return,
+            Err(error) => {
+                self.set_notice(Notice::Api(error));
+                return;
+            }
+        }
+        let Some(key) = self.speed_key.clone() else {
+            return;
+        };
+        self.stored.set_speed(key, speed);
+        if let Some(notice) = self.save().await {
+            self.set_notice(notice);
         }
     }
 

@@ -455,6 +455,10 @@ pub struct LocalStart {
     pub start_at: f64,
     /// Unknown if the Library Server doesn't know it.
     pub duration: Option<f64>,
+    /// The Library holding the Item, by Audiobookshelf's id; none from a Bridge before #26,
+    /// or when the Library Server didn't say.
+    #[serde(default)]
+    pub library: Option<String>,
 }
 
 impl fmt::Debug for LocalStart {
@@ -468,6 +472,7 @@ impl fmt::Debug for LocalStart {
             .field("artwork", &self.artwork.as_ref().map(|_| "REDACTED"))
             .field("start_at", &self.start_at)
             .field("duration", &self.duration)
+            .field("library", &self.library)
             .finish()
     }
 }
@@ -1176,8 +1181,26 @@ mod tests {
             artwork: Some("/cover/s3cret".into()),
             start_at: 0.0,
             duration: None,
+            library: Some("lib".into()),
         };
         assert!(!format!("{local:?}").contains("s3cret"), "{local:?}");
+    }
+
+    /// An App reads a start from a Bridge that names no Library, as one before #26 answers.
+    #[test]
+    fn a_start_without_its_library_reads_as_none() {
+        let started: LocalStart = serde_json::from_value(serde_json::json!({
+            "item": {"library_item": "li", "episode": null},
+            "title": "Title",
+            "author": null,
+            "podcast": null,
+            "stream": "/stream/id/a.mp3",
+            "artwork": null,
+            "start_at": 0.0,
+            "duration": null,
+        }))
+        .expect("a start from an earlier Bridge");
+        assert_eq!(started.library, None);
     }
 
     #[cfg(feature = "server")]

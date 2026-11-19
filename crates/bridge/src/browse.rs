@@ -120,7 +120,7 @@ pub fn continue_listening(
         .filter(|entry| {
             libraries
                 .iter()
-                .any(|library| library.id == entry.library_id)
+                .any(|library| entry.library_item.library_id.as_ref() == Some(&library.id))
         })
         .filter_map(|entry| {
             let last_update = entry.progress_last_update;
@@ -429,6 +429,7 @@ mod tests {
     fn the_podcast(episodes: Vec<abs::Episode>) -> abs::LibraryItem {
         abs::LibraryItem {
             id: "li-1".into(),
+            library_id: None,
             media: abs::Media::Podcast(abs::Podcast {
                 metadata: abs::PodcastMetadata {
                     title: "Podcast".into(),

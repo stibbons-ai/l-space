@@ -63,6 +63,7 @@ duration-under-minute = unter 1 Min.
 groups-title = Gruppen
 groups-none = Clacks hat in deinem Netzwerk keine Sonos-Lautsprecher gefunden.
 groups-refresh = Aktualisieren
+groups-normal-speed = Gruppen spielen immer mit normaler Geschwindigkeit (1,0×). Die Wiedergabegeschwindigkeit gilt nur auf diesem Telefon.
 group-playing = Spielt
 group-paused = Pausiert
 group-stopped = Gestoppt
@@ -85,6 +86,7 @@ now-playing-title = Wird abgespielt
 now-playing-none = Auf diesem Telefon wird nichts abgespielt.
 local-play = Abspielen
 local-stop = Beenden
+local-speed = Geschwindigkeit
 
 date = { $day }. { $month ->
         [1] Januar

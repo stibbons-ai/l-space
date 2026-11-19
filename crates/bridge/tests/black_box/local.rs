@@ -140,6 +140,11 @@ async fn local_playback_starts_at_the_users_progress_and_streams_the_file() {
     assert_eq!(started.author, None);
     assert_eq!(started.start_at, 123.0);
     assert_eq!(started.duration, Some(EPISODE_DURATIONS[1]));
+    // Its Library, for the App to keep a Playback speed per podcast or audiobook Library by.
+    assert_eq!(
+        started.library.as_deref(),
+        Some(setup.abs.seeded().podcast_library.as_str())
+    );
     // A path on the Bridge, for the App to append to its own Bridge URL: no address in it.
     assert!(started.stream.starts_with("/stream/"), "{}", started.stream);
     assert!(
@@ -212,6 +217,10 @@ async fn a_finished_item_or_one_without_progress_starts_at_the_beginning() {
     assert_eq!(silence.title, "Silence");
     assert_eq!(silence.author.as_deref(), Some("L-Space"));
     assert_eq!(silence.artwork, None);
+    assert_eq!(
+        silence.library.as_deref(),
+        Some(setup.abs.seeded().audiobook_library.as_str())
+    );
     assert!(
         silence
             .stream
