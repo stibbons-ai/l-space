@@ -92,9 +92,10 @@ Kind one pauses at the end of the current chapter (audiobook) or episode (podcas
 4. With wired or Bluetooth headphones, pause and play from their controls.
 5. Receive a phone call; end it.
 6. Unlock and open Now playing.
-7. Over mobile data, "Play on this phone" an Item with Progress and choose 2.0× right away, within a second; then 30 seconds forward and choose 1.25× right away; then pause, 30 seconds forward and choose 1.5× right away. Lock the phone after each and look at the lock screen.
+7. Over mobile data, "Play on this phone" an Item with Progress and choose 2.0× right away, within a second; then 30 seconds forward and choose 1.25× right away; then pause, 30 seconds forward and choose 1.5× right away. Lock the phone after each and look at the lock screen. Repeat if the seek has already settled before you change speed.
+8. After the checks, restore 1.0× for the Item.
 
-- [ ] While playing, the elapsed time advances about 30 seconds in those 20 seconds (1.5 seconds of the Item per second), and Progress on the Library Server follows it.
+- [ ] While playing, the elapsed time advances about 30 seconds in those 20 seconds (1.5 seconds of the Item per second). Pause and check that Progress on the Library Server matches the paused position.
 - [ ] While paused, the elapsed time stands still.
 - [ ] 15 seconds back and 30 seconds forward move it by 15 and 30 seconds of the Item, not 1.5 times that.
 - [ ] After the lock screen's and Control Center's play, the headphones' play and the end of the call, it plays on at 1.5×, and Now playing still marks 1.5×.
