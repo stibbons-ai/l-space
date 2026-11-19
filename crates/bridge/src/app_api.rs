@@ -1718,8 +1718,11 @@ impl<S: Store> Controls<S> {
     /// either, with [`ApiError::LengthUnknown`]. Either way nothing is sent to the Group and
     /// nothing written. Chapters move as `domain::Chapters` says; a next chapter in the last
     /// chapter sends the Group nothing and writes nothing, answering with where it is.
+    /// A file seek on a playing Group pauses it first and plays on after, all in the control's
+    /// one Group budget, so no file ends between selecting the file and the time in it.
     /// A failed seek ends the Handoff and pauses only if file selection was acknowledged
-    /// or may have acted; a refusal before selection leaves the Handoff and Progress alone.
+    /// or may have acted, or the Group did not confirm playing on after it; a refusal before
+    /// selection (the pause's included) leaves the Handoff and Progress alone.
     async fn skip(
         &self,
         group: &str,
@@ -1805,8 +1808,8 @@ impl<S: Store> Controls<S> {
         };
         let to = files.seek(target);
         let control = Control::Skip(skip);
-        // Persist uncertainty before TRACK_NR. Cleanup deletion can fail, and a crash must
-        // not turn a half-finished seek back into trusted Progress.
+        // Persist uncertainty before any device change. Cleanup deletion can fail, and a crash
+        // must not turn a half-finished seek back into trusted Progress.
         if to.track.is_some()
             && !self
                 .store
@@ -1816,12 +1819,48 @@ impl<S: Store> Controls<S> {
         {
             return Err(ApiError::NoHandoff);
         }
-        // The seek owns this remaining deadline so it can report whether TRACK_NR acted,
-        // even on a timeout. An outer timeout would erase that information.
-        let mut sought = self
-            .sonos
-            .seek(group, to.track, to.within, group_time.0)
-            .await;
+        // A short file can end between TRACK_NR and REL_TIME, leaving REL_TIME to act on the
+        // next one: a playing Group is paused across both, then plays on.
+        let freeze = to.track.is_some() && playback.state == sonos::TransportState::Playing;
+        let paused = if freeze {
+            // A failed pause selected nothing: the Group is where it was, playing or paused.
+            group_time
+                .spend(self.sonos.pause(group))
+                .await
+                .unwrap_or(Err(sonos::Error::GroupFailed))
+        } else {
+            Ok(())
+        };
+        let mut sought = match paused {
+            Err(error) => Err(error),
+            Ok(()) => {
+                // The seek owns this remaining deadline so it can report whether TRACK_NR
+                // acted, even on a timeout. An outer timeout would erase that information.
+                let started = tokio::time::Instant::now();
+                let sought = self
+                    .sonos
+                    .seek(group, to.track, to.within, group_time.0)
+                    .await;
+                group_time.0 = group_time.0.saturating_sub(started.elapsed());
+                if freeze && sought != Err(sonos::Error::SeekMayHaveMoved) {
+                    let resumed = group_time.spend(self.sonos.resume(group)).await;
+                    // Moved but not confirmed playing again: as uncertain as a failed seek. A
+                    // refusal before selecting stays where it was, paused unless resumed.
+                    if sought.is_ok() && resumed != Some(Ok(())) {
+                        tracing::warn!(
+                            group,
+                            ?resumed,
+                            "a Group did not play on after a file seek"
+                        );
+                        Err(sonos::Error::SeekMayHaveMoved)
+                    } else {
+                        sought
+                    }
+                } else {
+                    sought
+                }
+            }
+        };
         if to.track.is_some() && sought != Err(sonos::Error::SeekMayHaveMoved) {
             match self.store.set_handoff_seeking(files.stream(), false).await {
                 Ok(true) => {}

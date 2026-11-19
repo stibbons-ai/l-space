@@ -646,6 +646,8 @@ async fn a_start_waits_for_the_failed_file_seeks_pause() {
         sonos_fake::Fault::RefuseSeekSlowPause(seconds(3)),
     );
     let api = setup.bridge.api();
+    let pause = || setup.household.asked(&setup.kitchen, "AVTransport#Pause");
+    let pauses = pause();
     assert_eq!(
         api.control_error(
             &setup.bobs,
@@ -655,7 +657,8 @@ async fn a_start_waits_for_the_failed_file_seeks_pause() {
         .await,
         (StatusCode::BAD_GATEWAY, ApiError::GroupFailed)
     );
-    let pausing = async || setup.household.asked(&setup.kitchen, "AVTransport#Pause") > 0;
+    // The second Pause: the first held playback still across the file seek.
+    let pausing = async || pause() > pauses + 1;
     eventually("the cleanup pause was never sent", WITHIN, pausing).await;
     setup
         .household
@@ -1015,6 +1018,7 @@ async fn a_file_seek_is_not_sent_when_its_quarantine_cannot_be_persisted() {
          BEGIN SELECT RAISE(FAIL, 'injected quarantine failure'); END;",
     )
     .unwrap();
+    let pauses = setup.household.asked(&setup.kitchen, "AVTransport#Pause");
     assert_eq!(
         setup
             .bridge
@@ -1027,7 +1031,13 @@ async fn a_file_seek_is_not_sent_when_its_quarantine_cannot_be_persisted() {
             .await,
         (StatusCode::INTERNAL_SERVER_ERROR, ApiError::Internal),
     );
+    // Not even paused for the seek.
     assert_eq!(setup.track(), (Some(1), seconds(2395)));
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+    assert_eq!(
+        setup.household.asked(&setup.kitchen, "AVTransport#Pause"),
+        pauses
+    );
     assert_eq!(setup.progress().await, Some((2395.0, false)));
     db.execute_batch("DROP TRIGGER refuse_quarantine;").unwrap();
     assert_eq!(setup.skip(Skip::Forward30).await, playing(2425.0));
@@ -1122,4 +1132,185 @@ async fn supervision_survives_a_successful_file_seek_overlapping_its_cadence() {
         .set_fault(&setup.kitchen, sonos_fake::Fault::None);
     setup.advance(31).await;
     setup.wait_for_progress((2456.0, false)).await;
+}
+
+/// "The Long Book" behind a proxy telling its files as `lengths` seconds long, on a Kitchen
+/// whose queue's tracks are as long, a Bridge on real time, and a user logged in.
+async fn short_files(
+    lengths: [u64; 3],
+) -> (
+    Household,
+    clock::ManualClock,
+    PlayerId,
+    TestBridge,
+    LibraryProxy,
+    AbsUser,
+    Session,
+) {
+    let abs = Audiobookshelf::shared();
+    let proxy = LibraryProxy::to(abs.base_url()).await;
+    proxy.set_file_lengths(&lengths.map(|length| length as f64));
+    let (household, clock) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    household.set_queue_lengths(&kitchen, &lengths.map(Duration::from_secs));
+    let url = proxy.url();
+    let bridge = TestBridge::start(&home_with_sonos_toml(&url, household.ssdp()));
+    let user = abs.new_user().await;
+    let session = bridge.api().login(&url, &user.api_key.key).await;
+    (household, clock, kitchen, bridge, proxy, user, session)
+}
+
+#[tokio::test]
+async fn a_playing_skip_keeps_its_file_while_a_short_one_would_end() {
+    let (household, clock, kitchen, bridge, _proxy, user, session) =
+        short_files([25, 10, 120]).await;
+    let abs = Audiobookshelf::shared();
+    let book = ItemId {
+        library_item: abs.seeded().long_book.clone(),
+        episode: None,
+    };
+    let api = bridge.api();
+    api.start_handoff(&session, &book, kitchen.uuid()).await;
+    household.set_fault(
+        &kitchen,
+        sonos_fake::Fault::SlowTransport(Duration::from_millis(250)),
+    );
+    // 30 s in: 5 s into the 10 s second file.
+    let (answer, ()) = tokio::join!(
+        api.skip_group(&session, kitchen.uuid(), Skip::Forward30),
+        async {
+            eventually("REL_TIME never arrived", WITHIN, async || {
+                household
+                    .sought(&kitchen)
+                    .iter()
+                    .any(|seek| seek.unit == "REL_TIME")
+            })
+            .await;
+            assert_eq!(household.track_number(&kitchen), Some(2));
+            assert_eq!(household.transport_state(&kitchen), "PAUSED_PLAYBACK");
+            // Longer than the second file: playing, it would end before REL_TIME acts.
+            clock.advance(seconds(10));
+        }
+    );
+    assert_eq!(
+        answer,
+        Playback {
+            state: TransportState::Playing,
+            position: Some(30.0),
+            duration: Some(155.0),
+        }
+    );
+    assert_eq!(household.track_number(&kitchen), Some(2));
+    assert_eq!(household.position(&kitchen), seconds(5));
+    assert_eq!(household.transport_state(&kitchen), "PLAYING");
+    assert_eq!(abs.item_progress(&user, &book).await, Some((30.0, false)));
+}
+
+#[tokio::test]
+async fn a_refused_file_selection_while_playing_plays_on_where_it_was() {
+    let setup = setup().await;
+    setup.start(Some(3005.0)).await;
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::RefuseTrackSeek);
+    let api = setup.bridge.api();
+    let before = api.handoffs(&setup.bobs).await;
+    let pauses = setup.household.asked(&setup.kitchen, "AVTransport#Pause");
+    assert_eq!(
+        api.control_error(
+            &setup.bobs,
+            setup.kitchen.uuid(),
+            GroupControl::Skip(Skip::Back15)
+        )
+        .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed)
+    );
+    // Paused for the seek, then playing again: not left paused while told it fails.
+    assert_eq!(
+        setup.household.asked(&setup.kitchen, "AVTransport#Pause"),
+        pauses + 1
+    );
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+    assert_eq!(setup.track(), (Some(2), seconds(605)));
+    assert_eq!(api.handoffs(&setup.bobs).await, before);
+    assert_eq!(setup.progress().await, Some((3005.0, false)));
+}
+
+#[tokio::test]
+async fn a_file_seek_that_does_not_play_on_ends_its_handoff_without_progress() {
+    let setup = setup().await;
+    setup.start(Some(3005.0)).await;
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::RefusePlay);
+    let api = setup.bridge.api();
+    assert_eq!(
+        api.control_error(
+            &setup.bobs,
+            setup.kitchen.uuid(),
+            GroupControl::Skip(Skip::Back15)
+        )
+        .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed)
+    );
+    // At its target, but paused, untrusted: the Handoff ends and nothing is written.
+    assert_eq!(setup.track(), (Some(2), seconds(590)));
+    assert_eq!(
+        setup.household.transport_state(&setup.kitchen),
+        "PAUSED_PLAYBACK"
+    );
+    assert_eq!(api.handoffs(&setup.bobs).await, []);
+    setup.advance(31).await;
+    assert_eq!(setup.progress().await, Some((3005.0, false)));
+}
+
+#[tokio::test]
+async fn a_paused_skip_across_files_stays_paused() {
+    let setup = setup().await;
+    setup.start(Some(2405.0)).await;
+    let api = setup.bridge.api();
+    api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
+    let plays = setup.household.asked(&setup.kitchen, "AVTransport#Play");
+    let skipped = setup.skip(Skip::Back15).await;
+    assert_eq!(skipped.state, TransportState::Paused);
+    assert_eq!(skipped.position, Some(2390.0));
+    assert_eq!(setup.track(), (Some(1), seconds(2390)));
+    assert_eq!(
+        setup.household.transport_state(&setup.kitchen),
+        "PAUSED_PLAYBACK"
+    );
+    assert_eq!(
+        setup.household.asked(&setup.kitchen, "AVTransport#Play"),
+        plays
+    );
+    assert_eq!(setup.progress().await, Some((2390.0, false)));
+}
+
+#[tokio::test]
+async fn a_start_whose_quarantine_cannot_be_persisted_leaves_the_group_alone() {
+    let setup = setup().await;
+    let book = setup.book();
+    setup
+        .abs
+        .set_item_progress(&setup.alice, &book, 3000.0, false)
+        .await;
+    let db = rusqlite::Connection::open(setup.bridge.database_path()).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse_start_mark BEFORE UPDATE OF seeking ON handoffs
+         WHEN NEW.seeking = 1
+         BEGIN SELECT RAISE(FAIL, 'injected startup quarantine failure'); END;",
+    )
+    .unwrap();
+    let api = setup.bridge.api();
+    assert_eq!(
+        api.start_handoff_error(&setup.alices, &book, setup.kitchen.uuid())
+            .await,
+        (StatusCode::INTERNAL_SERVER_ERROR, ApiError::Internal),
+    );
+    // Nothing reached the Group: no queue, nothing loaded, not playing.
+    assert_eq!(setup.household.queue(&setup.kitchen), Vec::<String>::new());
+    assert_eq!(setup.household.uri(&setup.kitchen), None);
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "STOPPED");
+    assert_eq!(api.handoffs(&setup.bobs).await, []);
+    assert_eq!(setup.progress().await, Some((3000.0, false)));
 }
