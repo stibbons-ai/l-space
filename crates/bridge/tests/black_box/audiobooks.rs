@@ -921,6 +921,80 @@ async fn failed_seek_quarantine_survives_cleanup_failure_recovery_and_restart() 
 }
 
 #[tokio::test]
+async fn a_failed_initial_seek_whose_cleanup_fails_stays_quarantined() {
+    let setup = setup().await;
+    setup
+        .abs
+        .set_item_progress(&setup.alice, &setup.book(), 2395.0, false)
+        .await;
+    // Fires only on deleting a stored row: the start's own pre-insert delete matches none.
+    let db = rusqlite::Connection::open(setup.bridge.database_path()).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse_cleanup BEFORE DELETE ON handoffs
+         BEGIN SELECT RAISE(FAIL, 'injected cleanup failure'); END;",
+    )
+    .unwrap();
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::RefuseSeek);
+    let api = setup.bridge.api();
+    assert_eq!(
+        api.start_handoff_error(&setup.alices, &setup.book(), setup.kitchen.uuid())
+            .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed),
+    );
+    // The queue played and its file was selected, but not the offset: far from 2395 s.
+    assert!(setup.household.asked(&setup.kitchen, "AVTransport#Play") > 0);
+    assert_eq!(setup.track(), (Some(1), Duration::ZERO));
+    assert_eq!(
+        setup.household.transport_state(&setup.kitchen),
+        "PAUSED_PLAYBACK"
+    );
+    let retained: i64 = db
+        .query_row("SELECT count(*) FROM handoffs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(retained, 1, "the test must exercise failed deletion");
+    // Recover storage and the Group, but never trust the retained failed start.
+    db.execute_batch("DROP TRIGGER refuse_cleanup;").unwrap();
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::None);
+    assert_eq!(api.handoffs(&setup.bobs).await, []);
+    for control in [
+        GroupControl::Resume,
+        GroupControl::Pause,
+        GroupControl::Skip(Skip::Forward30),
+    ] {
+        assert_eq!(
+            api.control_error(&setup.bobs, setup.kitchen.uuid(), control)
+                .await,
+            test_support::bridge::NO_HANDOFF,
+        );
+    }
+    assert_eq!(setup.track(), (Some(1), Duration::ZERO));
+    setup.advance(31).await;
+    assert_eq!(setup.progress().await, Some((2395.0, false)));
+    // Replacement must not write the uncertain start-of-file position for Alice.
+    let episode = setup.abs.seeded().episode(0);
+    api.start_handoff_from_start(&setup.bobs, &episode, setup.kitchen.uuid())
+        .await;
+    assert_eq!(setup.progress().await, Some((2395.0, false)));
+    assert_eq!(api.handoffs(&setup.bobs).await[0].item, episode);
+    setup.advance(10).await;
+    let paused = api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
+    assert_eq!(paused.position, Some(10.0));
+    assert_eq!(setup.progress().await, Some((2395.0, false)));
+    assert_eq!(
+        setup.abs.item_progress(&setup.bob, &episode).await,
+        Some((10.0, false)),
+    );
+    assert_eq!(
+        setup.abs.item_progress(&setup.bob, &setup.book()).await,
+        None
+    );
+}
+
+#[tokio::test]
 async fn a_file_seek_is_not_sent_when_its_quarantine_cannot_be_persisted() {
     let setup = setup().await;
     setup.start(Some(2395.0)).await;
