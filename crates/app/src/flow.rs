@@ -24,7 +24,7 @@ use tokio::sync::mpsc;
 
 use crate::client;
 use crate::i18n::{self, Language, LanguageChoice, Text};
-use crate::local::{Halted, LocalPlayback, LocalPlayer, LocalStatus, PlayerEvent};
+use crate::local::{Halted, LocalPlayback, LocalPlayer, LocalSkip, LocalStatus, PlayerEvent};
 use crate::storage::{DeviceStore, LoadError, Stored, StoredSession};
 
 /// What the App shows.
@@ -586,10 +586,9 @@ impl App {
         .await;
     }
 
-    /// Whether the Item screen offers to play its Item on a Group: only an Item in one audio
-    /// file plays there so far.
+    /// Whether the Item screen offers to play its Item on a Group: one with audio files.
     pub fn can_play_on(&self) -> bool {
-        matches!(&self.screen, Screen::Item { item, .. } if item.audio_files.len() == 1)
+        matches!(&self.screen, Screen::Item { item, .. } if !item.audio_files.is_empty())
     }
 
     /// On the Item screen, marks its Item Finished (`finished`) or unfinished on the Library
@@ -757,9 +756,10 @@ impl App {
     }
 
     /// Whether the Item screen offers to play its Item on this phone: only where the App has a
-    /// player (iOS), and for an Item that plays on a Group too.
+    /// player (iOS), and for an Item in one audio file (Local playback plays no more).
     pub fn can_play_on_phone(&self) -> bool {
-        self.local.is_some() && self.can_play_on()
+        self.local.is_some()
+            && matches!(&self.screen, Screen::Item { item, .. } if item.audio_files.len() == 1)
     }
 
     /// On the Item screen, plays its Item on this phone from the person's Progress, and opens
@@ -770,6 +770,10 @@ impl App {
     /// the end after it should that have failed too, unless it ended the session: the Item it
     /// was about no longer plays.
     pub async fn play_on_phone(&mut self) {
+        // Checked before whatever plays on the phone is stopped for it.
+        if !self.can_play_on_phone() {
+            return;
+        }
         let (Some(local), Some(bridge_url), Screen::Item { item, .. }) =
             (&self.local, &self.stored.bridge_url, &self.screen)
         else {
@@ -843,7 +847,7 @@ impl App {
 
     /// On Now playing, moves by `skip` (writing where to as Progress), as
     /// [`App::toggle_local`] does.
-    pub async fn skip_local(&mut self, skip: Skip) {
+    pub async fn skip_local(&mut self, skip: LocalSkip) {
         if let Some(local) = self.local_on_screen()
             && let Err(error) = local.skip(skip).await
         {
@@ -1355,6 +1359,13 @@ pub fn volume_step(volume: u8, louder: bool) -> u8 {
     } else {
         volume.saturating_sub(VOLUME_STEP)
     }
+}
+
+/// Whether the Groups screen offers previous and next chapter on `group`: for a Handoff of an
+/// audiobook (an Item without an episode).
+pub fn offers_chapters(group: &Group) -> bool {
+    let handoff = group.handoff.as_ref();
+    handoff.is_some_and(|handoff| handoff.item.episode.is_none())
 }
 
 /// Shows `playback`, a control's answer, on `group`'s row: its state and position, and the

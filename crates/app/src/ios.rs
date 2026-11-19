@@ -21,7 +21,6 @@ use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use api::Skip;
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use objc2::rc::{Retained, Weak};
@@ -55,7 +54,7 @@ use objc2_ui_kit::UIImage;
 use tokio::sync::mpsc;
 
 use crate::flow::{App, CALL_TIMEOUT};
-use crate::local::{LocalPlayer, Media, PlayerEvent, PlayerEvents};
+use crate::local::{LocalPlayer, LocalSkip, Media, PlayerEvent, PlayerEvents};
 
 /// How often AVPlayer tells the main thread where it is, in seconds.
 const POSITION_EVERY: f64 = 1.0;
@@ -330,21 +329,21 @@ fn init(position: Position, events: PlayerEvents) {
 
     let center = unsafe { MPRemoteCommandCenter::sharedCommandCenter() };
     let (back, forward) = unsafe { (center.skipBackwardCommand(), center.skipForwardCommand()) };
-    let interval = |skip: Skip| {
+    let interval = |skip: LocalSkip| {
         let seconds = NSNumber::new_f64(f64::from(skip.seconds().unsigned_abs()));
         NSArray::from_retained_slice(&[seconds])
     };
     unsafe {
-        back.setPreferredIntervals(&interval(Skip::Back15));
-        forward.setPreferredIntervals(&interval(Skip::Forward30));
+        back.setPreferredIntervals(&interval(LocalSkip::Back15));
+        forward.setPreferredIntervals(&interval(LocalSkip::Forward30));
     }
     let command_targets = unsafe {
         vec![
             command(&center.playCommand(), PlayerEvent::Play),
             command(&center.pauseCommand(), PlayerEvent::Pause),
             command(&center.togglePlayPauseCommand(), PlayerEvent::Toggle),
-            command(&back, PlayerEvent::Skip(Skip::Back15)),
-            command(&forward, PlayerEvent::Skip(Skip::Forward30)),
+            command(&back, PlayerEvent::Skip(LocalSkip::Back15)),
+            command(&forward, PlayerEvent::Skip(LocalSkip::Forward30)),
         ]
     };
 

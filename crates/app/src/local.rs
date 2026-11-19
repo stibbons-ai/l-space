@@ -26,12 +26,28 @@ use std::fmt::{self, Debug};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use api::{ApiError, ItemId, Skip};
+use api::{ApiError, ItemId};
 use clock::Clock;
 use tokio::sync::{mpsc, oneshot};
 
 /// How often the App reports its position while playing.
 pub const REPORT_EVERY: Duration = Duration::from_secs(30);
+
+/// The two time skips available on the phone, without Sonos chapter controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalSkip {
+    Back15,
+    Forward30,
+}
+
+impl LocalSkip {
+    pub(crate) fn seconds(self) -> i32 {
+        match self {
+            Self::Back15 => -15,
+            Self::Forward30 => 30,
+        }
+    }
+}
 
 /// What a [`LocalPlayer`] loads: an Item's stream with what the lock screen shows of it.
 /// Times are seconds. Its `Debug` output leaves out the URLs, which let anyone holding them
@@ -76,7 +92,7 @@ pub enum PlayerEvent {
     /// Play/pause toggle from there.
     Toggle,
     /// 15 s back or 30 s forward from there.
-    Skip(Skip),
+    Skip(LocalSkip),
     /// iOS interrupted playback (a phone call, say); the player stopped playing.
     InterruptionBegan,
     /// The interruption ended; `resume` if iOS says playback should go on.
@@ -212,7 +228,7 @@ impl Debug for Now {
 enum Command {
     Start(Box<Now>, oneshot::Sender<()>),
     Toggle(oneshot::Sender<()>),
-    Skip(Skip, oneshot::Sender<()>),
+    Skip(LocalSkip, oneshot::Sender<()>),
     Stop(oneshot::Sender<Result<(), ApiError>>),
 }
 
@@ -365,7 +381,7 @@ impl LocalPlayback {
     }
 
     /// Moves by `skip`, kept within the Item, and reports where to.
-    pub async fn skip(&self, skip: Skip) -> Result<(), ApiError> {
+    pub async fn skip(&self, skip: LocalSkip) -> Result<(), ApiError> {
         self.ask(|done| Command::Skip(skip, done)).await
     }
 
@@ -626,7 +642,7 @@ impl Task {
         }
     }
 
-    fn skip(&mut self, skip: Skip) {
+    fn skip(&mut self, skip: LocalSkip) {
         let Some((playing, duration)) = self.shared.read(|now| (now.playing, now.media.duration))
         else {
             return;

@@ -15,12 +15,18 @@
 //! ends when that key is revoked or can no longer be read; logging out doesn't end it. A Group
 //! has at most one: starting another on it replaces the one it had.
 //!
+//! File seeks are durably quarantined before sending them. Until their outcome is committed
+//! safe, Group lookups and listings exclude them (including after restart), but stream lookups
+//! still serve their files. Failed cleanup must never make uncertain playback into Progress.
+//!
 //! A Local session (Local playback) belongs to the App session that started it and acts with
 //! that session's key: it ends with the session (logout, the key revoked or unreadable), and an
 //! App session has at most one: starting another replaces the one it had.
 
 #[cfg(feature = "contract")]
 pub mod contract;
+
+use std::time::Duration;
 
 use abs::ApiKey;
 use sha2::{Digest, Sha256};
@@ -89,8 +95,8 @@ pub struct Handoff {
     pub library_item: String,
     /// The episode, for a podcast's.
     pub episode: Option<String>,
-    /// The audio file the stream serves.
-    pub file: HandoffFile,
+    /// The Item's audio files the stream serves, in playing order; at least one.
+    pub files: Vec<HandoffFile>,
     /// Who started it, and acts for it.
     pub started_by: LibraryUser,
     /// The starter's username when they started it.
@@ -99,13 +105,16 @@ pub struct Handoff {
     pub started_at: i64,
 }
 
-/// The audio file a Handoff's or a Local session's stream serves.
+/// An audio file a Handoff's or a Local session's stream serves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandoffFile {
     /// Audiobookshelf's id for the file within its library item.
     pub ino: String,
-    /// Its name, with its extension: the last segment of the stream's URL.
+    /// Its name, with extension, following `<n>-` in a numbered Handoff stream URL.
     pub name: String,
+    /// Its length as the Library Server told it at Handoff start, stored to the nanosecond.
+    /// None when unknown, for pre-upgrade Handoffs, and for Local sessions (which don't store it).
+    pub duration: Option<Duration>,
 }
 
 /// A Handoff as its stream needs it: with the API key it acts with.
@@ -217,6 +226,7 @@ pub trait Store: Send + Sync + 'static {
     /// The active Handoff on Group `group` (its id), if any, with its stream and the key it
     /// acts with. As for [`Store::handoff`], a Handoff whose key can no longer be read is not
     /// active, and the implementation forgets that key, ending its sessions and Handoffs.
+    /// A Handoff marked seeking is excluded: its position is not yet safe for Progress.
     fn group_handoff(
         &self,
         group: &str,
@@ -225,7 +235,19 @@ pub trait Store: Send + Sync + 'static {
     /// Every active Handoff, the earliest started first (ties by Group id). As for
     /// [`Store::handoff`], a Handoff whose key can no longer be read is not listed, and the
     /// implementation forgets that key, ending its sessions and Handoffs.
+    /// Handoffs marked seeking are excluded, also after reopening.
     fn handoffs(&self) -> impl Future<Output = Result<Vec<Handoff>, Error>> + Send;
+
+    /// Durably marks whether `stream` is in a file seek. Returns whether the row exists.
+    /// Mark before sending any file selection; clear only after success or a confirmed
+    /// refusal to move. While marked, `group_handoff` and `handoffs` exclude it, so neither
+    /// controls, supervision nor replacement can attribute an uncertain position to it.
+    /// `handoff` still serves its files while seeking. A crash leaves the mark intact.
+    fn set_handoff_seeking(
+        &self,
+        stream: &StreamId,
+        seeking: bool,
+    ) -> impl Future<Output = Result<bool, Error>> + Send;
 
     /// Ends the Handoff whose stream is `stream`. Returns whether it was active.
     fn end_handoff(&self, stream: &StreamId) -> impl Future<Output = Result<bool, Error>> + Send;

@@ -4,7 +4,7 @@
 //! - [`LibraryProxy::hide_lengths`]: every Item lookup (`GET /api/items/<id>`, exactly one path
 //!   segment after `/api/items/`, any query) with each `duration` in it set to `null`: an Item
 //!   whose length Audiobookshelf doesn't know (as for an audio file it could not probe),
-//!   without seeding one.
+//!   without seeding one; until [`LibraryProxy::show_lengths`].
 //! - [`LibraryProxy::reject_item_lookups`]: every Item lookup at once with 401, as for a
 //!   rejected key.
 //! - [`LibraryProxy::hang_identity`]: every `GET /api/me` never.
@@ -54,6 +54,7 @@ pub struct LibraryProxy {
 struct Faults {
     hide_lengths: AtomicBool,
     reject_item_lookups: AtomicBool,
+    hide_episodes: AtomicBool,
     hang_identity: AtomicBool,
     reject_progress_writes: AtomicBool,
     name_files_ogg: AtomicBool,
@@ -71,6 +72,8 @@ struct Faults {
     next_identity_delay_ms: AtomicU64,
     /// What the next Progress write waits for before it is passed on, if anything.
     next_write_held: Mutex<Option<Held>>,
+    /// Replacement audio-file lengths for Item lookups, when set.
+    file_lengths: Mutex<Option<Vec<f64>>>,
 }
 
 #[derive(Clone)]
@@ -108,7 +111,12 @@ impl LibraryProxy {
 
     /// The proxy's URL, as an operator would configure it.
     pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}", self.port)
+        format!("http://{}", self.address())
+    }
+
+    /// The proxy's `host:port`, for a forwarder in front of it.
+    pub fn address(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
     }
 
     /// From now on, Item lookups tell no length.
@@ -116,11 +124,26 @@ impl LibraryProxy {
         self.faults.hide_lengths.store(true, Ordering::SeqCst);
     }
 
+    /// From now on, Item lookups pass as they are again.
+    pub fn show_lengths(&self) {
+        self.faults.hide_lengths.store(false, Ordering::SeqCst);
+    }
+
+    /// Item lookups report these file lengths and their cumulative offsets.
+    pub fn set_file_lengths(&self, lengths: &[f64]) {
+        *self.faults.file_lengths.lock().expect("file lengths") = Some(lengths.to_vec());
+    }
+
     /// From now on, Item lookups are rejected with 401 at once.
     pub fn reject_item_lookups(&self) {
         self.faults
             .reject_item_lookups
             .store(true, Ordering::SeqCst);
+    }
+
+    /// Item lookups still answer, but no longer contain any podcast episodes.
+    pub fn hide_episodes(&self) {
+        self.faults.hide_episodes.store(true, Ordering::SeqCst);
     }
 
     /// From now on, `GET /api/me` is never answered.
@@ -314,10 +337,28 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         // Dropped by now if the test no longer waits for it.
         let _ = answered.send(());
     }
-    if (hidden || ogg) && status.is_success() {
+    let episodes_hidden = item_lookup && faults.hide_episodes.load(Ordering::SeqCst);
+    let lengths = (item_lookup && status.is_success())
+        .then(|| faults.file_lengths.lock().expect("file lengths").clone())
+        .flatten();
+    if (hidden || ogg || episodes_hidden || lengths.is_some()) && status.is_success() {
         let mut json: serde_json::Value = serde_json::from_slice(&bytes).expect("Item JSON");
         if hidden {
             hide_durations(&mut json);
+        }
+        if episodes_hidden {
+            json["media"]["episodes"] = serde_json::json!([]);
+        }
+        if let Some(lengths) = lengths {
+            let tracks = json["media"]["tracks"].as_array_mut().expect("audio files");
+            assert_eq!(tracks.len(), lengths.len());
+            let mut offset = 0.0;
+            for (track, duration) in tracks.iter_mut().zip(lengths) {
+                track["duration"] = serde_json::json!(duration);
+                track["startOffset"] = serde_json::json!(offset);
+                offset += duration;
+            }
+            json["media"]["duration"] = serde_json::json!(offset);
         }
         if ogg {
             name_ogg(&mut json);

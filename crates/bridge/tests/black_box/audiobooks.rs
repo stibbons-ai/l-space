@@ -1,0 +1,1360 @@
+//! Audiobooks in several audio files (#19): a Handoff plays all of an Item's files as its
+//! Group's queue, Progress is the position in the whole Item, skips and seeks cross file
+//! boundaries, previous and next chapter move between chapters, and the Item is Finished when
+//! the Group stops at the end of its last file. Against the seeded "The Long Book" (files of
+//! 40, 30 and 2 minutes, a chapter each) in the shared Audiobookshelf, read back with each
+//! user's own key, and `sonos-fake` players playing queues, with the Bridge following the
+//! household's manual clock through its test-only clock hook.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use api::{ApiError, ItemId, Playback, Session, Skip, TransportState};
+use reqwest::StatusCode;
+use sonos_fake::{Household, PlayerId, Seek};
+
+use test_support::audiobookshelf::{AbsUser, Audiobookshelf};
+use test_support::bridge::{
+    GroupControl, LIBRARY_SERVER_UNREACHABLE, TestBridge, clock_toml, home_with_sonos_toml,
+};
+use test_support::{WITHIN, eventually};
+
+use crate::forwarder::Forwarder;
+use crate::library_proxy::LibraryProxy;
+use crate::seconds;
+
+/// The SOAP action a Bridge reads a Group's transport state with, as `sonos-fake` records it.
+const READ: &str = "AVTransport#GetTransportInfo";
+
+/// The SOAP action a Bridge reads a Group's position with, alongside [`READ`].
+const READ_POSITION: &str = "AVTransport#GetPositionInfo";
+
+/// "The Long Book"'s files' lengths in seconds, in playing order.
+const FILES: [u64; 3] = [2400, 1800, 120];
+
+/// Its length in seconds: all its files'.
+const LENGTH: f64 = 4320.0;
+
+/// The App API's answer to starting an Item a Group can't play.
+const NOT_PLAYABLE: (StatusCode, ApiError) =
+    (StatusCode::UNPROCESSABLE_ENTITY, ApiError::ItemNotPlayable);
+
+/// A household of Kitchen and Office, whose queues' tracks are as long as "The Long Book"'s
+/// files, a Bridge searching it and following its clock, with the shared Audiobookshelf as its
+/// Library Server behind a forwarder, and two users logged in: Alice, who starts Handoffs, and
+/// Bob, who controls them.
+struct Setup {
+    abs: Arc<Audiobookshelf>,
+    forwarder: Forwarder,
+    household: Household,
+    clock: clock::ManualClock,
+    kitchen: PlayerId,
+    office: PlayerId,
+    bridge: TestBridge,
+    alice: AbsUser,
+    bob: AbsUser,
+    alices: Session,
+    bobs: Session,
+}
+
+async fn setup() -> Setup {
+    let abs = Audiobookshelf::shared();
+    let forwarder = Forwarder::to(abs.address()).await;
+    let (household, clock) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let office = household.add_player("Office");
+    let lengths = FILES.map(Duration::from_secs);
+    household.set_queue_lengths(&kitchen, &lengths);
+    let url = forwarder.url();
+    let config = format!(
+        "{}{}",
+        home_with_sonos_toml(&url, household.ssdp()),
+        clock_toml(household.clock_address())
+    );
+    let bridge = TestBridge::start(&config);
+    let (alice, bob) = (abs.new_user().await, abs.new_user().await);
+    let alices = bridge.api().login(&url, &alice.api_key.key).await;
+    let bobs = bridge.api().login(&url, &bob.api_key.key).await;
+    Setup {
+        abs,
+        forwarder,
+        household,
+        clock,
+        kitchen,
+        office,
+        bridge,
+        alice,
+        bob,
+        alices,
+        bobs,
+    }
+}
+
+impl Setup {
+    /// "The Long Book".
+    fn book(&self) -> ItemId {
+        ItemId {
+            library_item: self.abs.seeded().long_book.clone(),
+            episode: None,
+        }
+    }
+
+    /// Alice starts the book on Kitchen, with her Progress in it at `progress` seconds first,
+    /// if given; waits until Kitchen fetched the file it starts in.
+    async fn start(&self, progress: Option<f64>) {
+        let book = self.book();
+        if let Some(current_time) = progress {
+            let abs = &self.abs;
+            abs.set_item_progress(&self.alice, &book, current_time, false)
+                .await;
+        }
+        let kitchen = self.kitchen.uuid();
+        self.bridge
+            .api()
+            .start_handoff(&self.alices, &book, kitchen)
+            .await;
+        self.household.fetched(&self.kitchen).await;
+    }
+
+    /// Which track of its queue Kitchen plays (1-based), and how far into it it is.
+    fn track(&self) -> (Option<usize>, Duration) {
+        let number = self.household.track_number(&self.kitchen);
+        (number, self.household.position(&self.kitchen))
+    }
+
+    /// Moves time on by `seconds`, and waits until the Bridge has seen it.
+    async fn advance(&self, seconds: u64) {
+        self.clock.advance(Duration::from_secs(seconds));
+        self.household.clock_followed().await;
+    }
+
+    /// Moves time on by `seconds`, and waits until the Bridge read Kitchen afterwards.
+    async fn advance_and_read(&self, seconds: u64) {
+        let asked = |action| self.household.asked(&self.kitchen, action);
+        let before = (asked(READ), asked(READ_POSITION));
+        self.advance(seconds).await;
+        let read = async || asked(READ) > before.0 && asked(READ_POSITION) > before.1;
+        eventually("the Bridge never read Kitchen", WITHIN, read).await;
+    }
+
+    /// Moves time on by `seconds`, one second at a time, waiting each time until the Bridge
+    /// read Kitchen afterwards: as real time passes near the end of an Item.
+    async fn read_every_second(&self, seconds: u64) {
+        for _ in 0..seconds {
+            self.advance_and_read(1).await;
+        }
+    }
+
+    /// Alice's Progress in the book, read from Audiobookshelf with her own key.
+    async fn progress(&self) -> Option<(f64, bool)> {
+        self.abs.item_progress(&self.alice, &self.book()).await
+    }
+
+    /// Waits until Alice's Progress in the book is `expected`.
+    async fn wait_for_progress(&self, expected: (f64, bool)) {
+        let what = format!("Progress never became {expected:?}");
+        let current = async || self.progress().await == Some(expected);
+        eventually(&what, WITHIN, current).await;
+    }
+
+    /// Bob skips Kitchen as `skip` says.
+    async fn skip(&self, skip: Skip) -> Playback {
+        let kitchen = self.kitchen.uuid();
+        self.bridge
+            .api()
+            .skip_group(&self.bobs, kitchen, skip)
+            .await
+    }
+}
+
+fn playing(position: f64) -> Playback {
+    Playback {
+        state: TransportState::Playing,
+        position: Some(position),
+        duration: Some(LENGTH),
+    }
+}
+
+#[tokio::test]
+async fn a_book_starts_in_the_file_and_at_the_offset_of_its_progress() {
+    let setup = setup().await;
+    // 3000.4 seconds in: 600 into the second file.
+    setup.start(Some(3000.4)).await;
+
+    // Its three files are Kitchen's queue, in order, each its own URL on the one stream.
+    let queue = setup.household.queue(&setup.kitchen);
+    let names: Vec<&str> = queue
+        .iter()
+        .map(|url| url.rsplit('/').next().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "1-01%20-%20Part%20One.wav",
+            "2-02%20-%20Part%20Two.wav",
+            "3-03%20-%20Part%20Three.wav",
+        ]
+    );
+    let stream = |url: &str| url.rsplit('/').nth(1).unwrap().to_owned();
+    assert!(queue.iter().all(|url| stream(url) == stream(&queue[0])));
+    assert_eq!(setup.track(), (Some(2), seconds(600)));
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+    // It fetched the second file, the one it plays.
+    let fetched = setup.household.fetched(&setup.kitchen).await;
+    assert_eq!(fetched.uri, queue[1]);
+    assert_eq!(fetched.status, Some(206));
+
+    // Each file is served only under its own number and name.
+    let api = setup.bridge.api();
+    let path = |url: &str| url[url.find("/stream/").unwrap()..].to_owned();
+    for url in &queue {
+        let response = api.fetch(reqwest::Method::HEAD, &path(url), None).await;
+        assert_eq!(response.status(), StatusCode::OK, "{url}");
+    }
+    let swapped = path(&queue[0]).replace("/1-01", "/2-01");
+    let response = api.fetch(reqwest::Method::HEAD, &swapped, None).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let legacy = path(&queue[0]).replacen("/1-01", "/01", 1);
+    assert_ne!(legacy, path(&queue[0]));
+    let missing = "/stream/made-up-id/01%20-%20Part%20One.wav";
+    let mut failures = Vec::new();
+    for path in [legacy.as_str(), missing] {
+        let response = api.fetch(reqwest::Method::GET, path, None).await;
+        let status = response.status();
+        let mut headers: Vec<_> = response
+            .headers()
+            .keys()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        headers.sort();
+        failures.push((status, headers, response.bytes().await.unwrap()));
+    }
+    assert_eq!(failures[0].0, StatusCode::NOT_FOUND);
+    assert_eq!(failures[0], failures[1]);
+
+    // On a file boundary, the later file from its start, without a seek into it.
+    let book = setup.book();
+    let abs = &setup.abs;
+    abs.set_item_progress(&setup.alice, &book, 4200.0, false)
+        .await;
+    let office = setup.office.uuid();
+    api.start_handoff(&setup.alices, &book, office).await;
+    assert_eq!(setup.household.track_number(&setup.office), Some(3));
+    let sought = setup.household.sought(&setup.office);
+    assert_eq!(sought, [Seek::new("TRACK_NR", "3")]);
+}
+
+#[tokio::test]
+async fn initial_resume_keeps_its_file_when_a_short_file_advances_during_start() {
+    let abs = Audiobookshelf::shared();
+    let proxy = LibraryProxy::to(abs.base_url()).await;
+    proxy.set_file_lengths(&[2.0, 1800.0, 120.0]);
+    let (household, clock) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    household.set_queue_lengths(&kitchen, &[seconds(2), seconds(1800), seconds(120)]);
+    household.set_fault(
+        &kitchen,
+        sonos_fake::Fault::SlowTransport(Duration::from_millis(250)),
+    );
+    let url = proxy.url();
+    let bridge = TestBridge::start(&home_with_sonos_toml(&url, household.ssdp()));
+    let user = abs.new_user().await;
+    let book = ItemId {
+        library_item: abs.seeded().long_book.clone(),
+        episode: None,
+    };
+    abs.set_item_progress(&user, &book, 1.0, false).await;
+    let api = bridge.api();
+    let session = api.login(&url, &user.api_key.key).await;
+    tokio::join!(api.start_handoff(&session, &book, kitchen.uuid()), async {
+        // Natural advancement after Play, before the initial seek has acted.
+        eventually("Play never acted", WITHIN, async || {
+            household.transport_state(&kitchen) == "PLAYING"
+        })
+        .await;
+        clock.advance(seconds(2));
+        assert_eq!(household.track_number(&kitchen), Some(2));
+        eventually("initial REL_TIME never arrived", WITHIN, async || {
+            household
+                .sought(&kitchen)
+                .iter()
+                .any(|seek| seek.unit == "REL_TIME")
+        })
+        .await;
+        // It must not advance again while REL_TIME is in flight.
+        clock.advance(seconds(2));
+    });
+    assert_eq!(household.track_number(&kitchen), Some(1));
+    assert_eq!(household.position(&kitchen), seconds(1));
+    assert_eq!(household.transport_state(&kitchen), "PLAYING");
+    assert_eq!(abs.item_progress(&user, &book).await, Some((1.0, false)));
+}
+
+#[tokio::test]
+async fn play_from_start_or_finished_starts_at_the_first_file() {
+    let setup = setup().await;
+    let book = setup.book();
+    let api = setup.bridge.api();
+    let abs = &setup.abs;
+    abs.set_item_progress(&setup.alice, &book, 3000.0, false)
+        .await;
+    let kitchen = setup.kitchen.uuid();
+    api.start_handoff_from_start(&setup.alices, &book, kitchen)
+        .await;
+    assert_eq!(setup.track(), (Some(1), Duration::ZERO));
+
+    abs.set_item_progress(&setup.alice, &book, 3000.0, true)
+        .await;
+    api.start_handoff(&setup.alices, &book, kitchen).await;
+    assert_eq!(setup.track(), (Some(1), Duration::ZERO));
+    let sought = setup.household.sought(&setup.kitchen);
+    assert!(
+        sought.iter().all(|seek| seek.unit == "TRACK_NR"),
+        "{sought:?}"
+    );
+}
+
+#[tokio::test]
+async fn progress_is_written_in_the_whole_book_while_a_later_file_plays() {
+    let setup = setup().await;
+    setup.start(Some(3000.0)).await;
+
+    // The cadence writes where Kitchen is in the whole book, not in its file.
+    setup.advance(30).await;
+    setup.wait_for_progress((3030.0, false)).await;
+
+    // So does a pause, which answers in the whole book too.
+    setup.advance(5).await;
+    let kitchen = setup.kitchen.uuid();
+    let api = setup.bridge.api();
+    let paused = api.pause_group(&setup.bobs, kitchen).await;
+    let expected = Playback {
+        state: TransportState::Paused,
+        ..playing(3035.0)
+    };
+    assert_eq!(paused, expected);
+    assert_eq!(setup.progress().await, Some((3035.0, false)));
+
+    // The Groups list shows the Handoff on Kitchen.
+    let groups = api.groups(&setup.bobs).await;
+    let listed = groups.iter().find(|group| group.name == "Kitchen").unwrap();
+    let handoff = listed.handoff.as_ref().unwrap();
+    assert_eq!(handoff.item, setup.book());
+    let now = listed.now_playing.as_ref().unwrap();
+    assert_eq!((now.position, now.duration), (Some(3035.0), Some(LENGTH)));
+}
+
+#[tokio::test]
+async fn the_book_plays_on_into_its_next_file_and_progress_follows() {
+    let setup = setup().await;
+    // 10 seconds before the end of the first file.
+    setup.start(Some(2390.0)).await;
+
+    setup.advance(30).await;
+    assert_eq!(setup.track(), (Some(2), seconds(20)));
+    setup.wait_for_progress((2420.0, false)).await;
+    // The end of a file that isn't the last is not the end of the book.
+    assert_eq!(setup.bridge.api().handoffs(&setup.bobs).await.len(), 1);
+
+    // On into the last file too.
+    setup.advance(1800).await;
+    assert_eq!(setup.track(), (Some(3), seconds(20)));
+    let writes_in_whole_book = async || {
+        let progress = setup.progress().await;
+        progress.is_some_and(|(time, finished)| time > 4200.0 && !finished)
+    };
+    eventually(
+        "Progress never moved into the last file",
+        WITHIN,
+        writes_in_whole_book,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn skips_across_file_boundaries_land_in_the_right_file() {
+    let setup = setup().await;
+    // 5 seconds into the second file.
+    setup.start(Some(2405.0)).await;
+
+    // 15 s back lands 10 s before the end of the first file.
+    assert_eq!(setup.skip(Skip::Back15).await, playing(2390.0));
+    assert_eq!(setup.track(), (Some(1), seconds(2390)));
+    assert_eq!(setup.progress().await, Some((2390.0, false)));
+    let sought = setup.household.sought(&setup.kitchen);
+    let back = [Seek::new("TRACK_NR", "1"), Seek::new("REL_TIME", "0:39:50")];
+    assert!(sought.ends_with(&back), "{sought:?}");
+
+    // 30 s forward lands 20 s into the second.
+    assert_eq!(setup.skip(Skip::Forward30).await, playing(2420.0));
+    assert_eq!(setup.track(), (Some(2), seconds(20)));
+    assert_eq!(setup.progress().await, Some((2420.0, false)));
+
+    // Within a file, select it too: the pre-skip reading may already be stale.
+    let before = setup.household.sought(&setup.kitchen).len();
+    assert_eq!(setup.skip(Skip::Forward30).await, playing(2450.0));
+    let sought = setup.household.sought(&setup.kitchen);
+    assert_eq!(
+        sought[before..],
+        [Seek::new("TRACK_NR", "2"), Seek::new("REL_TIME", "0:00:50")]
+    );
+
+    // The book's length comes from its files', told at the start: with the Library Server
+    // down, a forward skip still knows where the end is, and lands at the end of the last
+    // file.
+    setup.advance(4200 - 2450 + 95).await;
+    assert_eq!(setup.track(), (Some(3), seconds(95)));
+    setup.forwarder.stop().await;
+    assert_eq!(setup.skip(Skip::Forward30).await, playing(LENGTH));
+    let sought = setup.household.sought(&setup.kitchen);
+    assert_eq!(sought.last(), Some(&Seek::new("REL_TIME", "0:02:00")));
+}
+
+#[tokio::test]
+async fn the_group_stops_at_the_end_of_the_last_file_and_the_book_is_finished() {
+    let setup = setup().await;
+    // 90 seconds into the last file, 30 before the end of the book.
+    setup.start(Some(4290.0)).await;
+
+    // Read every second near the end, up to the end, where Kitchen stops.
+    setup.advance_and_read(25).await;
+    setup.read_every_second(5).await;
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "STOPPED");
+    setup.wait_for_progress((LENGTH, true)).await;
+    let api = setup.bridge.api();
+    let ended = async || api.handoffs(&setup.bobs).await.is_empty();
+    eventually("the Handoff never ended", WITHIN, ended).await;
+}
+
+#[tokio::test]
+async fn previous_and_next_chapter_move_between_the_books_chapters() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    let item = api
+        .item(&setup.alices, &setup.book().library_item, None)
+        .await;
+    let starts: Vec<f64> = item.chapters.iter().map(|chapter| chapter.start).collect();
+    assert_eq!(starts, [0.0, 2400.0, 4200.0]);
+    // 5 seconds into the second chapter.
+    setup.start(Some(2405.0)).await;
+
+    // More than 3 seconds in: back to its start, in the second file.
+    assert_eq!(setup.skip(Skip::PreviousChapter).await, playing(2400.0));
+    assert_eq!(setup.track(), (Some(2), Duration::ZERO));
+    assert_eq!(setup.progress().await, Some((2400.0, false)));
+    // At its start: to the chapter before, in the first file.
+    assert_eq!(setup.skip(Skip::PreviousChapter).await, playing(0.0));
+    assert_eq!(setup.track(), (Some(1), Duration::ZERO));
+    assert_eq!(setup.progress().await, Some((0.0, false)));
+    // In the first chapter: its start.
+    setup.advance(2).await;
+    assert_eq!(setup.skip(Skip::PreviousChapter).await, playing(0.0));
+    assert_eq!(setup.track(), (Some(1), Duration::ZERO));
+
+    // Next, chapter by chapter, file by file.
+    assert_eq!(setup.skip(Skip::NextChapter).await, playing(2400.0));
+    assert_eq!(setup.track(), (Some(2), Duration::ZERO));
+    assert_eq!(setup.skip(Skip::NextChapter).await, playing(4200.0));
+    assert_eq!(setup.track(), (Some(3), Duration::ZERO));
+    assert_eq!(setup.progress().await, Some((4200.0, false)));
+
+    // In the last chapter, next sends nothing and writes nothing: the answer is where Kitchen
+    // is.
+    setup.advance(10).await;
+    let before = setup.household.sought(&setup.kitchen);
+    assert_eq!(setup.skip(Skip::NextChapter).await, playing(4210.0));
+    assert_eq!(setup.household.sought(&setup.kitchen), before);
+    assert_eq!(setup.track(), (Some(3), seconds(10)));
+    assert_eq!(setup.progress().await, Some((4200.0, false)));
+
+    // Chapters come from the Library Server: without it, a chapter skip is refused, and
+    // nothing is sent.
+    setup.forwarder.stop().await;
+    let kitchen = setup.kitchen.uuid();
+    let previous = GroupControl::Skip(Skip::PreviousChapter);
+    assert_eq!(
+        api.control_error(&setup.bobs, kitchen, previous).await,
+        LIBRARY_SERVER_UNREACHABLE
+    );
+    assert_eq!(setup.household.sought(&setup.kitchen), before);
+}
+
+#[tokio::test]
+async fn an_episode_counts_as_one_chapter() {
+    let setup = setup().await;
+    let api = setup.bridge.api();
+    let episode = setup.abs.seeded().episode(0);
+    let kitchen = setup.kitchen.uuid();
+    api.start_handoff(&setup.alices, &episode, kitchen).await;
+    setup.advance(10).await;
+    let at = |position| Playback {
+        duration: Some(600.0),
+        ..playing(position)
+    };
+
+    let before = setup.household.sought(&setup.kitchen);
+    assert_eq!(setup.skip(Skip::NextChapter).await, at(10.0));
+    assert_eq!(setup.household.sought(&setup.kitchen), before);
+    assert_eq!(setup.skip(Skip::PreviousChapter).await, at(0.0));
+    assert_eq!(setup.household.position(&setup.kitchen), Duration::ZERO);
+}
+
+#[tokio::test]
+async fn a_book_with_a_file_of_unknown_length_is_not_playable() {
+    let abs = Audiobookshelf::shared();
+    let proxy = LibraryProxy::to(abs.base_url()).await;
+    let household = Household::with_manual_clock().0;
+    let kitchen = household.add_player("Kitchen");
+    let bridge = TestBridge::start(&home_with_sonos_toml(&proxy.url(), household.ssdp()));
+    let user = abs.new_user().await;
+    let session = bridge.api().login(&proxy.url(), &user.api_key.key).await;
+    let book = ItemId {
+        library_item: abs.seeded().long_book.clone(),
+        episode: None,
+    };
+
+    proxy.hide_lengths();
+    let api = bridge.api();
+    assert_eq!(
+        api.start_handoff_error(&session, &book, kitchen.uuid())
+            .await,
+        NOT_PLAYABLE
+    );
+    assert_eq!(
+        household
+            .actions_of(&kitchen)
+            .iter()
+            .filter(|a| a.contains("Queue"))
+            .count(),
+        0
+    );
+    assert_eq!(api.handoffs(&session).await, []);
+}
+
+#[tokio::test]
+async fn a_book_with_a_file_in_a_format_sonos_doesnt_play_is_not_playable() {
+    let abs = Audiobookshelf::shared();
+    let mixed = abs.mixed_format_book().await;
+    let household = Household::with_manual_clock().0;
+    let kitchen = household.add_player("Kitchen");
+    let bridge = TestBridge::start(&home_with_sonos_toml(abs.base_url(), household.ssdp()));
+    let reader = abs.new_user_seeing(&[&mixed.library]).await;
+    let session = bridge
+        .api()
+        .login(abs.base_url(), &reader.api_key.key)
+        .await;
+    let book = ItemId {
+        library_item: mixed.book,
+        episode: None,
+    };
+
+    let api = bridge.api();
+    // Both files' lengths are known: only the second's format keeps the book off a Group.
+    let item = api.item(&session, &book.library_item, None).await;
+    let lengths: Vec<_> = item.audio_files.iter().map(|file| file.duration).collect();
+    assert_eq!(lengths, [Some(60.0), Some(60.0)]);
+    assert_eq!(
+        api.start_handoff_error(&session, &book, kitchen.uuid())
+            .await,
+        NOT_PLAYABLE
+    );
+    assert_eq!(
+        household
+            .actions_of(&kitchen)
+            .iter()
+            .filter(|a| a.contains("Queue"))
+            .count(),
+        0
+    );
+    assert_eq!(api.handoffs(&session).await, []);
+}
+
+#[tokio::test]
+async fn a_failed_cross_file_seek_ends_the_handoff_without_overwriting_progress() {
+    let setup = setup().await;
+    setup.start(Some(2405.0)).await;
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::RefuseSeek);
+    let api = setup.bridge.api();
+    let error = api
+        .control_error(
+            &setup.bobs,
+            setup.kitchen.uuid(),
+            GroupControl::Skip(Skip::Back15),
+        )
+        .await;
+    assert_eq!(error, (StatusCode::BAD_GATEWAY, ApiError::GroupFailed));
+    let paused = async || setup.household.transport_state(&setup.kitchen) == "PAUSED_PLAYBACK";
+    eventually("the failed seek was not paused", WITHIN, paused).await;
+    assert_eq!(api.handoffs(&setup.bobs).await, []);
+    setup.advance(31).await;
+    assert_eq!(setup.progress().await, Some((2405.0, false)));
+}
+
+#[tokio::test]
+async fn a_refused_file_selection_keeps_its_handoff_and_progress() {
+    let setup = setup().await;
+    setup.start(Some(3005.0)).await;
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::RefuseControl);
+    let api = setup.bridge.api();
+    let before = api.handoffs(&setup.bobs).await;
+    assert_eq!(
+        api.control_error(
+            &setup.bobs,
+            setup.kitchen.uuid(),
+            GroupControl::Skip(Skip::Back15)
+        )
+        .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed)
+    );
+    assert_eq!(api.handoffs(&setup.bobs).await, before);
+    assert_eq!(setup.track(), (Some(2), seconds(605)));
+    assert_eq!(setup.progress().await, Some((3005.0, false)));
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+}
+
+#[tokio::test]
+async fn an_unreachable_household_keeps_its_handoff_and_progress() {
+    let setup = setup().await;
+    setup.start(Some(3005.0)).await;
+    let api = setup.bridge.api();
+    let before = api.handoffs(&setup.bobs).await;
+    setup.household.remove(&setup.kitchen);
+    setup.household.remove(&setup.office);
+    assert_eq!(
+        api.control_error(
+            &setup.bobs,
+            setup.kitchen.uuid(),
+            GroupControl::Skip(Skip::Back15)
+        )
+        .await,
+        (StatusCode::BAD_GATEWAY, ApiError::SonosUnreachable)
+    );
+    assert_eq!(api.handoffs(&setup.bobs).await, before);
+    assert_eq!(setup.progress().await, Some((3005.0, false)));
+}
+
+#[tokio::test]
+async fn a_start_waits_for_the_failed_file_seeks_pause() {
+    let setup = setup().await;
+    setup.start(Some(3005.0)).await;
+    setup.household.set_fault(
+        &setup.kitchen,
+        sonos_fake::Fault::RefuseSeekSlowPause(seconds(3)),
+    );
+    let api = setup.bridge.api();
+    let pause = || setup.household.asked(&setup.kitchen, "AVTransport#Pause");
+    let pauses = pause();
+    assert_eq!(
+        api.control_error(
+            &setup.bobs,
+            setup.kitchen.uuid(),
+            GroupControl::Skip(Skip::Back15)
+        )
+        .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed)
+    );
+    // The second Pause: the first held playback still across the file seek.
+    let pausing = async || pause() > pauses + 1;
+    eventually("the cleanup pause was never sent", WITHIN, pausing).await;
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::None);
+    let episode = setup.abs.seeded().episode(0);
+    let started = std::time::Instant::now();
+    api.start_handoff_from_start(&setup.bobs, &episode, setup.kitchen.uuid())
+        .await;
+    assert!(started.elapsed() >= Duration::from_millis(2500));
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+    assert_eq!(api.handoffs(&setup.bobs).await[0].item, episode);
+}
+
+#[tokio::test]
+async fn a_replaced_handoff_writes_the_whole_book_position_from_a_later_file() {
+    let setup = setup().await;
+    setup.start(Some(3000.0)).await;
+    setup.advance(10).await;
+    setup
+        .bridge
+        .api()
+        .start_handoff(
+            &setup.bobs,
+            &setup.abs.seeded().episode(0),
+            setup.kitchen.uuid(),
+        )
+        .await;
+    assert_eq!(setup.progress().await, Some((3010.0, false)));
+}
+
+#[tokio::test]
+async fn a_takeover_in_a_later_file_retains_the_handoff_and_whole_book_progress() {
+    let setup = setup().await;
+    setup.start(Some(3000.0)).await;
+    setup.advance_and_read(30).await;
+    setup.wait_for_progress((3030.0, false)).await;
+    setup.household.play(
+        &setup.kitchen,
+        sonos_fake::FakeTrack::new("Other music", seconds(600)),
+    );
+    setup.advance_and_read(30).await;
+    let api = setup.bridge.api();
+    assert_eq!(
+        api.control_error(&setup.bobs, setup.kitchen.uuid(), GroupControl::Pause)
+            .await,
+        test_support::bridge::NO_HANDOFF
+    );
+    assert_eq!(setup.progress().await, Some((3030.0, false)));
+    assert_eq!(api.handoffs(&setup.bobs).await.len(), 1);
+    let kitchen = api
+        .groups(&setup.bobs)
+        .await
+        .into_iter()
+        .find(|group| group.id == setup.kitchen.uuid())
+        .unwrap();
+    let external = kitchen.now_playing.unwrap();
+    assert_eq!(external.position, Some(30.0));
+    assert_eq!(external.duration, Some(600.0));
+}
+
+#[tokio::test]
+async fn a_forward_skip_to_the_end_of_a_multi_file_book_marks_it_finished() {
+    let setup = setup().await;
+    setup.start(Some(4310.0)).await;
+    assert_eq!(setup.skip(Skip::Forward30).await, playing(LENGTH));
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "STOPPED");
+    for _ in 0..5 {
+        setup.advance(1).await;
+    }
+    setup.wait_for_progress((LENGTH, true)).await;
+}
+
+#[tokio::test]
+async fn fractional_files_resume_at_and_skip_by_chapter_across_their_boundaries() {
+    let abs = Audiobookshelf::shared();
+    let fractional = abs.fractional_book().await;
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let office = household.add_player("Office");
+    let bridge = TestBridge::start(&home_with_sonos_toml(abs.base_url(), household.ssdp()));
+    let user = abs.new_user_seeing(&[&fractional.library]).await;
+    let api = bridge.api();
+    let session = api.login(abs.base_url(), &user.api_key.key).await;
+    let book = ItemId {
+        library_item: fractional.book,
+        episode: None,
+    };
+    let item = api.item(&session, &book.library_item, None).await;
+    let durations: Vec<_> = item
+        .audio_files
+        .iter()
+        .map(|file| Duration::from_secs_f64(file.duration.unwrap()))
+        .collect();
+    assert_eq!(durations[0], Duration::from_millis(40050));
+    household.set_queue_lengths(&kitchen, &durations);
+    household.set_queue_lengths(&office, &durations);
+    api.start_handoff(&session, &book, kitchen.uuid()).await;
+    api.pause_group(&session, kitchen.uuid()).await;
+    api.skip_group(&session, kitchen.uuid(), Skip::NextChapter)
+        .await;
+    assert_eq!(
+        (
+            household.track_number(&kitchen),
+            household.position(&kitchen)
+        ),
+        (Some(2), Duration::ZERO)
+    );
+    assert_eq!(abs.item_progress(&user, &book).await, Some((40.05, false)));
+    api.skip_group(&session, kitchen.uuid(), Skip::NextChapter)
+        .await;
+    assert_eq!(
+        (
+            household.track_number(&kitchen),
+            household.position(&kitchen)
+        ),
+        (Some(3), Duration::ZERO)
+    );
+    assert_eq!(abs.item_progress(&user, &book).await, Some((70.12, false)));
+    api.skip_group(&session, kitchen.uuid(), Skip::PreviousChapter)
+        .await;
+    assert_eq!(
+        (
+            household.track_number(&kitchen),
+            household.position(&kitchen)
+        ),
+        (Some(2), Duration::ZERO)
+    );
+    assert_eq!(abs.item_progress(&user, &book).await, Some((40.05, false)));
+    assert_eq!(household.transport_state(&kitchen), "PAUSED_PLAYBACK");
+    // Forward30's whole-second target is 70; in file 2 it rounds up to 30 seconds,
+    // so both the answer and Progress must carry 40.05 + 30, not the raw target.
+    let skipped = api
+        .skip_group(&session, kitchen.uuid(), Skip::Forward30)
+        .await;
+    assert_eq!(skipped.position, Some(70.05));
+    assert_eq!(household.track_number(&kitchen), Some(2));
+    assert_eq!(household.position(&kitchen), seconds(30));
+    assert_eq!(abs.item_progress(&user, &book).await, Some((70.05, false)));
+
+    // A resume exactly where the second file starts: that file, from its start, not the
+    // first file's whole seconds.
+    abs.set_item_progress(&user, &book, 40.05, false).await;
+    api.start_handoff(&session, &book, office.uuid()).await;
+    assert_eq!(household.track_number(&office), Some(2));
+    assert_eq!(household.position(&office), Duration::ZERO);
+    assert_eq!(household.sought(&office), [Seek::new("TRACK_NR", "2")]);
+    assert_eq!(abs.item_progress(&user, &book).await, Some((40.05, false)));
+}
+
+#[tokio::test]
+async fn a_chapter_skip_refuses_an_item_missing_from_a_successful_library_answer() {
+    let abs = Audiobookshelf::shared();
+    let proxy = LibraryProxy::to(abs.base_url()).await;
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let bridge = TestBridge::start(&home_with_sonos_toml(&proxy.url(), household.ssdp()));
+    let user = abs.new_user().await;
+    let api = bridge.api();
+    let session = api.login(&proxy.url(), &user.api_key.key).await;
+    let episode = abs.seeded().episode(0);
+    api.start_handoff(&session, &episode, kitchen.uuid()).await;
+    proxy.hide_episodes();
+    let before = household.sought(&kitchen);
+    assert_eq!(
+        api.control_error(
+            &session,
+            kitchen.uuid(),
+            GroupControl::Skip(Skip::PreviousChapter)
+        )
+        .await,
+        LIBRARY_SERVER_UNREACHABLE
+    );
+    assert_eq!(household.sought(&kitchen), before);
+    assert_eq!(abs.item_progress(&user, &episode).await, None);
+}
+
+#[tokio::test]
+async fn a_replacement_after_a_stop_at_the_last_files_end_marks_the_book_finished() {
+    let setup = setup().await;
+    // Sonos only tells whole seconds: a stop in the final second counts as the end under
+    // the existing Finished rule, judged from the last playing sighting, not its reset pointer.
+    setup.start(Some(4319.0)).await;
+    setup.household.stop(&setup.kitchen);
+    setup
+        .bridge
+        .api()
+        .start_handoff(
+            &setup.bobs,
+            &setup.abs.seeded().episode(0),
+            setup.kitchen.uuid(),
+        )
+        .await;
+    assert_eq!(setup.progress().await, Some((LENGTH, true)));
+}
+
+#[tokio::test]
+async fn failed_seek_quarantine_survives_cleanup_failure_recovery_and_restart() {
+    for restart in [false, true] {
+        let mut setup = setup().await;
+        setup.start(Some(2395.0)).await;
+        let db = rusqlite::Connection::open(setup.bridge.database_path()).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER refuse_cleanup BEFORE DELETE ON handoffs
+             BEGIN SELECT RAISE(FAIL, 'injected cleanup failure'); END;",
+        )
+        .unwrap();
+        setup
+            .household
+            .set_fault(&setup.kitchen, sonos_fake::Fault::RefuseSeek);
+        assert_eq!(
+            setup
+                .bridge
+                .api()
+                .control_error(
+                    &setup.bobs,
+                    setup.kitchen.uuid(),
+                    GroupControl::Skip(Skip::Forward30),
+                )
+                .await,
+            (StatusCode::BAD_GATEWAY, ApiError::GroupFailed),
+        );
+        eventually("cleanup never paused", WITHIN, async || {
+            setup.household.transport_state(&setup.kitchen) == "PAUSED_PLAYBACK"
+        })
+        .await;
+        assert_eq!(setup.track(), (Some(2), Duration::ZERO));
+        let retained: i64 = db
+            .query_row("SELECT count(*) FROM handoffs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(retained, 1, "the test must exercise failed deletion");
+        if restart {
+            setup.bridge.restart();
+        }
+        // Recover storage and the Group, but never trust the retained failed seek again.
+        db.execute_batch("DROP TRIGGER refuse_cleanup;").unwrap();
+        setup
+            .household
+            .set_fault(&setup.kitchen, sonos_fake::Fault::None);
+        let api = setup.bridge.api();
+        assert_eq!(api.handoffs(&setup.bobs).await, []);
+        for control in [
+            GroupControl::Resume,
+            GroupControl::Pause,
+            GroupControl::Skip(Skip::Back15),
+        ] {
+            assert_eq!(
+                api.control_error(&setup.bobs, setup.kitchen.uuid(), control)
+                    .await,
+                test_support::bridge::NO_HANDOFF,
+            );
+            assert_eq!(setup.progress().await, Some((2395.0, false)));
+        }
+        setup.advance(31).await;
+        assert_eq!(setup.progress().await, Some((2395.0, false)));
+        // Replacement must not write the uncertain selected-file-start position for Alice.
+        let episode = setup.abs.seeded().episode(0);
+        api.start_handoff_from_start(&setup.bobs, &episode, setup.kitchen.uuid())
+            .await;
+        assert_eq!(setup.progress().await, Some((2395.0, false)));
+        assert_eq!(api.handoffs(&setup.bobs).await[0].item, episode);
+        setup.advance(10).await;
+        let paused = api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
+        assert_eq!(paused.position, Some(10.0));
+        assert_eq!(setup.progress().await, Some((2395.0, false)));
+        assert_eq!(
+            setup.abs.item_progress(&setup.bob, &episode).await,
+            Some((10.0, false)),
+        );
+        assert_eq!(
+            setup.abs.item_progress(&setup.bob, &setup.book()).await,
+            None
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_failed_initial_seek_whose_cleanup_fails_stays_quarantined() {
+    let setup = setup().await;
+    setup
+        .abs
+        .set_item_progress(&setup.alice, &setup.book(), 2395.0, false)
+        .await;
+    // Fires only on deleting a stored row: the start's own pre-insert delete matches none.
+    let db = rusqlite::Connection::open(setup.bridge.database_path()).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse_cleanup BEFORE DELETE ON handoffs
+         BEGIN SELECT RAISE(FAIL, 'injected cleanup failure'); END;",
+    )
+    .unwrap();
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::RefuseSeek);
+    let api = setup.bridge.api();
+    assert_eq!(
+        api.start_handoff_error(&setup.alices, &setup.book(), setup.kitchen.uuid())
+            .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed),
+    );
+    // The queue played and its file was selected, but not the offset: far from 2395 s.
+    assert!(setup.household.asked(&setup.kitchen, "AVTransport#Play") > 0);
+    assert_eq!(setup.track(), (Some(1), Duration::ZERO));
+    assert_eq!(
+        setup.household.transport_state(&setup.kitchen),
+        "PAUSED_PLAYBACK"
+    );
+    let retained: i64 = db
+        .query_row("SELECT count(*) FROM handoffs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(retained, 1, "the test must exercise failed deletion");
+    // Recover storage and the Group, but never trust the retained failed start.
+    db.execute_batch("DROP TRIGGER refuse_cleanup;").unwrap();
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::None);
+    assert_eq!(api.handoffs(&setup.bobs).await, []);
+    for control in [
+        GroupControl::Resume,
+        GroupControl::Pause,
+        GroupControl::Skip(Skip::Forward30),
+    ] {
+        assert_eq!(
+            api.control_error(&setup.bobs, setup.kitchen.uuid(), control)
+                .await,
+            test_support::bridge::NO_HANDOFF,
+        );
+    }
+    assert_eq!(setup.track(), (Some(1), Duration::ZERO));
+    setup.advance(31).await;
+    assert_eq!(setup.progress().await, Some((2395.0, false)));
+    // Replacement must not write the uncertain start-of-file position for Alice.
+    let episode = setup.abs.seeded().episode(0);
+    api.start_handoff_from_start(&setup.bobs, &episode, setup.kitchen.uuid())
+        .await;
+    assert_eq!(setup.progress().await, Some((2395.0, false)));
+    assert_eq!(api.handoffs(&setup.bobs).await[0].item, episode);
+    setup.advance(10).await;
+    let paused = api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
+    assert_eq!(paused.position, Some(10.0));
+    assert_eq!(setup.progress().await, Some((2395.0, false)));
+    assert_eq!(
+        setup.abs.item_progress(&setup.bob, &episode).await,
+        Some((10.0, false)),
+    );
+    assert_eq!(
+        setup.abs.item_progress(&setup.bob, &setup.book()).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_file_seek_is_not_sent_when_its_quarantine_cannot_be_persisted() {
+    let setup = setup().await;
+    setup.start(Some(2395.0)).await;
+    let db = rusqlite::Connection::open(setup.bridge.database_path()).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse_quarantine BEFORE UPDATE OF seeking ON handoffs
+         BEGIN SELECT RAISE(FAIL, 'injected quarantine failure'); END;",
+    )
+    .unwrap();
+    let pauses = setup.household.asked(&setup.kitchen, "AVTransport#Pause");
+    assert_eq!(
+        setup
+            .bridge
+            .api()
+            .control_error(
+                &setup.bobs,
+                setup.kitchen.uuid(),
+                GroupControl::Skip(Skip::Forward30),
+            )
+            .await,
+        (StatusCode::INTERNAL_SERVER_ERROR, ApiError::Internal),
+    );
+    // Not even paused for the seek.
+    assert_eq!(setup.track(), (Some(1), seconds(2395)));
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+    assert_eq!(
+        setup.household.asked(&setup.kitchen, "AVTransport#Pause"),
+        pauses
+    );
+    assert_eq!(setup.progress().await, Some((2395.0, false)));
+    db.execute_batch("DROP TRIGGER refuse_quarantine;").unwrap();
+    assert_eq!(setup.skip(Skip::Forward30).await, playing(2425.0));
+    assert_eq!(setup.track(), (Some(2), seconds(25)));
+    assert_eq!(setup.progress().await, Some((2425.0, false)));
+}
+
+#[tokio::test]
+async fn starts_override_repeat_and_shuffle_to_play_files_in_order_then_finish() {
+    for mode in [
+        sonos_fake::PlayMode::RepeatOne,
+        sonos_fake::PlayMode::RepeatAll,
+        sonos_fake::PlayMode::ShuffleNoRepeat,
+    ] {
+        let setup = setup().await;
+        setup.household.set_play_mode(&setup.kitchen, mode);
+        setup.start(None).await;
+        assert_eq!(setup.track(), (Some(1), Duration::ZERO), "{mode:?}");
+        setup.advance(2405).await;
+        assert_eq!(setup.track(), (Some(2), seconds(5)), "{mode:?}");
+        setup.wait_for_progress((2405.0, false)).await;
+        setup.advance(1800).await;
+        assert_eq!(setup.track(), (Some(3), seconds(5)), "{mode:?}");
+        setup.wait_for_progress((4205.0, false)).await;
+        setup.advance_and_read(110).await;
+        setup.read_every_second(5).await;
+        assert_eq!(
+            setup.household.transport_state(&setup.kitchen),
+            "STOPPED",
+            "{mode:?}"
+        );
+        setup.wait_for_progress((LENGTH, true)).await;
+        eventually("the finished Handoff never ended", WITHIN, async || {
+            setup.bridge.api().handoffs(&setup.bobs).await.is_empty()
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn a_refused_normal_mode_fails_start_without_playing_or_writing_progress() {
+    let setup = setup().await;
+    setup
+        .abs
+        .set_item_progress(&setup.alice, &setup.book(), 2395.0, false)
+        .await;
+    setup
+        .household
+        .set_play_mode(&setup.kitchen, sonos_fake::PlayMode::RepeatAll);
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::RefusePlayMode);
+    let api = setup.bridge.api();
+    assert_eq!(
+        api.start_handoff_error(&setup.alices, &setup.book(), setup.kitchen.uuid())
+            .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed),
+    );
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "STOPPED");
+    assert_eq!(api.handoffs(&setup.bobs).await, []);
+    setup.advance(31).await;
+    assert_eq!(setup.progress().await, Some((2395.0, false)));
+    let queue = setup.household.queue(&setup.kitchen);
+    let path = &queue[0][queue[0].find("/stream/").unwrap()..];
+    assert_eq!(
+        api.fetch(reqwest::Method::GET, path, None).await.status(),
+        StatusCode::NOT_FOUND,
+    );
+}
+
+#[tokio::test]
+async fn supervision_survives_a_successful_file_seek_overlapping_its_cadence() {
+    let setup = setup().await;
+    setup.start(Some(2395.0)).await;
+    setup.household.set_fault(
+        &setup.kitchen,
+        sonos_fake::Fault::SlowTransport(Duration::from_millis(500)),
+    );
+    let before = setup.household.sought(&setup.kitchen).len();
+    let (playback, ()) = tokio::join!(setup.skip(Skip::Forward30), async {
+        eventually("the file seek never arrived", WITHIN, async || {
+            setup.household.sought(&setup.kitchen).len() > before
+        })
+        .await;
+        // Wake the supervisor while the seek's durable uncertainty mark is still set.
+        setup.advance(31).await;
+    });
+    assert_eq!(playback.position, Some(2425.0));
+    assert_eq!(setup.track(), (Some(2), seconds(25)));
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::None);
+    setup.advance(31).await;
+    setup.wait_for_progress((2456.0, false)).await;
+}
+
+/// "The Long Book" behind a proxy telling its files as `lengths` seconds long, on a Kitchen
+/// whose queue's tracks are as long, a Bridge on real time, and a user logged in.
+async fn short_files(
+    lengths: [u64; 3],
+) -> (
+    Household,
+    clock::ManualClock,
+    PlayerId,
+    TestBridge,
+    LibraryProxy,
+    AbsUser,
+    Session,
+) {
+    let abs = Audiobookshelf::shared();
+    let proxy = LibraryProxy::to(abs.base_url()).await;
+    proxy.set_file_lengths(&lengths.map(|length| length as f64));
+    let (household, clock) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    household.set_queue_lengths(&kitchen, &lengths.map(Duration::from_secs));
+    let url = proxy.url();
+    let bridge = TestBridge::start(&home_with_sonos_toml(&url, household.ssdp()));
+    let user = abs.new_user().await;
+    let session = bridge.api().login(&url, &user.api_key.key).await;
+    (household, clock, kitchen, bridge, proxy, user, session)
+}
+
+#[tokio::test]
+async fn a_playing_skip_keeps_its_file_while_a_short_one_would_end() {
+    // Held across the fixture: dropping the last shared handle would stop its container.
+    let abs = Audiobookshelf::shared();
+    let (household, clock, kitchen, bridge, _proxy, user, session) =
+        short_files([25, 10, 120]).await;
+    let book = ItemId {
+        library_item: abs.seeded().long_book.clone(),
+        episode: None,
+    };
+    let api = bridge.api();
+    api.start_handoff(&session, &book, kitchen.uuid()).await;
+    household.set_fault(
+        &kitchen,
+        sonos_fake::Fault::SlowTransport(Duration::from_millis(250)),
+    );
+    // 30 s in: 5 s into the 10 s second file.
+    let (answer, ()) = tokio::join!(
+        api.skip_group(&session, kitchen.uuid(), Skip::Forward30),
+        async {
+            eventually("REL_TIME never arrived", WITHIN, async || {
+                household
+                    .sought(&kitchen)
+                    .iter()
+                    .any(|seek| seek.unit == "REL_TIME")
+            })
+            .await;
+            assert_eq!(household.track_number(&kitchen), Some(2));
+            assert_eq!(household.transport_state(&kitchen), "PAUSED_PLAYBACK");
+            // Longer than the second file: playing, it would end before REL_TIME acts.
+            clock.advance(seconds(10));
+        }
+    );
+    assert_eq!(
+        answer,
+        Playback {
+            state: TransportState::Playing,
+            position: Some(30.0),
+            duration: Some(155.0),
+        }
+    );
+    assert_eq!(household.track_number(&kitchen), Some(2));
+    assert_eq!(household.position(&kitchen), seconds(5));
+    assert_eq!(household.transport_state(&kitchen), "PLAYING");
+    assert_eq!(abs.item_progress(&user, &book).await, Some((30.0, false)));
+}
+
+#[tokio::test]
+async fn a_refused_file_selection_while_playing_plays_on_where_it_was() {
+    let setup = setup().await;
+    setup.start(Some(3005.0)).await;
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::RefuseTrackSeek);
+    let api = setup.bridge.api();
+    let before = api.handoffs(&setup.bobs).await;
+    let pauses = setup.household.asked(&setup.kitchen, "AVTransport#Pause");
+    assert_eq!(
+        api.control_error(
+            &setup.bobs,
+            setup.kitchen.uuid(),
+            GroupControl::Skip(Skip::Back15)
+        )
+        .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed)
+    );
+    // Paused for the seek, then playing again: not left paused while told it fails.
+    assert_eq!(
+        setup.household.asked(&setup.kitchen, "AVTransport#Pause"),
+        pauses + 1
+    );
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+    assert_eq!(setup.track(), (Some(2), seconds(605)));
+    assert_eq!(api.handoffs(&setup.bobs).await, before);
+    assert_eq!(setup.progress().await, Some((3005.0, false)));
+}
+
+#[tokio::test]
+async fn a_file_seek_whose_play_is_refused_keeps_its_handoff_paused_at_its_target() {
+    let setup = setup().await;
+    setup.start(Some(3005.0)).await;
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::RefusePlay);
+    let api = setup.bridge.api();
+    let before = api.handoffs(&setup.bobs).await;
+    assert_eq!(
+        api.control_error(
+            &setup.bobs,
+            setup.kitchen.uuid(),
+            GroupControl::Skip(Skip::Back15)
+        )
+        .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed)
+    );
+    // At its confirmed target, paused: the Handoff stays, the skip itself writes nothing.
+    assert_eq!(setup.track(), (Some(2), seconds(590)));
+    assert_eq!(
+        setup.household.transport_state(&setup.kitchen),
+        "PAUSED_PLAYBACK"
+    );
+    assert_eq!(api.handoffs(&setup.bobs).await, before);
+    assert_eq!(setup.progress().await, Some((3005.0, false)));
+    // Supervision writes nothing for a paused Group; the listener plays on from the target.
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::None);
+    setup.advance_and_read(31).await;
+    assert_eq!(setup.progress().await, Some((3005.0, false)));
+    api.resume_group(&setup.bobs, setup.kitchen.uuid()).await;
+    setup.advance(30).await;
+    setup.wait_for_progress((3020.0, false)).await;
+    assert_eq!(setup.track(), (Some(2), seconds(620)));
+}
+
+#[tokio::test]
+async fn a_file_seek_whose_play_is_not_confirmed_in_time_keeps_its_handoff() {
+    let setup = setup().await;
+    setup.start(Some(3005.0)).await;
+    // Read, Pause, TRACK_NR and REL_TIME fit the control deadline; Play doesn't.
+    setup.household.set_fault(
+        &setup.kitchen,
+        sonos_fake::Fault::SlowTransport(Duration::from_millis(880)),
+    );
+    let api = setup.bridge.api();
+    let before = api.handoffs(&setup.bobs).await;
+    assert_eq!(
+        api.control_error(
+            &setup.bobs,
+            setup.kitchen.uuid(),
+            GroupControl::Skip(Skip::Back15)
+        )
+        .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed)
+    );
+    assert_eq!(api.handoffs(&setup.bobs).await, before);
+    assert_eq!(setup.progress().await, Some((3005.0, false)));
+    // Whether or not the late Play still acts, the Group is at its target and plays on there.
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::None);
+    api.resume_group(&setup.bobs, setup.kitchen.uuid()).await;
+    assert_eq!(setup.track(), (Some(2), seconds(590)));
+    setup.advance(30).await;
+    setup.wait_for_progress((3020.0, false)).await;
+    assert_eq!(api.handoffs(&setup.bobs).await, before);
+}
+
+#[tokio::test]
+async fn a_paused_skip_across_files_stays_paused() {
+    let setup = setup().await;
+    setup.start(Some(2405.0)).await;
+    let api = setup.bridge.api();
+    api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
+    let plays = setup.household.asked(&setup.kitchen, "AVTransport#Play");
+    let skipped = setup.skip(Skip::Back15).await;
+    assert_eq!(skipped.state, TransportState::Paused);
+    assert_eq!(skipped.position, Some(2390.0));
+    assert_eq!(setup.track(), (Some(1), seconds(2390)));
+    assert_eq!(
+        setup.household.transport_state(&setup.kitchen),
+        "PAUSED_PLAYBACK"
+    );
+    assert_eq!(
+        setup.household.asked(&setup.kitchen, "AVTransport#Play"),
+        plays
+    );
+    assert_eq!(setup.progress().await, Some((2390.0, false)));
+}
+
+#[tokio::test]
+async fn a_start_whose_quarantine_cannot_be_persisted_leaves_the_group_alone() {
+    let setup = setup().await;
+    let book = setup.book();
+    setup
+        .abs
+        .set_item_progress(&setup.alice, &book, 3000.0, false)
+        .await;
+    let db = rusqlite::Connection::open(setup.bridge.database_path()).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER refuse_start_mark BEFORE UPDATE OF seeking ON handoffs
+         WHEN NEW.seeking = 1
+         BEGIN SELECT RAISE(FAIL, 'injected startup quarantine failure'); END;",
+    )
+    .unwrap();
+    let api = setup.bridge.api();
+    assert_eq!(
+        api.start_handoff_error(&setup.alices, &book, setup.kitchen.uuid())
+            .await,
+        (StatusCode::INTERNAL_SERVER_ERROR, ApiError::Internal),
+    );
+    // Nothing reached the Group: no queue, nothing loaded, not playing.
+    assert_eq!(setup.household.queue(&setup.kitchen), Vec::<String>::new());
+    assert_eq!(setup.household.uri(&setup.kitchen), None);
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "STOPPED");
+    assert_eq!(api.handoffs(&setup.bobs).await, []);
+    assert_eq!(setup.progress().await, Some((3000.0, false)));
+}

@@ -20,7 +20,7 @@ use api::{
 };
 use app::flow::{App, Notice, Screen};
 use app::i18n::{self, Language, LanguageChoice, Text};
-use app::local::{LocalPlayer, LocalStatus, Media, PlayerEvent, REPORT_EVERY};
+use app::local::{LocalPlayer, LocalSkip, LocalStatus, Media, PlayerEvent, REPORT_EVERY};
 use app::storage::{DeviceStore, FileStore, LoadError, Stored, StoredSession};
 use clock::{Clock, ManualClock};
 use sonos_fake::{FakeTrack, Fault, Household, PlayerId};
@@ -3501,7 +3501,7 @@ fn a_session_ended_elsewhere_leads_from_the_groups_to_login() {
 }
 
 /// Opens episode `n` (0-based) of the seeded podcast through its Library from Home; its Item
-/// screen offers "Play on…": an episode is one audio file.
+/// screen offers "Play on…" for its playable audio.
 async fn open_episode(app: &mut App, abs: &Audiobookshelf, n: usize) {
     let seeded = abs.seeded();
     app.open_library(podcasts(abs)).await;
@@ -3600,7 +3600,6 @@ fn play_on_starts_at_the_progress_and_play_from_start_at_0() {
     let office = household.add_player("Office");
     let (bridge, abs) = bridge_with_household(&household);
     let device = Device::new();
-    let seek = "AVTransport#Seek";
     run(async || {
         let seeded = abs.seeded();
         let user = abs.new_user().await;
@@ -3627,12 +3626,9 @@ fn play_on_starts_at_the_progress_and_play_from_start_at_0() {
         );
         assert_eq!(household.transport_state(&kitchen), "PLAYING");
         assert_eq!(household.position(&kitchen), Duration::ZERO);
-        assert!(
-            !household
-                .actions_of(&kitchen)
-                .iter()
-                .any(|action| action == seek)
-        );
+        // Only the seek to its one file, none into it.
+        let sought = household.sought(&kitchen);
+        assert_eq!(sought, [sonos_fake::Seek::new("TRACK_NR", "1")]);
 
         // "Play on…" on the same Item, then Office: at the Progress, in whole seconds.
         app.open_play_on().await;
@@ -3744,7 +3740,7 @@ fn a_start_that_fails_is_explained_on_the_picker() {
 }
 
 #[test]
-fn an_item_in_several_files_is_not_offered_and_cannot_play_on_a_group() {
+fn an_item_in_several_files_is_offered_and_plays_on_a_group() {
     let (household, _) = Household::with_manual_clock();
     let kitchen = household.add_player("Kitchen");
     let (bridge, abs) = bridge_with_household(&household);
@@ -3758,10 +3754,38 @@ fn an_item_in_several_files_is_not_offered_and_cannot_play_on_a_group() {
             panic!("{:?}", app.screen());
         };
         assert_eq!(item.audio_files.len(), 3);
-        // The Item screen doesn't offer "Play on…".
-        assert!(!app.can_play_on());
+        assert!(app.can_play_on());
 
-        // Asked anyway, the Bridge refuses.
+        app.open_play_on().await;
+        app.play_on(kitchen.uuid()).await;
+        assert_eq!(
+            app.screen().notice(),
+            Some(&Notice::PlayingOn("Kitchen".to_owned()))
+        );
+        // Kitchen plays its three files as its queue.
+        assert_eq!(household.queue(&kitchen).len(), 3);
+        assert_eq!(household.transport_state(&kitchen), "PLAYING");
+        assert_eq!(bridge.api().handoffs(&session(&app)).await.len(), 1);
+    });
+}
+
+#[test]
+fn a_mixed_format_book_explains_why_it_cannot_play_on_a_group() {
+    let (household, _) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let mixed = abs.mixed_format_book().await;
+        let user = abs.new_user_seeing(&[&mixed.library]).await;
+        let mut app = logged_in(&device, &bridge, &abs, &user).await;
+        app.open_library(Library {
+            id: mixed.library,
+            name: "Mixed".into(),
+            kind: LibraryKind::Audiobooks,
+        })
+        .await;
+        app.open_entry(&mixed.book).await;
         app.open_play_on().await;
         app.play_on(kitchen.uuid()).await;
         assert_eq!(
@@ -3772,7 +3796,7 @@ fn an_item_in_several_files_is_not_offered_and_cannot_play_on_a_group() {
             notice_texts(&mut app).await,
             both(Text::ErrorItemNotPlayable)
         );
-        assert_eq!(household.uri(&kitchen), None);
+        assert_eq!(bridge.api().handoffs(&session(&app)).await, []);
     });
 }
 
@@ -3953,6 +3977,69 @@ fn the_groups_screen_controls_a_handoff_another_member_started() {
         assert_eq!(
             shown_playback(&app, "Kitchen"),
             (Some(TransportState::Playing), Some(135.0))
+        );
+    });
+}
+
+#[test]
+fn the_groups_screen_moves_an_audiobooks_handoff_by_chapter() {
+    let (household, clock) = Household::with_manual_clock();
+    let kitchen = household.add_player("Kitchen");
+    household.set_queue_lengths(&kitchen, &[2400, 1800, 120].map(Duration::from_secs));
+    let office = household.add_player("Office");
+    let (bridge, abs) = bridge_with_household(&household);
+    let device = Device::new();
+    run(async || {
+        let (alice, bob) = (abs.new_user().await, abs.new_user().await);
+        let book = ItemId {
+            library_item: abs.seeded().long_book.clone(),
+            episode: None,
+        };
+        let session = bridge.api().login(abs.base_url(), &alice.api_key.key).await;
+        bridge
+            .api()
+            .start_handoff(&session, &book, kitchen.uuid())
+            .await;
+        started_by(&bridge, &abs, &alice, 0, &office).await;
+        clock.advance(Duration::from_secs(10));
+        let mut app = logged_in(&device, &bridge, &abs, &bob).await;
+        app.open_groups().await;
+        // Chapters are offered for the audiobook's Handoff, not for the episode's.
+        assert!(app::flow::offers_chapters(shown_group(&app, "Kitchen")));
+        assert!(!app::flow::offers_chapters(shown_group(&app, "Office")));
+
+        // The next chapter is the second file's start.
+        app.skip_group(kitchen.uuid(), Skip::NextChapter).await;
+        assert_eq!(app.screen().notice(), None);
+        assert_eq!(
+            shown_playback(&app, "Kitchen"),
+            (Some(TransportState::Playing), Some(2400.0))
+        );
+        assert_eq!(household.track_number(&kitchen), Some(2));
+        assert_eq!(household.position(&kitchen), Duration::ZERO);
+        let progress = abs.progress(&alice, &book.library_item, None).await;
+        assert_eq!(progress, Some((2400.0, false)));
+
+        // Back at its start, the previous chapter is the first.
+        app.skip_group(kitchen.uuid(), Skip::PreviousChapter).await;
+        assert_eq!(
+            shown_playback(&app, "Kitchen"),
+            (Some(TransportState::Playing), Some(0.0))
+        );
+        assert_eq!(household.track_number(&kitchen), Some(1));
+
+        assert_eq!(
+            (
+                both(Text::GroupPreviousChapter),
+                both(Text::GroupNextChapter)
+            ),
+            (
+                (
+                    "Previous chapter".to_owned(),
+                    "Vorheriges Kapitel".to_owned()
+                ),
+                ("Next chapter".to_owned(), "Nächstes Kapitel".to_owned())
+            )
         );
     });
 }
@@ -4462,9 +4549,9 @@ fn local_playback_reports_every_30_seconds_and_at_once_on_pause_skip_and_stop() 
         assert_eq!(progress_writes(&log).await, writes);
 
         clock.advance(Duration::from_millis(4_500));
-        app.skip_local(Skip::Forward30).await;
+        app.skip_local(LocalSkip::Forward30).await;
         progress_becomes(&abs, &user, &episode, (75.0, false)).await;
-        app.skip_local(Skip::Back15).await;
+        app.skip_local(LocalSkip::Back15).await;
         progress_becomes(&abs, &user, &episode, (60.0, false)).await;
 
         // The timer starts over from the skip.
@@ -4552,7 +4639,7 @@ fn a_slow_report_holds_back_no_player_action() {
         eventually("paused", || !player.playing()).await;
         within(Duration::from_secs(1), app.toggle_local()).await;
         assert!(player.playing());
-        within(Duration::from_secs(1), app.skip_local(Skip::Forward30)).await;
+        within(Duration::from_secs(1), app.skip_local(LocalSkip::Forward30)).await;
         assert!(
             asked.elapsed() < Duration::from_secs(3),
             "{:?}",
@@ -4946,9 +5033,11 @@ fn remote_commands_interruptions_and_the_end_act_like_the_buttons() {
         eventually("playing again", playing).await;
 
         clock.advance(Duration::from_secs(20));
-        events.send(PlayerEvent::Skip(Skip::Back15)).unwrap();
+        events.send(PlayerEvent::Skip(LocalSkip::Back15)).unwrap();
         progress_becomes(&abs, &user, &episode, (17.0, false)).await;
-        events.send(PlayerEvent::Skip(Skip::Forward30)).unwrap();
+        events
+            .send(PlayerEvent::Skip(LocalSkip::Forward30))
+            .unwrap();
         progress_becomes(&abs, &user, &episode, (47.0, false)).await;
 
         // A call pauses, writing where; its end resumes when iOS says so, and only then.
@@ -4980,7 +5069,7 @@ fn remote_commands_interruptions_and_the_end_act_like_the_buttons() {
         events
             .send(PlayerEvent::InterruptionEnded { resume: true })
             .unwrap();
-        events.send(PlayerEvent::Skip(Skip::Back15)).unwrap();
+        events.send(PlayerEvent::Skip(LocalSkip::Back15)).unwrap();
         progress_becomes(&abs, &user, &episode, (35.0, false)).await;
         assert!(!playing());
         // Nor after the person played and paused during the interruption.
@@ -4991,7 +5080,7 @@ fn remote_commands_interruptions_and_the_end_act_like_the_buttons() {
         events
             .send(PlayerEvent::InterruptionEnded { resume: true })
             .unwrap();
-        events.send(PlayerEvent::Skip(Skip::Back15)).unwrap();
+        events.send(PlayerEvent::Skip(LocalSkip::Back15)).unwrap();
         progress_becomes(&abs, &user, &episode, (20.0, false)).await;
         assert!(!playing());
 
@@ -5095,7 +5184,7 @@ fn a_report_finding_the_local_session_gone_stops_playback_and_says_why() {
                 // The key deleted; a button skips.
                 _ => {
                     abs.delete_api_key(&user.api_key).await;
-                    app.skip_local(Skip::Forward30).await;
+                    app.skip_local(LocalSkip::Forward30).await;
                 }
             }
 
@@ -5553,5 +5642,35 @@ fn a_replaced_session_ends_only_after_an_end_on_its_way() {
         );
         tokio::time::sleep(QUIET).await;
         assert!(!app.local_halted());
+    });
+}
+
+#[test]
+fn a_multi_file_book_offers_its_group_but_not_the_phone_and_leaves_the_episode_playing() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let Phone {
+            mut app, player, ..
+        } = on_episode_with_player(&device, &bridge, abs.base_url(), &user, &clock, &abs, 1).await;
+        app.play_on_phone().await;
+        let playing = app.local_status();
+        assert!(playing.is_some());
+        assert!(player.media().is_some());
+
+        app.open_item(ItemId {
+            library_item: abs.seeded().long_book.clone(),
+            episode: None,
+        })
+        .await;
+        assert!(app.can_play_on());
+        assert!(!app.can_play_on_phone());
+        // Even asked directly, the episode is not ended for a book the phone can't play.
+        app.play_on_phone().await;
+        assert_eq!(app.screen().notice(), None);
+        assert!(app.local_status().is_some());
+        assert!(player.media().is_some());
     });
 }

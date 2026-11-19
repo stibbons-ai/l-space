@@ -9,8 +9,9 @@ use api::{
 };
 use dioxus::prelude::*;
 
-use crate::flow::{App, Notice, Screen, volume_step};
+use crate::flow::{App, Notice, Screen, offers_chapters, volume_step};
 use crate::i18n::{self, LanguageChoice, Text};
+use crate::local::LocalSkip;
 use crate::storage::FileStore;
 
 const STYLE: &str = include_str!("../assets/app.css");
@@ -726,8 +727,8 @@ fn GroupsScreen(
 }
 
 /// A Group's controls: for its Handoff, Pause or Resume (by its state), 15 s back and 30 s
-/// forward; its volume with a step down and up, if it told one. All are off while any action
-/// runs, this Group's included.
+/// forward, and for an audiobook's, the previous and next chapter; its volume with a step down
+/// and up, if it told one. All are off while any action runs, this Group's included.
 #[component]
 fn GroupControls(app: Signal<App>, busy: Signal<bool>, group: Group) -> Element {
     let text = |text| app.read().text(text);
@@ -741,6 +742,7 @@ fn GroupControls(app: Signal<App>, busy: Signal<bool>, group: Group) -> Element 
     } else {
         (Control::Resume, Text::GroupResume)
     };
+    let chapters = offers_chapters(&group);
     let id = group.id.clone();
     let control = move |action: Control| {
         let id = id.clone();
@@ -776,6 +778,22 @@ fn GroupControls(app: Signal<App>, busy: Signal<bool>, group: Group) -> Element 
                     disabled: busy(),
                     onclick: control(Control::Skip(Skip::Forward30)),
                     {text(Text::GroupForward30)}
+                }
+                if chapters {
+                    button {
+                        r#type: "button",
+                        class: "secondary",
+                        disabled: busy(),
+                        onclick: control(Control::Skip(Skip::PreviousChapter)),
+                        {text(Text::GroupPreviousChapter)}
+                    }
+                    button {
+                        r#type: "button",
+                        class: "secondary",
+                        disabled: busy(),
+                        onclick: control(Control::Skip(Skip::NextChapter)),
+                        {text(Text::GroupNextChapter)}
+                    }
                 }
             }
         }
@@ -987,14 +1005,14 @@ fn NowPlayingScreen(app: Signal<App>, busy: Signal<bool>) -> Element {
                     r#type: "button",
                     class: "secondary",
                     disabled: busy(),
-                    onclick: control(LocalControl::Skip(Skip::Back15)),
+                    onclick: control(LocalControl::Skip(LocalSkip::Back15)),
                     {text(Text::GroupBack15)}
                 }
                 button {
                     r#type: "button",
                     class: "secondary",
                     disabled: busy(),
-                    onclick: control(LocalControl::Skip(Skip::Forward30)),
+                    onclick: control(LocalControl::Skip(LocalSkip::Forward30)),
                     {text(Text::GroupForward30)}
                 }
                 button {
@@ -1015,6 +1033,6 @@ fn NowPlayingScreen(app: Signal<App>, busy: Signal<bool>) -> Element {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum LocalControl {
     Toggle,
-    Skip(Skip),
+    Skip(LocalSkip),
     Stop,
 }

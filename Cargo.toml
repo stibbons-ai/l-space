@@ -12,6 +12,7 @@ publish = false
 abs = { path = "crates/abs" }
 api = { path = "crates/api" }
 clock = { path = "crates/clock" }
+domain = { path = "crates/domain" }
 sonos = { path = "crates/sonos" }
 sonos-fake = { path = "crates/sonos-fake" }
 store = { path = "crates/store" }
