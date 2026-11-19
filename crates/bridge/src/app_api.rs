@@ -1523,12 +1523,14 @@ impl<S: Store> Controls<S> {
     /// already paused (or playing) is sent nothing for a pause (or resume). After a pause or
     /// a skip, the Group's position is written as Progress for the starter, with the
     /// Handoff's key, once the Library Server confirmed that key still acts for the starter:
-    /// for a pause, where the Group tells it paused (read right after the pause; if that read
-    /// fails, is late, or tells no position of the Handoff's stream, where it was just before
-    /// the pause), for a skip, the seek's target. The control's calls to the Group take [`sonos::CONTROL_TIMEOUT`] in all, its
-    /// requests to the Library Server [`CONTROL_LIBRARY_SERVER_TIME`]; a write that fails or
-    /// runs out of time is logged and otherwise left alone, as the Group already did what was
-    /// asked, except that a key the Library Server rejects is revoked, which ends the Handoff.
+    /// for a pause, where the Group tells it paused (read right after the pause, playing or
+    /// paused on the Handoff's stream; if that read fails, is late, or tells no such position,
+    /// where it was just before the pause if it was playing there, else nothing is written),
+    /// for a skip, the seek's target. The control's calls to the Group take
+    /// [`sonos::CONTROL_TIMEOUT`] in all, its requests to the Library Server
+    /// [`CONTROL_LIBRARY_SERVER_TIME`]; a write that fails or runs out of time is logged and
+    /// otherwise left alone, as the Group already did what was asked, except that a key the
+    /// Library Server rejects is revoked, which ends the Handoff.
     async fn control(
         &self,
         group: &str,
@@ -1571,12 +1573,11 @@ impl<S: Store> Controls<S> {
                     self.act(group, control, &mut group_time, self.sonos.pause(group))
                         .await?;
                     let paused = self.paused_at(group, &found.stream, &mut group_time).await;
-                    reliable = paused.is_some() || reliable;
-                    let position = paused.or(position);
-                    let Some(position) = position else {
+                    // The written position is the one the supervisor caches: both reliable.
+                    let Some(position) = paused.or(position.filter(|_| reliable)) else {
                         tracing::warn!(
                             group,
-                            reason = "the Group did not tell where it paused",
+                            reason = "the Group did not tell reliably where it paused",
                             "Progress not written"
                         );
                         return Ok(Playback {
@@ -1585,6 +1586,7 @@ impl<S: Store> Controls<S> {
                             duration,
                         });
                     };
+                    reliable = true;
                     let duration = self
                         .check_and_write(
                             &found.active,
@@ -1725,7 +1727,8 @@ impl<S: Store> Controls<S> {
     }
 
     /// Where Group `group` tells it is, read right after a pause within `time`, if it still
-    /// plays `stream` and tells a position; none otherwise.
+    /// plays `stream` and tells a reliable position there ([`supervise::reliable_position`]);
+    /// none otherwise.
     async fn paused_at(
         &self,
         group: &str,
@@ -1735,29 +1738,30 @@ impl<S: Store> Controls<S> {
         let read = match time.spend(self.sonos.playback(group)).await {
             Some(Ok(read)) => read,
             Some(Err(error)) => {
-                tracing::info!(group, %error, "cannot read where a Group paused; using where it was just before");
+                tracing::info!(group, %error, "cannot read where a Group paused; using where it reliably was just before, if anywhere");
                 return None;
             }
             None => {
                 tracing::info!(
                     group,
-                    "a Group did not tell where it paused in time; using where it was just before"
+                    "a Group did not tell where it paused in time; using where it reliably was just before, if anywhere"
                 );
                 return None;
             }
         };
         let plays_handoff = plays_stream(&read, stream);
-        let position = read.position.filter(|_| plays_handoff);
+        let position = supervise::reliable_position(&read).filter(|_| plays_handoff);
         if position.is_none() {
             if plays_handoff {
                 tracing::info!(
                     group,
-                    "a Group told no position after pausing; using where it was just before"
+                    state = ?read.state,
+                    "a Group told no reliable position after pausing; using where it reliably was just before, if anywhere"
                 );
             } else {
                 tracing::info!(
                     group,
-                    "a Group plays something other than its Handoff after pausing; using where it was just before"
+                    "a Group plays something other than its Handoff after pausing; using where it reliably was just before, if anywhere"
                 );
             }
         }
@@ -1811,22 +1815,24 @@ impl<S: Store> Controls<S> {
 
     /// Writes where Group `group` is on `replaced`'s stream as Progress for the replaced
     /// Handoff's starter, with its key ([`Controls::write_progress`]), within `time` in all:
-    /// reading the Group, checking the key (and the Item's length, if neither the Group nor
-    /// its supervisor (`known`) tells it), writing. A Group playing or paused on that stream
-    /// supplies its current position; a stopped one may tell 0 there. A positive foreign
-    /// source uses the supervisor's pending Finished or cached reliable old-stream position
-    /// instead, unless Finished was already written. A Group
-    /// stopped on that stream after playing to the end of the Item gets Progress at the end
-    /// written Finished: the supervisor's pending Finished write, or, when it hadn't found the
-    /// Group stopped yet, one by the supervisor's rule on what it last saw of the Group
-    /// ([`supervise::Replaced::finished_at_stop`], timed on `clock`). A Group stopped there
-    /// short of the end, or not read often enough near it to tell, gets nothing written. With
-    /// no `time` at all, nothing is tried. Anything else, a failure or running out of time is
-    /// logged and otherwise left alone. A Finished write left unmade is logged as an error when
-    /// the write doesn't land or the key is revoked instead; a pending one (`known.finished`)
-    /// also when there is no `time`, the Group doesn't tell what it plays, or it tells no
-    /// position playing or paused on that stream; a Group playing or paused on that stream,
-    /// telling a position, gets that position written instead, with no such error.
+    /// reading the Group, checking the key (on that stream also the Item's length, if neither
+    /// the Group nor its supervisor (`known`) tells it), writing. Nothing is written once the
+    /// supervisor's Finished is settled (written, or its tries ran out and it was logged as
+    /// lost). A Group playing or paused on that stream supplies its current position; a
+    /// stopped one may tell 0 there. A Group on any other source (a positive foreign URI)
+    /// gets the supervisor's pending Finished or cached reliable old-stream position instead,
+    /// never the foreign source's. A Group stopped on that stream after playing to the end of
+    /// the Item gets Progress at the end written Finished: the supervisor's pending Finished
+    /// write, or, when it hadn't found the Group stopped yet, one by the supervisor's rule on
+    /// what it last saw of the Group ([`supervise::Replaced::finished_at_stop`], timed on
+    /// `clock`). A Group stopped there short of the end, or not read often enough near it to
+    /// tell, gets nothing written. With no `time` at all, nothing is tried. Anything else, a
+    /// failure or running out of time is logged and otherwise left alone. A Finished write
+    /// left unmade is logged as an error when the write doesn't land or the key is revoked
+    /// instead; a pending one (`known.finished`) also when there is no `time`, the Group
+    /// doesn't tell what it plays, or it tells no position playing or paused on that stream; a
+    /// Group playing or paused on that stream, telling a position, gets that position written
+    /// instead, with no such error.
     async fn write_replaced(
         &self,
         group: &str,
@@ -1851,7 +1857,12 @@ impl<S: Store> Controls<S> {
                 );
             }
         };
-        if known.finished_written {
+        if known.finish_settled {
+            tracing::info!(
+                group,
+                reason = "its Finished is already settled",
+                "{not_written}"
+            );
             return;
         }
         if time.is_zero() {
@@ -1876,20 +1887,23 @@ impl<S: Store> Controls<S> {
                     .position
                     .map(|position| abs::ProgressUpdate::at(position.as_secs_f64(), known.length))
             });
-            if let Some(update) = update {
-                let checked = self.check(&replaced.active, Wanted::No, &mut time).await;
-                let wrote = self
-                    .write_progress(
-                        &replaced.active,
-                        checked.acting,
-                        update,
-                        "replaced after Takeover",
-                        &mut time,
-                    )
-                    .await;
-                if !matches!(wrote, Wrote::Written) {
-                    lost(known.finished, "final replacement write did not land");
-                }
+            let Some(update) = update else {
+                tracing::info!(
+                    group,
+                    reason = "no reliable position on the replaced Handoff's stream",
+                    "{not_written}"
+                );
+                return;
+            };
+            let checked = self.check(&replaced.active, Wanted::No, &mut time).await;
+            let cause = "replaced on a foreign source";
+            let wrote = self
+                .write_progress(&replaced.active, checked.acting, update, cause, &mut time)
+                .await;
+            match wrote {
+                Wrote::Written => {}
+                Wrote::Revoked => lost(known.finished, "the Handoff's API key was revoked"),
+                Wrote::Not => lost(known.finished, "not written (see the warning before)"),
             }
             return;
         }

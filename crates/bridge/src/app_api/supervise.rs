@@ -158,8 +158,9 @@ pub(super) struct Replaced {
     pub(super) finished: Option<ProgressUpdate>,
     /// Last reliable old-stream position; none without a supervisor.
     pub(super) position: Option<Duration>,
-    /// Finished already persisted; only local Handoff removal remains.
-    pub(super) finished_written: bool,
+    /// Finished was written, or its tries ran out (logged as lost); only removing the Handoff
+    /// from the store remains, so a replacement writes no Progress for it.
+    pub(super) finish_settled: bool,
     /// What the supervisor last saw of the Group; none without a supervisor.
     last: Option<Seen>,
 }
@@ -346,7 +347,7 @@ impl<S: Store> Supervisors<S> {
             length: known.length,
             finished,
             position: Some(known.position),
-            finished_written: matches!(known.ending, Some(Ending::Store)),
+            finish_settled: matches!(known.ending, Some(Ending::Store)),
             last: Some(known.last),
         }
     }

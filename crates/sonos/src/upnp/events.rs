@@ -182,8 +182,9 @@ pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn 
                 due.entry((addr, path)).or_insert(Some(now));
             }
         }
-        // Renew the earliest expiring leases first. A saturated set of stalled requests
-        // must also yield a slot to a healthy short lease when its deadline arrives.
+        // Renew the earliest expiring leases first. At the limit, a lease whose renewal is due
+        // cancels one attempt without a lease or for a later-expiring one; an attempt for an
+        // earlier-expiring lease is never cancelled and can delay it by one request timeout.
         ready.clear();
         {
             let subscriptions = shared
@@ -253,7 +254,8 @@ pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn 
     }
 }
 
-/// One bounded request per endpoint; dropping the owning JoinSet cancels all requests.
+/// One bounded request for an endpoint; `run` keeps one per endpoint and owns the JoinSet
+/// whose drop cancels them.
 async fn subscribe(
     shared: &Shared,
     listen: SocketAddr,
@@ -330,7 +332,8 @@ async fn subscribe(
             Err(kind)
         }
     };
-    // Discovery may have invalidated this endpoint while its request was in flight.
+    // Discovery may have invalidated this endpoint while its request was in flight: even a
+    // granted lease is discarded then.
     if !shared.known().players.values().any(|player| {
         player.addr == addr && shared.clock.now().saturating_duration_since(player.seen) < EXPIRY
     }) {

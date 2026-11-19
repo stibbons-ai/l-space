@@ -16,7 +16,7 @@ use test_support::bridge::{
     LIBRARY_SERVER_UNREACHABLE, NO_HANDOFF, SESSION_INVALID, TestBridge, home_with_sonos_toml,
     output_contains,
 };
-use test_support::eventually;
+use test_support::{WITHIN, eventually};
 
 use crate::forwarder::Forwarder;
 use crate::library_proxy::LibraryProxy;
@@ -1340,7 +1340,27 @@ async fn a_controls_calls_to_the_group_share_one_time_limit() {
     let setup = setup().await;
     let api = setup.bridge.api();
     let episode = setup.episode(0);
+    // Nothing but this control may hold Kitchen's turn while it is timed: every callback lease
+    // (AVTransport and ZoneGroupTopology of the three players) exists before the start, and
+    // later callbacks are dropped, so neither a new lease nor a NOTIFY wakes the supervisor.
+    eventually("callback leases never established", WITHIN, async || {
+        setup.household.subscriptions().len() == 6
+    })
+    .await;
+    setup.household.drop_notifications(true);
+    let reads = setup.asked(&setup.kitchen, "AVTransport#GetPositionInfo");
     setup.start(&episode, &setup.kitchen).await;
+    // The supervisor's initial reconcile reads Kitchen (a start alone reads no position); a
+    // same-volume set then takes Kitchen's turn only after that reconcile released it.
+    setup
+        .wait_until_asked(&setup.kitchen, "AVTransport#GetPositionInfo", reads, WITHIN)
+        .await;
+    let volume = setup.household.volume(&setup.kitchen);
+    assert_eq!(
+        api.set_group_volume(&setup.bobs, setup.kitchen.uuid(), volume)
+            .await,
+        volume
+    );
     setup.clock.advance(seconds(60));
     // Each call alone answers well within the 4 seconds a control has for the Group (a fresh
     // 4 seconds per call would pass each), but a forward skip's three (read, read again after

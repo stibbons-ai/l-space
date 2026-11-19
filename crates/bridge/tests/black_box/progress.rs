@@ -1774,6 +1774,11 @@ async fn takeover_after_pause_keeps_the_recovered_post_pause_position() {
         setup.progress(&setup.alice, &episode).await,
         Some((37.0, false))
     );
+    // A Takeover that wrote nothing would leave this sentinel.
+    setup.settle().await;
+    setup
+        .set_progress(&setup.alice, &episode, 11.0, false)
+        .await;
     setup.household.play(
         &setup.kitchen,
         FakeTrack::new("Radio", Duration::from_secs(3600)),
@@ -1782,6 +1787,75 @@ async fn takeover_after_pause_keeps_the_recovered_post_pause_position() {
     assert_eq!(
         setup.progress(&setup.alice, &episode).await,
         Some((37.0, false))
+    );
+    assert_eq!(
+        reqwest::get(&old_stream).await.unwrap().status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn takeover_after_pause_without_a_reliable_position_keeps_the_cached_position() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    let old_stream = setup.household.fetched(&setup.kitchen).await.uri;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    setup.settle().await;
+    setup.household.drop_notifications(true);
+    setup
+        .set_progress(&setup.alice, &episode, 11.0, false)
+        .await;
+    setup.advance(7).await;
+    // The pre-pause read tells 37 on the old stream, but while transitioning: not reliable.
+    setup
+        .household
+        .set_transport_state(&setup.kitchen, "TRANSITIONING");
+    assert_eq!(
+        setup.household.position(&setup.kitchen),
+        Duration::from_secs(37)
+    );
+    let mut gate = setup.household.hold_next_call(&setup.kitchen, "Pause");
+    let pause = async {
+        let playback = setup
+            .bridge
+            .api()
+            .pause_group(&setup.bobs, setup.kitchen.uuid())
+            .await;
+        assert_eq!(playback.position, Some(37.0));
+    };
+    let fail_after_pause = async {
+        gate.arrived().await;
+        setup
+            .household
+            .set_transport_state(&setup.kitchen, "PLAYING");
+        setup
+            .household
+            .set_fault(&setup.kitchen, Fault::FailTransportInfo);
+        gate.release();
+    };
+    tokio::join!(pause, fail_after_pause);
+    assert_eq!(
+        setup.household.transport_state(&setup.kitchen),
+        "PAUSED_PLAYBACK"
+    );
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((11.0, false))
+    );
+    setup.household.set_fault(&setup.kitchen, Fault::None);
+    setup.household.drop_notifications(false);
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("Radio", Duration::from_secs(3600)),
+    );
+    setup.wait_until_no_handoff().await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
     );
     assert_eq!(
         reqwest::get(&old_stream).await.unwrap().status(),
@@ -1807,6 +1881,14 @@ async fn takeover_immediately_after_skip_keeps_the_seek_target() {
         .skip_group(&setup.bobs, setup.kitchen.uuid(), Skip::Forward30)
         .await;
     assert_eq!(playback.position, Some(60.0));
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((60.0, false))
+    );
+    // A Takeover that wrote nothing would leave this sentinel.
+    setup
+        .set_progress(&setup.alice, &episode, 11.0, false)
+        .await;
     setup.household.drop_notifications(false);
     setup.household.play(
         &setup.kitchen,
@@ -1853,7 +1935,7 @@ async fn replacement_during_takeover(finished: bool) {
         .set_progress(&setup.alice, &episode, 11.0, false)
         .await;
     let identities = proxy.identity_requests();
-    proxy.delay_next_identity(Duration::from_millis(2400));
+    let identity = proxy.hold_next_identity();
     setup.household.play(
         &setup.kitchen,
         FakeTrack::new("Radio", Duration::from_secs(3600)),
@@ -1867,6 +1949,8 @@ async fn replacement_during_takeover(finished: bool) {
     let replacement = setup.episode(1);
     setup.start(&setup.bobs, &replacement, None).await;
     assert_bobs_handoff_listed(&setup).await;
+    // The replacement won the turn while the Takeover's identity check was still held.
+    drop(identity);
     assert_eq!(setup.progress(&setup.alice, &episode).await, Some(expected));
     assert_eq!(setup.progress(&setup.bob, &episode).await, None);
     assert_eq!(
