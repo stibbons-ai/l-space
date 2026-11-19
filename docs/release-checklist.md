@@ -78,8 +78,25 @@ Kind one pauses at the end of the current chapter (audiobook) or episode (podcas
 - [ ] The lock-screen controls work, and Progress follows them on the Library Server.
 - [ ] Right after the start and after each skip, the lock screen's elapsed time shows the new position (not the old one, nor 0:00), and keeps counting from there.
 - [ ] Pause or Stop within a second of "Play on this phone" keeps the Progress: the Library Server holds where it started, not 0.
-- [ ] 30 seconds after "Play on this phone" of an Item with Progress, the Library Server holds the start plus about 30 seconds (not about 30).
+- [ ] At 1.0× (the Item's Playback speed in Now playing), 30 seconds after "Play on this phone" of an Item with Progress, the Library Server holds the start plus about 30 seconds (not about 30).
 - [ ] The call pauses playback, and it resumes when the call ends.
 - [ ] Playback moves to the AirPlay speaker and back without restarting the Item or losing its position.
 - [ ] Bluetooth headphones play it; taking them off pauses it, and Progress shows where.
 - [ ] Over Tailscale it plays as at home.
+
+## Local playback at 1.5× from the lock screen, headphones and a call
+
+1. In Now playing, choose 1.5× ("1,5×" in German) for an Item playing on the phone; lock the phone.
+2. Note the lock screen's elapsed time, and watch it for 20 seconds by a clock.
+3. Use the lock screen's play/pause, 15 seconds back and 30 seconds forward; then the same in Control Center.
+4. With wired or Bluetooth headphones, pause and play from their controls.
+5. Receive a phone call; end it.
+6. Unlock and open Now playing.
+7. Over mobile data, "Play on this phone" an Item with Progress and choose 2.0× right away, within a second; then 30 seconds forward and choose 1.25× right away; then pause, 30 seconds forward and choose 1.5× right away. Lock the phone after each and look at the lock screen. Repeat if the seek has already settled before you change speed.
+8. After the checks, restore 1.0× for the Item.
+
+- [ ] While playing, the elapsed time advances about 30 seconds in those 20 seconds (1.5 seconds of the Item per second). Pause and check that Progress on the Library Server matches the paused position.
+- [ ] While paused, the elapsed time stands still.
+- [ ] 15 seconds back and 30 seconds forward move it by 15 and 30 seconds of the Item, not 1.5 times that.
+- [ ] After the lock screen's and Control Center's play, the headphones' play and the end of the call, it plays on at 1.5×, and Now playing still marks 1.5×.
+- [ ] A speed chosen right after the start or a skip keeps the lock screen's elapsed time at the start's or skip's position (not the old one, nor 0:00), counting on from there at the new speed; paused, it stands still there and the Item stays paused.

@@ -5,17 +5,19 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use api::{CurrentUser, LibraryServer, SessionToken};
+use api::{CurrentUser, LibraryServer, LocalStart, SessionToken};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::i18n::LanguageChoice;
+use crate::local::Speed;
 
 /// Everything the App remembers. The session tokens are the only secrets; their `Debug`
 /// output is redacted ([`SessionToken`]).
 ///
 /// Reads what earlier Apps wrote too: their single `session` becomes the only session, selected.
 /// A file holding several sessions on one Library Server keeps the last; a `selected` naming
-/// none of the sessions selects nothing.
+/// none of the sessions selects nothing. A Playback speed it can't read (from a newer App, say)
+/// is left out, the rest kept.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "StoredFile")]
 pub struct Stored {
@@ -27,6 +29,8 @@ pub struct Stored {
     /// selected (it ended, or the file named none), until the person switches or logs in.
     selected: Option<String>,
     pub language: LanguageChoice,
+    /// Every Playback speed other than [`Speed::Normal`], at most one per [`SpeedKey`].
+    speeds: Vec<StoredSpeed>,
 }
 
 impl Stored {
@@ -108,6 +112,22 @@ impl Stored {
         self.sessions.clear();
         self.selected = None;
     }
+
+    /// The Playback speed kept for `key`; [`Speed::Normal`] if none is.
+    pub fn speed(&self, key: &SpeedKey) -> Speed {
+        self.speeds
+            .iter()
+            .find(|kept| kept.key == *key)
+            .map_or(Speed::Normal, |kept| kept.speed)
+    }
+
+    /// Keeps `speed` for `key`, replacing the one kept before.
+    pub fn set_speed(&mut self, key: SpeedKey, speed: Speed) {
+        self.speeds.retain(|kept| kept.key != key);
+        if speed != Speed::Normal {
+            self.speeds.push(StoredSpeed { key, speed });
+        }
+    }
 }
 
 /// [`Stored`] as the file holds it, written by this App or an earlier one.
@@ -124,6 +144,9 @@ struct StoredFile {
     /// A value this build doesn't know (from a newer App) reads as [`LanguageChoice::System`].
     #[serde(default, deserialize_with = "language_or_system")]
     language: LanguageChoice,
+    /// From an App before #26: none.
+    #[serde(default, deserialize_with = "known_speeds")]
+    speeds: Vec<StoredSpeed>,
 }
 
 impl From<StoredFile> for Stored {
@@ -131,6 +154,7 @@ impl From<StoredFile> for Stored {
         let mut stored = Self {
             bridge_url: file.bridge_url,
             language: file.language,
+            speeds: file.speeds,
             ..Self::default()
         };
         // At most one per Library Server, whatever the file holds: the last one wins.
@@ -174,6 +198,68 @@ fn language_or_system<'de, D: Deserializer<'de>>(
 ) -> Result<LanguageChoice, D::Error> {
     let value = serde_json::Value::deserialize(deserializer)?;
     Ok(LanguageChoice::deserialize(value).unwrap_or_default())
+}
+
+/// The Playback speeds in the file this App reads; others are left out.
+fn known_speeds<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<StoredSpeed>, D::Error> {
+    let values = Vec::<serde_json::Value>::deserialize(deserializer)?;
+    let mut speeds: Vec<StoredSpeed> = Vec::new();
+    for value in values {
+        match StoredSpeed::deserialize(value) {
+            // At most one per key: the last one wins, as with sessions.
+            Ok(speed) => {
+                speeds.retain(|kept| kept.key != speed.key);
+                speeds.push(speed);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the saved state holds a Playback speed this App doesn't know; leaving it out")
+            }
+        }
+    }
+    Ok(speeds)
+}
+
+/// What a Playback speed is kept for: a podcast, or an audiobook Library, by Audiobookshelf's
+/// id, on the Library Server (its base URL) the id is from. Ids alone could match another
+/// Library Server's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeedKey {
+    library_server: String,
+    kind: SpeedKind,
+    id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SpeedKind {
+    /// Every episode of a podcast shares one.
+    Podcast,
+    /// Every audiobook in an audiobook Library shares one.
+    AudiobookLibrary,
+}
+
+impl SpeedKey {
+    /// The key of the Item `started` plays, on the Library Server with base URL
+    /// `library_server`: its podcast for an episode, else its Library; none for an audiobook
+    /// whose Library the Bridge didn't name (a Bridge before #26).
+    pub fn of_start(library_server: &str, started: &LocalStart) -> Option<Self> {
+        let (kind, id) = match &started.item.episode {
+            Some(_) => (SpeedKind::Podcast, started.item.library_item.clone()),
+            None => (SpeedKind::AudiobookLibrary, started.library.clone()?),
+        };
+        Some(Self {
+            library_server: library_server.to_owned(),
+            kind,
+            id,
+        })
+    }
+}
+
+/// A Playback speed kept for its key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredSpeed {
+    key: SpeedKey,
+    speed: Speed,
 }
 
 /// A logged-in session on the stored Bridge.
@@ -322,7 +408,8 @@ mod tests {
     use api::{CurrentUser, LibraryServer, SessionToken};
     use serde_json::json;
 
-    use super::{Stored, StoredSession};
+    use super::{SpeedKey, SpeedKind, Stored, StoredSession};
+    use crate::local::Speed;
 
     fn session(library_server: &str, token: &str) -> StoredSession {
         StoredSession {
@@ -417,5 +504,35 @@ mod tests {
         }));
         let debug = format!("{stored:?}");
         assert!(!debug.contains("secret"), "{debug}");
+    }
+
+    fn podcast(library_server: &str, id: &str) -> SpeedKey {
+        SpeedKey {
+            library_server: library_server.to_owned(),
+            kind: SpeedKind::Podcast,
+            id: id.to_owned(),
+        }
+    }
+
+    /// A speed this App doesn't know (a newer App's) is left out, keeping the file and the
+    /// speeds it knows; one kept for a podcast is that podcast's on that Library Server alone.
+    #[test]
+    fn speeds_this_app_doesnt_know_are_left_out() {
+        let stored = load(json!({
+            "bridge_url": "http://bridge",
+            "speeds": [
+                {"key": {"library_server": "http://home", "kind": "podcast", "id": "p1"}, "speed": "1.5"},
+                {"key": {"library_server": "http://home", "kind": "podcast", "id": "p2"}, "speed": "3.0"},
+                {"key": {"library_server": "http://home", "kind": "series", "id": "p3"}, "speed": "1.5"},
+            ],
+        }));
+        assert_eq!(stored.speed(&podcast("http://home", "p1")), Speed::X1_5);
+        assert_eq!(stored.speed(&podcast("http://home", "p2")), Speed::Normal);
+        assert_eq!(stored.speed(&podcast("http://second", "p1")), Speed::Normal);
+        let audiobooks = SpeedKey {
+            kind: SpeedKind::AudiobookLibrary,
+            ..podcast("http://home", "p1")
+        };
+        assert_eq!(stored.speed(&audiobooks), Speed::Normal);
     }
 }

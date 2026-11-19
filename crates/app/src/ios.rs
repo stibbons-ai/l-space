@@ -55,7 +55,7 @@ use objc2_ui_kit::UIImage;
 use tokio::sync::mpsc;
 
 use crate::flow::{App, CALL_TIMEOUT};
-use crate::local::{LocalPlayer, Media, PlayerEvent, PlayerEvents};
+use crate::local::{LocalPlayer, Media, PlayerEvent, PlayerEvents, Speed};
 
 /// How often AVPlayer tells the main thread where it is, in seconds.
 const POSITION_EVERY: f64 = 1.0;
@@ -90,6 +90,9 @@ struct Spot {
     load: u64,
     /// Seeks asked of the current load that haven't landed.
     seeking: usize,
+    /// Of those, the ones the main thread has asked AVPlayer for: while any is, AVPlayer may
+    /// tell the time from before it, and `at` is where it goes.
+    issued: usize,
 }
 
 impl Position {
@@ -107,6 +110,7 @@ impl Position {
         spot.at = at;
         spot.load += 1;
         spot.seeking = 1;
+        spot.issued = 0;
         spot.load
     }
 
@@ -118,6 +122,20 @@ impl Position {
         spot.load
     }
 
+    /// The main thread asks AVPlayer for a seek of load `load`, before its landing.
+    fn issued(&self, load: u64) {
+        let mut spot = self.spot();
+        if spot.load == load {
+            spot.issued += 1;
+        }
+    }
+
+    /// Where AVPlayer goes while a seek it was asked for hasn't landed.
+    fn pending(&self) -> Option<f64> {
+        let spot = self.spot();
+        (spot.issued > 0).then_some(spot.at)
+    }
+
     /// A seek of load `load` landed (or gave way to a later one): answers whether it was the
     /// last one of the current load still on its way.
     fn landed(&self, load: u64) -> bool {
@@ -126,6 +144,7 @@ impl Position {
             return false;
         }
         spot.seeking = spot.seeking.saturating_sub(1);
+        spot.issued = spot.issued.saturating_sub(1);
         spot.seeking == 0
     }
 
@@ -142,6 +161,7 @@ impl Position {
         let mut spot = self.spot();
         spot.at = 0.0;
         spot.seeking = 0;
+        spot.issued = 0;
         // A seek still on its way landing later is about nothing loaded now.
         spot.load += 1;
     }
@@ -168,7 +188,8 @@ impl LocalPlayer for AvPlayer {
             activate_session();
             with_main(|main| {
                 if let Some(player) = &main.player {
-                    unsafe { player.play() };
+                    // `play` would play at 1.0×; a rate other than 0 plays at that rate.
+                    unsafe { player.setRate(main.speed()) };
                 }
                 main.playing = true;
             });
@@ -206,12 +227,17 @@ impl LocalPlayer for AvPlayer {
             with_main(|main| {
                 if let Some(player) = &main.player {
                     let time = unsafe { CMTime::with_seconds(position, 1000) };
+                    landed.issued(number);
                     unsafe { player.seekToTime_completionHandler(time, &landing(landed, number)) };
                 }
             });
             // AVPlayer seeks in the background: until then it still tells the old time.
             update_now_playing(Some(position));
         });
+    }
+
+    fn set_speed(&self, speed: Speed) {
+        on_main(move |_| apply_speed(speed));
     }
 
     fn unload(&self) {
@@ -271,6 +297,11 @@ struct Main {
 }
 
 impl Main {
+    /// The rate what is loaded plays at, while it plays.
+    fn speed(&self) -> f32 {
+        self.media.as_ref().map_or(1.0, |media| media.speed.rate())
+    }
+
     /// Pauses and drops the player, if any, with its observers.
     fn release_player(&mut self) {
         if let Some(player) = self.player.take() {
@@ -523,12 +554,13 @@ fn load(mtm: MainThreadMarker, media: Media, number: u64) {
             &tick,
         )
     };
+    position.issued(number);
     unsafe {
         player.seekToTime_completionHandler(
             CMTime::with_seconds(media.start_at, 1000),
             &landing(position, number),
         );
-        player.play();
+        player.setRate(media.speed.rate());
     }
     let item_observers = item.map(|item| observe_item(&item)).unwrap_or_default();
     let start_at = media.start_at;
@@ -588,12 +620,14 @@ fn set_artwork(url: &str, bytes: Vec<u8>) {
     update_now_playing(None);
 }
 
-/// Publishes what plays to the lock screen and Control Center, `elapsed` seconds in if given
-/// (right after a load or seek, which AVPlayer doesn't tell yet), else where AVPlayer is.
+/// Publishes what plays to the lock screen and Control Center, `elapsed` seconds in if given,
+/// else where a seek still on its way goes (AVPlayer may tell the time from before it), else
+/// where AVPlayer is.
 fn update_now_playing(elapsed: Option<f64>) {
     let info = with_main(|main| {
         let media = main.media.as_ref()?;
         let elapsed = elapsed
+            .or_else(|| main.position.pending())
             .or_else(|| {
                 main.player
                     .as_ref()
@@ -625,7 +659,11 @@ fn update_now_playing(elapsed: Option<f64>) {
                 MPNowPlayingInfoPropertyElapsedPlaybackTime,
                 NSNumber::new_f64(elapsed).into(),
             );
-            let rate = if main.playing { 1.0 } else { 0.0 };
+            let rate = if main.playing {
+                f64::from(main.speed())
+            } else {
+                0.0
+            };
             add(
                 MPNowPlayingInfoPropertyPlaybackRate,
                 NSNumber::new_f64(rate).into(),
@@ -642,5 +680,158 @@ fn update_now_playing(elapsed: Option<f64>) {
     .flatten();
     if let Some(info) = info {
         unsafe { MPNowPlayingInfoCenter::defaultCenter().setNowPlayingInfo(Some(&info)) };
+    }
+}
+
+/// Has what is loaded play at `speed`.
+fn apply_speed(speed: Speed) {
+    with_main(|main| {
+        if let Some(media) = &mut main.media {
+            media.speed = speed;
+        }
+        // Setting a rate other than 0 plays: only while App logic has it play.
+        if main.playing
+            && let Some(player) = &main.player
+        {
+            unsafe { player.setRate(speed.rate()) };
+        }
+    });
+    update_now_playing(None);
+}
+
+/// Run on the iOS Simulator: build with `cargo test --package app --lib --target
+/// aarch64-apple-ios-sim --no-run`, then `xcrun simctl spawn <device> <test binary>`.
+#[cfg(test)]
+mod tests {
+    use std::net::TcpListener;
+
+    use objc2::MainThreadMarker;
+    use objc2_core_media::CMTime;
+    use objc2_foundation::NSNumber;
+    use objc2_media_player::{
+        MPNowPlayingInfoCenter, MPNowPlayingInfoPropertyElapsedPlaybackTime,
+        MPNowPlayingInfoPropertyPlaybackRate,
+    };
+    use tokio::sync::mpsc;
+
+    use super::{Position, apply_speed, init, load, with_main};
+    use crate::local::{Media, Speed};
+
+    /// The elapsed time and rate the lock screen and Control Center get.
+    fn now_playing() -> (f64, f64) {
+        let info = unsafe { MPNowPlayingInfoCenter::defaultCenter().nowPlayingInfo() }
+            .expect("Now Playing is set");
+        let number = |key| {
+            info.objectForKey(key)
+                .and_then(|value| value.downcast::<NSNumber>().ok())
+                .expect("a number")
+                .as_f64()
+        };
+        unsafe {
+            (
+                number(MPNowPlayingInfoPropertyElapsedPlaybackTime),
+                number(MPNowPlayingInfoPropertyPlaybackRate),
+            )
+        }
+    }
+
+    #[test]
+    fn a_speed_change_while_a_seek_is_on_its_way_keeps_the_seeks_position() {
+        // A stream that never answers: the item never gets ready, and AVPlayer completes a seek
+        // of it at once (seen on the Simulator), its time then being the seek's.
+        let stream = TcpListener::bind("127.0.0.1:0").expect("a port");
+        let (events, _received) = mpsc::unbounded_channel();
+        let position = Position::default();
+        init(position.clone(), events);
+        // AVPlayer only asks for the main thread by convention; this test's thread is its own.
+        let mtm = unsafe { MainThreadMarker::new_unchecked() };
+        let media = Media {
+            url: format!(
+                "http://{}/stream.mp3",
+                stream.local_addr().expect("an address")
+            ),
+            start_at: 120.0,
+            title: "An Item".to_owned(),
+            artist: None,
+            artwork_url: None,
+            duration: Some(3600.0),
+            speed: Speed::Normal,
+        };
+        load(mtm, media, position.load_at(120.0));
+        let native = || {
+            with_main(|main| unsafe {
+                main.player
+                    .as_ref()
+                    .expect("a player")
+                    .currentTime()
+                    .seconds()
+            })
+            .expect("set up")
+        };
+        // A seek to `to` still on its way, with AVPlayer telling the time `from` before it, as a
+        // phone's AVPlayer does mid-seek: what the main thread keeps for a seek it asked for, and
+        // AVPlayer moved to `from` behind it.
+        let seeking = |from: f64, to: f64| {
+            let number = position.seek_to(to);
+            position.issued(number);
+            with_main(|main| unsafe {
+                let player = main.player.as_ref().expect("a player");
+                player.seekToTime(CMTime::with_seconds(from, 1000));
+            });
+            assert_eq!(native(), from, "AVPlayer tells the time before the seek");
+            number
+        };
+
+        // The start's seek.
+        seeking(0.0, 120.0);
+        apply_speed(Speed::X1_5);
+        assert_eq!(now_playing(), (120.0, 1.5), "after the start");
+
+        // A skip's.
+        let number = seeking(120.0, 150.0);
+        apply_speed(Speed::X2);
+        assert_eq!(now_playing(), (150.0, 2.0), "after a skip");
+
+        with_main(|main| {
+            unsafe { main.player.as_ref().expect("a player").pause() };
+            main.playing = false;
+        });
+        apply_speed(Speed::X1_25);
+        assert_eq!(now_playing(), (150.0, 0.0), "paused");
+        let rate = with_main(|main| unsafe { main.player.as_ref().expect("a player").rate() });
+        assert_eq!(rate, Some(0.0), "a speed change doesn't play a paused Item");
+
+        // Both seeks landed: AVPlayer's own time counts again.
+        assert!(!position.landed(number));
+        assert!(position.landed(number));
+        apply_speed(Speed::X1_5);
+        assert_eq!(now_playing(), (120.0, 0.0), "once the seeks landed");
+    }
+
+    #[test]
+    fn only_seeks_asked_of_avplayer_for_what_it_plays_hold_now_playing() {
+        let position = Position::default();
+        let first = position.load_at(10.0);
+        position.issued(first);
+        assert_eq!(position.pending(), Some(10.0));
+
+        // A load asked off the main thread, ahead of what the main queue still does for the
+        // first: its start is no position for the first.
+        let second = position.load_at(99.0);
+        assert_eq!(position.pending(), None);
+        position.issued(first);
+        assert!(!position.landed(first));
+        assert_eq!(position.pending(), None);
+
+        position.issued(second);
+        let number = position.seek_to(50.0);
+        position.issued(number);
+        assert!(
+            !position.landed(second),
+            "the load's seek gave way to the skip"
+        );
+        assert_eq!(position.pending(), Some(50.0));
+        assert!(position.landed(number));
+        assert_eq!(position.pending(), None);
     }
 }

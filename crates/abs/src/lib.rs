@@ -152,6 +152,9 @@ pub enum MediaType {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct LibraryItem {
     pub id: String,
+    /// The Library holding it; always there in Audiobookshelf 2.37.2's answers.
+    #[serde(default, rename = "libraryId")]
+    pub library_id: Option<String>,
     #[serde(flatten)]
     pub media: Media,
 }
@@ -273,8 +276,6 @@ pub struct FileMetadata {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InProgress {
-    /// The Library holding it.
-    pub library_id: String,
     #[serde(flatten)]
     pub library_item: LibraryItem,
     /// The episode the Progress is in, for a podcast.
@@ -1804,8 +1805,11 @@ mod tests {
             panic!("{in_progress:?}");
         };
         assert_eq!(
-            (book.library_id.as_str(), book.library_item.id.as_str()),
-            ("lib-books", "li-book")
+            (
+                book.library_item.library_id.as_deref(),
+                book.library_item.id.as_str()
+            ),
+            (Some("lib-books"), "li-book")
         );
         assert_eq!(book.progress_last_update, Some(1_793_967_063_333));
         assert_eq!(book.recent_episode, None);

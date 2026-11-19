@@ -8,7 +8,8 @@
 //! ([`Audiobookshelf::set_progress`]). The seeded Libraries are shared by all tests, and users
 //! are never deleted while the container runs. A test user sees only the seeded Libraries,
 //! explicit content included, unless the test says otherwise; so a test may add a Library
-//! ([`Audiobookshelf::crowded_podcast`], [`Audiobookshelf::resumable_book`]) or mark a seeded
+//! ([`Audiobookshelf::crowded_podcast`], [`Audiobookshelf::resumable_book`],
+//! [`Audiobookshelf::twin_books`]) or mark a seeded
 //! Item explicit or tag it without hiding or showing anything to other tests' users, as long
 //! as it undoes the mark or tags.
 //!
@@ -102,6 +103,23 @@ const RESUMABLE_FILE: (&str, u32) = ("/resumable/L-Space/Resumed/Resumed.wav", 1
 pub struct Resumable {
     pub library: String,
     pub book: String,
+}
+
+/// The folder of [`Audiobookshelf::twin_books`], in no Library until a test asks for it.
+const TWINS_FOLDER: &str = "/twins";
+
+/// [`Audiobookshelf::twin_books`]' audio files, one per audiobook: path in the container,
+/// length in seconds.
+const TWIN_FILES: [(&str, u32); 2] = [
+    ("/twins/L-Space/Twin One/Twin One.wav", 300),
+    ("/twins/L-Space/Twin Two/Twin Two.wav", 300),
+];
+
+/// The Library [`Audiobookshelf::twin_books`] created, and its audiobooks, "Twin One" first.
+#[derive(Debug, Clone)]
+pub struct Twins {
+    pub library: String,
+    pub books: [String; 2],
 }
 
 /// The seeded episodes' publish dates, oldest first: 2026-01-01, 2026-02-15 and 2026-03-31,
@@ -408,6 +426,39 @@ impl Audiobookshelf {
         Resumable { library, book }
     }
 
+    /// Creates the audiobook Library "Twins", holding "Twin One" and "Twin Two" by L-Space,
+    /// each one audio file of 5 minutes, and waits until a scan has found both: two
+    /// single-file audiobooks in one Library. No test user sees it unless created to
+    /// ([`Audiobookshelf::new_user_seeing`]). At most one test per test run may call this: the
+    /// folder takes one Library, so a second call panics.
+    pub async fn twin_books(&self) -> Twins {
+        let library = self.new_library("Twins", TWINS_FOLDER, "book").await;
+        let deadline = Instant::now() + SCAN_TIMEOUT;
+        loop {
+            let items = self.library_items(&library).await;
+            let id = |title: &str| {
+                items
+                    .iter()
+                    .find(|book| {
+                        book["media"]["metadata"]["title"] == title
+                            && book["media"]["numAudioFiles"] == 1
+                    })
+                    .map(|book| book["id"].as_str().expect("library item id").to_owned())
+            };
+            if let (Some(one), Some(two)) = (id("Twin One"), id("Twin Two")) {
+                return Twins {
+                    library,
+                    books: [one, two],
+                };
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the twin books did not appear within {SCAN_TIMEOUT:?}: {items:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     /// The id of the one library item in Library `library` once a scan found it `ready`;
     /// panics, naming it `what`, if that takes longer than [`SCAN_TIMEOUT`].
     async fn scanned_alone(
@@ -652,6 +703,9 @@ impl Audiobookshelf {
         }
         let (path, seconds) = RESUMABLE_FILE;
         image = image.with_copy_to(path, silence(seconds));
+        for (path, seconds) in TWIN_FILES {
+            image = image.with_copy_to(path, silence(seconds));
+        }
         let container = image
             .with_startup_timeout(STARTUP_TIMEOUT)
             .start()

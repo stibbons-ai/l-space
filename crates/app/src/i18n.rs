@@ -23,6 +23,8 @@ use fluent_bundle::{FluentArgs, FluentResource};
 use serde::{Deserialize, Serialize};
 use unic_langid::LanguageIdentifier;
 
+use crate::local::Speed;
+
 /// A language the App is translated into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Language {
@@ -166,6 +168,7 @@ texts! {
     GroupsTitle => "groups-title",
     GroupsNone => "groups-none",
     GroupsRefresh => "groups-refresh",
+    GroupsNormalSpeed => "groups-normal-speed",
     GroupPlaying => "group-playing",
     GroupPaused => "group-paused",
     GroupStopped => "group-stopped",
@@ -184,6 +187,7 @@ texts! {
     NowPlayingNone => "now-playing-none",
     LocalPlay => "local-play",
     LocalStop => "local-stop",
+    LocalSpeed => "local-speed",
     PlayFromStart => "play-from-start",
     SettingsTitle => "settings-title",
     SettingsLibraryServer => "settings-library-server",
@@ -485,6 +489,21 @@ pub fn position(position: f64, duration: Option<f64>) -> String {
     match duration {
         Some(duration) => format!("{} / {}", clock(position), clock(duration)),
         None => clock(position),
+    }
+}
+
+/// A Playback speed as Now playing offers it: "1.25×", or "1,25×" in German.
+pub fn speed(language: Language, speed: Speed) -> String {
+    let rate = match speed {
+        Speed::Normal => "1.0",
+        Speed::X1_25 => "1.25",
+        Speed::X1_5 => "1.5",
+        Speed::X1_75 => "1.75",
+        Speed::X2 => "2.0",
+    };
+    match language {
+        Language::English => format!("{rate}×"),
+        Language::German => format!("{}×", rate.replace('.', ",")),
     }
 }
 

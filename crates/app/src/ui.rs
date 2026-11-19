@@ -11,6 +11,7 @@ use dioxus::prelude::*;
 
 use crate::flow::{App, Notice, Screen, volume_step};
 use crate::i18n::{self, LanguageChoice, Text};
+use crate::local::Speed;
 use crate::storage::FileStore;
 
 const STYLE: &str = include_str!("../assets/app.css");
@@ -656,6 +657,7 @@ fn PlayOnScreen(
         BackButton { app, busy }
         h1 { {text(if from_start { Text::PlayFromStart } else { Text::PlayOn })} }
         p { class: "byline", "{item.title}" }
+        p { class: "detail", {text(Text::GroupsNormalSpeed)} }
         NoticeView { app, notice }
         if groups.is_empty() {
             p { {text(Text::GroupsNone)} }
@@ -705,6 +707,7 @@ fn GroupsScreen(
             }
         }
         h1 { {text(Text::GroupsTitle)} }
+        p { class: "detail", {text(Text::GroupsNormalSpeed)} }
         NoticeView { app, notice }
         if groups.is_empty() && !failed {
             p { {text(Text::GroupsNone)} }
@@ -945,19 +948,21 @@ fn NowPlayingBar(app: Signal<App>, busy: Signal<bool>) -> Element {
     }
 }
 
-/// What plays on this phone, with its controls: play or pause, 15 s back, 30 s forward and
-/// stop. All are off while any action runs.
+/// What plays on this phone, with its controls: play or pause, 15 s back, 30 s forward, stop
+/// and the Playback speed. All are off while any action runs.
 #[component]
 fn NowPlayingScreen(app: Signal<App>, busy: Signal<bool>) -> Element {
     let ticks = use_second_ticks();
     ticks.read();
     let text = |text| app.read().text(text);
     let status = app.read().local_status();
+    let language = app.read().language();
     let control = move |action: LocalControl| {
         move |_: MouseEvent| {
             act(app, busy, async move |app: &mut App| match action {
                 LocalControl::Toggle => app.toggle_local().await,
                 LocalControl::Skip(skip) => app.skip_local(skip).await,
+                LocalControl::Speed(speed) => app.set_local_speed(speed).await,
                 LocalControl::Stop => app.stop_local().await,
             });
         }
@@ -1005,6 +1010,20 @@ fn NowPlayingScreen(app: Signal<App>, busy: Signal<bool>) -> Element {
                     {text(Text::LocalStop)}
                 }
             }
+            p { class: "detail", {text(Text::LocalSpeed)} }
+            div { class: "filters", role: "group", aria_label: text(Text::LocalSpeed),
+                for option in Speed::ALL {
+                    button {
+                        key: "{option:?}",
+                        r#type: "button",
+                        class: if option == status.speed { "selected" } else { "" },
+                        aria_pressed: option == status.speed,
+                        disabled: busy(),
+                        onclick: control(LocalControl::Speed(option)),
+                        {i18n::speed(language, option)}
+                    }
+                }
+            }
         } else {
             p { {text(Text::NowPlayingNone)} }
         }
@@ -1016,5 +1035,6 @@ fn NowPlayingScreen(app: Signal<App>, busy: Signal<bool>) -> Element {
 enum LocalControl {
     Toggle,
     Skip(Skip),
+    Speed(Speed),
     Stop,
 }

@@ -28,10 +28,50 @@ use std::time::{Duration, Instant};
 
 use api::{ApiError, ItemId, Skip};
 use clock::Clock;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 /// How often the App reports its position while playing.
 pub const REPORT_EVERY: Duration = Duration::from_secs(30);
+
+/// A Playback speed Local playback offers. Every time Local playback tells, it tells in media
+/// seconds (seconds into the Item), whatever the speed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Speed {
+    #[default]
+    #[serde(rename = "1.0")]
+    Normal,
+    #[serde(rename = "1.25")]
+    X1_25,
+    #[serde(rename = "1.5")]
+    X1_5,
+    #[serde(rename = "1.75")]
+    X1_75,
+    #[serde(rename = "2.0")]
+    X2,
+}
+
+impl Speed {
+    /// Every speed, slowest first.
+    pub const ALL: [Speed; 5] = [
+        Speed::Normal,
+        Speed::X1_25,
+        Speed::X1_5,
+        Speed::X1_75,
+        Speed::X2,
+    ];
+
+    /// Media seconds played per second.
+    pub fn rate(self) -> f32 {
+        match self {
+            Self::Normal => 1.0,
+            Self::X1_25 => 1.25,
+            Self::X1_5 => 1.5,
+            Self::X1_75 => 1.75,
+            Self::X2 => 2.0,
+        }
+    }
+}
 
 /// What a [`LocalPlayer`] loads: an Item's stream with what the lock screen shows of it.
 /// Times are seconds. Its `Debug` output leaves out the URLs, which let anyone holding them
@@ -48,6 +88,8 @@ pub struct Media {
     /// The cover's full URL on the Bridge, if the Item has one.
     pub artwork_url: Option<String>,
     pub duration: Option<f64>,
+    /// The speed it plays at.
+    pub speed: Speed,
 }
 
 impl Debug for Media {
@@ -62,6 +104,7 @@ impl Debug for Media {
                 &self.artwork_url.as_ref().map(|_| "REDACTED"),
             )
             .field("duration", &self.duration)
+            .field("speed", &self.speed)
             .finish()
     }
 }
@@ -103,6 +146,8 @@ pub trait LocalPlayer: Debug + Send + Sync + 'static {
     fn pause(&self) -> f64;
     /// Moves to `position` seconds in, playing or paused as it was.
     fn seek(&self, position: f64);
+    /// Plays at `speed` from now on, whenever it plays; neither plays on nor moves.
+    fn set_speed(&self, speed: Speed);
     /// Stops and forgets what was loaded; the lock screen shows nothing of it any more.
     fn unload(&self);
     /// Seconds into what is loaded, as of the last second or so; 0 without anything.
@@ -122,6 +167,7 @@ pub struct LocalStatus {
     pub duration: Option<f64>,
     pub position: f64,
     pub playing: bool,
+    pub speed: Speed,
     /// Why the last report failed, until one succeeds.
     pub report_failed: Option<ApiError>,
 }
@@ -139,6 +185,7 @@ impl Debug for LocalStatus {
             .field("duration", &self.duration)
             .field("position", &self.position)
             .field("playing", &self.playing)
+            .field("speed", &self.speed)
             .field("report_failed", &self.report_failed)
             .finish()
     }
@@ -213,6 +260,8 @@ enum Command {
     Start(Box<Now>, oneshot::Sender<()>),
     Toggle(oneshot::Sender<()>),
     Skip(Skip, oneshot::Sender<()>),
+    /// Answers whether something was loaded to take it.
+    Speed(Speed, oneshot::Sender<bool>),
     Stop(oneshot::Sender<Result<(), ApiError>>),
 }
 
@@ -306,6 +355,7 @@ impl LocalPlayback {
             duration: now.media.duration,
             position,
             playing: now.playing,
+            speed: now.media.speed,
             report_failed: now.report_failed.clone(),
         })
     }
@@ -336,10 +386,15 @@ impl LocalPlayback {
     }
 
     /// Loads `started`, the Bridge's answer to a start, from the Bridge at `bridge_url`, and
-    /// plays it from where the answer says; replaces what played without reporting on it, and
-    /// forgets why Local playback last stopped on its own: an answer about an earlier Local
-    /// session that comes later is dropped.
-    pub async fn start(&self, started: api::LocalStart, bridge_url: &str) -> Result<(), ApiError> {
+    /// plays it at `speed` from where the answer says; replaces what played without reporting
+    /// on it, and forgets why Local playback last stopped on its own: an answer about an
+    /// earlier Local session that comes later is dropped.
+    pub async fn start(
+        &self,
+        started: api::LocalStart,
+        bridge_url: &str,
+        speed: Speed,
+    ) -> Result<(), ApiError> {
         let artist = started.author.or(started.podcast);
         let now = Now {
             item: started.item,
@@ -350,6 +405,7 @@ impl LocalPlayback {
                 artist,
                 artwork_url: started.artwork.map(|path| format!("{bridge_url}{path}")),
                 duration: started.duration,
+                speed,
             },
             stream: started.stream,
             playing: true,
@@ -367,6 +423,13 @@ impl LocalPlayback {
     /// Moves by `skip`, kept within the Item, and reports where to.
     pub async fn skip(&self, skip: Skip) -> Result<(), ApiError> {
         self.ask(|done| Command::Skip(skip, done)).await
+    }
+
+    /// Plays at `speed` from now on, if something is loaded: at once if it plays, else once it
+    /// plays on. It neither moves nor plays on, so nothing is reported. Answers whether
+    /// something was loaded.
+    pub async fn set_speed(&self, speed: Speed) -> Result<bool, ApiError> {
+        self.ask(|done| Command::Speed(speed, done)).await
     }
 
     /// Ends Local playback: stops the player, then ends the Local session on the Bridge with
@@ -497,6 +560,14 @@ impl Task {
             Command::Skip(skip, done) => {
                 self.skip(skip);
                 let _ = done.send(());
+            }
+            Command::Speed(speed, done) => {
+                let loaded = self.shared.playing().is_some();
+                if loaded {
+                    self.shared.player.set_speed(speed);
+                    self.shared.update(|now| now.media.speed = speed);
+                }
+                let _ = done.send(loaded);
             }
             Command::Stop(answer) => {
                 if self.shared.playing().is_some() {
