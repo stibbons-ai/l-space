@@ -1,9 +1,9 @@
 //! A fake Sonos household for tests (PRD "Testing Decisions"): players on loopback that answer
 //! SSDP M-SEARCH and serve their device description and the UPnP subset the Bridge uses
 //! (ZoneGroupTopology `GetZoneGroupState`; AVTransport `GetTransportInfo`, `GetPositionInfo`,
-//! `SetAVTransportURI`, `Play`, `Pause` and `Seek`; GroupRenderingControl `GetGroupVolume`,
-//! `SnapshotGroupVolume` and `SetGroupVolume`), with Groups, playback, volume and faults the
-//! test controls.
+//! `GetMediaInfo`, `SetAVTransportURI`, `Play`, `Pause` and `Seek`; GroupRenderingControl
+//! `GetGroupVolume`, `SnapshotGroupVolume` and `SetGroupVolume`), with Groups, playback,
+//! volume and faults the test controls.
 //!
 //! A Group told to play a URL (`SetAVTransportURI`, then `Play`) plays it like a speaker: its
 //! transport is Playing, its position moves on the clock, `GetPositionInfo` reports the URL,
@@ -43,6 +43,8 @@
 //! household.play(&kitchen, FakeTrack::new("Moby Dick", Duration::from_secs(600)));
 //! clock.advance(Duration::from_secs(30));     // Kitchen's position is now 0:00:30
 //! ```
+
+mod events;
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -147,6 +149,35 @@ impl Fetch {
     }
 }
 
+/// One SOAP call held before it acts, until the test releases it.
+#[derive(Debug)]
+pub struct HeldCall {
+    arrived: tokio::sync::oneshot::Receiver<()>,
+    release: tokio::sync::oneshot::Sender<()>,
+}
+
+impl HeldCall {
+    /// Waits until the selected call has arrived and is held.
+    pub async fn arrived(&mut self) {
+        tokio::time::timeout(FOLLOW_TIMEOUT, &mut self.arrived)
+            .await
+            .expect("the held SOAP call arrived in time")
+            .expect("the held SOAP call arrived");
+    }
+
+    /// Allows the call to act and answer. Dropping the gate also releases it.
+    pub fn release(self) {
+        let _ = self.release.send(());
+    }
+}
+
+#[derive(Debug)]
+struct CallGate {
+    action: &'static str,
+    arrived: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
 /// How a player misbehaves over HTTP.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Fault {
@@ -197,6 +228,9 @@ pub enum Fault {
     SlowTransport(Duration),
     /// It answers `GetGroupVolume` with a SOAP fault, and everything else correctly.
     FailGroupVolume,
+    /// It answers `GetZoneGroupState` with no Group at all, as a valid answer, and everything
+    /// else correctly.
+    EmptyTopology,
 }
 
 /// A fake Sonos household; dropping it stops every player.
@@ -218,6 +252,7 @@ struct Shared {
     state: Mutex<HouseholdState>,
     /// How players fetch the URLs they play.
     http: reqwest::Client,
+    events: events::Events,
 }
 
 #[derive(Debug, Default)]
@@ -253,6 +288,7 @@ struct Player {
     /// Its Group's volume, while it coordinates the Group.
     volume: u8,
     fault: Fault,
+    gate: Option<CallGate>,
     /// The length of each URL it is given from now on, if the test set one.
     url_length: Option<Duration>,
 }
@@ -266,9 +302,18 @@ struct Transport {
     offset: Duration,
     /// When playback last started, while it is playing.
     since: Option<Instant>,
+    /// A source selected without a track ([`Household::select_source`]): `GetMediaInfo`
+    /// tells it as `CurrentURI` while `GetPositionInfo` tells no `TrackURI`.
+    source: Option<String>,
 }
 
 impl Transport {
+    /// The selected source, as `GetMediaInfo` tells it (`CurrentURI`): the track's URL, if any.
+    fn current_uri(&self) -> &str {
+        let track = self.track.as_ref().map(|track| track.uri.as_str());
+        self.source.as_deref().or(track).unwrap_or_default()
+    }
+
     fn position(&self, now: Instant) -> Duration {
         let moved = self
             .since
@@ -316,6 +361,7 @@ impl Household {
             clock,
             state: Mutex::default(),
             http,
+            events: events::Events::default(),
         });
         let clock_listener =
             std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind the clock");
@@ -418,9 +464,11 @@ impl Household {
                     track: None,
                     offset: Duration::ZERO,
                     since: None,
+                    source: None,
                 },
                 volume: DEFAULT_VOLUME,
                 fault: Fault::None,
+                gate: None,
                 url_length: None,
             });
             uuid
@@ -433,6 +481,14 @@ impl Household {
             .route(
                 "/MediaRenderer/GroupRenderingControl/Control",
                 post(control),
+            )
+            .route(
+                "/MediaRenderer/AVTransport/Event",
+                axum::routing::any(events::subscribe),
+            )
+            .route(
+                "/ZoneGroupTopology/Event",
+                axum::routing::any(events::subscribe),
             )
             .with_state(Served {
                 shared: Arc::clone(&self.shared),
@@ -460,11 +516,14 @@ impl Household {
         );
         let group = state.player(coordinator).group.clone();
         state.regroup(&member.0, &group);
+        drop(state);
+        self.changed();
     }
 
     /// Takes `member` (with the speakers bonded to it) out of its Group into one of its own.
     pub fn leave(&self, member: &PlayerId) {
         self.shared.lock().regroup(&member.0, &member.0);
+        self.changed();
     }
 
     /// `coordinator`'s Group starts playing `track` from its start.
@@ -476,7 +535,10 @@ impl Household {
             track: Some(track),
             offset: Duration::ZERO,
             since: Some(now),
+            source: None,
         };
+        drop(state);
+        self.changed();
     }
 
     /// `coordinator`'s Group pauses where it is.
@@ -486,6 +548,7 @@ impl Household {
             transport.since = None;
             transport.state = "PAUSED_PLAYBACK";
         });
+        self.changed();
     }
 
     /// `coordinator`'s Group stops; its track stays loaded, back at its start.
@@ -495,6 +558,22 @@ impl Household {
         transport.offset = Duration::ZERO;
         transport.since = None;
         transport.state = "STOPPED";
+        drop(state);
+        self.changed();
+    }
+
+    /// `coordinator`'s Group selects `uri` as its source with no track, as for a line-in or TV
+    /// input: Playing, `GetMediaInfo` telling `uri` as `CurrentURI`, `GetPositionInfo` no
+    /// `TrackURI`.
+    pub fn select_source(&self, coordinator: &PlayerId, uri: &str) {
+        self.shared.lock().coordinator_mut(coordinator).transport = Transport {
+            state: "PLAYING",
+            track: None,
+            offset: Duration::ZERO,
+            since: None,
+            source: Some(uri.to_owned()),
+        };
+        self.changed();
     }
 
     /// Each URL `coordinator` is given from now on (`SetAVTransportURI`) is `length` long, as
@@ -518,6 +597,25 @@ impl Household {
         self.shared.lock().player_mut(player).fault = fault;
     }
 
+    /// Holds the next SOAP `action` (without the service prefix) on `player` before it acts.
+    /// Only one gate may be armed per player; faults still apply after release.
+    pub fn hold_next_call(&self, player: &PlayerId, action: &'static str) -> HeldCall {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut state = self.shared.lock();
+        let gate = &mut state.player_mut(player).gate;
+        assert!(gate.is_none(), "a SOAP call gate is already armed");
+        *gate = Some(CallGate {
+            action,
+            arrived,
+            release: released,
+        });
+        HeldCall {
+            arrived: arrival,
+            release,
+        }
+    }
+
     /// Takes `player` (with the speakers bonded to it) out of the household, as if unplugged:
     /// it no longer answers searches or calls, and players in its Group get Groups of their
     /// own.
@@ -534,6 +632,49 @@ impl Household {
                     .unwrap_or_else(|| other.uuid.clone());
             }
         }
+        drop(state);
+        self.changed();
+    }
+
+    fn changed(&self) {
+        self.runtime()
+            .spawn(events::publish(Arc::clone(&self.shared)));
+    }
+
+    /// GENA leases normally use real time, like a Bridge without the test-clock hook.
+    /// Set the same manual clock as a Bridge following that hook, before subscribing.
+    pub fn set_event_clock(&self, clock: Arc<dyn Clock>) {
+        self.shared.events.lock().clock = clock;
+    }
+
+    /// Whether new and renewed subscriptions fail (existing leases keep delivering).
+    pub fn reject_subscriptions(&self, reject: bool) {
+        self.shared.events.lock().reject = reject;
+    }
+
+    /// Successful GENA renewals received by the household.
+    pub fn renewals(&self) -> usize {
+        self.shared.events.lock().renewals
+    }
+
+    /// Sends current GENA snapshots again. Used to exercise delayed and duplicate hints.
+    pub fn notify(&self) {
+        self.changed();
+    }
+
+    /// Drops NOTIFY deliveries without affecting subscription and renewal responses.
+    pub fn drop_notifications(&self, drop: bool) {
+        self.shared.events.lock().drop_notifications = drop;
+    }
+
+    /// Current public callback lease identities and next sequences, for HTTP protocol tests.
+    pub fn subscriptions(&self) -> Vec<(String, u32)> {
+        self.shared.events.subscriptions()
+    }
+
+    /// AVTransport callback lease for a player, for realistic LastChange protocol tests.
+    pub fn transport_subscription(&self, player: &PlayerId) -> Option<(String, u32)> {
+        self.shared.events.transport_subscription(player.uuid())
     }
 
     /// Every SOAP action the household was called with, in order, as `Service#Action`, such as
@@ -796,6 +937,7 @@ impl HouseholdState {
                     }),
                     offset: Duration::ZERO,
                     since: None,
+                    source: None,
                 };
             }
             "Play" => {
@@ -1011,7 +1153,7 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
     let (urn, action) = soap_action.split_once('#').unwrap_or(("", soap_action));
     let service = urn.rsplit(':').nth(1).unwrap_or_default();
     // When the call came: what it answers and does then, unless a fault delays it.
-    let (fault, received) = {
+    let (fault, received, gate) = {
         let mut state = served.shared.lock();
         let received = served.shared.clock.now();
         state
@@ -1022,11 +1164,31 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         {
             state.offered.push((served.uuid.clone(), uri));
         }
-        (
-            state.find(&served.uuid).map(|player| player.fault),
-            received,
-        )
+        match state
+            .players
+            .iter_mut()
+            .find(|player| player.uuid == served.uuid)
+        {
+            Some(player) => {
+                let gate = if player
+                    .gate
+                    .as_ref()
+                    .is_some_and(|gate| gate.action == action)
+                {
+                    player.gate.take()
+                } else {
+                    None
+                };
+                (Some(player.fault), received, gate)
+            }
+            None => (None, received, None),
+        }
     };
+    let gated = gate.is_some();
+    if let Some(gate) = gate {
+        let _ = gate.arrived.send(());
+        let _ = gate.release.await;
+    }
     // Whether a fault held the call up: it then answers and acts as of when it is let go.
     let delayed = match fault {
         Some(Fault::Hang) => std::future::pending().await,
@@ -1087,12 +1249,13 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             | Fault::HangSeek
             | Fault::RefuseSeekSlowPause(_)
             | Fault::FailGroupVolume
-            | Fault::SlowTransport(_),
+            | Fault::SlowTransport(_)
+            | Fault::EmptyTopology,
         ) => false,
         // Removed from the household: as good as unplugged.
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let now = if delayed {
+    let now = if delayed || gated {
         served.shared.clock.now()
     } else {
         received
@@ -1102,10 +1265,14 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         player.transport.settle(now);
     }
     let arguments: Vec<(&str, String)> = match (urn, action) {
+        (TOPOLOGY, "GetZoneGroupState") if fault == Some(Fault::EmptyTopology) => vec![(
+            "ZoneGroupState",
+            "<ZoneGroupState><ZoneGroups></ZoneGroups></ZoneGroupState>".to_owned(),
+        )],
         (TOPOLOGY, "GetZoneGroupState") => {
             vec![("ZoneGroupState", state.zone_group_state())]
         }
-        (AV_TRANSPORT, "GetTransportInfo") | (AV_TRANSPORT, "GetPositionInfo") => {
+        (AV_TRANSPORT, "GetTransportInfo" | "GetPositionInfo" | "GetMediaInfo") => {
             let Some(transport) = state
                 .find(&served.uuid)
                 .and_then(|player| state.find(&player.group))
@@ -1113,7 +1280,9 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             else {
                 return invalid_action();
             };
-            if action == "GetTransportInfo" {
+            if action == "GetMediaInfo" {
+                vec![("CurrentURI", transport.current_uri().to_owned())]
+            } else if action == "GetTransportInfo" {
                 let mut arguments = vec![
                     ("CurrentTransportStatus", "OK".to_owned()),
                     ("CurrentSpeed", "1".to_owned()),
@@ -1164,6 +1333,9 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         _ => return invalid_action(),
     };
     drop(state);
+    if matches!(action, "SetAVTransportURI" | "Play" | "Pause" | "Seek") {
+        tokio::spawn(events::publish(Arc::clone(&served.shared)));
+    }
     let mut body = String::new();
     for (name, value) in arguments {
         body.push_str(&format!("<{name}>{}</{name}>", escape(&value)));

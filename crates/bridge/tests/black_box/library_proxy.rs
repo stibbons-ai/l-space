@@ -10,6 +10,7 @@
 //! - [`LibraryProxy::hang_identity`]: every `GET /api/me` never.
 //! - [`LibraryProxy::delay_next_identity`]: the next `GET /api/me` only after a while, as a
 //!   slow Library Server would.
+//! - [`LibraryProxy::hold_next_identity`]: the next `GET /api/me` until the test releases it.
 //! - [`LibraryProxy::reject_progress_writes`]: every `PATCH /api/me/progress/...` at once with
 //!   401, as for a rejected key, while the key stays valid, until
 //!   [`LibraryProxy::pass_progress_writes`].
@@ -71,6 +72,8 @@ struct Faults {
     next_identity_delay_ms: AtomicU64,
     /// What the next Progress write waits for before it is passed on, if anything.
     next_write_held: Mutex<Option<Held>>,
+    /// What the next `GET /api/me` waits for before it is passed on, if anything.
+    next_identity_held: Mutex<Option<Held>>,
 }
 
 #[derive(Clone)]
@@ -136,6 +139,12 @@ impl LibraryProxy {
             .store(millis, Ordering::SeqCst);
     }
 
+    /// The next `GET /api/me` is held when it arrives, and passed on only once the returned
+    /// [`HeldRequest`] is released (or dropped).
+    pub fn hold_next_identity(&self) -> HeldRequest {
+        hold(&self.faults.next_identity_held)
+    }
+
     /// From now on, Progress writes are rejected with 401 at once.
     pub fn reject_progress_writes(&self) {
         self.faults
@@ -185,38 +194,53 @@ impl LibraryProxy {
     }
 
     /// The next Progress write is held when it arrives, and passed on only once the returned
-    /// [`HeldWrite`] is released (or dropped).
-    pub fn hold_next_progress_write(&self) -> HeldWrite {
-        let (release, held) = oneshot::channel();
-        let (answered, answer) = oneshot::channel();
-        *self.faults.next_write_held.lock().expect("held write") = Some(Held { held, answered });
-        HeldWrite { release, answer }
+    /// [`HeldRequest`] is released (or dropped).
+    pub fn hold_next_progress_write(&self) -> HeldRequest {
+        hold(&self.faults.next_write_held)
     }
 }
 
-/// Lets a held Progress write pass ([`LibraryProxy::hold_next_progress_write`]).
-pub struct HeldWrite {
+/// Arms `slot` to hold the next request it is for.
+fn hold(slot: &Mutex<Option<Held>>) -> HeldRequest {
+    let (release, held) = oneshot::channel();
+    let (answered, answer) = oneshot::channel();
+    *slot.lock().expect("held request") = Some(Held { held, answered });
+    HeldRequest { release, answer }
+}
+
+/// Waits, if `slot` is armed, until its held request is released (or dropped); returns what
+/// to tell once the Library Server answered it.
+async fn pass_held(slot: &Mutex<Option<Held>>) -> Option<oneshot::Sender<()>> {
+    let held = slot.lock().expect("held request").take()?;
+    // Released or dropped, it passes on.
+    let _ = held.held.await;
+    Some(held.answered)
+}
+
+/// Lets a held Progress write or identity request pass
+/// ([`LibraryProxy::hold_next_progress_write`], [`LibraryProxy::hold_next_identity`]).
+pub struct HeldRequest {
     release: oneshot::Sender<()>,
     answer: oneshot::Receiver<()>,
 }
 
-impl HeldWrite {
-    /// Passes the held write on, and waits until the Library Server answered it. Panics if no
-    /// write was answered within [`WITHIN`]: none was held (none arrived, or one failed or
-    /// rejected by the proxy answered first); or at once if the held write was taken but
+impl HeldRequest {
+    /// Passes the held request on, and waits until the Library Server answered it. Panics if
+    /// none was answered within [`WITHIN`]: none was held (none arrived, or one failed or
+    /// rejected by the proxy answered first); or at once if the held request was taken but
     /// dropped unanswered (the proxy's task for it panicked on the upstream call).
     pub async fn release(self) {
         self.release
             .send(())
-            .expect("the held write is still waiting");
+            .expect("the held request is still waiting");
         tokio::time::timeout(WITHIN, self.answer)
             .await
-            .expect("no held Progress write was answered: none arrived to be held")
-            .expect("the held write was dropped unanswered");
+            .expect("no held request was answered: none arrived to be held")
+            .expect("the held request was dropped unanswered");
     }
 }
 
-/// A held Progress write's side of a [`HeldWrite`].
+/// A held request's side of a [`HeldRequest`].
 struct Held {
     held: oneshot::Receiver<()>,
     answered: oneshot::Sender<()>,
@@ -266,16 +290,7 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
     }
     let mut answered = None;
     if progress_write {
-        let held = faults.next_write_held.lock().expect("held write").take();
-        if let Some(Held {
-            held,
-            answered: done,
-        }) = held
-        {
-            // Released or dropped, it passes on.
-            let _ = held.await;
-            answered = Some(done);
-        }
+        answered = pass_held(&faults.next_write_held).await;
         let delay = faults.progress_write_delay_ms.load(Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }
@@ -284,6 +299,7 @@ async fn forward(State(proxy): State<Proxy>, request: Request) -> Response {
         if faults.hang_identity.load(Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
+        answered = pass_held(&faults.next_identity_held).await;
         let delay = faults.next_identity_delay_ms.swap(0, Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(delay)).await;
     }

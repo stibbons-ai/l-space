@@ -6,6 +6,7 @@ mod browse;
 mod config;
 mod encryption_key;
 mod shutdown;
+mod sonos_events;
 mod stream;
 mod telemetry;
 mod test_clock;
@@ -128,7 +129,6 @@ async fn run(args: Args) -> Result<Closer, ExitCode> {
     }
     let discovery_address = config.sonos.discovery_address;
     tracing::info!(%discovery_address, "searching for Sonos players");
-    let sonos = sonos::Upnp::start(discovery_address, Arc::new(clock::SystemClock));
     let clock = match test_clock::clock(config.testing.clock_address).await {
         Ok(clock) => clock,
         Err(error) => {
@@ -136,14 +136,20 @@ async fn run(args: Args) -> Result<Closer, ExitCode> {
             return Err(ExitCode::FAILURE);
         }
     };
+    let sonos = Arc::new(sonos::Upnp::start(
+        discovery_address,
+        Arc::new(clock::SystemClock),
+    ));
     let app_api = Arc::new(AppApi::new(
         config.library_servers,
         store,
-        Arc::new(sonos),
+        sonos.clone(),
         clock,
         addr,
     ));
-    let router = api::server::router(app_api.clone()).merge(stream::router(app_api));
+    let router = api::server::router(app_api.clone())
+        .merge(stream::router(app_api))
+        .merge(sonos_events::router(sonos));
 
     tracing::info!(%addr, "listening");
     if let Err(error) = shutdown::serve(listener, router, signals).await {
