@@ -15,11 +15,15 @@
 //! (`crate::ios`), tests a fake. Where no player is plugged in (any App built for something
 //! other than iOS), Local playback is not offered.
 //!
-//! A report that fails doesn't stop playback and isn't sent again (buffering it is #24); the
-//! Now playing screen says why. One that tells the Local session is gone on the Bridge
-//! (`api_key_rejected`, `session_invalid`, `no_local_session`) stops playback here too; so does
-//! a player that can't play the stream. Why it stopped is kept ([`LocalPlayback::take_halted`])
-//! for the App to tell the person.
+//! A report that fails doesn't stop playback; the Now playing screen says why. One that couldn't
+//! reach the Bridge (`bridge_unreachable`, a call timing out included) while paused, and that
+//! no newer report followed, is sent again every [`REPORT_EVERY`] until it reaches the Bridge
+//! or anything newer is reported; while playing, the timer's next report stands in for it.
+//! The position waiting is kept in memory only, for the Local playback it was taken in: Stop,
+//! the end, another start or the App going away forget it. One that tells the Local session
+//! is gone on the Bridge (`api_key_rejected`, `session_invalid`, `no_local_session`) stops
+//! playback here too; so does a player that can't play the stream. Why it stopped is kept
+//! ([`LocalPlayback::take_halted`]) for the App to tell the person.
 
 use std::collections::VecDeque;
 use std::fmt::{self, Debug};
@@ -235,8 +239,8 @@ impl Debug for Report {
 /// A call for the sender task.
 #[derive(Debug)]
 enum Outgoing {
-    /// Reports where it is.
-    Report(Report),
+    /// Reports where it is; the number is the task's count of reports so far.
+    Report(Report, u64),
     /// Ends the Local session there; the answer goes to whoever waits for it, if anyone, else
     /// back to the task.
     End(Report, Option<oneshot::Sender<Result<(), ApiError>>>),
@@ -245,10 +249,10 @@ enum Outgoing {
     Settle(oneshot::Sender<Result<(), ApiError>>),
 }
 
-/// The Bridge's answer to a call, back to the task. A report's or an end's names the Local
-/// session by its stream's path, which its `Debug` output leaves out.
+/// The Bridge's answer to a call, back to the task. A report's (with its number) or an end's
+/// names the Local session by its stream's path, which its `Debug` output leaves out.
 enum Answer {
-    Reported(String, Result<(), ApiError>),
+    Reported(Report, u64, Result<(), ApiError>),
     /// An end nobody waited for that failed.
     EndFailed(String, ApiError),
     /// Every call before a [`Outgoing::Settle`] is answered or dropped.
@@ -258,7 +262,7 @@ enum Answer {
 impl Debug for Answer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Reported(_, reported) => f.debug_tuple("Reported").field(reported).finish(),
+            Self::Reported(_, _, reported) => f.debug_tuple("Reported").field(reported).finish(),
             Self::EndFailed(_, error) => f.debug_tuple("EndFailed").field(error).finish(),
             Self::Settled(_) => f.write_str("Settled"),
         }
@@ -288,6 +292,8 @@ impl LocalPlayback {
             clock,
             outgoing,
             next_report: None,
+            reports: 0,
+            unsent: None,
             started: None,
         };
         tokio::spawn(task.run(received, events, answered));
@@ -437,8 +443,14 @@ struct Task {
     clock: Arc<dyn Clock>,
     /// Where calls to the Bridge go.
     outgoing: mpsc::UnboundedSender<Outgoing>,
-    /// When the next report on the timer is due: only while playing.
+    /// When the next report on the timer is due: while playing, or while paused with a
+    /// position `unsent`.
     next_report: Option<Instant>,
+    /// How many reports went to the sender task: the last one's number.
+    reports: u64,
+    /// Paused, where the last report said, which couldn't reach the Bridge: sent again when
+    /// the timer is due.
+    unsent: Option<f64>,
     /// The stream's path of the Local session started last, playing or not: answers about
     /// any other are old news.
     started: Option<String>,
@@ -468,10 +480,7 @@ impl Task {
                 }
                 Some(event) = events.recv() => self.event(event),
                 Some(answer) = answers.recv() => self.answered(answer),
-                () = report_due => {
-                    self.schedule();
-                    self.report(self.shared.player.position());
-                }
+                () = report_due => self.due(),
             }
         }
         // The App is gone; so is what it played.
@@ -549,7 +558,7 @@ impl Task {
     /// Takes the Bridge's answer to a call on the Local session that plays now (or, for an end,
     /// was started last); one on another (sent before a new start) is old news.
     fn answered(&mut self, answer: Answer) {
-        let (stream, reported) = match answer {
+        let (report, number, reported) = match answer {
             Answer::Settled(answer) => {
                 let _ = answer.send(Ok(()));
                 return;
@@ -563,12 +572,12 @@ impl Task {
                 }
                 return;
             }
-            Answer::Reported(stream, reported) => (stream, reported),
+            Answer::Reported(report, number, reported) => (report, number, reported),
         };
         // A report sent before Stop can answer with nothing playing, or, in a race, after the
         // next start: Stop's own answer doesn't wait for the task to take this one. The
         // settle in `App::play_on_phone` closes that race only when nothing played.
-        if self.shared.read(|now| now.stream == stream) != Some(true) {
+        if self.shared.read(|now| now.stream == report.stream) != Some(true) {
             return;
         }
         match reported {
@@ -584,7 +593,31 @@ impl Task {
                 self.halt();
                 self.shared.halted(Halted::Api(error));
             }
-            reported => self.shared.update(|now| now.report_failed = reported.err()),
+            reported => {
+                // Paused, nothing newer sent since: try again on the timer.
+                if reported == Err(ApiError::BridgeUnreachable)
+                    && number == self.reports
+                    && self.shared.playing() == Some(false)
+                {
+                    self.unsent = Some(report.position);
+                    self.schedule();
+                }
+                self.shared.update(|now| now.report_failed = reported.err());
+            }
+        }
+    }
+
+    /// The timer is due: reports where it plays, and goes on; paused, sends again the position
+    /// `unsent`, if still there.
+    fn due(&mut self) {
+        if self.shared.playing() == Some(true) {
+            self.schedule();
+            self.report(self.shared.player.position());
+        } else {
+            self.next_report = None;
+            if let Some(position) = self.unsent {
+                self.report(position);
+            }
         }
     }
 
@@ -660,12 +693,15 @@ impl Task {
         self.shared.player.unload();
         self.shared.set(None);
         self.next_report = None;
+        self.unsent = None;
     }
 
-    /// Has `position` reported, if something plays.
-    fn report(&self, position: f64) {
+    /// Has `position` reported, if something plays; nothing older is sent again.
+    fn report(&mut self, position: f64) {
         if let Some(report) = self.report_at(position) {
-            self.send(Outgoing::Report(report));
+            self.unsent = None;
+            self.reports += 1;
+            self.send(Outgoing::Report(report, self.reports));
         }
     }
 
@@ -676,7 +712,7 @@ impl Task {
         };
         tracing::error!("the Local playback sender task is gone; the Bridge isn't told");
         match call {
-            Outgoing::Report(_) => self
+            Outgoing::Report(..) => self
                 .shared
                 .update(|now| now.report_failed = Some(ApiError::Internal)),
             Outgoing::End(_, Some(answer)) | Outgoing::Settle(answer) => {
@@ -720,15 +756,12 @@ async fn send_calls(
         };
         match call {
             // Something newer comes after it.
-            Outgoing::Report(_) if !queued.is_empty() => {}
-            Outgoing::Report(Report {
-                stream,
-                position,
-                duration,
-            }) => {
-                let call = api::report_local(stream.clone(), position, duration);
-                let reported = send(call_timeout, "report", position, call).await;
-                let _ = answers.send(Answer::Reported(stream, reported));
+            Outgoing::Report(..) if !queued.is_empty() => {}
+            Outgoing::Report(report, number) => {
+                let call =
+                    api::report_local(report.stream.clone(), report.position, report.duration);
+                let reported = send(call_timeout, "report", report.position, call).await;
+                let _ = answers.send(Answer::Reported(report, number, reported));
             }
             Outgoing::End(
                 Report {

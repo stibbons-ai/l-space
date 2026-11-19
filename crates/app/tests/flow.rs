@@ -5045,6 +5045,278 @@ fn a_failed_report_keeps_playing_and_says_why() {
     });
 }
 
+/// A pause's report the Library Server fails is said, and not tried again: only a lost Bridge
+/// is. Once the Library Server is back, nothing is written until the person acts.
+#[test]
+fn a_paused_report_the_library_server_fails_is_not_sent_again() {
+    let (bridge, abs, proxy, failing) = bridge_behind_proxy();
+    let (front, log, _) = bridge_behind_outage(&bridge);
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        let Phone {
+            mut app, player, ..
+        } = Device::new().launch_playing(&clock).await;
+        app.submit_bridge_url(&front).await;
+        app.log_in(&proxy, ApiKey::new(&user.api_key.key)).await;
+        open_episode(&mut app, &abs, 1).await;
+        app.play_on_phone().await;
+        clock.advance(REPORT_EVERY);
+        progress_becomes(&abs, &user, &episode, (30.0, false)).await;
+        assert!(
+            app.local_status()
+                .is_some_and(|status| status.report_failed.is_none())
+        );
+
+        *failing.lock().unwrap() = Some("PATCH /api/me/progress/");
+        clock.advance(Duration::from_secs(10));
+        app.toggle_local().await;
+        eventually("the pause's failed report is shown", || {
+            app.local_status().is_some_and(|status| {
+                status.report_failed == Some(ApiError::LibraryServerUnreachable)
+            })
+        })
+        .await;
+        let tried = reports_sent(&log).await;
+        clock.advance(REPORT_EVERY * 2);
+        assert_eq!(reports_sent(&log).await, tried);
+
+        *failing.lock().unwrap() = None;
+        clock.advance(REPORT_EVERY * 2);
+        assert_eq!(reports_sent(&log).await, tried);
+        assert_eq!(
+            abs.item_progress(&user, &episode).await,
+            Some((30.0, false))
+        );
+        assert!(!player.playing());
+        assert!(!app.local_halted());
+    });
+}
+
+/// A proxy in front of `bridge`, standing for the network between the App and it: while the
+/// flag it returns is set, every connection drops without an answer. Its log has each request.
+fn bridge_behind_outage(bridge: &TestBridge) -> (String, ProxyLog, Arc<AtomicBool>) {
+    let down = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::clone(&down);
+    let bridge_address = bridge.url().strip_prefix("http://").unwrap();
+    let (front, log) = proxy_answering(bridge_address, move |_, _| {
+        dropped.load(Ordering::SeqCst).then_some(b"".as_slice())
+    });
+    (front, log, down)
+}
+
+/// Launches the App with a fake player on `clock`, enters `front` as the Bridge's URL, logs in
+/// as `user` on the shared Audiobookshelf and opens episode `n` of the seeded podcast.
+async fn on_episode_through(
+    front: &str,
+    user: &AbsUser,
+    clock: &ManualClock,
+    abs: &Audiobookshelf,
+    n: usize,
+) -> Phone {
+    let mut phone = Device::new().launch_playing(clock).await;
+    phone.app.submit_bridge_url(front).await;
+    phone
+        .app
+        .log_in(abs.base_url(), ApiKey::new(&user.api_key.key))
+        .await;
+    open_episode(&mut phone.app, abs, n).await;
+    phone
+}
+
+/// The reports that reached the network after [`QUIET`].
+async fn reports_sent(log: &ProxyLog) -> usize {
+    tokio::time::sleep(QUIET).await;
+    requests(log, "POST /api/local/report ")
+}
+
+/// The App loses the Bridge while playing on the phone: it plays on, takes every pause and
+/// skip as before, and tries the newest position again every 30 seconds; once the Bridge is
+/// back, that position lands on its own, paused and untouched, once, and the notice goes.
+#[test]
+fn the_newest_position_lands_once_the_bridge_is_back() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let (front, log, down) = bridge_behind_outage(&bridge);
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        let Phone {
+            mut app, player, ..
+        } = on_episode_through(&front, &user, &clock, &abs, 1).await;
+        app.play_on_phone().await;
+        clock.advance(REPORT_EVERY);
+        progress_becomes(&abs, &user, &episode, (30.0, false)).await;
+
+        down.store(true, Ordering::SeqCst);
+        clock.advance(REPORT_EVERY);
+        eventually("the report couldn't reach the Bridge", || {
+            app.local_status()
+                .is_some_and(|status| status.report_failed == Some(ApiError::BridgeUnreachable))
+        })
+        .await;
+        assert!(player.playing());
+        app.skip_local(Skip::Forward30).await;
+        clock.advance(Duration::from_secs(10));
+        app.toggle_local().await;
+        assert!(!player.playing());
+        // Back below the positions before it: the newest, not the furthest, is kept.
+        app.skip_local(Skip::Back15).await;
+        assert_eq!(app.local_status().map(|status| status.position), Some(85.0));
+        assert_eq!(
+            app.now_playing_notice(),
+            Some(Notice::Api(ApiError::BridgeUnreachable))
+        );
+
+        // Still gone: tried again on the timer, not before.
+        let tried = reports_sent(&log).await;
+        clock.advance(REPORT_EVERY - Duration::from_secs(1));
+        assert_eq!(reports_sent(&log).await, tried);
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(reports_sent(&log).await, tried + 1);
+        assert_eq!(
+            abs.item_progress(&user, &episode).await,
+            Some((30.0, false))
+        );
+
+        down.store(false, Ordering::SeqCst);
+        clock.advance(REPORT_EVERY);
+        progress_becomes(&abs, &user, &episode, (85.0, false)).await;
+        eventually("the notice goes once the report lands", || {
+            app.now_playing_notice().is_none()
+        })
+        .await;
+        assert_eq!(reports_sent(&log).await, tried + 2);
+
+        // Nothing left to send.
+        clock.advance(REPORT_EVERY * 3);
+        assert_eq!(reports_sent(&log).await, tried + 2);
+        assert_eq!(
+            abs.item_progress(&user, &episode).await,
+            Some((85.0, false))
+        );
+        assert!(!player.playing());
+    });
+}
+
+/// A position waiting for the Bridge is only ever sent for the Local playback it was taken
+/// in: Stop forgets it (its end, failing too, says so), and so does playing another Item.
+#[test]
+fn a_position_waiting_for_the_bridge_ends_with_its_local_playback() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let (front, log, down) = bridge_behind_outage(&bridge);
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let (episode, next) = (abs.seeded().episode(1), abs.seeded().episode(0));
+        let Phone { mut app, .. } = on_episode_through(&front, &user, &clock, &abs, 1).await;
+
+        // Stopped while the Bridge is gone.
+        app.play_on_phone().await;
+        clock.advance(Duration::from_secs(10));
+        down.store(true, Ordering::SeqCst);
+        app.toggle_local().await;
+        let tried = reports_sent(&log).await;
+        app.stop_local().await;
+        assert!(
+            matches!(
+                app.screen(),
+                Screen::Item {
+                    notice: Some(Notice::Api(ApiError::BridgeUnreachable)),
+                    ..
+                }
+            ),
+            "{:?}",
+            app.screen()
+        );
+        down.store(false, Ordering::SeqCst);
+        clock.advance(REPORT_EVERY * 2);
+        assert_eq!(reports_sent(&log).await, tried);
+        assert_eq!(abs.item_progress(&user, &episode).await, None);
+
+        // Another Item played after a pause the Bridge didn't get: the pause's own retry,
+        // due before the new Item's first report, never goes out.
+        app.play_on_phone().await;
+        clock.advance(Duration::from_secs(10));
+        down.store(true, Ordering::SeqCst);
+        app.toggle_local().await;
+        let tried = reports_sent(&log).await;
+        down.store(false, Ordering::SeqCst);
+        clock.advance(Duration::from_secs(5));
+        app.go_back();
+        open_episode(&mut app, &abs, 0).await;
+        app.play_on_phone().await;
+        assert_eq!(
+            abs.item_progress(&user, &episode).await,
+            Some((10.0, false))
+        );
+        clock.advance(REPORT_EVERY - Duration::from_secs(5));
+        assert_eq!(reports_sent(&log).await, tried);
+        assert_eq!(abs.item_progress(&user, &next).await, None);
+        clock.advance(Duration::from_secs(5));
+        progress_becomes(&abs, &user, &next, (30.0, false)).await;
+        assert_eq!(
+            abs.item_progress(&user, &episode).await,
+            Some((10.0, false))
+        );
+    });
+}
+
+/// The Bridge is lost while a pause's report is on its way, and back before the skip after it
+/// goes out: the skip's position lands, and the pause's, though it couldn't reach the Bridge,
+/// is never sent again.
+#[test]
+fn a_report_lost_behind_a_newer_one_is_not_sent_again() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let (hold, lose) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (held, lost) = (Arc::clone(&hold), Arc::clone(&lose));
+    let bridge_address = bridge.url().strip_prefix("http://").unwrap();
+    // Between the App and the Bridge: holds a report while `hold` is set, then drops it once
+    // if `lose` is.
+    let (front, log) = proxy_answering(bridge_address, move |_, request| {
+        if !request.starts_with(b"POST /api/local/report ") {
+            return None;
+        }
+        while held.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        lost.swap(false, Ordering::SeqCst).then_some(b"".as_slice())
+    });
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let episode = abs.seeded().episode(1);
+        let Phone { mut app, .. } = on_episode_through(&front, &user, &clock, &abs, 1).await;
+        app.play_on_phone().await;
+        clock.advance(REPORT_EVERY);
+        progress_becomes(&abs, &user, &episode, (30.0, false)).await;
+        clock.advance(Duration::from_secs(10));
+        hold.store(true, Ordering::SeqCst);
+        lose.store(true, Ordering::SeqCst);
+        app.toggle_local().await;
+        eventually("the pause's report is on its way", || {
+            requests(&log, "POST /api/local/report ") == 2
+        })
+        .await;
+        app.skip_local(Skip::Back15).await;
+        hold.store(false, Ordering::SeqCst);
+
+        progress_becomes(&abs, &user, &episode, (25.0, false)).await;
+        assert_eq!(reports_sent(&log).await, 3);
+        clock.advance(REPORT_EVERY * 2);
+        assert_eq!(reports_sent(&log).await, 3);
+        assert_eq!(
+            abs.item_progress(&user, &episode).await,
+            Some((25.0, false))
+        );
+        assert_eq!(app.now_playing_notice(), None);
+    });
+}
+
 /// A report the Bridge answers with the Local session gone stops playback here, and the App
 /// says why: on Now playing for `no_local_session`; at Login, the session forgotten, for
 /// `session_invalid` and `api_key_rejected`. Whichever reported it: the timer, the lock
