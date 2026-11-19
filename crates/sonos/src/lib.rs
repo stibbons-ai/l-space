@@ -227,6 +227,10 @@ pub struct Playback {
     pub position: Option<Duration>,
     /// The track's length; none when unknown, as for a stream.
     pub duration: Option<Duration>,
+    /// The source the Group has selected (`GetMediaInfo` `CurrentURI`), read only when it tells
+    /// no track URL; none otherwise, or when that read fails or tells none. Evidence of what is
+    /// selected, never of a position.
+    pub source: Option<String>,
 }
 
 impl std::fmt::Debug for Playback {
@@ -236,6 +240,7 @@ impl std::fmt::Debug for Playback {
             .field("uri", &self.uri.as_ref().map(|_| "REDACTED"))
             .field("position", &self.position)
             .field("duration", &self.duration)
+            .field("source", &self.source.as_ref().map(|_| "REDACTED"))
             .finish()
     }
 }

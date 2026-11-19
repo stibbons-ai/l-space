@@ -52,25 +52,23 @@ struct Setup {
 async fn setup() -> Setup {
     let abs = Audiobookshelf::shared();
     let url = abs.base_url().to_owned();
-    setup_on(abs, &url, None).await
+    setup_on(abs, &url, true).await
 }
 
-/// As [`setup`], with every GENA subscription granted for `seconds`, so none is renewed or
-/// expires before half of that has passed.
-async fn setup_granting(seconds: u32) -> Setup {
+/// As [`setup`], with every GENA subscription refused from before the Bridge starts: no
+/// lease, so no notification or fresh lease's snapshot ever wakes the Bridge.
+async fn setup_without_subscriptions() -> Setup {
     let abs = Audiobookshelf::shared();
     let url = abs.base_url().to_owned();
-    setup_on(abs, &url, Some(seconds)).await
+    setup_on(abs, &url, false).await
 }
 
-/// As [`setup`], with the Library Server at `url` (a proxy in front of `abs`), and the
-/// household's GENA grant if given.
-async fn setup_on(abs: Arc<Audiobookshelf>, url: &str, grant: Option<u32>) -> Setup {
+/// As [`setup`], with the Library Server at `url` (a proxy in front of `abs`), the household
+/// granting GENA subscriptions only if `subscriptions`.
+async fn setup_on(abs: Arc<Audiobookshelf>, url: &str, subscriptions: bool) -> Setup {
     let (household, clock) = Household::with_manual_clock();
     household.set_event_clock(Arc::new(clock.clone()));
-    if let Some(seconds) = grant {
-        household.set_event_timeout(seconds);
-    }
+    household.reject_subscriptions(!subscriptions);
     let kitchen = household.add_player("Kitchen");
     let office = household.add_player("Office");
     let config = format!(
@@ -100,7 +98,7 @@ async fn setup_on(abs: Arc<Audiobookshelf>, url: &str, grant: Option<u32>) -> Se
 async fn setup_with_proxy() -> (LibraryProxy, Setup) {
     let abs = Audiobookshelf::shared();
     let proxy = LibraryProxy::to(abs.base_url()).await;
-    let setup = setup_on(abs, &proxy.url(), None).await;
+    let setup = setup_on(abs, &proxy.url(), true).await;
     (proxy, setup)
 }
 
@@ -1224,11 +1222,9 @@ async fn a_group_resumed_paused_and_stopped_during_a_finished_retry_is_not_finis
 
 #[tokio::test]
 async fn a_group_that_cant_be_read_past_its_end_is_read_at_a_bounded_rate() {
-    // Leases outlast the counted window, so no renewal, expiry or fresh lease's snapshot wakes
-    // the Bridge into an extra read: renewals are due only at 1800 seconds.
-    let setup = setup_granting(3600).await;
-    let leases = async || setup.household.subscriptions().len() == 4;
-    eventually("Kitchen and Office never subscribed", WITHIN, leases).await;
+    // No lease from before the Bridge starts, so no notification, renewal or fresh lease's
+    // snapshot wakes it into an extra read: only its own schedule reads Kitchen.
+    let setup = setup_without_subscriptions().await;
     let episode = setup.episode(0);
     setup.start(&setup.alices, &episode, None).await;
     setup.advance(590).await;
@@ -2631,4 +2627,396 @@ async fn a_late_group_read_for_the_replaced_progress_does_not_hold_up_the_new_st
     let started = Instant::now();
     setup.start(&setup.bobs, &setup.episode(1), None).await;
     assert_replaced_without_progress(&setup, started.elapsed()).await;
+}
+
+/// Alice's Handoff of episode 0 on Kitchen, `seconds` in, with that Progress written and
+/// Kitchen's turn free; returns its stream's URL.
+async fn alice_playing(setup: &Setup, seconds: u64) -> String {
+    let episode = setup.episode(0);
+    setup.start(&setup.alices, &episode, None).await;
+    let stream = setup.household.fetched(&setup.kitchen).await.uri;
+    setup.advance(seconds).await;
+    let progress = (Duration::from_secs(seconds).as_secs_f64(), false);
+    setup
+        .wait_for_progress(&setup.alice, &episode, progress)
+        .await;
+    setup.settle().await;
+    stream
+}
+
+/// Whether `url` answers at all, as a live stream does.
+async fn serves(url: &str) -> bool {
+    reqwest::get(url).await.unwrap().status().is_success()
+}
+
+/// Asserts `url` is gone.
+async fn assert_gone(url: &str) {
+    let status = reqwest::get(url).await.unwrap().status();
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn takeover_after_a_skip_while_stopped_keeps_the_seek_target() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    let old_stream = alice_playing(&setup, 60).await;
+    setup.household.stop(&setup.kitchen);
+    let playback = setup
+        .bridge
+        .api()
+        .skip_group(&setup.bobs, setup.kitchen.uuid(), Skip::Forward30)
+        .await;
+    assert_eq!(playback.state, TransportState::Stopped);
+    assert_eq!(playback.position, Some(30.0));
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("Radio", Duration::from_secs(3600)),
+    );
+    setup.wait_until_no_handoff().await;
+    assert_gone(&old_stream).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
+}
+
+#[tokio::test]
+async fn takeover_by_a_regroup_is_finalized_by_a_replacement_that_wins_the_turn() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    let old_stream = alice_playing(&setup, 30).await;
+    // Stopped short: an ordinary replacement would write nothing for it.
+    setup.household.stop(&setup.kitchen);
+    setup.advance_and_settle(30).await;
+    setup
+        .set_progress(&setup.alice, &episode, 11.0, false)
+        .await;
+    let identities = proxy.identity_requests();
+    let identity = proxy.hold_next_identity();
+    // Same coordinator, still loading the old stream: only membership changed.
+    setup.household.join(&setup.office, &setup.kitchen);
+    eventually(
+        "the regroup's identity check never arrived",
+        WITHIN,
+        async || proxy.identity_requests() > identities,
+    )
+    .await;
+    setup.start(&setup.bobs, &setup.episode(1), None).await;
+    assert_bobs_handoff_listed(&setup).await;
+    drop(identity);
+    assert_gone(&old_stream).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.bob, &setup.episode(1), (30.0, false))
+        .await;
+    assert_bobs_handoff_listed(&setup).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
+}
+
+#[tokio::test]
+async fn unrelated_hints_do_not_spend_a_pending_finished_writes_retries() {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    let leases = async || setup.household.subscriptions().len() == 4;
+    eventually("Kitchen and Office never subscribed", WITHIN, leases).await;
+    setup.household.drop_notifications(true);
+    // A Library Server outage: every write fails until it clears.
+    setup.ended_with_finished_failing(&proxy, usize::MAX).await;
+    assert_eq!(setup.handoffs().await, 1);
+    for offset in 1..=2 {
+        let reads = setup.asked(READ);
+        setup.hint(offset).await;
+        eventually("a hint never reconciled Kitchen", WITHIN, async || {
+            setup.asked(READ) > reads
+        })
+        .await;
+        setup.settle().await;
+    }
+    assert_eq!(
+        proxy.progress_writes_failed(),
+        1,
+        "hints spent Finished retries"
+    );
+    assert_eq!(setup.handoffs().await, 1);
+    // The outage clears before the next tick: its retry lands.
+    proxy.fail_progress_writes(0);
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (EPISODE_DURATIONS[0], true))
+        .await;
+    setup.wait_until_no_handoff().await;
+}
+
+#[tokio::test]
+async fn takeover_past_the_items_length_without_an_end_stays_unfinished() {
+    takeover_past_the_items_length(false).await;
+}
+
+#[tokio::test]
+async fn takeover_past_the_items_length_finalized_by_a_replacement_stays_unfinished() {
+    takeover_past_the_items_length(true).await;
+}
+
+/// Alice's Handoff of episode 0 (600 seconds as its Library Server tells it), resumed at 590,
+/// plays on past 600 (the stream is longer): Radio takes over at 605, with no natural end seen.
+/// Its final Progress is 605, unfinished, as Audiobookshelf stores it: written by the
+/// supervisor, or, `replaced`, by Bob's start that wins the turn while the Takeover's identity
+/// check is held.
+async fn takeover_past_the_items_length(replaced: bool) {
+    let (proxy, setup) = setup_with_proxy().await;
+    let episode = setup.episode(0);
+    setup
+        .set_progress(&setup.alice, &episode, 590.0, false)
+        .await;
+    setup.start(&setup.alices, &episode, Some(700.0)).await;
+    setup.advance_and_settle(15).await;
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+    assert_eq!(
+        setup.household.position(&setup.kitchen),
+        Duration::from_secs(605)
+    );
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((590.0, false))
+    );
+    let identities = proxy.identity_requests();
+    let identity = replaced.then(|| proxy.hold_next_identity());
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("Radio", Duration::from_secs(3600)),
+    );
+    if let Some(identity) = identity {
+        eventually(
+            "the Takeover's identity check never arrived",
+            WITHIN,
+            async || proxy.identity_requests() > identities,
+        )
+        .await;
+        setup.start(&setup.bobs, &setup.episode(1), None).await;
+        assert_bobs_handoff_listed(&setup).await;
+        drop(identity);
+    } else {
+        setup.wait_until_no_handoff().await;
+    }
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((605.0, false))
+    );
+}
+
+/// Alice's Handoff at 30 seconds on Kitchen, taken over by Radio while another connection
+/// holds the database's write lock: the final Progress lands, removing the Handoff fails.
+/// Then Alice's Progress becomes 12 (a second final write would overwrite it) and the old
+/// stream plays on Kitchen again. Returns the old stream's URL and the lock, still held.
+async fn takeover_whose_end_fails(setup: &mut Setup) -> (String, rusqlite::Connection) {
+    let episode = setup.episode(0);
+    let old_stream = alice_playing(setup, 30).await;
+    setup
+        .set_progress(&setup.alice, &episode, 11.0, false)
+        .await;
+    // Only this test's explicit hint wakes the Bridge; time stands still.
+    setup.household.drop_notifications(true);
+    let lock = rusqlite::Connection::open(setup.bridge.database_path()).unwrap();
+    lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    setup.household.play(
+        &setup.kitchen,
+        FakeTrack::new("Radio", Duration::from_secs(3600)),
+    );
+    setup.hint(1).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (30.0, false))
+        .await;
+    setup.bridge.wait_for_event(|event| {
+        event["message"] == "storage failed" && event["operation"] == "end a Handoff on Takeover"
+    });
+    assert_eq!(setup.handoffs().await, 1);
+    assert!(serves(&old_stream).await);
+    setup
+        .set_progress(&setup.alice, &episode, 12.0, false)
+        .await;
+    let track = FakeTrack {
+        uri: old_stream.clone(),
+        ..FakeTrack::new("Old stream", Duration::from_secs(3600))
+    };
+    setup.household.play(&setup.kitchen, track);
+    (old_stream, lock)
+}
+
+#[tokio::test]
+async fn takeover_retries_a_failed_end_without_writing_again_though_the_old_stream_is_back() {
+    let mut setup = setup().await;
+    let (old_stream, lock) = takeover_whose_end_fails(&mut setup).await;
+    lock.execute_batch("ROLLBACK;").unwrap();
+    setup.advance(30).await;
+    setup.wait_until_no_handoff().await;
+    assert_gone(&old_stream).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &setup.episode(0)).await,
+        Some((12.0, false))
+    );
+}
+
+#[tokio::test]
+async fn a_replacement_after_a_failed_takeover_end_writes_no_progress_again() {
+    let mut setup = setup().await;
+    let (old_stream, lock) = takeover_whose_end_fails(&mut setup).await;
+    lock.execute_batch("ROLLBACK;").unwrap();
+    setup.start(&setup.bobs, &setup.episode(1), None).await;
+    assert_bobs_handoff_listed(&setup).await;
+    assert_gone(&old_stream).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.bob, &setup.episode(1), (30.0, false))
+        .await;
+    assert_bobs_handoff_listed(&setup).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &setup.episode(0)).await,
+        Some((12.0, false))
+    );
+}
+
+#[tokio::test]
+async fn takeover_by_a_source_selected_without_a_track_ends_but_no_source_does_not() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    let old_stream = alice_playing(&setup, 30).await;
+    setup
+        .set_progress(&setup.alice, &episode, 11.0, false)
+        .await;
+    // Neither a track nor a source: no evidence of anything, so no Takeover.
+    setup.household.select_source(&setup.kitchen, "");
+    setup.advance_and_settle(30).await;
+    assert_eq!(setup.handoffs().await, 1);
+    assert!(serves(&old_stream).await);
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((11.0, false))
+    );
+    // A line-in selected: no track, but a foreign source.
+    setup
+        .household
+        .select_source(&setup.kitchen, "x-rincon-stream:RINCON_FAKE00000101400");
+    setup.wait_until_no_handoff().await;
+    assert_gone(&old_stream).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((30.0, false))
+    );
+}
+
+#[tokio::test]
+async fn takeover_by_replacing_a_member_under_the_same_coordinator_ends_only_that_group() {
+    let setup = setup().await;
+    // Players added after the Bridge's search are known only as members, never coordinators.
+    let (bedroom, den) = (
+        setup.household.add_player("Bedroom"),
+        setup.household.add_player("Den"),
+    );
+    setup.household.join(&bedroom, &setup.kitchen);
+    setup.start(&setup.alices, &setup.episode(0), None).await;
+    let old_stream = setup.household.fetched(&setup.kitchen).await.uri;
+    setup
+        .bridge
+        .api()
+        .start_handoff(&setup.bobs, &setup.episode(1), setup.office.uuid())
+        .await;
+    setup.household.fetched(&setup.office).await;
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &setup.episode(0), (30.0, false))
+        .await;
+    setup
+        .wait_for_progress(&setup.bob, &setup.episode(1), (30.0, false))
+        .await;
+    setup.settle().await;
+    setup.household.drop_notifications(true);
+    setup.advance(7).await;
+    // Kitchen still coordinates two players; only who they are changed.
+    setup.household.leave(&bedroom);
+    setup.household.join(&den, &setup.kitchen);
+    setup.hint(1).await;
+    eventually("Kitchen's Handoff stayed active", WITHIN, async || {
+        let handoffs = setup.bridge.api().handoffs(&setup.bobs).await;
+        handoffs.len() == 1 && handoffs[0].group == setup.office.uuid()
+    })
+    .await;
+    assert_gone(&old_stream).await;
+    assert_eq!(
+        setup.progress(&setup.alice, &setup.episode(0)).await,
+        Some((37.0, false))
+    );
+    setup.advance(23).await;
+    setup
+        .wait_for_progress(&setup.bob, &setup.episode(1), (60.0, false))
+        .await;
+}
+
+#[tokio::test]
+async fn an_empty_topology_keeps_the_handoff_and_its_progress_until_it_recovers() {
+    let setup = setup().await;
+    let episode = setup.episode(0);
+    let old_stream = alice_playing(&setup, 30).await;
+    setup
+        .set_progress(&setup.alice, &episode, 11.0, false)
+        .await;
+    setup.household.drop_notifications(true);
+    let topology_reads = || {
+        let read = "ZoneGroupTopology#GetZoneGroupState";
+        setup.household.asked(&setup.kitchen, read) + setup.household.asked(&setup.office, read)
+    };
+    let reads = topology_reads();
+    // Every player answers, validly, that there is no Group at all; Kitchen plays on.
+    setup
+        .household
+        .set_fault(&setup.kitchen, Fault::EmptyTopology);
+    setup
+        .household
+        .set_fault(&setup.office, Fault::EmptyTopology);
+    setup.hint(1).await;
+    // The hint's topology read, then the playback read's own (which finds no coordinator).
+    eventually(
+        "the hint never read the topology twice",
+        WITHIN,
+        async || topology_reads() >= reads + 2,
+    )
+    .await;
+    // Once a turn-taking request is done, so is whatever the hint did holding the turn; the
+    // request itself fails without a topology.
+    let authorization = format!("Bearer {}", setup.bobs.token.expose());
+    let response = setup
+        .bridge
+        .api()
+        .post(
+            "/api/groups/volume",
+            Some(&authorization),
+            serde_json::json!({"group": setup.kitchen.uuid(), "volume": 20}),
+        )
+        .await;
+    assert!(!response.status().is_success());
+    assert_eq!(setup.handoffs().await, 1);
+    assert!(serves(&old_stream).await);
+    assert_eq!(
+        setup.progress(&setup.alice, &episode).await,
+        Some((11.0, false))
+    );
+    assert_eq!(setup.household.transport_state(&setup.kitchen), "PLAYING");
+    // The topology recovers: the next tick writes where Kitchen is.
+    setup.household.set_fault(&setup.kitchen, Fault::None);
+    setup.household.set_fault(&setup.office, Fault::None);
+    setup.advance(30).await;
+    setup
+        .wait_for_progress(&setup.alice, &episode, (60.0, false))
+        .await;
+    assert_eq!(setup.handoffs().await, 1);
 }

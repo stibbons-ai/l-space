@@ -156,7 +156,7 @@ pub(super) async fn publish(shared: Arc<Shared>) {
             } else {
                 let player = state.find(&lease.player)?;
                 let transport = &player.transport;
-                let uri = transport.track.as_ref().map(|track| track.uri.as_str()).unwrap_or_default();
+                let uri = transport.current_uri();
                 let change = format!("<Event xmlns=\"urn:schemas-upnp-org:metadata-1-0/AVT/\"><InstanceID val=\"0\"><TransportState val=\"{}\"/><AVTransportURI val=\"{}\"/></InstanceID></Event>", transport.state, escape(uri));
                 Cow::Owned(format!("<LastChange>{}</LastChange>", escape(&change)))
             };

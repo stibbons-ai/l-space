@@ -57,6 +57,7 @@ Kind one pauses at the end of the current chapter (audiobook) or episode (podcas
 - [ ] The Item's unfinished Progress is the last reliable old-stream position (normally within the 30-second cadence while playing; failed reads can widen the gap), never the new source's position. Repeat paused. An already-known pending Finished is preserved instead.
 - [ ] In a private local capture of SUBSCRIBE responses, record the granted TIMEOUT and confirm renewal before expiry (normally half the grant); repeat the Takeover after the original lease would have expired.
 - [ ] The Group plays what the Sonos app started; the Bridge doesn't take it back.
+- [ ] Repeat with a source that has no track (a line-in or TV input) selected in the Sonos app: the Handoff ends the same way.
 - [ ] Repeat for membership changes and coordinator changes; unrelated Groups keep playing and continue cadence Progress writes, and other users' Progress remains unchanged. Fetch the captured old stream URL after Takeover: `404`.
 - [ ] After each App pause/resume, seek and volume change, the same Handoff remains active and has correct Progress. Replace it from the App: the replacement Handoff stays active. A concurrent external source change still ends the affected Handoff.
 

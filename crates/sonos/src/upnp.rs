@@ -1,10 +1,10 @@
 //! [`Sonos`] over local UPnP: players found with SSDP, the Group topology read from any of
 //! them (ZoneGroupTopology `GetZoneGroupState`), each Group's playback from its coordinator
-//! (AVTransport `GetTransportInfo` and `GetPositionInfo`) and its volume (GroupRenderingControl
-//! `GetGroupVolume`), a stream started on a Group by its coordinator (AVTransport
-//! `SetAVTransportURI`, then `Play`), and a Group controlled by its coordinator (AVTransport
-//! `Pause`, `Play` and `Seek`; GroupRenderingControl `SnapshotGroupVolume`, then
-//! `SetGroupVolume`).
+//! (AVTransport `GetTransportInfo` and `GetPositionInfo`, and `GetMediaInfo` when it tells no
+//! track) and its volume (GroupRenderingControl `GetGroupVolume`), a stream started on a
+//! Group by its coordinator (AVTransport `SetAVTransportURI`, then `Play`), and a Group
+//! controlled by its coordinator (AVTransport `Pause`, `Play` and `Seek`; GroupRenderingControl
+//! `SnapshotGroupVolume`, then `SetGroupVolume`).
 
 mod events;
 use std::collections::BTreeMap;
@@ -519,7 +519,9 @@ impl Shared {
 
     /// What Group `group` plays, as its coordinator tells it by `deadline`: its transport
     /// state, and its track's URL, position and length. A coordinator that doesn't tell
-    /// both, or tells no transport state at all, failed.
+    /// both, or tells no transport state at all, failed. Without a track URL, its selected
+    /// source is read too (`GetMediaInfo`, by the same deadline); that read failing leaves it
+    /// unknown.
     async fn playback(
         &self,
         group: &str,
@@ -540,6 +542,15 @@ impl Shared {
         let uri = argument(&position, "TrackURI")
             .map(str::trim)
             .filter(|uri| !uri.is_empty());
+        let source = match uri {
+            Some(_) => None,
+            None => call("GetMediaInfo").await.ok().and_then(|media| {
+                argument(&media, "CurrentURI")
+                    .map(str::trim)
+                    .filter(|uri| !uri.is_empty())
+                    .map(str::to_owned)
+            }),
+        };
         Ok(Playback {
             state: state(group, &transport),
             uri: uri.map(str::to_owned),
@@ -547,6 +558,7 @@ impl Shared {
                 .and(argument(&position, "RelTime"))
                 .and_then(xml::duration),
             duration: track_duration(&position),
+            source,
         })
     }
 
@@ -1393,6 +1405,7 @@ mod tests {
                 uri: Some("http://127.0.0.1:1/track.mp3".into()),
                 position: Some(Duration::from_secs(90)),
                 duration: Some(Duration::from_secs(600)),
+                source: None,
             }
         );
 
@@ -1552,21 +1565,32 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_group_with_nothing_loaded_tells_no_track() {
+    async fn a_group_with_no_track_tells_only_its_selected_source() {
         let (household, clock) = Household::with_manual_clock();
         let kitchen = household.add_player("Kitchen");
         let shared = knowing(&household, &clock).await;
-
-        assert_eq!(
+        let playback = async || {
             shared
                 .playback(kitchen.uuid(), soon(CONTROL_TIMEOUT))
                 .await
-                .unwrap(),
+                .unwrap()
+        };
+        let nothing = Playback {
+            state: TransportState::Stopped,
+            uri: None,
+            position: None,
+            duration: None,
+            source: None,
+        };
+        assert_eq!(playback().await, nothing);
+
+        household.select_source(&kitchen, "x-rincon-stream:RINCON_LINEIN");
+        assert_eq!(
+            playback().await,
             Playback {
-                state: TransportState::Stopped,
-                uri: None,
-                position: None,
-                duration: None,
+                state: TransportState::Playing,
+                source: Some("x-rincon-stream:RINCON_LINEIN".into()),
+                ..nothing
             }
         );
     }

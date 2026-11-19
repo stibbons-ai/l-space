@@ -11,10 +11,17 @@
 //! unsupervised.
 //!
 //! GENA source/topology hints are reconciled with current state, never applied as snapshots.
-//! A Takeover attempts final unfinished Progress before ending, or preserves an already-known
-//! Finished update without rewriting one already completed. It never controls the new source.
-//! If the old stream is gone, its last reliable playing/paused position is used without
-//! extrapolation; failed reads widen the normal cadence-sized accuracy gap.
+//! Takeover evidence is a foreign track URL, else, with no track, a foreign selected source,
+//! or a healthy topology read showing the Group's membership changed; an empty or failed read
+//! is none. A Takeover attempts final unfinished Progress before ending (never marked
+//! Finished by Audiobookshelf itself, as no natural end was seen), or preserves an
+//! already-known Finished update without rewriting one already completed. It never controls
+//! the new source. If the old stream is gone, its last reliable playing/paused position (or a
+//! successful seek's target) is used without extrapolation; failed reads widen the normal
+//! cadence-sized accuracy gap. A confirmed regroup is kept for a start that replaces the
+//! Handoff first. Once the final attempt was made, only removing this exact stream from the
+//! store remains: retried after a storage failure without reading or writing again, and a
+//! replacement writes nothing for it.
 //!
 //! End-of-Item detection assumes a Group stops (`STOPPED`) on the Handoff's stream at the end
 //! of a single URL, as `sonos-fake` models it. It never relies on the position a stopped Group
@@ -40,12 +47,12 @@
 //!
 //! The Finished write at the end is tried at most [`FINISH_TRIES`] times, again at the next
 //! cadence tick after one that didn't land (failed, unconfirmed, or the key's user not known),
-//! and each ordinary retry only while the Group is still found stopped on the Handoff's
-//! stream, not seen playing there since: found playing or paused there again, the Handoff
-//! goes on without it. An empty URI preserves the pending Finished without retrying its write;
-//! positive Takeover evidence makes one final attempt before ending. While empty, identity is
-//! still checked once per cadence (bounded by [`CHECK_TIME`]). After the last ordinary failure
-//! the Handoff ends all the same (logged as an error, Finished lost).
+//! never on an unrelated hint, and each ordinary retry only while the Group is still found
+//! stopped on the Handoff's stream, not seen playing there since: found playing or paused there
+//! again, the Handoff goes on without it. An empty URI preserves the pending Finished without
+//! retrying its write; positive Takeover evidence makes one final attempt before ending. While
+//! empty, identity is still checked once per cadence (bounded by [`CHECK_TIME`]). After the
+//! last ordinary failure the Handoff ends all the same (logged as an error, Finished lost).
 //! A revoked key ends it too. A control that leaves the Group playing drops the ending,
 //! under the Group's turn ([`Supervisors::seen`]), and a visit acts only on what is left of it
 //! once it holds the turn. A start replacing a Handoff whose Finished write is still pending
@@ -65,7 +72,8 @@ use store::{GroupHandoff, Handoff, Store, StreamId};
 use tokio::sync::watch;
 
 use super::{
-    Acting, Budget, CONTROL_TURN_TIME, Controls, Turns, Wanted, Wrote, plays_stream, told_length,
+    Acting, Budget, CONTROL_TURN_TIME, Controls, Turns, Wanted, Wrote, foreign_source,
+    plays_stream, told_length,
 };
 
 /// How often a playing Handoff's Progress is written, on the Bridge's clock. A tick that finds
@@ -147,6 +155,12 @@ struct Known {
     /// Last reliable old-stream position, including a paused position. Never extrapolated
     /// across a source change, whose exact time is not known.
     position: Duration,
+    /// A healthy topology read showed this exact stream's Group regrouped: Takeover evidence a
+    /// replacement honors even if it wins the Group's turn before the supervisor finalizes.
+    regrouped: bool,
+    /// Takeover's final Progress was attempted: only removing this exact stream from the store
+    /// remains, retried without reading the Group again and never written again.
+    finalized: bool,
 }
 
 /// What a start replacing a Handoff learns from its supervisor ([`Supervisors::replaced`]).
@@ -158,9 +172,13 @@ pub(super) struct Replaced {
     pub(super) finished: Option<ProgressUpdate>,
     /// Last reliable old-stream position; none without a supervisor.
     pub(super) position: Option<Duration>,
-    /// Finished was written, or its tries ran out (logged as lost); only removing the Handoff
-    /// from the store remains, so a replacement writes no Progress for it.
+    /// Finished was written, or its tries ran out (logged as lost), or Takeover's final Progress
+    /// was attempted; only removing the Handoff from the store remains, so a replacement writes
+    /// no Progress for it.
     pub(super) finish_settled: bool,
+    /// A healthy topology read showed the Group regrouped: Takeover, even if the old stream is
+    /// still loaded, stopped.
+    pub(super) regrouped: bool,
     /// What the supervisor last saw of the Group; none without a supervisor.
     last: Option<Seen>,
 }
@@ -281,6 +299,8 @@ impl<S: Store> Supervisors<S> {
             ending: None,
             last: seen,
             position,
+            regrouped: false,
+            finalized: false,
         }));
         let mut events = self.events.clone();
         events.mark_unchanged();
@@ -347,7 +367,8 @@ impl<S: Store> Supervisors<S> {
             length: known.length,
             finished,
             position: Some(known.position),
-            finish_settled: matches!(known.ending, Some(Ending::Store)),
+            finish_settled: known.finalized || matches!(known.ending, Some(Ending::Store)),
+            regrouped: known.regrouped,
             last: Some(known.last),
         }
     }
@@ -650,6 +671,9 @@ impl<S: Store> Supervisor<S> {
     /// Reads topology before the turn, then reconciles current playback under the turn.
     /// Notification payloads never identify which Handoff ends; stale snapshots are harmless.
     async fn event(&self, cadence: bool) -> ControlFlow<(), (bool, Then)> {
+        if self.known().finalized {
+            return self.end_takeover().await;
+        }
         let group = &self.handoff.group;
         let due = cadence && self.known().last.playing.is_some();
         // Topology and identity checks do not hold the Group's turn.
@@ -675,13 +699,23 @@ impl<S: Store> Supervisor<S> {
                         .iter()
                         .any(|member| !self.members.contains(&member.id))
             });
+        // Confirmed before any await, so a replacement winning the turn honors it.
+        let regrouped = {
+            let mut known = self.known();
+            known.regrouped |= regrouped;
+            known.regrouped
+        };
         let Some(before) = self.active().await? else {
             self.skipped(due, "storage failed");
             return Continue((true, Then::Wait));
         };
-        let needs_check = (cadence && self.known().last.playing.is_some())
-            || regrouped
-            || matches!(self.known().ending, Some(Ending::Finish { .. }));
+        // A pending Finished is retried at cadence ticks only, never on unrelated hints;
+        // confirmed Takeover still makes its final attempt.
+        let needs_check = regrouped
+            || cadence && {
+                let known = self.known();
+                known.last.playing.is_some() || matches!(known.ending, Some(Ending::Finish { .. }))
+            };
         let mut checked = if needs_check {
             Some(
                 self.controls
@@ -699,9 +733,12 @@ impl<S: Store> Supervisor<S> {
             return Continue((true, Then::Wait));
         };
         let mut held = Some(turn);
-        let mut changed_source = playback.as_ref().is_some_and(|playback| {
-            playback.uri.is_some() && !plays_stream(playback, &self.stream)
-        });
+        let foreign = |playback: &Option<sonos::Playback>| {
+            playback
+                .as_ref()
+                .is_some_and(|playback| foreign_source(playback, &self.stream))
+        };
+        let mut changed_source = foreign(&playback);
         if changed_source && checked.is_none() {
             // A source hint that really changed needs a key check, but never while holding
             // the turn. Re-read playback after reacquiring it: a control may have restored it.
@@ -724,9 +761,7 @@ impl<S: Store> Supervisor<S> {
             found = current;
             at = current_at;
             playback = current_playback;
-            changed_source = playback.as_ref().is_some_and(|playback| {
-                playback.uri.is_some() && !plays_stream(playback, &self.stream)
-            });
+            changed_source = foreign(&playback);
         }
         if !regrouped && !changed_source {
             let Some(playback) = playback else {
@@ -755,7 +790,7 @@ impl<S: Store> Supervisor<S> {
         if !matches!(ending, Some(Ending::Store)) {
             let update = match ending {
                 Some(Ending::Finish { update, .. }) => update,
-                None => ProgressUpdate::at(position.as_secs_f64(), length),
+                None => ProgressUpdate::at(position.as_secs_f64(), length).never_finished(),
                 Some(Ending::Store) => unreachable!(),
             };
             if let Some(acting) = checked {
@@ -776,10 +811,17 @@ impl<S: Store> Supervisor<S> {
                 }
             }
         }
+        self.known().finalized = true;
         let _held = held;
-        match self.controls.store.end_handoff(&found.stream).await {
+        self.end_takeover().await
+    }
+
+    /// Removes this exact stream's Handoff once Takeover's final Progress was attempted; a
+    /// storage failure is retried by the next reconciliation, without reading or writing again.
+    async fn end_takeover(&self) -> ControlFlow<(), (bool, Then)> {
+        match self.controls.store.end_handoff(&self.stream).await {
             Ok(_) => {
-                tracing::info!(group, "Handoff ended by Takeover");
+                tracing::info!(group = self.handoff.group, "Handoff ended by Takeover");
                 Break(())
             }
             Err(error) => {
@@ -863,7 +905,7 @@ impl<S: Store> Supervisor<S> {
             return Continue(Visit::Next(Then::Wait));
         };
         if !plays_stream(&playback, &self.stream) {
-            if playback.uri.is_some() {
+            if foreign_source(&playback, &self.stream) {
                 tracing::warn!(
                     group,
                     "a supervision read found a foreign source; reconciling Takeover"

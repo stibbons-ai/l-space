@@ -574,7 +574,23 @@ async fn a_group_without_a_handoff_or_playing_something_else_is_not_controlled()
     .await;
     assert_eq!(setup.progress(&setup.alice, &episode).await, Some(60.0));
 
-    // A Group the stream of another Group's Handoff plays on is not that Handoff's.
+    // A Group playing the stream of another Group's Handoff is not playing its own: Kitchen's
+    // Handoff stays active, with no notification to end it, while every control is refused,
+    // nothing is sent to Kitchen and nothing written. Notifications are held from before
+    // that Handoff starts; once its supervisor's first reconciliation read Kitchen, only its
+    // 30-second cadence would wake it.
+    setup.household.drop_notifications(true);
+    let episode = setup.episode(2);
+    let read = "AVTransport#GetTransportInfo";
+    let reads = setup.asked(&setup.kitchen, read);
+    setup.start(&episode, &setup.kitchen).await;
+    setup
+        .wait_until_asked(&setup.kitchen, read, reads, seconds(10))
+        .await;
+    setup.clock.advance(seconds(60));
+    api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
+    api.resume_group(&setup.bobs, setup.kitchen.uuid()).await;
+    setup.set_progress(&setup.alice, &episode, 25.0).await;
     let other = setup.start(&setup.episode(1), &setup.office).await;
     let office_stream = setup.household.uri(&setup.office).unwrap();
     setup.household.play(
@@ -584,11 +600,28 @@ async fn a_group_without_a_handoff_or_playing_something_else_is_not_controlled()
             ..FakeTrack::new("Episode 2", seconds(900))
         },
     );
-    assert_eq!(
-        api.control_error(&setup.bobs, setup.kitchen.uuid(), GroupControl::Pause)
-            .await,
-        NO_HANDOFF
-    );
+    let before = setup.playback_controls(&setup.kitchen);
+    for control in HANDOFF_CONTROLS {
+        assert_eq!(
+            api.control_error(&setup.bobs, setup.kitchen.uuid(), control)
+                .await,
+            NO_HANDOFF,
+            "{control:?}"
+        );
+    }
+    assert_eq!(setup.playback_controls(&setup.kitchen), before);
+    assert_eq!(api.handoffs(&setup.bobs).await.len(), 2);
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(25.0));
+    // Released, the notification ends Kitchen's Handoff with its last reliable position.
+    setup.household.drop_notifications(false);
+    setup.household.notify();
+    eventually(
+        "the taken-over Handoff stayed active",
+        seconds(10),
+        async || api.handoffs(&setup.bobs).await.len() == 1,
+    )
+    .await;
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(60.0));
     assert_eq!(other.group, setup.office.uuid());
     assert_eq!(api.handoffs(&setup.bobs).await, [other]);
 }
@@ -1392,10 +1425,19 @@ async fn a_forward_skip_acts_only_if_the_group_still_plays_the_handoff_after_the
     let setup = setup_on(Arc::clone(&abs), &forwarder.url()).await;
     let api = setup.bridge.api();
     let episode = setup.episode(0);
+    // Notifications are held until released below; once the supervisor's first
+    // reconciliation read Kitchen, only its 30-second cadence would wake it.
+    setup.household.drop_notifications(true);
+    let read = "AVTransport#GetTransportInfo";
+    let reads = setup.asked(&setup.kitchen, read);
     setup.start(&episode, &setup.kitchen).await;
+    setup
+        .wait_until_asked(&setup.kitchen, read, reads, seconds(10))
+        .await;
     setup.clock.advance(seconds(60));
     // Establish a reliable final position independent of initial snapshot timing.
     api.pause_group(&setup.bobs, setup.kitchen.uuid()).await;
+    setup.set_progress(&setup.alice, &episode, 25.0).await;
     // A slow Library Server: the Group changes while the Bridge waits for the Item's length.
     // Each skip on fresh connections, so none reuses one already through the delay.
     let skip_while = async |change: &dyn Fn()| {
@@ -1431,8 +1473,13 @@ async fn a_forward_skip_acts_only_if_the_group_still_plays_the_handoff_after_the
     };
     assert_eq!(skip_while(&radio).await, NO_HANDOFF);
 
-    // Neither was skipped; event reconciliation independently ends the taken-over Handoff.
+    // Neither was skipped, nothing written, and the Handoff is still active: refusing the
+    // control ended nothing. Released, the notification ends the taken-over Handoff.
     assert_eq!(setup.playback_controls(&setup.kitchen), before);
+    assert_eq!(api.handoffs(&setup.bobs).await.len(), 1);
+    assert_eq!(setup.progress(&setup.alice, &episode).await, Some(25.0));
+    setup.household.drop_notifications(false);
+    setup.household.notify();
     eventually(
         "the taken-over Handoff stayed active",
         seconds(10),

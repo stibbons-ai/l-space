@@ -316,6 +316,9 @@ pub struct ProgressUpdate {
     finished: bool,
     /// Whether an unfinished write clears Finished first.
     over_finished: bool,
+    /// Whether Audiobookshelf must not mark an unfinished write Finished itself, even at or
+    /// past the Item's length.
+    never_finished: bool,
 }
 
 impl ProgressUpdate {
@@ -327,6 +330,7 @@ impl ProgressUpdate {
             duration,
             finished: false,
             over_finished: false,
+            never_finished: false,
         }
     }
 
@@ -338,7 +342,18 @@ impl ProgressUpdate {
             duration: Some(length),
             finished: true,
             over_finished: false,
+            never_finished: false,
         })
+    }
+
+    /// Unfinished, this write is never marked Finished by Audiobookshelf itself
+    /// ([`Client::set_progress`]), even at or past the Item's length: for a position where no
+    /// natural end was seen. Finished, it is left as it is.
+    pub fn never_finished(self) -> Self {
+        Self {
+            never_finished: !self.finished,
+            ..self
+        }
     }
 
     /// This write over Progress Audiobookshelf holds Finished: unfinished, it clears Finished
@@ -685,7 +700,10 @@ impl Client {
     /// they already have leaves it unfinished, also a Finished one, unless Finished is sent or
     /// `currentTime` lies past the Item's length as Audiobookshelf then holds it (it marks it
     /// Finished itself then); without the `markAsFinishedTimeRemaining` above it would also
-    /// mark it Finished when under 10 seconds of a known length remain. A write that leaves
+    /// mark it Finished when under 10 seconds of a known length remain. A
+    /// [`ProgressUpdate::never_finished`] write also sends `"markAsFinishedPercentComplete":
+    /// 100`: Audiobookshelf then marks it Finished only when its progress, capped at 1, exceeds
+    /// 1, so never, wherever `currentTime` lies. A write that leaves
     /// `currentTime` as it was leaves Finished as it was: hence the first PATCH over Progress
     /// held Finished. `"isFinished": false` sets a Finished one back to 0 and drops a
     /// `currentTime` sent with it, so it goes in a PATCH of its own; over unfinished Progress
@@ -718,6 +736,8 @@ impl Client {
             is_finished: Option<bool>,
             #[serde(skip_serializing_if = "Option::is_none")]
             mark_as_finished_time_remaining: Option<u8>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            mark_as_finished_percent_complete: Option<u8>,
         }
         let not_written = |error| ProgressError {
             error,
@@ -729,6 +749,7 @@ impl Client {
             duration,
             finished,
             over_finished,
+            never_finished,
         } = update;
         if over_finished {
             let request = self.http.patch(url.clone()).json(&ClearFinished {
@@ -746,6 +767,7 @@ impl Client {
             progress: duration.map(|duration| (current_time / duration).clamp(0.0, 1.0)),
             is_finished: finished.then_some(true),
             mark_as_finished_time_remaining: (!finished).then_some(0),
+            mark_as_finished_percent_complete: never_finished.then_some(100),
         });
         self.send(request, api_key, Names::One)
             .await

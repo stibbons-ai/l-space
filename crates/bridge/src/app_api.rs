@@ -1610,14 +1610,17 @@ impl<S: Store> Controls<S> {
         }
         .await;
         controlled.map(|playback| {
+            // A successful seek's target is where the Group is, even stopped; a stopped read
+            // is not.
             let position = playback
                 .position
                 .filter(|_| reliable)
                 .filter(|_| {
-                    matches!(
-                        playback.state,
-                        TransportState::Playing | TransportState::Paused
-                    )
+                    matches!(control, Control::Skip(_))
+                        || matches!(
+                            playback.state,
+                            TransportState::Playing | TransportState::Paused
+                        )
                 })
                 .and_then(|position| Duration::try_from_secs_f64(position).ok());
             (playback, position)
@@ -1818,21 +1821,23 @@ impl<S: Store> Controls<S> {
     /// reading the Group, checking the key (on that stream also the Item's length, if neither
     /// the Group nor its supervisor (`known`) tells it), writing. Nothing is written once the
     /// supervisor's Finished is settled (written, or its tries ran out and it was logged as
-    /// lost). A Group playing or paused on that stream supplies its current position; a
-    /// stopped one may tell 0 there. A Group on any other source (a positive foreign URI)
-    /// gets the supervisor's pending Finished or cached reliable old-stream position instead,
+    /// lost) or its Takeover's final Progress was attempted. A Group playing or paused on that
+    /// stream supplies its current position; a stopped one may tell 0 there. A Group on any
+    /// other source ([`foreign_source`]), or one whose regroup the supervisor confirmed and
+    /// that is stopped short on that stream, gets the supervisor's pending Finished or cached
+    /// reliable old-stream position instead (never marked Finished by Audiobookshelf itself),
     /// never the foreign source's. A Group stopped on that stream after playing to the end of
     /// the Item gets Progress at the end written Finished: the supervisor's pending Finished
     /// write, or, when it hadn't found the Group stopped yet, one by the supervisor's rule on
     /// what it last saw of the Group ([`supervise::Replaced::finished_at_stop`], timed on
     /// `clock`). A Group stopped there short of the end, or not read often enough near it to
-    /// tell, gets nothing written. With no `time` at all, nothing is tried. Anything else, a
-    /// failure or running out of time is logged and otherwise left alone. A Finished write
-    /// left unmade is logged as an error when the write doesn't land or the key is revoked
-    /// instead; a pending one (`known.finished`) also when there is no `time`, the Group
-    /// doesn't tell what it plays, or it tells no position playing or paused on that stream; a
-    /// Group playing or paused on that stream, telling a position, gets that position written
-    /// instead, with no such error.
+    /// tell, gets nothing written, unless regrouped. With no `time` at all, nothing is tried.
+    /// Anything else, a failure or running out of time is logged and otherwise left alone. A
+    /// Finished write left unmade is logged as an error when the write doesn't land or the
+    /// key is revoked instead; a pending one (`known.finished`) also when there is no `time`,
+    /// the Group doesn't tell what it plays, or it tells no position playing or paused on that
+    /// stream; a Group playing or paused on that stream, telling a position, gets that
+    /// position written instead, with no such error.
     async fn write_replaced(
         &self,
         group: &str,
@@ -1879,13 +1884,21 @@ impl<S: Store> Controls<S> {
             return;
         };
         let on_stream = plays_stream(&playback, &replaced.stream);
-        if !on_stream && playback.uri.is_some() {
-            // A replacement can hold the turn while Takeover checks identity. It owns the
-            // displaced Handoff's final write before stopping that supervisor.
+        let stopped = on_stream && playback.state == sonos::TransportState::Stopped;
+        let finished = stopped
+            .then(|| known.finished_at_stop(at, told_length(&playback)))
+            .flatten();
+        // Takeover evidence: a foreign source, or a regroup confirmed for this exact stream
+        // that left it loaded, stopped short. A replacement can hold the turn while Takeover
+        // checks identity; it owns the displaced Handoff's final write before stopping that
+        // supervisor.
+        if foreign_source(&playback, &replaced.stream)
+            || (known.regrouped && stopped && finished.is_none())
+        {
             let update = known.finished.or_else(|| {
-                known
-                    .position
-                    .map(|position| abs::ProgressUpdate::at(position.as_secs_f64(), known.length))
+                known.position.map(|position| {
+                    abs::ProgressUpdate::at(position.as_secs_f64(), known.length).never_finished()
+                })
             });
             let Some(update) = update else {
                 tracing::info!(
@@ -1896,7 +1909,7 @@ impl<S: Store> Controls<S> {
                 return;
             };
             let checked = self.check(&replaced.active, Wanted::No, &mut time).await;
-            let cause = "replaced on a foreign source";
+            let cause = "replaced after Takeover";
             let wrote = self
                 .write_progress(&replaced.active, checked.acting, update, cause, &mut time)
                 .await;
@@ -1907,8 +1920,8 @@ impl<S: Store> Controls<S> {
             }
             return;
         }
-        if on_stream && playback.state == sonos::TransportState::Stopped {
-            let Some(update) = known.finished_at_stop(at, told_length(&playback)) else {
+        if stopped {
+            let Some(update) = finished else {
                 tracing::info!(
                     group,
                     user_id = handoff.started_by.user_id,
@@ -1931,13 +1944,7 @@ impl<S: Store> Controls<S> {
             }
             return;
         }
-        let position = playback.position.filter(|_| {
-            on_stream
-                && matches!(
-                    playback.state,
-                    sonos::TransportState::Playing | sonos::TransportState::Paused
-                )
-        });
+        let position = supervise::reliable_position(&playback).filter(|_| on_stream);
         let Some(position) = position else {
             tracing::info!(
                 group,
@@ -2402,6 +2409,14 @@ fn ensure_plays(
 fn plays_stream(playback: &sonos::Playback, stream: &store::StreamId) -> bool {
     let played = playback.uri.as_deref().and_then(stream::stream_in_url);
     played.is_some_and(|played| played == *stream)
+}
+
+/// Positive evidence that the Group selected a source other than `stream`: its track's URL,
+/// else, with no track told, its selected source ([`sonos::Playback::source`]). Takeover
+/// evidence only, never a position or a control's authorization.
+fn foreign_source(playback: &sonos::Playback, stream: &store::StreamId) -> bool {
+    let uri = playback.uri.as_deref().or(playback.source.as_deref());
+    uri.is_some_and(|uri| stream::stream_in_url(uri) != Some(*stream))
 }
 
 /// `base_url` (already normalized), if it is one of `library_servers`'.

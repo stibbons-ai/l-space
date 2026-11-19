@@ -1,9 +1,9 @@
 //! A fake Sonos household for tests (PRD "Testing Decisions"): players on loopback that answer
 //! SSDP M-SEARCH and serve their device description and the UPnP subset the Bridge uses
 //! (ZoneGroupTopology `GetZoneGroupState`; AVTransport `GetTransportInfo`, `GetPositionInfo`,
-//! `SetAVTransportURI`, `Play`, `Pause` and `Seek`; GroupRenderingControl `GetGroupVolume`,
-//! `SnapshotGroupVolume` and `SetGroupVolume`), with Groups, playback, volume and faults the
-//! test controls.
+//! `GetMediaInfo`, `SetAVTransportURI`, `Play`, `Pause` and `Seek`; GroupRenderingControl
+//! `GetGroupVolume`, `SnapshotGroupVolume` and `SetGroupVolume`), with Groups, playback,
+//! volume and faults the test controls.
 //!
 //! A Group told to play a URL (`SetAVTransportURI`, then `Play`) plays it like a speaker: its
 //! transport is Playing, its position moves on the clock, `GetPositionInfo` reports the URL,
@@ -228,6 +228,9 @@ pub enum Fault {
     SlowTransport(Duration),
     /// It answers `GetGroupVolume` with a SOAP fault, and everything else correctly.
     FailGroupVolume,
+    /// It answers `GetZoneGroupState` with no Group at all, as a valid answer, and everything
+    /// else correctly.
+    EmptyTopology,
 }
 
 /// A fake Sonos household; dropping it stops every player.
@@ -299,9 +302,18 @@ struct Transport {
     offset: Duration,
     /// When playback last started, while it is playing.
     since: Option<Instant>,
+    /// A source selected without a track ([`Household::select_source`]): `GetMediaInfo`
+    /// tells it as `CurrentURI` while `GetPositionInfo` tells no `TrackURI`.
+    source: Option<String>,
 }
 
 impl Transport {
+    /// The selected source, as `GetMediaInfo` tells it (`CurrentURI`): the track's URL, if any.
+    fn current_uri(&self) -> &str {
+        let track = self.track.as_ref().map(|track| track.uri.as_str());
+        self.source.as_deref().or(track).unwrap_or_default()
+    }
+
     fn position(&self, now: Instant) -> Duration {
         let moved = self
             .since
@@ -452,6 +464,7 @@ impl Household {
                     track: None,
                     offset: Duration::ZERO,
                     since: None,
+                    source: None,
                 },
                 volume: DEFAULT_VOLUME,
                 fault: Fault::None,
@@ -522,6 +535,7 @@ impl Household {
             track: Some(track),
             offset: Duration::ZERO,
             since: Some(now),
+            source: None,
         };
         drop(state);
         self.changed();
@@ -545,6 +559,20 @@ impl Household {
         transport.since = None;
         transport.state = "STOPPED";
         drop(state);
+        self.changed();
+    }
+
+    /// `coordinator`'s Group selects `uri` as its source with no track, as for a line-in or TV
+    /// input: Playing, `GetMediaInfo` telling `uri` as `CurrentURI`, `GetPositionInfo` no
+    /// `TrackURI`.
+    pub fn select_source(&self, coordinator: &PlayerId, uri: &str) {
+        self.shared.lock().coordinator_mut(coordinator).transport = Transport {
+            state: "PLAYING",
+            track: None,
+            offset: Duration::ZERO,
+            since: None,
+            source: Some(uri.to_owned()),
+        };
         self.changed();
     }
 
@@ -617,12 +645,6 @@ impl Household {
     /// Set the same manual clock as a Bridge following that hook, before subscribing.
     pub fn set_event_clock(&self, clock: Arc<dyn Clock>) {
         self.shared.events.lock().clock = clock;
-    }
-
-    /// Seconds granted to new and renewed GENA subscriptions, 60 unless set. Set before
-    /// subscribing for it to apply to a Bridge's first leases.
-    pub fn set_event_timeout(&self, seconds: u32) {
-        self.shared.events.lock().timeout = seconds;
     }
 
     /// Whether new and renewed subscriptions fail (existing leases keep delivering).
@@ -915,6 +937,7 @@ impl HouseholdState {
                     }),
                     offset: Duration::ZERO,
                     since: None,
+                    source: None,
                 };
             }
             "Play" => {
@@ -1226,7 +1249,8 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             | Fault::HangSeek
             | Fault::RefuseSeekSlowPause(_)
             | Fault::FailGroupVolume
-            | Fault::SlowTransport(_),
+            | Fault::SlowTransport(_)
+            | Fault::EmptyTopology,
         ) => false,
         // Removed from the household: as good as unplugged.
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1241,10 +1265,14 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
         player.transport.settle(now);
     }
     let arguments: Vec<(&str, String)> = match (urn, action) {
+        (TOPOLOGY, "GetZoneGroupState") if fault == Some(Fault::EmptyTopology) => vec![(
+            "ZoneGroupState",
+            "<ZoneGroupState><ZoneGroups></ZoneGroups></ZoneGroupState>".to_owned(),
+        )],
         (TOPOLOGY, "GetZoneGroupState") => {
             vec![("ZoneGroupState", state.zone_group_state())]
         }
-        (AV_TRANSPORT, "GetTransportInfo") | (AV_TRANSPORT, "GetPositionInfo") => {
+        (AV_TRANSPORT, "GetTransportInfo" | "GetPositionInfo" | "GetMediaInfo") => {
             let Some(transport) = state
                 .find(&served.uuid)
                 .and_then(|player| state.find(&player.group))
@@ -1252,7 +1280,9 @@ async fn control(State(served): State<Served>, headers: HeaderMap, request: Stri
             else {
                 return invalid_action();
             };
-            if action == "GetTransportInfo" {
+            if action == "GetMediaInfo" {
+                vec![("CurrentURI", transport.current_uri().to_owned())]
+            } else if action == "GetTransportInfo" {
                 let mut arguments = vec![
                     ("CurrentTransportStatus", "OK".to_owned()),
                     ("CurrentSpeed", "1".to_owned()),
