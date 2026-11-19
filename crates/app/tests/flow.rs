@@ -4665,6 +4665,21 @@ fn a_local_speed_is_kept_per_podcast_and_audiobook_library_on_its_library_server
             Speed::X1_25
         );
         app.stop_local().await;
+
+        // Back to 1.0× for the podcast, kept across a launch; its audiobook Library keeps 2.0×.
+        app.switch_to(abs.base_url()).await;
+        assert_eq!(plays_at(&mut app, &seeded.episode(0)).await, Speed::X1_5);
+        app.set_local_speed(Speed::Normal).await;
+        app.stop_local().await;
+        drop((app, player));
+        let Phone {
+            mut app, player, ..
+        } = device.launch_playing(&clock).await;
+        assert_on_home(&app);
+        assert_eq!(plays_at(&mut app, &seeded.episode(2)).await, Speed::Normal);
+        assert_eq!(player.speed(), Speed::Normal);
+        assert_eq!(plays_at(&mut app, &book(&twins.books[0])).await, Speed::X2);
+        app.stop_local().await;
         drop((app, player));
 
         // As an App from before speeds left the file.
