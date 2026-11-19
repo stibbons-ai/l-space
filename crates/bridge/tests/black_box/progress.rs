@@ -52,13 +52,25 @@ struct Setup {
 async fn setup() -> Setup {
     let abs = Audiobookshelf::shared();
     let url = abs.base_url().to_owned();
-    setup_on(abs, &url).await
+    setup_on(abs, &url, None).await
 }
 
-/// As [`setup`], with the Library Server at `url` (a proxy in front of `abs`).
-async fn setup_on(abs: Arc<Audiobookshelf>, url: &str) -> Setup {
+/// As [`setup`], with every GENA subscription granted for `seconds`, so none is renewed or
+/// expires before half of that has passed.
+async fn setup_granting(seconds: u32) -> Setup {
+    let abs = Audiobookshelf::shared();
+    let url = abs.base_url().to_owned();
+    setup_on(abs, &url, Some(seconds)).await
+}
+
+/// As [`setup`], with the Library Server at `url` (a proxy in front of `abs`), and the
+/// household's GENA grant if given.
+async fn setup_on(abs: Arc<Audiobookshelf>, url: &str, grant: Option<u32>) -> Setup {
     let (household, clock) = Household::with_manual_clock();
     household.set_event_clock(Arc::new(clock.clone()));
+    if let Some(seconds) = grant {
+        household.set_event_timeout(seconds);
+    }
     let kitchen = household.add_player("Kitchen");
     let office = household.add_player("Office");
     let config = format!(
@@ -88,7 +100,7 @@ async fn setup_on(abs: Arc<Audiobookshelf>, url: &str) -> Setup {
 async fn setup_with_proxy() -> (LibraryProxy, Setup) {
     let abs = Audiobookshelf::shared();
     let proxy = LibraryProxy::to(abs.base_url()).await;
-    let setup = setup_on(abs, &proxy.url()).await;
+    let setup = setup_on(abs, &proxy.url(), None).await;
     (proxy, setup)
 }
 
@@ -1212,7 +1224,11 @@ async fn a_group_resumed_paused_and_stopped_during_a_finished_retry_is_not_finis
 
 #[tokio::test]
 async fn a_group_that_cant_be_read_past_its_end_is_read_at_a_bounded_rate() {
-    let setup = setup().await;
+    // Leases outlast the counted window, so no renewal, expiry or fresh lease's snapshot wakes
+    // the Bridge into an extra read: renewals are due only at 1800 seconds.
+    let setup = setup_granting(3600).await;
+    let leases = async || setup.household.subscriptions().len() == 4;
+    eventually("Kitchen and Office never subscribed", WITHIN, leases).await;
     let episode = setup.episode(0);
     setup.start(&setup.alices, &episode, None).await;
     setup.advance(590).await;

@@ -619,6 +619,12 @@ impl Household {
         self.shared.events.lock().clock = clock;
     }
 
+    /// Seconds granted to new and renewed GENA subscriptions, 60 unless set. Set before
+    /// subscribing for it to apply to a Bridge's first leases.
+    pub fn set_event_timeout(&self, seconds: u32) {
+        self.shared.events.lock().timeout = seconds;
+    }
+
     /// Whether new and renewed subscriptions fail (existing leases keep delivering).
     pub fn reject_subscriptions(&self, reject: bool) {
         self.shared.events.lock().reject = reject;
