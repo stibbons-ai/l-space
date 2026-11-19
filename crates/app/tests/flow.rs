@@ -5644,3 +5644,33 @@ fn a_replaced_session_ends_only_after_an_end_on_its_way() {
         assert!(!app.local_halted());
     });
 }
+
+#[test]
+fn a_multi_file_book_offers_its_group_but_not_the_phone_and_leaves_the_episode_playing() {
+    let (bridge, abs, _) = bridge_with_abs();
+    let device = Device::new();
+    let clock = ManualClock::new();
+    run(async || {
+        let user = abs.new_user().await;
+        let Phone {
+            mut app, player, ..
+        } = on_episode_with_player(&device, &bridge, abs.base_url(), &user, &clock, &abs, 1).await;
+        app.play_on_phone().await;
+        let playing = app.local_status();
+        assert!(playing.is_some());
+        assert!(player.media().is_some());
+
+        app.open_item(ItemId {
+            library_item: abs.seeded().long_book.clone(),
+            episode: None,
+        })
+        .await;
+        assert!(app.can_play_on());
+        assert!(!app.can_play_on_phone());
+        // Even asked directly, the episode is not ended for a book the phone can't play.
+        app.play_on_phone().await;
+        assert_eq!(app.screen().notice(), None);
+        assert!(app.local_status().is_some());
+        assert!(player.media().is_some());
+    });
+}
