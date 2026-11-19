@@ -182,9 +182,12 @@ pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn 
                 due.entry((addr, path)).or_insert(Some(now));
             }
         }
-        // Renew the earliest expiring leases first. At the limit, a lease whose renewal is due
-        // cancels one attempt without a lease or for a later-expiring one; an attempt for an
-        // earlier-expiring lease is never cancelled and can delay it by one request timeout.
+        // Renew the earliest expiring live leases first. At the limit, a live lease whose
+        // renewal is due cancels one attempt without a live lease (never granted, or expired,
+        // also while running) or for a later-expiring one; an attempt for an earlier-expiring
+        // live lease is never cancelled and can delay it by one request timeout. Only a live
+        // lease renews by SID ([`subscribe`]), so only it keeps renewal priority.
+        let live = |expires: Option<Instant>| expires.filter(|expires| *expires > now);
         ready.clear();
         {
             let subscriptions = shared
@@ -198,7 +201,7 @@ pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn 
                         at.is_some_and(|at| at <= now) && !running.contains_key(*key)
                     })
                     .map(|(key, at)| {
-                        let expires = subscriptions.get(key).and_then(|lease| lease.expires);
+                        let expires = live(subscriptions.get(key).and_then(|lease| lease.expires));
                         (expires.is_none(), expires, at.expect("due deadline"), *key)
                     }),
             );
@@ -208,6 +211,7 @@ pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn 
             && let Some((false, Some(expires), _, _)) = ready.first()
             && let Some((handle, _)) = running
                 .values()
+                .map(|(handle, deadline)| (handle, live(*deadline)))
                 .filter(|(_, deadline)| deadline.is_none_or(|deadline| deadline > *expires))
                 .max_by_key(|(_, deadline)| (deadline.is_none(), *deadline))
         {
@@ -222,11 +226,13 @@ pub(super) async fn run(shared: Arc<Shared>, listen: SocketAddr, clock: Arc<dyn 
             });
             running.insert(key, (handle, expires));
         }
+        // A running attempt whose lease lapses becomes preemptible: wake for that too.
         let next = due
             .iter()
             .filter(|(key, _)| !running.contains_key(*key))
             .filter_map(|(_, at)| *at)
             .filter(|at| attempts.len() < MAX_ATTEMPTS || *at > now)
+            .chain(running.values().filter_map(|(_, deadline)| live(*deadline)))
             .min()
             .unwrap_or(now + RETRY);
         tokio::select! {
@@ -370,22 +376,27 @@ async fn subscribe(
             renew.map(|at| at.max(clock.now() + Duration::from_millis(100)))
         }
         Err(reason) => {
-            // Only a publisher's invalid-SID response revokes a still-valid lease.
-            // Transient failures keep accepting callbacks and retry at RETRY.
+            // Only a publisher's invalid-SID response revokes a still-valid lease. Transient
+            // failures keep accepting callbacks and retry within what is left of the lease (at
+            // most RETRY), so one prompt failure cannot expire it; without one, at RETRY.
             let mut subscriptions = shared
                 .events
                 .subscriptions
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            let now = clock.now();
             let expired = subscriptions
                 .get(&(addr, path))
-                .is_some_and(|lease| lease.expires.is_some_and(|expiry| expiry <= clock.now()));
+                .is_some_and(|lease| lease.expires.is_some_and(|expiry| expiry <= now));
             let dropped = invalid_sid || expired;
             if dropped {
                 subscriptions.remove(&(addr, path));
             }
-            let retained = subscriptions.contains_key(&(addr, path));
-            let lease = if retained { "retained" } else { "absent" };
+            let held = subscriptions.get(&(addr, path));
+            let lease = if held.is_some() { "retained" } else { "absent" };
+            let retry = held
+                .and_then(|lease| lease.expires)
+                .map_or(RETRY, |expiry| RETRY.min((expiry - now) / 2));
             let reason = if invalid_sid {
                 "invalid SID"
             } else if expired {
@@ -402,7 +413,7 @@ async fn subscribe(
                 reason,
                 "Sonos subscription failed; retrying"
             );
-            Some(clock.now() + RETRY)
+            Some(now + retry)
         }
     }
 }
