@@ -1844,17 +1844,13 @@ impl<S: Store> Controls<S> {
                 group_time.0 = group_time.0.saturating_sub(started.elapsed());
                 if freeze && sought != Err(sonos::Error::SeekMayHaveMoved) {
                     let resumed = group_time.spend(self.sonos.resume(group)).await;
-                    // Moved but not confirmed playing again: as uncertain as a failed seek. A
-                    // refusal before selecting stays where it was, paused unless resumed.
-                    if sought.is_ok() && resumed != Some(Ok(())) {
-                        tracing::warn!(
-                            group,
-                            ?resumed,
-                            "a Group did not play on after a file seek"
-                        );
-                        Err(sonos::Error::SeekMayHaveMoved)
-                    } else {
-                        sought
+                    // A confirmed seek left the Group paused at its target: certain, so the
+                    // Handoff stays and supervision records what it does, but the skip fails
+                    // and writes nothing. A refusal before selecting stays where it was.
+                    match (sought, resumed) {
+                        (Ok(()), None) => Err(sonos::Error::GroupFailed),
+                        (Ok(()), Some(resumed)) => resumed,
+                        (sought, _) => sought,
                     }
                 } else {
                     sought

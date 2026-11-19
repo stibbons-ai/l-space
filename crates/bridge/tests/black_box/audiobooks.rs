@@ -1162,9 +1162,10 @@ async fn short_files(
 
 #[tokio::test]
 async fn a_playing_skip_keeps_its_file_while_a_short_one_would_end() {
+    // Held across the fixture: dropping the last shared handle would stop its container.
+    let abs = Audiobookshelf::shared();
     let (household, clock, kitchen, bridge, _proxy, user, session) =
         short_files([25, 10, 120]).await;
-    let abs = Audiobookshelf::shared();
     let book = ItemId {
         library_item: abs.seeded().long_book.clone(),
         episode: None,
@@ -1237,13 +1238,14 @@ async fn a_refused_file_selection_while_playing_plays_on_where_it_was() {
 }
 
 #[tokio::test]
-async fn a_file_seek_that_does_not_play_on_ends_its_handoff_without_progress() {
+async fn a_file_seek_whose_play_is_refused_keeps_its_handoff_paused_at_its_target() {
     let setup = setup().await;
     setup.start(Some(3005.0)).await;
     setup
         .household
         .set_fault(&setup.kitchen, sonos_fake::Fault::RefusePlay);
     let api = setup.bridge.api();
+    let before = api.handoffs(&setup.bobs).await;
     assert_eq!(
         api.control_error(
             &setup.bobs,
@@ -1253,15 +1255,57 @@ async fn a_file_seek_that_does_not_play_on_ends_its_handoff_without_progress() {
         .await,
         (StatusCode::BAD_GATEWAY, ApiError::GroupFailed)
     );
-    // At its target, but paused, untrusted: the Handoff ends and nothing is written.
+    // At its confirmed target, paused: the Handoff stays, the skip itself writes nothing.
     assert_eq!(setup.track(), (Some(2), seconds(590)));
     assert_eq!(
         setup.household.transport_state(&setup.kitchen),
         "PAUSED_PLAYBACK"
     );
-    assert_eq!(api.handoffs(&setup.bobs).await, []);
-    setup.advance(31).await;
+    assert_eq!(api.handoffs(&setup.bobs).await, before);
     assert_eq!(setup.progress().await, Some((3005.0, false)));
+    // Supervision writes nothing for a paused Group; the listener plays on from the target.
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::None);
+    setup.advance_and_read(31).await;
+    assert_eq!(setup.progress().await, Some((3005.0, false)));
+    api.resume_group(&setup.bobs, setup.kitchen.uuid()).await;
+    setup.advance(30).await;
+    setup.wait_for_progress((3020.0, false)).await;
+    assert_eq!(setup.track(), (Some(2), seconds(620)));
+}
+
+#[tokio::test]
+async fn a_file_seek_whose_play_is_not_confirmed_in_time_keeps_its_handoff() {
+    let setup = setup().await;
+    setup.start(Some(3005.0)).await;
+    // Read, Pause, TRACK_NR and REL_TIME fit the control deadline; Play doesn't.
+    setup.household.set_fault(
+        &setup.kitchen,
+        sonos_fake::Fault::SlowTransport(Duration::from_millis(880)),
+    );
+    let api = setup.bridge.api();
+    let before = api.handoffs(&setup.bobs).await;
+    assert_eq!(
+        api.control_error(
+            &setup.bobs,
+            setup.kitchen.uuid(),
+            GroupControl::Skip(Skip::Back15)
+        )
+        .await,
+        (StatusCode::BAD_GATEWAY, ApiError::GroupFailed)
+    );
+    assert_eq!(api.handoffs(&setup.bobs).await, before);
+    assert_eq!(setup.progress().await, Some((3005.0, false)));
+    // Whether or not the late Play still acts, the Group is at its target and plays on there.
+    setup
+        .household
+        .set_fault(&setup.kitchen, sonos_fake::Fault::None);
+    api.resume_group(&setup.bobs, setup.kitchen.uuid()).await;
+    assert_eq!(setup.track(), (Some(2), seconds(590)));
+    setup.advance(30).await;
+    setup.wait_for_progress((3020.0, false)).await;
+    assert_eq!(api.handoffs(&setup.bobs).await, before);
 }
 
 #[tokio::test]
